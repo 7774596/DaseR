@@ -33,5 +33,3 @@ What actually happened. Include error messages and stack traces.
 - OS:
 - Python version:
 - CUDA / driver version:
-- GDS available (yes/no):
-- DaseR version / commit:

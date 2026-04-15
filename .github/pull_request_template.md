@@ -18,21 +18,7 @@ How was this tested?
 
 ## Checklist
 
-### Correctness
-- [ ] Code does what the PR description claims
-- [ ] Edge cases handled
-- [ ] No regressions — existing tests still pass
-
-### Architecture
-- [ ] No cross-layer direct imports
-- [ ] No `threading` + `asyncio` mixing
-- [ ] No LMCache imports in `daser/`
-
-### Style & Standards
 - [ ] `pre-commit run --all-files` passes
 - [ ] Type hints and docstrings on all new/modified functions
-- [ ] License header on all new Python files
-
-### Testing
-- [ ] Tests use `IOUringBackend` or mock — no GDS hardware required
-- [ ] Tests target public interface, not internals
+- [ ] New features and bug fixes include tests
+- [ ] No regressions — existing tests still pass

@@ -21,7 +21,7 @@ dev = [
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "B", "SLF"]
+select = ["E", "F", "B", "SLF", "I"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["daser"]

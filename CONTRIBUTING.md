@@ -41,20 +41,8 @@ chore(ci): add ruff pre-commit hook
 
 ## Pull Request Checklist
 
-Before opening a PR, verify:
-
-- [ ] `pre-commit run --all-files` passes
-- [ ] All new/modified functions have type hints and docstrings
-- [ ] New features and bug fixes include tests
-- [ ] Tests use `IOUringBackend` or mock — no GDS hardware required
-- [ ] No cross-layer imports (connector must not import server internals)
-- [ ] No `threading` + `asyncio` mixing
-- [ ] No LMCache imports in `daser/`
+Use the pr templates in `.github/pull_request_template.md`.
 
 ## Reporting Issues
 
 Use the issue templates in `.github/ISSUE_TEMPLATE/`. For bugs, include a minimal reproduction. For features, describe the motivation and how it fits the architecture.
-
-## Code Style
-
-See [CLAUDE.md](CLAUDE.md) for detailed coding conventions, architecture rules, and the full code review checklist.
