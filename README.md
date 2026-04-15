@@ -29,8 +29,7 @@ NVIDIA cuFile (GDS) or kvikio compat-mode as a fallback.
 ### 1. Environment
 
 ```bash
-source /data/zwt/vllm/bin/activate
-cd /home/zwt/daser_project/DaseR
+source <venv>/bin/activate
 pip install -e .
 ```
 
@@ -38,7 +37,7 @@ pip install -e .
 
 ```bash
 python -m daser.server \
-    --store-path /data/zwt/daser_test/daser.store \
+    --store-path /path/to/daser.store \
     --store-size 10737418240 \
     --socket-path /tmp/daser.sock \
     --index-path /tmp/daser.index
@@ -46,7 +45,7 @@ python -m daser.server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--store-path` | `/data/zwt/daser_test/daser.store` | Pre-allocated NVMe store file |
+| `--store-path` | (required) | Pre-allocated NVMe store file |
 | `--store-size` | `10 GB` | Total store capacity in bytes |
 | `--socket-path` | `/tmp/daser.sock` | Unix domain socket |
 | `--index-path` | `/tmp/daser.index` | Metadata index file |
@@ -74,8 +73,8 @@ using IMDB review-derived KV chunk sizes (2 MB/slot, 32 layers, bfloat16).
 ```bash
 python benchmarks/bench_storage_imdb.py \
     --num-chunks 100 \
-    --store-dir /data/zwt/daser_test \
-    --imdb /data/zwt/imdb.csv
+    --store-dir /path/to/scratch-dir \
+    --imdb /path/to/imdb.csv
 ```
 
 **Latest results** (100 chunks × 2 MB = 0.21 GB, btrfs filesystem, kvikio compat mode):
@@ -101,7 +100,7 @@ ktc = KVTransferConfig(
     kv_role="kv_both",
     kv_connector_extra_config={
         "socket_path": "/tmp/daser.sock",
-        "store_path": "/data/zwt/daser_test/daser.store",
+        "store_path": "/path/to/daser.store",
         "slot_size": 2097152,       # must match server --slot-size
         "block_tokens": 16,
         "model_id": "my-model",

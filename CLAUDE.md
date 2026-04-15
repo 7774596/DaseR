@@ -22,7 +22,7 @@ All production code lives under `DaseR/daser/`. Do not place source code outside
 ## Python Environment
 
 ```bash
-source /data/zwt/vllm/bin/activate
+source <venv>/bin/activate
 ```
 
 Install in editable mode:
@@ -31,20 +31,6 @@ Install in editable mode:
 cd DaseR
 pip install -e .
 ```
-
-## Key Paths
-
-| Resource | Path |
-|----------|------|
-| Python venv | `/data/zwt/vllm/` |
-| LMCache reference | `/home/zwt/daser_project/LMCache/` |
-| vLLM reference | `/home/zwt/daser_project/vllm/` |
-| Design docs | `DaseR/docs/superpowers/design/` |
-| Server resources | `docs/source.md` |
-| Default model | `/data/zwt/model/models/Qwen/Qwen3-8B` |
-| Test working directory | `/data/zwt/daser_test/` |
-
-Server topology (GPU inventory, NVMe devices, PCIe bus IDs, NUMA config, default model and test paths) is documented in [`docs/source.md`](docs/source.md). Read it before writing storage paths, CUDA device indices, or NUMA assumptions into code.
 
 ## Architecture Rules
 
