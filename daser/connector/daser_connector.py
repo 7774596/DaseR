@@ -3,11 +3,11 @@
 # Standard
 import asyncio
 import concurrent.futures
+from dataclasses import dataclass, field
 import hashlib
 import math
 import os
 import threading
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -21,12 +21,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.attention import AttentionMetadata
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_utils import KVCacheBlocks
     from vllm.v1.core.scheduler import SchedulerOutput
     from vllm.v1.request import Request
-    from vllm.attention import AttentionMetadata
 
 # First Party
 from daser.connector.gds_transfer import GDSTransferLayer
@@ -517,9 +517,9 @@ class DaserConnector(KVConnectorBase_V1):
         async def _run_all(coros: list) -> list:
             return await asyncio.gather(*coros)
 
-        asyncio.run_coroutine_threadsafe(
-            _run_all(all_reads), self._bg_loop
-        ).result(timeout=120.0)
+        asyncio.run_coroutine_threadsafe(_run_all(all_reads), self._bg_loop).result(
+            timeout=120.0
+        )
 
         # All GDS reads are done.  Copy staging buffers into the KV cache on
         # the calling (model-runner) thread so the copies land on the same

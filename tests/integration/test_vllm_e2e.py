@@ -171,13 +171,11 @@ def test_output_correctness_and_perf(daser_server: tuple[str, str, int]) -> None
     # ------------------------------------------------------------------
     # Correctness: each prompt must produce identical output tokens
     # ------------------------------------------------------------------
-    for i, (cold, warm) in enumerate(zip(cold_outputs, warm_outputs)):
+    for i, (cold, warm) in enumerate(zip(cold_outputs, warm_outputs, strict=False)):
         cold_text = cold.outputs[0].text
         warm_text = warm.outputs[0].text
         assert cold_text == warm_text, (
-            f"Prompt {i}: output mismatch\n"
-            f"  cold: {cold_text!r}\n"
-            f"  warm: {warm_text!r}"
+            f"Prompt {i}: output mismatch\n  cold: {cold_text!r}\n  warm: {warm_text!r}"
         )
     logger.info("[E2E] correctness check passed: all %d outputs match", len(PROMPTS))
 

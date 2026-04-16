@@ -27,9 +27,7 @@ DTYPE_BYTES: int = 2  # bfloat16
 # Must match DaserConnector's computed slot_size so that file_offset
 # arithmetic agrees between the server and the connector.
 # = 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296
-SLOT_SIZE: int = (
-    NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
-)
+SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 
 TOTAL_SLOTS: int = 128  # ring buffer capacity for the test
 

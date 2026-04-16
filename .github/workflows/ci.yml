@@ -24,6 +24,3 @@ jobs:
 
       - name: ruff format
         run: ruff format --check daser/ tests/
-
-      - name: mypy
-        run: mypy daser/

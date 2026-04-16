@@ -60,7 +60,9 @@ class GDSTransferLayer:
             kvikio.defaults.set("num_threads", nthreads)
 
         self._file = kvikio.cufile.CuFile(path, "r+")
-        logger.info("[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path)
+        logger.info(
+            "[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path
+        )
 
     @property
     def backend(self) -> TransferBackend:

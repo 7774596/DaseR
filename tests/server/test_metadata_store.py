@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import time
 from pathlib import Path
+import time
 
 import pytest
 

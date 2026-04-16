@@ -5,7 +5,8 @@ Simulates KV-cache save/load patterns derived from IMDB review lengths.
 
 Usage:
     source /data/zwt/vllm/bin/activate
-    python benchmarks/bench_storage_imdb.py [--num-chunks 100] [--store-dir /data/zwt/daser_test]
+    python benchmarks/bench_storage_imdb.py [--num-chunks 100]
+                                            [--store-dir /data/zwt/daser_test]
                                             [--daser-threads 4]
 """
 
@@ -20,7 +21,6 @@ import json
 import os
 import statistics
 import sys
-import tempfile
 import threading
 import time
 from typing import Any
@@ -31,8 +31,7 @@ import torch
 
 # First Party - add project root so we can import daser without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from daser.connector.gds_transfer import GDSTransferLayer, TransferBackend
-
+from daser.connector.gds_transfer import GDSTransferLayer
 
 # ---------------------------------------------------------------------------
 # Constants — mimic a realistic LLM KV layout
@@ -40,17 +39,19 @@ from daser.connector.gds_transfer import GDSTransferLayer, TransferBackend
 NUM_LAYERS = 32  # Llama-3-8B / similar
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
-BLOCK_TOKENS = 16       # tokens per vLLM KV block
+BLOCK_TOKENS = 16  # tokens per vLLM KV block
 KV_DTYPE = torch.bfloat16
 
-# Bytes per block per layer: 2 (K+V) * BLOCK_TOKENS * NUM_KV_HEADS * HEAD_DIM * dtype_bytes
+# Bytes per block per layer:
+# 2 (K+V) * BLOCK_TOKENS * NUM_KV_HEADS * HEAD_DIM * dtype_bytes
 _BYTES_PER_LAYER = 2 * BLOCK_TOKENS * NUM_KV_HEADS * HEAD_DIM * 2  # 65 536 B
-SLOT_SIZE = NUM_LAYERS * _BYTES_PER_LAYER                           # 2 097 152 B = 2 MB
+SLOT_SIZE = NUM_LAYERS * _BYTES_PER_LAYER  # 2 097 152 B = 2 MB
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _percentile(data: list[float], p: float) -> float:
     """Return the p-th percentile (0–100) of a sorted list."""
@@ -97,6 +98,7 @@ def _alloc_store(path: str, num_slots: int) -> None:
 # ---------------------------------------------------------------------------
 # DaseR benchmark
 # ---------------------------------------------------------------------------
+
 
 async def _daser_write_all(
     gds: GDSTransferLayer, bufs: list[cupy.ndarray]
@@ -147,8 +149,10 @@ async def _daser_read_all(
 
 
 def _bench_daser(store_path: str, num_chunks: int, nthreads: int = 4) -> dict[str, Any]:
-    print(f"\n[DaseR] Backend: kvikio — writing {num_chunks} slots × {SLOT_SIZE/1024/1024:.1f} MB "
-          f"(threads={nthreads})")
+    print(
+        f"\n[DaseR] Backend: kvikio — writing {num_chunks} slots"
+        f" × {SLOT_SIZE / 1024 / 1024:.1f} MB (threads={nthreads})"
+    )
 
     _alloc_store(store_path, num_chunks)
     bufs = [_make_slot_gpu() for _ in range(num_chunks)]
@@ -160,26 +164,39 @@ def _bench_daser(store_path: str, num_chunks: int, nthreads: int = 4) -> dict[st
     # --- cold write ---
     write_elapsed, write_lats = asyncio.run(_daser_write_all(gds, bufs))
     write_gbps = total_bytes / write_elapsed / 1e9
-    print(f"[DaseR] cold write: {write_gbps:.3f} GB/s  ({write_elapsed*1000:.1f} ms total)  "
-          f"p50={_percentile(write_lats,50):.1f}ms  "
-          f"p95={_percentile(write_lats,95):.1f}ms  "
-          f"p99={_percentile(write_lats,99):.1f}ms")
+    print(
+        f"[DaseR] cold write: {write_gbps:.3f} GB/s"
+        f"  ({write_elapsed * 1000:.1f} ms total)  "
+        f"p50={_percentile(write_lats, 50):.1f}ms  "
+        f"p95={_percentile(write_lats, 95):.1f}ms  "
+        f"p99={_percentile(write_lats, 99):.1f}ms"
+    )
 
     # --- cold read ---
-    read_elapsed_cold, read_bufs_cold, read_cold_lats = asyncio.run(_daser_read_all(gds, num_chunks))
+    read_elapsed_cold, read_bufs_cold, read_cold_lats = asyncio.run(
+        _daser_read_all(gds, num_chunks)
+    )
     read_gbps_cold = total_bytes / read_elapsed_cold / 1e9
-    print(f"[DaseR] cold read : {read_gbps_cold:.3f} GB/s  ({read_elapsed_cold*1000:.1f} ms total)  "
-          f"p50={_percentile(read_cold_lats,50):.1f}ms  "
-          f"p95={_percentile(read_cold_lats,95):.1f}ms  "
-          f"p99={_percentile(read_cold_lats,99):.1f}ms")
+    print(
+        f"[DaseR] cold read : {read_gbps_cold:.3f} GB/s"
+        f"  ({read_elapsed_cold * 1000:.1f} ms total)  "
+        f"p50={_percentile(read_cold_lats, 50):.1f}ms  "
+        f"p95={_percentile(read_cold_lats, 95):.1f}ms  "
+        f"p99={_percentile(read_cold_lats, 99):.1f}ms"
+    )
 
     # --- warm read (OS page cache likely warm) ---
-    read_elapsed_warm, read_bufs_warm, read_warm_lats = asyncio.run(_daser_read_all(gds, num_chunks))
+    read_elapsed_warm, read_bufs_warm, read_warm_lats = asyncio.run(
+        _daser_read_all(gds, num_chunks)
+    )
     read_gbps_warm = total_bytes / read_elapsed_warm / 1e9
-    print(f"[DaseR] warm read : {read_gbps_warm:.3f} GB/s  ({read_elapsed_warm*1000:.1f} ms total)  "
-          f"p50={_percentile(read_warm_lats,50):.1f}ms  "
-          f"p95={_percentile(read_warm_lats,95):.1f}ms  "
-          f"p99={_percentile(read_warm_lats,99):.1f}ms")
+    print(
+        f"[DaseR] warm read : {read_gbps_warm:.3f} GB/s"
+        f"  ({read_elapsed_warm * 1000:.1f} ms total)  "
+        f"p50={_percentile(read_warm_lats, 50):.1f}ms  "
+        f"p95={_percentile(read_warm_lats, 95):.1f}ms  "
+        f"p99={_percentile(read_warm_lats, 99):.1f}ms"
+    )
 
     # Correctness spot-check
     match = bool(cupy.array_equal(bufs[0], read_bufs_cold[0]))
@@ -215,6 +232,7 @@ def _bench_daser(store_path: str, num_chunks: int, nthreads: int = 4) -> dict[st
 # LMCache benchmark (LocalDiskBackend)
 # ---------------------------------------------------------------------------
 
+
 def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
     """Benchmark LMCache LocalDiskBackend write + read."""
     try:
@@ -224,8 +242,6 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
         from lmcache.v1.memory_management import (
             AdHocMemoryAllocator,
             MemoryFormat,
-            MemoryObjMetadata,
-            TensorMemoryObj,
         )
         from lmcache.v1.metadata import LMCacheMetadata
         from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -241,7 +257,7 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
     lm_dtype = KV_DTYPE
     total_bytes = num_chunks * SLOT_SIZE
 
-    print(f"\n[LMCache] writing {num_chunks} chunks × {SLOT_SIZE/1024/1024:.1f} MB")
+    print(f"\n[LMCache] writing {num_chunks} chunks × {SLOT_SIZE / 1024 / 1024:.1f} MB")
 
     loop = asyncio.new_event_loop()
     loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -267,13 +283,17 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
 
     allocator = AdHocMemoryAllocator(device="cpu")
     local_cpu = LocalCPUBackend(
-        config=config, metadata=metadata,
-        dst_device="cpu", memory_allocator=allocator,
+        config=config,
+        metadata=metadata,
+        dst_device="cpu",
+        memory_allocator=allocator,
     )
     backend = LocalDiskBackend(
-        config=config, loop=loop,
+        config=config,
+        loop=loop,
         local_cpu_backend=local_cpu,
-        dst_device="cpu", metadata=metadata,
+        dst_device="cpu",
+        metadata=metadata,
     )
 
     keys = [CacheEngineKey("benchmark", 1, 0, i, lm_dtype) for i in range(num_chunks)]
@@ -311,10 +331,13 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
     done_evt.wait(timeout=300)
     write_elapsed = time.perf_counter() - t0
     write_gbps = total_bytes / write_elapsed / 1e9
-    print(f"[LMCache] cold write: {write_gbps:.3f} GB/s  ({write_elapsed*1000:.1f} ms total)  "
-          f"p50={_percentile(write_lats,50):.1f}ms  "
-          f"p95={_percentile(write_lats,95):.1f}ms  "
-          f"p99={_percentile(write_lats,99):.1f}ms")
+    print(
+        f"[LMCache] cold write: {write_gbps:.3f} GB/s"
+        f"  ({write_elapsed * 1000:.1f} ms total)  "
+        f"p50={_percentile(write_lats, 50):.1f}ms  "
+        f"p95={_percentile(write_lats, 95):.1f}ms  "
+        f"p99={_percentile(write_lats, 99):.1f}ms"
+    )
 
     # --- cold read (parallel blocking reads from disk) ---
     from concurrent.futures import ThreadPoolExecutor as _TPE
@@ -337,10 +360,13 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
             except Exception:
                 pass
     read_gbps_cold = total_bytes / read_elapsed_cold / 1e9
-    print(f"[LMCache] cold read : {read_gbps_cold:.3f} GB/s  ({read_elapsed_cold*1000:.1f} ms total)  "
-          f"p50={_percentile(read_cold_lats,50):.1f}ms  "
-          f"p95={_percentile(read_cold_lats,95):.1f}ms  "
-          f"p99={_percentile(read_cold_lats,99):.1f}ms")
+    print(
+        f"[LMCache] cold read : {read_gbps_cold:.3f} GB/s"
+        f"  ({read_elapsed_cold * 1000:.1f} ms total)  "
+        f"p50={_percentile(read_cold_lats, 50):.1f}ms  "
+        f"p95={_percentile(read_cold_lats, 95):.1f}ms  "
+        f"p99={_percentile(read_cold_lats, 99):.1f}ms"
+    )
 
     # --- warm read (repeat; OS page cache likely hot) ---
     t0 = time.perf_counter()
@@ -355,10 +381,13 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
             except Exception:
                 pass
     read_gbps_warm = total_bytes / read_elapsed_warm / 1e9
-    print(f"[LMCache] warm read : {read_gbps_warm:.3f} GB/s  ({read_elapsed_warm*1000:.1f} ms total)  "
-          f"p50={_percentile(read_warm_lats,50):.1f}ms  "
-          f"p95={_percentile(read_warm_lats,95):.1f}ms  "
-          f"p99={_percentile(read_warm_lats,99):.1f}ms")
+    print(
+        f"[LMCache] warm read : {read_gbps_warm:.3f} GB/s"
+        f"  ({read_elapsed_warm * 1000:.1f} ms total)  "
+        f"p50={_percentile(read_warm_lats, 50):.1f}ms  "
+        f"p95={_percentile(read_warm_lats, 95):.1f}ms  "
+        f"p99={_percentile(read_warm_lats, 99):.1f}ms"
+    )
 
     # cleanup
     try:
@@ -397,6 +426,7 @@ def _bench_lmcache(store_dir: str, num_chunks: int) -> dict[str, Any]:
 # IMDB profiling summary
 # ---------------------------------------------------------------------------
 
+
 def _imdb_summary(imdb_path: str) -> dict[str, Any]:
     blocks = _sample_imdb(imdb_path, n=1000)
     return {
@@ -414,20 +444,35 @@ def _imdb_summary(imdb_path: str) -> dict[str, Any]:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DaseR vs LMCache storage benchmark")
-    parser.add_argument("--num-chunks", type=int, default=100,
-                        help="Number of KV slots/chunks to write and read (default: 100)")
-    parser.add_argument("--store-dir", default="/data/zwt/daser_test",
-                        help="Directory for benchmark store files")
-    parser.add_argument("--imdb", default="/data/zwt/imdb.csv",
-                        help="Path to IMDB CSV dataset")
-    parser.add_argument("--daser-threads", type=int, default=4,
-                        help="kvikio thread-pool size for DaseR compat mode (default: 4)")
-    parser.add_argument("--skip-lmcache", action="store_true",
-                        help="Skip LMCache benchmark (e.g. not installed)")
-    parser.add_argument("--out", default=None,
-                        help="Write JSON results to this file")
+    parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=100,
+        help="Number of KV slots/chunks to write and read (default: 100)",
+    )
+    parser.add_argument(
+        "--store-dir",
+        default="/data/zwt/daser_test",
+        help="Directory for benchmark store files",
+    )
+    parser.add_argument(
+        "--imdb", default="/data/zwt/imdb.csv", help="Path to IMDB CSV dataset"
+    )
+    parser.add_argument(
+        "--daser-threads",
+        type=int,
+        default=4,
+        help="kvikio thread-pool size for DaseR compat mode (default: 4)",
+    )
+    parser.add_argument(
+        "--skip-lmcache",
+        action="store_true",
+        help="Skip LMCache benchmark (e.g. not installed)",
+    )
+    parser.add_argument("--out", default=None, help="Write JSON results to this file")
     args = parser.parse_args()
 
     os.makedirs(args.store_dir, exist_ok=True)
@@ -440,27 +485,39 @@ def main() -> None:
     if os.path.exists(args.imdb):
         summary = _imdb_summary(args.imdb)
         print(f"\nIMDB dataset stats ({summary['sampled_reviews']} reviews sampled):")
-        print(f"  avg blocks/review : {summary['avg_blocks_per_review']:.1f} × {BLOCK_TOKENS} tokens")
+        avg_blk = summary["avg_blocks_per_review"]
+        print(f"  avg blocks/review : {avg_blk:.1f} × {BLOCK_TOKENS} tokens")
         print(f"  median            : {summary['median_blocks']:.0f} blocks")
         print(f"  P90               : {summary['p90_blocks']} blocks")
-        print(f"  slot size         : {summary['slot_mb']:.1f} MB  "
-              f"({NUM_LAYERS}L × {_BYTES_PER_LAYER//1024}KB/layer)")
+        print(
+            f"  slot size         : {summary['slot_mb']:.1f} MB  "
+            f"({NUM_LAYERS}L × {_BYTES_PER_LAYER // 1024}KB/layer)"
+        )
     else:
         summary = {}
         print(f"\nIMDB not found at {args.imdb}, skipping stats")
 
-    print(f"\nBenchmark config: {args.num_chunks} chunks × {SLOT_SIZE/1024/1024:.1f} MB "
-          f"= {args.num_chunks * SLOT_SIZE / 1e9:.2f} GB total")
+    print(
+        f"\nBenchmark config: {args.num_chunks} chunks"
+        f" × {SLOT_SIZE / 1024 / 1024:.1f} MB "
+        f"= {args.num_chunks * SLOT_SIZE / 1e9:.2f} GB total"
+    )
 
     # --- DaseR ---
     daser_store = os.path.join(args.store_dir, "bench_daser.store")
-    daser_result = _bench_daser(daser_store, args.num_chunks, nthreads=args.daser_threads)
+    daser_result = _bench_daser(
+        daser_store, args.num_chunks, nthreads=args.daser_threads
+    )
 
     # --- LMCache ---
     lmcache_dir = os.path.join(args.store_dir, "bench_lmcache")
     os.makedirs(lmcache_dir, exist_ok=True)
     if args.skip_lmcache:
-        lmcache_result = {"system": "LMCache", "skipped": True, "reason": "--skip-lmcache"}
+        lmcache_result = {
+            "system": "LMCache",
+            "skipped": True,
+            "reason": "--skip-lmcache",
+        }
     else:
         lmcache_result = _bench_lmcache(lmcache_dir, args.num_chunks)
 
@@ -491,16 +548,17 @@ def main() -> None:
         ("Cold read latency (total)", "read_cold_ms"),
         ("Warm read latency (total)", "read_warm_ms"),
     ]:
-        print(f"  {label:<28} {_fmt(daser_result, key):>12} {_fmt(lmcache_result, key):>12}")
+        print(
+            f"  {label:<28} {_fmt(daser_result, key):>12}"
+            f" {_fmt(lmcache_result, key):>12}"
+        )
 
     if not lmcache_result.get("skipped"):
-        speedup_cold = (
-            daser_result.get("read_cold_gbps", 0)
-            / max(lmcache_result.get("read_cold_gbps", 1e-9), 1e-9)
+        speedup_cold = daser_result.get("read_cold_gbps", 0) / max(
+            lmcache_result.get("read_cold_gbps", 1e-9), 1e-9
         )
-        speedup_warm = (
-            daser_result.get("read_warm_gbps", 0)
-            / max(lmcache_result.get("read_warm_gbps", 1e-9), 1e-9)
+        speedup_warm = daser_result.get("read_warm_gbps", 0) / max(
+            lmcache_result.get("read_warm_gbps", 1e-9), 1e-9
         )
         print(f"\n  DaseR cold read speedup : {speedup_cold:.2f}×")
         print(f"  DaseR warm read speedup : {speedup_warm:.2f}×")

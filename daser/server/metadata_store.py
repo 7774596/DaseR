@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import time
 from dataclasses import asdict, dataclass
+import time
 from typing import Literal, Optional
 
 # Third Party
