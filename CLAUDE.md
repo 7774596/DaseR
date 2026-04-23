@@ -8,8 +8,10 @@ DaseR is a RAG-native KV cache service for LLM inference. It integrates with vLL
 
 - Default branch: `master`. Base all branches and PRs against `master`.
 - All production code lives under `daser/`. Do not place source code elsewhere.
-- See [docs/architecture.md](docs/architecture.md) for system design and component overview.
 - See [docs/development.md](docs/development.md) for environment setup, commands, and vLLM integration.
+- See [docs/design](docs/design) for system design and component overview.
+- See [docs/insights/](docs/insights/) for project insights — research motivation, related work analysis, and roadmap.
+- See [docs/optimizations/](docs/optimizations/) for optimization records and performance comparison benchmarks.
 - See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit format, and PR process — follow these conventions for all contributions.
 
 ## Rules

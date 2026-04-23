@@ -11,6 +11,8 @@ pip install -e .
 
 ## Docs
 
-- [Architecture](docs/architecture.md) — system overview, components, design decisions
+- [System design](docs/design/) — architecture, components, data flows
 - [Development guide](docs/development.md) — server setup, tests, lint, benchmarks, vLLM integration
+- [Insights](docs/insights/) — research motivation, related work, roadmap
+- [Optimizations](docs/optimizations/) — performance records and benchmarks
 - [Contributing](CONTRIBUTING.md) — branch conventions, commit format, PR process

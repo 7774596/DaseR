@@ -42,6 +42,23 @@ pytest -xvs tests/test_chunk_manager.py
 pytest -xvs tests/test_chunk_manager.py::test_ring_wrap
 ```
 
+### vLLM E2E Integration Test
+
+Runs a cold → warm inference cycle through DaserConnector + vLLM, verifying cache-hit correctness and speedup.
+
+**Requirements:**
+- CUDA GPU with ≥ 24 GB VRAM
+- Qwen3-8B weights at `models/Qwen/Qwen3-8B`
+- vLLM installed in the active venv
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+pytest -xvs tests/integration/test_vllm_e2e.py -m integration \
+    --log-cli-level=INFO
+```
+
+The test fixture automatically starts an in-process DaseR `IPCServer` (no external server needed) with a temporary store file, then tears it down after the module completes.
+
 ---
 
 ## Linting and Formatting
