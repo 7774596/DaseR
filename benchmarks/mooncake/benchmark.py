@@ -255,6 +255,7 @@ def summarise(
     wall_seconds: float,
     time_scale: float,
     prefix_cache_metrics: dict[str, float] | None = None,
+    aborted: bool = False,
 ) -> dict[str, Any]:
     """Summarize trace coverage and successful request latency.
 
@@ -264,6 +265,7 @@ def summarise(
         wall_seconds: Measured replay wall duration.
         time_scale: Configured arrival acceleration factor.
         prefix_cache_metrics: Optional vLLM local/external cache counter deltas.
+        aborted: Whether the replay stopped early after too many failures.
 
     Returns:
         JSON-serializable aggregate metrics.
@@ -290,6 +292,7 @@ def summarise(
         "skipped_output_tokens": sum(row.output_length for row in selection.skipped),
         "completed_requests": len(successful),
         "failed_requests": len(results) - len(successful),
+        "aborted": aborted,
         "wall_seconds": wall_seconds,
         "time_scale": time_scale,
         "achieved_completion_rps": (
@@ -315,7 +318,8 @@ async def replay(
     timeout_seconds: float,
     time_scale: float,
     seed: int,
-) -> tuple[list[dict[str, Any]], float]:
+    abort_after_failures: int = 0,
+) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
     Args:
@@ -328,9 +332,12 @@ async def replay(
         timeout_seconds: Per-request HTTP timeout.
         time_scale: Arrival acceleration factor.
         seed: Generation seed.
+        abort_after_failures: Cancel all outstanding requests once this many
+            requests have failed; zero disables early abort.
 
     Returns:
-        Completion-order result dictionaries and measured wall duration.
+        Completion-order result dictionaries of finished requests, measured
+        wall duration, and whether the replay was aborted early.
 
     Async/thread-safety:
         Uses one asyncio event loop for scheduling and a dedicated writer
@@ -340,6 +347,8 @@ async def replay(
 
     if max_inflight <= 0:
         raise ValueError("max_inflight must be positive")
+    if abort_after_failures < 0:
+        raise ValueError("abort_after_failures must be non-negative")
     scheduled_offset_seconds(0, time_scale)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _ResultWriter(output_path)
@@ -373,10 +382,27 @@ async def replay(
                 )
                 for request in selection.eligible
             ]
-            results = list(await asyncio.gather(*tasks))
+            results: list[dict[str, Any]] = []
+            failures = 0
+            aborted = False
+            pending: set[asyncio.Task[dict[str, Any]]] = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    record = task.result()
+                    results.append(record)
+                    failures += record.get("error") is not None
+                if abort_after_failures and failures >= abort_after_failures:
+                    aborted = bool(pending)
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    break
     finally:
         writer.close()
-    return results, time.perf_counter() - started_at
+    return results, time.perf_counter() - started_at, aborted
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -407,6 +433,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--abort-after-failures",
+        type=int,
+        default=0,
+        help="Cancel the replay once this many requests fail (0 disables).",
+    )
     parser.add_argument("--overflow", choices=("skip", "error"), default="skip")
     return parser.parse_args(argv)
 
@@ -449,7 +481,7 @@ async def main_async(args: argparse.Namespace) -> int:
     results_path = args.output_dir / "requests.jsonl"
     summary_path = args.output_dir / "summary.json"
     before_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))
-    results, wall_seconds = await replay(
+    results, wall_seconds, aborted = await replay(
         selection=selection,
         prompt_builder=prompt_builder,
         server_url=args.server_url.rstrip("/"),
@@ -459,6 +491,7 @@ async def main_async(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout,
         time_scale=args.time_scale,
         seed=args.seed,
+        abort_after_failures=args.abort_after_failures,
     )
     after_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))
     summary = summarise(
@@ -467,12 +500,13 @@ async def main_async(args: argparse.Namespace) -> int:
         wall_seconds,
         args.time_scale,
         compute_metric_delta(before_metrics, after_metrics),
+        aborted=aborted,
     )
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 1 if summary["failed_requests"] else 0
+    return 1 if summary["failed_requests"] or aborted else 0
 
 
 def main(argv: list[str] | None = None) -> None:

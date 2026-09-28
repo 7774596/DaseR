@@ -3,20 +3,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from benchmarks.mooncake import benchmark
 from benchmarks.mooncake.benchmark import (
     MOONCAKE_BLOCK_TOKENS,
     PromptBuilder,
     TraceRequest,
     load_trace,
+    replay,
     scheduled_offset_seconds,
     select_requests,
     summarise,
 )
+from benchmarks.utils.loadgen import RequestResult
 
 
 def _write_trace(path: Path, rows: list[dict[str, object]]) -> None:
@@ -218,3 +223,36 @@ def test_load_trace_rejects_invalid_rows(
 
     with pytest.raises(ValueError, match=message):
         load_trace(trace)
+
+
+def test_replay_aborts_after_failure_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay cancels outstanding requests once the failure budget is spent."""
+
+    async def failing_stream(*args: Any, **kwargs: Any) -> RequestResult:
+        return RequestResult(0, "mooncake-toolagent", "", 0.0, 0.0, 0, 0, "boom")
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", failing_stream)
+    requests = [TraceRequest(i, i * 20, 10, 1, (i,)) for i in range(50)]
+    selection = select_requests(requests, max_model_len=100)
+
+    results, _, aborted = asyncio.run(
+        replay(
+            selection=selection,
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            abort_after_failures=3,
+        )
+    )
+
+    assert aborted
+    # Requests finishing in the same wakeup may overshoot the budget slightly.
+    assert 3 <= len(results) < len(requests)
+    assert summarise(selection, results, 1.0, 1.0, aborted=aborted)["aborted"]
