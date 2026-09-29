@@ -24,6 +24,12 @@ STORAGE_FORMATS = (
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
+#: Research switch for CLOCK second-chance eviction of the packed arena.
+ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
+#: Logical ring headroom under second chance. Spared chunks leave skip holes
+#: behind the hand, so the ring must outlast the byte arena or its FIFO
+#: allocation eviction removes referenced chunks before the hand sees them.
+ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
 
 
 @dataclass(frozen=True)
@@ -280,7 +286,10 @@ class DaserConfig:
         packed_size = self.resolved_online_packed_slot_size()
         local_bytes = self.resolved_local_slot_size()
         logical_bytes = physical_slots * local_bytes
-        return max(physical_slots, logical_bytes // packed_size)
+        slots = max(physical_slots, logical_bytes // packed_size)
+        if os.environ.get(ARENA_SECOND_CHANCE_ENV) == "1":
+            slots *= ARENA_SECOND_CHANCE_SLOT_FACTOR
+        return slots
 
     @property
     def physical_total_slots(self) -> int:

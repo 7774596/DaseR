@@ -7,10 +7,10 @@ import math
 import os
 from typing import Any, Callable, Optional
 
+# First Party
+from daser.config import ARENA_SECOND_CHANCE_ENV
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
-
-# First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.position.base import PositionEncoder
@@ -26,7 +26,6 @@ logger = init_logger(__name__)
 # writer are recorded so commit can report how long that lookup was early.
 # Off by default because it hashes every prompt's candidate keys.
 PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
-ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
 # Writer claims happen at scheduling time, so publication latency spans the
 # request's queueing and prefill (seconds) as well as the save window (ms).
 _PUBLISH_BUCKETS = (
@@ -1361,10 +1360,22 @@ class ServerCore:
                 ).inc()
                 continue
             self._clock_hand = hand
+            self._record_clock_probe(walked)
             await self._remove_chunk(meta.chunk_key, reason="second_chance")
             return meta
         self._clock_hand = hand
         return None
+
+    def _record_clock_probe(self, walked: int) -> None:
+        """Publish CLOCK hand state after one second-chance eviction."""
+        self._metrics.gauge(
+            "daser_arena_referenced_chunks",
+            "Chunks holding a second-chance reference bit.",
+        ).set(len(self._referenced))
+        self._metrics.counter(
+            "daser_arena_clock_walked_slots_total",
+            "Logical slots walked by the arena CLOCK hand.",
+        ).inc(walked)
 
     def _has_store_owner(
         self,
