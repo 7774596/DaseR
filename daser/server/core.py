@@ -4,6 +4,7 @@
 import asyncio
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, Callable, Optional
 
 from daser.connector.helpers import TokenSequence
@@ -20,6 +21,28 @@ from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
+
+# Research switch: when set to "1", lookups that could have used a still-pending
+# writer are recorded so commit can report how long that lookup was early.
+# Off by default because it hashes every prompt's candidate keys.
+PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
+# Writer claims happen at scheduling time, so publication latency spans the
+# request's queueing and prefill (seconds) as well as the save window (ms).
+_PUBLISH_BUCKETS = (
+    0.005,
+    0.01,
+    0.02,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    60.0,
+)
 
 
 @dataclass(frozen=True)
@@ -239,6 +262,7 @@ class ServerCore:
         self._packed_slot_owners: dict[int, str] = {}
         self._packed_slots_by_owner: dict[str, set[int]] = {}
         self._removal_listeners: list[Callable[[str], None]] = []
+        self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
         self._record_capacity_metrics()
 
     @property
@@ -300,11 +324,18 @@ class ServerCore:
         """
         matches = await self._ri.lookup(tokens, model_id)
         candidate_keys: set[str] | None = None
-        if wait_for_pending and self._lifecycle.pending_write_keys:
+        pending_keys = self._lifecycle.pending_write_keys
+        if pending_keys and (wait_for_pending or self._publish_probe):
             # Candidate-key generation hashes the complete prompt. Keep its
             # result across retries because the token sequence is immutable;
             # only index visibility changes between attempts.
             candidate_keys = self._ri.candidate_keys(tokens, model_id)
+        if (
+            self._publish_probe
+            and candidate_keys is not None
+            and self._lookup_needs_pending_retry(tokens, matches, candidate_keys)
+        ):
+            self._lifecycle.note_pending_overlap(candidate_keys & pending_keys)
         if wait_for_pending and self._lookup_needs_pending_retry(
             tokens, matches, candidate_keys
         ):
@@ -565,11 +596,24 @@ class ServerCore:
         except BaseException:
             self._lifecycle.abort_publish(chunk_key)
             raise
-        self._lifecycle.mark_committed(chunk_key)
+        publish_s, overlap_wait_s = self._lifecycle.mark_committed(chunk_key)
         self._metrics.counter(
             "daser_cache_committed_chunks_total",
             "Chunks committed and published to the retrieval index.",
         ).inc()
+        if publish_s is not None:
+            self._metrics.histogram(
+                "daser_cache_publish_seconds",
+                "Seconds from store-writer claim to retrieval publication.",
+                buckets=_PUBLISH_BUCKETS,
+            ).observe(publish_s)
+        if overlap_wait_s is not None:
+            self._metrics.histogram(
+                "daser_cache_pending_overlap_seconds",
+                "Seconds from the first lookup that needed a pending chunk to "
+                "its publication.",
+                buckets=_PUBLISH_BUCKETS,
+            ).observe(overlap_wait_s)
         self._record_capacity_metrics()
         logger.debug(
             "[CORE] commit_chunk key=%s tp_rank=%d tp_size=%d",

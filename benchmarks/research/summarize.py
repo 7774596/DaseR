@@ -92,6 +92,26 @@ def _histogram_sum(
     )
 
 
+def _bucket_quantile(
+    before: dict[str, float], after: dict[str, float], name: str, q: float
+) -> float:
+    """Return the smallest ``<name>`` bucket bound holding quantile ``q``.
+
+    Returns ``inf`` when the quantile falls past the largest finite bucket and
+    0 when the histogram has no observations.
+    """
+    prefix = f'{name}_bucket{{le="'
+    buckets = sorted(
+        (float(key[len(prefix) : -2]), value - before.get(key, 0.0))
+        for key, value in after.items()
+        if key.startswith(prefix)
+    )
+    total = buckets[-1][1] if buckets else 0.0
+    if total <= 0:
+        return 0.0
+    return next(bound for bound, count in buckets if count >= q * total)
+
+
 def _rate(part: float, total: float) -> str:
     """Format ``part / total`` or ``-`` when vLLM metrics were not captured."""
     return f"{part / total:.3f}" if total else "-"
@@ -165,6 +185,45 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
     }
 
 
+def publish_rows(arm_dirs: list[Path]) -> list[str]:
+    """Summarize DaseR store-publication timing per arm.
+
+    Args:
+        arm_dirs: Arm artifact directories.
+
+    Returns:
+        One line per arm that recorded ``daser_cache_publish_seconds``: lookup
+        hit/miss counts, publish count/mean/p50/p90, and (with the publish
+        probe on) the count/mean/p50/p90 of how early a lookup arrived before
+        the chunk it needed was published. Percentiles are bucket upper bounds.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        before = _counters(arm_dir / "daser_metrics_before.prom")
+        after = _counters(arm_dir / "daser_metrics_after.prom")
+        cells = [f"{arm_dir.parent.name}/{arm_dir.name}:"]
+        hit = _delta(before, after, 'daser_cache_lookup_total{result="hit"}')
+        miss = _delta(before, after, 'daser_cache_lookup_total{result="miss"}')
+        cells.append(f"lookup={hit:.0f}/{miss:.0f}")
+        for label, name in (
+            ("publish", "daser_cache_publish_seconds"),
+            ("early", "daser_cache_pending_overlap_seconds"),
+        ):
+            count = _delta(before, after, f"{name}_count")
+            if count <= 0:
+                continue
+            mean = _delta(before, after, f"{name}_sum") / count
+            p50 = _bucket_quantile(before, after, name, 0.5)
+            p90 = _bucket_quantile(before, after, name, 0.9)
+            cells.append(
+                f"{label} n={count:.0f} mean={mean * 1000:.0f}ms "
+                f"p50<={p50 * 1000:.0f}ms p90<={p90 * 1000:.0f}ms"
+            )
+        if len(cells) > 2:
+            lines.append("  " + " ".join(cells))
+    return lines
+
+
 def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
     """Compare per-request TTFT on the first ``first`` shared trace requests.
 
@@ -222,6 +281,10 @@ def main() -> None:
     print("  ".join(c.rjust(widths[c]) for c in _COLUMNS))
     for row in rows:
         print("  ".join(row[c].rjust(widths[c]) for c in _COLUMNS))
+    publish = publish_rows(arm_dirs)
+    if publish:
+        print("store publication (DaseR)")
+        print("\n".join(publish))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first)))
 

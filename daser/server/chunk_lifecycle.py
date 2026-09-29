@@ -4,6 +4,7 @@
 
 # Standard
 import asyncio
+import time
 
 
 class ChunkLifecycle:
@@ -30,6 +31,10 @@ class ChunkLifecycle:
         self._write_expectations: dict[tuple[str, int], tuple[int, int]] = {}
         self._complete_write_ranks: set[tuple[str, int]] = set()
         self._written_slots: dict[tuple[str, int], set[int]] = {}
+        # Publication timing: when a writer claimed each pending key, and when
+        # a lookup first found that key still pending (monotonic seconds).
+        self._owner_since: dict[str, float] = {}
+        self._first_overlap: dict[str, float] = {}
 
     def is_committed(self, chunk_key: str) -> bool:
         """Return whether ``chunk_key`` is committed and visible to lookup."""
@@ -66,15 +71,45 @@ class ChunkLifecycle:
     def mark_write_owner(self, chunk_key: str) -> None:
         """Record that a store writer claimed ``chunk_key``."""
         self._write_owners.add(chunk_key)
+        if chunk_key not in self._committed:
+            self._owner_since.setdefault(chunk_key, time.monotonic())
 
-    def mark_committed(self, chunk_key: str) -> None:
-        """Mark ``chunk_key`` committed, claim ownership, and wake waiters."""
+    def note_pending_overlap(self, chunk_keys: set[str]) -> None:
+        """Record the first time a lookup needed still-pending ``chunk_keys``.
+
+        Args:
+            chunk_keys: Pending writer keys that a lookup could have used.
+
+        Async/thread-safety:
+            Runs on the server event loop; only the earliest overlap per key is
+            kept, so repeated retries do not move the timestamp.
+        """
+        now = time.monotonic()
+        for key in chunk_keys:
+            if key in self._owner_since:
+                self._first_overlap.setdefault(key, now)
+
+    def mark_committed(self, chunk_key: str) -> tuple[float | None, float | None]:
+        """Mark ``chunk_key`` committed, claim ownership, and wake waiters.
+
+        Returns:
+            ``(publish_s, overlap_wait_s)``: seconds from write-owner claim to
+            publication, and from the first lookup that found the key pending
+            to publication. Either is ``None`` when not observed.
+        """
+        now = time.monotonic()
+        since = self._owner_since.pop(chunk_key, None)
+        overlap = self._first_overlap.pop(chunk_key, None)
         self._committed.add(chunk_key)
         self._write_owners.add(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
         self._clear_written_ranges(chunk_key)
         self._notify_commit_waiters(chunk_key)
+        return (
+            None if since is None else now - since,
+            None if overlap is None else now - overlap,
+        )
 
     def record_written_range(
         self,
@@ -239,7 +274,9 @@ class ChunkLifecycle:
         self._clear_written_ranges(chunk_key)
 
     def _clear_written_ranges(self, chunk_key: str) -> None:
-        """Remove transfer coverage state for a chunk."""
+        """Remove transfer coverage and publication-timing state for a chunk."""
+        self._owner_since.pop(chunk_key, None)
+        self._first_overlap.pop(chunk_key, None)
         identities = [
             identity
             for identity in self._write_expectations

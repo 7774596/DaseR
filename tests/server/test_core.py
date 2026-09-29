@@ -142,6 +142,65 @@ async def test_online_lookup_ignores_unrelated_pending_commit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_commit_records_publish_latency() -> None:
+    """Commit should observe seconds from writer claim to publication."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await asyncio.sleep(0.01)
+    await core.commit_chunk(key)
+
+    rendered = registry.render_prometheus()
+    assert "daser_cache_publish_seconds_count 1" in rendered
+    assert 'daser_cache_publish_seconds_bucket{le="0.005"} 0' in rendered
+    assert "daser_cache_pending_overlap_seconds" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", [False, True])
+async def test_publish_probe_records_early_lookup(
+    probe: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the probe on, a lookup that beat its writer is timed to commit."""
+    if probe:
+        monkeypatch.setenv("DASER_PUBLISH_PROBE", "1")
+    else:
+        monkeypatch.delenv("DASER_PUBLISH_PROBE", raising=False)
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    assert await core.lookup(tokens, "m") == []
+    assert await core.lookup(tokens, "m") == []
+    await core.commit_chunk(key)
+
+    rendered = registry.render_prometheus()
+    assert ("daser_cache_pending_overlap_seconds_count 1" in rendered) is probe
+
+
+@pytest.mark.asyncio
+async def test_evicted_writer_drops_publish_timing() -> None:
+    """An evicted pending writer must not leave publication timing behind."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.evict_chunk(key)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+
+    rendered = registry.render_prometheus()
+    assert "daser_cache_publish_seconds_count 1" in rendered
+
+
+@pytest.mark.asyncio
 async def test_alloc_chunks_returns_contiguous_allocations() -> None:
     """ServerCore allocates multiple chunks in one batch."""
     core = make_core()
