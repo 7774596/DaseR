@@ -182,6 +182,7 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         "l1_hits": f"{_delta(before, after, 'daser_l1_hits_total'):.0f}",
         "load_gib": f"{_delta(before, after, _LOAD) / gib:.1f}",
         "store_gib": f"{_delta(before, after, _STORE) / gib:.1f}",
+        "l2w_gib": f"{_delta(before, after, 'daser_l2_write_bytes_total') / gib:.1f}",
     }
 
 

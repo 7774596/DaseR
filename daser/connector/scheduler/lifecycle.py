@@ -92,6 +92,8 @@ class RequestLifecycle:
         self._prefetch_signatures: dict[str, tuple[tuple[int, int], ...]] = {}
         self._prefetch_lookup_results: dict[str, PrefetchLookupResult] = {}
         self._leased_request_ids: set[str] = set()
+        self._finish_admission = False
+        self._written_chunks: dict[str, list[str]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -749,6 +751,16 @@ class RequestLifecycle:
         ]
         self._maybe_allocate_pending_store(req_id, pending_store)
 
+    def _report_finish(self, request: "Request") -> None:
+        """Send the finished request's written chunks for L2 admission."""
+        chunk_keys = getattr(self, "_written_chunks", {}).pop(request.request_id, [])
+        if not chunk_keys:
+            return
+        try:
+            self._ipc_sync.finish_request(chunk_keys, int(request.num_output_tokens))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CONNECTOR] finish_request failed: %s", exc)
+
     def _refresh_runtime_config(self) -> None:
         """Refresh scheduler geometry and reuse policy over owned sync IPC."""
         try:
@@ -770,6 +782,7 @@ class RequestLifecycle:
             )
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
+        self._finish_admission = bool(config.get("finish_admission", False))
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))
         if (
             cache_reuse_mode != self._cache_reuse_mode
@@ -995,6 +1008,10 @@ class RequestLifecycle:
                 alloc["num_slots"] = len(intent.block_ids)
                 alloc["block_ids"] = intent.block_ids
                 self._pending_stores[intent.req_id] = alloc
+                if getattr(self, "_finish_admission", False):
+                    self._written_chunks.setdefault(intent.req_id, []).append(
+                        alloc["chunk_key"]
+                    )
         pending_store.rolling_key = plan.next_key
         pending_store.rolling_slot_index = plan.next_slot
         if plan.complete:
@@ -1017,6 +1034,7 @@ class RequestLifecycle:
             otherwise (False, None).
         """
         del block_ids
+        self._report_finish(request)
         if request.request_id in self._pending_async_save_ids():
             return True, None
         self._req_tokens.pop(request.request_id, None)

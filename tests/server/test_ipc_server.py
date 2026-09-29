@@ -173,7 +173,30 @@ def test_coalesce_transfer_spans_preserves_accounting_charge() -> None:
             "nbytes": 8,
             "accounted_nbytes": 32,
             "packed": True,
+            "hold": False,
+            "hold_key": "",
         }
+    ]
+
+
+def test_coalesce_transfer_spans_keeps_held_chunks_apart() -> None:
+    """Adjacent held records of different chunks stay separate transfer keys."""
+    spans = [
+        {
+            "source_offset": index * 4,
+            "file_offset": index * 4,
+            "nbytes": 4,
+            "packed": True,
+            "hold": True,
+            "hold_key": key,
+        }
+        for index, key in enumerate(("a", "a", "b"))
+    ]
+
+    merged = _coalesce_transfer_spans(spans)
+    assert [(span["hold_key"], span["nbytes"]) for span in merged] == [
+        ("a", 8),
+        ("b", 4),
     ]
 
 
@@ -1354,7 +1377,10 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
 
 
 def _online_arena_server(
-    tmp_path: Any, logical_slots: int, arena_slots: int
+    tmp_path: Any,
+    logical_slots: int,
+    arena_slots: int,
+    metrics_registry: MetricsRegistry | None = None,
 ) -> tuple[ServerCore, IPCServer, str, int]:
     """Build a compressed-online server whose arena is smaller than its ring."""
     local_slot_size = 4 * SLOT_SIZE
@@ -1374,7 +1400,8 @@ def _online_arena_server(
         "l2_size_bytes": arena_slots * local_slot_size,
     }
     socket_path = str(tmp_path / "arena.sock")
-    return core, IPCServer(socket_path, core, config), socket_path, local_slot_size
+    server = IPCServer(socket_path, core, config, metrics_registry=metrics_registry)
+    return core, server, socket_path, local_slot_size
 
 
 async def _store_online_record(
@@ -1429,6 +1456,86 @@ async def test_online_store_evicts_oldest_when_packed_arena_is_full(tmp_path) ->
         assert core.chunk_manager.store.get("a") is None
         assert core.chunk_manager.store.get("b") is not None
         assert core.chunk_manager.store.get("c") is not None
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+def _l2_write_bytes(registry: MetricsRegistry) -> float:
+    """Return the rendered ``daser_l2_write_bytes_total`` value (0 if absent)."""
+    for line in registry.render_prometheus().splitlines():
+        if line.startswith("daser_l2_write_bytes_total "):
+            return float(line.split()[1])
+    return 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_tokens", "finish_first", "kept", "written"),
+    [(600, False, True, 1), (10, False, False, 0), (10, True, False, 0)],
+)
+async def test_finish_admission_writes_only_admitted_chunks(
+    tmp_path, monkeypatch, output_tokens, finish_first, kept, written
+) -> None:
+    """Long outputs reach L2; short outputs are evicted without an L2 write."""
+    monkeypatch.setenv("DASER_FINISH_ADMIT_MIN_OUTPUT", "500")
+    registry = MetricsRegistry()
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path, logical_slots=8, arena_slots=4, metrics_registry=registry
+    )
+    await server.start()
+    try:
+        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
+        assert config["runtime_config"]["finish_admission"] is True
+        finish = {
+            "op": "finish_request",
+            "chunk_keys": ["a"],
+            "output_tokens": output_tokens,
+        }
+        if finish_first:
+            await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": "a",
+                    "token_count": BLOCK_TOKENS,
+                    "model_id": "m",
+                },
+            )
+            core_alloc = core.chunk_manager.store.get("a")
+            assert core_alloc is not None
+            assert "error" not in await _send_recv(socket_path, finish)
+            stored = await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_store",
+                    "payload": {"data": b"x" * local_slot_size},
+                    "spans": [
+                        {
+                            "source_offset": 0,
+                            "file_offset": 0,
+                            "nbytes": local_slot_size,
+                            "chunk_key": "a",
+                            "start_slot": core_alloc.start_slot,
+                            "num_slots": 1,
+                            "logical_slot_start": 0,
+                            "logical_slot_count": 1,
+                            "packed": True,
+                            "mode": "raw",
+                        }
+                    ],
+                },
+            )
+            assert "error" not in stored
+        else:
+            stored = await _store_online_record(socket_path, "a", local_slot_size)
+            assert "error" not in stored
+            assert "error" not in await _send_recv(socket_path, finish)
+        await server.drain_transfer()
+        # Any later transfer refreshes the tier counters.
+        await _store_online_record(socket_path, "z", local_slot_size)
+        assert (core.chunk_manager.store.get("a") is not None) is kept
+        assert _l2_write_bytes(registry) == written * local_slot_size
     finally:
         await server.drain_transfer()
         await server.stop()

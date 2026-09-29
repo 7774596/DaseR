@@ -423,6 +423,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     """
 
     coalesce_store_spans = True
+    supports_held_stores = True
 
     def __init__(
         self,
@@ -453,6 +454,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
+        # L1-only packed ranges waiting for an admission decision. They stay
+        # pinned; leaving L1 before a decision writes them back to L2.
+        self._held: dict[tuple[int, int], PinnedMemorySlice] = {}
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
         self._cache_epoch = 0
@@ -890,6 +894,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         ):
             raise ValueError("packed source spans are not contiguous")
         keys = [(int(span["file_offset"]), int(span["nbytes"])) for span in spans]
+        holds = [bool(span.get("hold", False)) for span in spans]
         accounting = [
             self._accounted_nbytes(span, int(span["nbytes"])) for span in spans
         ]
@@ -1005,16 +1010,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                     )
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
-                    for key, child in children:
-                        previous = self._find_pending_l2_locked(*key)
-                        task = self._schedule_l2_write_locked(
-                            key,
-                            key[0],
-                            child,
-                            previous,
-                        )
-                        self._pending_l2[key] = task
-                        self._pending_l2_buffers[key] = child
+                    for (key, child), hold in zip(children, holds, strict=True):
+                        if hold:
+                            self._held[key] = child
+                        else:
+                            self._persist_locked(key, child)
                     data.close()
                     # Ensure every scheduled write has entered the executor
                     # before callers can close the layer synchronously.
@@ -1240,6 +1240,40 @@ class TieredIOUringTransferLayer(TransferLayer):
         async with self._lock:
             self._release_request_lease_locked(lease_id)
 
+    def persist_held(self, ranges: list[tuple[int, int]]) -> None:
+        """Schedule L2 writes for held ranges; unknown ranges are ignored.
+
+        Args:
+            ranges: ``(file_offset, nbytes)`` keys of held packed spans.
+
+        Async/thread-safety:
+            Must run on the owning event loop. It does not await, so it is
+            atomic with respect to every locked metadata section.
+        """
+        for key in ranges:
+            data = self._held.pop(key, None)
+            if data is not None:
+                self._persist_locked(key, data)
+
+    def discard_held(self, ranges: list[tuple[int, int]]) -> None:
+        """Drop held ranges from L1 without writing them to L2.
+
+        Args:
+            ranges: ``(file_offset, nbytes)`` keys of held packed spans.
+
+        Async/thread-safety:
+            Must run on the owning event loop before the file range is reused.
+            It does not await, so it is atomic with respect to locked sections.
+        """
+        for key in ranges:
+            data = self._held.pop(key, None)
+            if data is None:
+                continue
+            if self._l1.get(key) is data:
+                self._l1.drop_overlapping(*key)
+            else:
+                self._close_unowned_slice_locked(data)
+
     async def drain(self) -> None:
         """Wait until all pending L2 writes and destination copies complete.
 
@@ -1274,6 +1308,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             task.cancel()
         self._pending_l2.clear()
         self._pending_l2_buffers.clear()
+        # Held ranges are L1 residents; the L1 close below frees them.
+        self._held.clear()
         if self._l2 is not None:
             self._l2.close()
         for pending_buffer in pending_buffers:
@@ -1282,10 +1318,26 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1.close()
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
-        """Return whether a writer, request lease or CUDA copy owns ``data``."""
+        """Return whether a writer, request lease or CUDA copy owns ``data``.
+
+        A held range leaving L1 before its admission decision has never been
+        written to L2, so it is written back here and the new writer owns it.
+        """
+        if self._held.get(key) is data:
+            del self._held[key]
+            self._stats.held_evict_persists += 1
+            self._persist_locked(key, data)
         return (
             self._pending_l2_buffers.get(key) is data or id(data) in self._leased_slices
         )
+
+    def _persist_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
+        """Schedule one L2 write for a published L1 range and pin its buffer."""
+        previous = self._find_pending_l2_locked(*key)
+        self._pending_l2[key] = self._schedule_l2_write_locked(
+            key, key[0], data, previous
+        )
+        self._pending_l2_buffers[key] = data
 
     @property
     def l1_bytes_used(self) -> int:
@@ -1418,6 +1470,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             await future
             async with self._lock:
                 self._stats.l2_writes += 1
+                self._stats.l2_write_bytes += key[1]
         except BaseException as exc:
             async with self._lock:
                 self._l2_errors.append(exc)
@@ -1448,6 +1501,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             await self._run_l2_write(loop, file_offset, data)
             async with self._lock:
                 self._stats.l2_writes += 1
+                self._stats.l2_write_bytes += key[1]
         except BaseException as exc:
             async with self._lock:
                 self._l2_errors.append(exc)

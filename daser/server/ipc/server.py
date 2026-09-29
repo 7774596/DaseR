@@ -18,6 +18,11 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
+from daser.server.admission import (
+    FINISH_ADMIT_MIN_OUTPUT_ENV,
+    AdmissionActions,
+    FinishAdmission,
+)
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 from daser.transfer import TransferLayer
@@ -234,8 +239,11 @@ def _coalesce_transfer_spans(
     spans: list[dict[str, Any]],
     *,
     max_packed_bytes: int | None = None,
-) -> list[dict[str, int]]:
+) -> list[dict[str, Any]]:
     """Merge adjacent transfer spans without changing byte contents.
+
+    Spans are merged only when they share ``hold_key``, so every held range
+    belongs to exactly one chunk.
 
     Args:
         spans: transfer spans with source_offset, file_offset, and nbytes.
@@ -255,6 +263,8 @@ def _coalesce_transfer_spans(
             "nbytes": int(span["nbytes"]),
             "packed": bool(span.get("packed", False)),
             "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
+            "hold": bool(span.get("hold", False)),
+            "hold_key": str(span.get("hold_key", "")),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -272,6 +282,7 @@ def _coalesce_transfer_spans(
             span["source_offset"] == prev_source_end
             and span["file_offset"] == prev_file_end
             and span["packed"] == prev["packed"]
+            and span["hold_key"] == prev["hold_key"]
             and (
                 not span["packed"]
                 or max_packed_bytes is None
@@ -334,6 +345,7 @@ class IPCServer:
             or os.environ.get(LOOKUP_WAIT_PENDING_ENV) == "1"
         )
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
+        self._admission: FinishAdmission | None = None
         if (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
@@ -344,6 +356,16 @@ class IPCServer:
                     chunk_key, core.chunk_manager
                 )
             )
+            min_output = os.environ.get(FINISH_ADMIT_MIN_OUTPUT_ENV, "")
+            if min_output:
+                self._admission = FinishAdmission(int(min_output))
+                self._runtime_config["finish_admission"] = True
+                # Held bytes of a removed chunk must never reach L2.
+                core.add_chunk_removal_listener(self._forget_admission)
+        logger.info(
+            "finish admission min_output=%s",
+            None if self._admission is None else self._admission.min_output_tokens,
+        )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -371,6 +393,7 @@ class IPCServer:
             "register_load_staging": self._register_load_staging,
             "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
+            "finish_request": self._op_finish_request,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
         }
@@ -623,7 +646,7 @@ class IPCServer:
             that do not expose the keyword.
         """
         try:
-            return await self._core.lookup(
+            chunks = await self._core.lookup(
                 tokens,
                 model_id,
                 wait_for_pending=self._lookup_wait_pending,
@@ -631,7 +654,10 @@ class IPCServer:
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
                 raise
-            return await self._core.lookup(tokens, model_id)
+            chunks = await self._core.lookup(tokens, model_id)
+        if self._admission is not None:
+            self._admission.mark_hit([chunk.chunk_key for chunk in chunks])
+        return chunks
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -748,6 +774,23 @@ class IPCServer:
         self._ensure_transfer()
         return {"ok": True}
 
+    async def _op_finish_request(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle ``finish_request``: decide L2 admission for a request's chunks.
+
+        Args:
+            msg: IPC request with ``chunk_keys`` and ``output_tokens``.
+
+        Returns:
+            ``{"ok": True}``; a no-op when finish admission is disabled.
+        """
+        if self._admission is not None:
+            actions = self._admission.finish(
+                [str(key) for key in msg.get("chunk_keys", [])],
+                int(msg.get("output_tokens", 0)),
+            )
+            await self._apply_admission(actions)
+        return {"ok": True}
+
     async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle an ``evict_chunk`` request."""
         await self._core.evict_chunk(msg["chunk_key"])
@@ -790,6 +833,7 @@ class IPCServer:
         backend = str(self._runtime_config.get("transfer_mode", "gds"))
         transfer = self._ensure_transfer()
         total = 0
+        held_spans: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
         stored_chunk_keys: list[str] = []
         accepted_spans: list[dict[str, Any]] = []
         place_ms = 0.0
@@ -945,6 +989,14 @@ class IPCServer:
                     }
                 )
 
+            holding = self._admission is not None and transfer.supports_held_stores
+            if holding:
+                live_spans = [
+                    {**span, "hold": True, "hold_key": str(span["chunk_key"])}
+                    if span.get("packed", False) and span.get("chunk_key")
+                    else span
+                    for span in live_spans
+                ]
             if transfer.coalesce_store_spans:
                 store_spans = _coalesce_transfer_spans(
                     live_spans,
@@ -961,6 +1013,8 @@ class IPCServer:
                 store_spans = live_spans
             io_started = time.perf_counter()
             total = await transfer.store_bytes_grouped(buffer, store_spans)
+            if holding:
+                held_spans = (live_spans, store_spans)
             logger.info(
                 "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d "
                 "place_ms=%.1f evictions=%d io_ms=%.1f total_ms=%.1f",
@@ -1001,6 +1055,9 @@ class IPCServer:
                 local_slot_size=local_slot_size,
                 rank_stride_bytes=rank_stride_bytes,
             )
+        if held_spans is not None:
+            # After record_store_ranges: an early deny may evict the chunk.
+            await self._record_held_spans(transfer, *held_spans)
         self._record_transfer_metrics(
             op="store",
             backend=backend,
@@ -1218,6 +1275,71 @@ class IPCServer:
             throughput_gbps,
         )
 
+    async def _record_held_spans(
+        self,
+        transfer: TransferLayer,
+        live_spans: list[dict[str, Any]],
+        store_spans: list[dict[str, Any]],
+    ) -> None:
+        """Register held ranges per chunk and apply any early decisions.
+
+        A chunk that was evicted while its store was in flight has already
+        been forgotten, so its ranges are discarded instead of held.
+        """
+        assert self._admission is not None
+        ranges: dict[str, list[tuple[int, int]]] = {}
+        for span in store_spans:
+            if span.get("hold"):
+                ranges.setdefault(str(span["hold_key"]), []).append(
+                    (int(span["file_offset"]), int(span["nbytes"]))
+                )
+        allocations = {
+            str(span["chunk_key"]): span for span in live_spans if span.get("hold")
+        }
+        actions = AdmissionActions()
+        for chunk_key, held in ranges.items():
+            span = allocations[chunk_key]
+            if not self._core.is_current_allocation(
+                chunk_key=chunk_key,
+                start_slot=int(span.get("start_slot", -1)),
+                num_slots=int(span.get("num_slots", 0)),
+            ):
+                transfer.discard_held(held)
+                continue
+            part = self._admission.hold(chunk_key, held)
+            actions.persist.extend(part.persist)
+            actions.evict.extend(part.evict)
+            actions.admitted += part.admitted
+            actions.rescued += part.rescued
+        self._metrics.counter(
+            "daser_admission_chunks_total", "Finish-admission chunk outcomes."
+        ).inc(len(ranges), labels={"outcome": "held"})
+        await self._apply_admission(actions)
+
+    async def _apply_admission(self, actions: AdmissionActions) -> None:
+        """Persist admitted held ranges and evict denied chunks."""
+        if actions.persist and self._transfer is not None:
+            self._transfer.persist_held(actions.persist)
+        for chunk_key in actions.evict:
+            await self._core.evict_chunk(chunk_key)
+        counter = self._metrics.counter(
+            "daser_admission_chunks_total", "Finish-admission chunk outcomes."
+        )
+        for outcome, count in (
+            ("admitted", actions.admitted),
+            ("rescued", actions.rescued),
+            ("denied", len(actions.evict)),
+        ):
+            if count:
+                counter.inc(count, labels={"outcome": outcome})
+
+    def _forget_admission(self, chunk_key: str) -> None:
+        """Removal listener: discard a removed chunk's held ranges."""
+        assert self._admission is not None
+        held = self._admission.forget(chunk_key)
+        if held and self._transfer is not None:
+            self._transfer.discard_held(held)
+
     def _record_tier_metrics(self) -> None:
         """Publish L1 cache metrics and the cumulative L2 read counter."""
         transfer = self._transfer
@@ -1227,6 +1349,21 @@ class IPCServer:
         current_hits = stats.l1_hits
         current_misses = stats.l1_misses
         current_l2_reads = stats.l2_reads
+        l2_write_bytes = stats.l2_write_bytes - getattr(self, "_prev_l2_write_bytes", 0)
+        if l2_write_bytes > 0:
+            self._metrics.counter(
+                "daser_l2_write_bytes_total", "Bytes written to the L2 storage tier."
+            ).inc(l2_write_bytes)
+        self._prev_l2_write_bytes = stats.l2_write_bytes
+        held_evicts = stats.held_evict_persists - getattr(
+            self, "_prev_held_evict_persists", 0
+        )
+        if held_evicts > 0:
+            self._metrics.counter(
+                "daser_admission_ranges_total",
+                "Finish-admission held-range outcomes.",
+            ).inc(held_evicts, labels={"outcome": "l1_evicted"})
+        self._prev_held_evict_persists = stats.held_evict_persists
         prev_hits = getattr(self, "_prev_l1_hits", 0)
         prev_misses = getattr(self, "_prev_l1_misses", 0)
         prev_l2_reads = getattr(self, "_prev_l2_reads", 0)

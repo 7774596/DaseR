@@ -17,6 +17,9 @@ class TransferStats:
         l1_misses: number of reads not found in the memory tier.
         l2_reads: number of reads issued to the SSD tier.
         l2_writes: number of writes issued to the SSD tier.
+        l2_write_bytes: bytes written to the SSD tier.
+        held_evict_persists: held ranges written to L2 because they left the
+            memory tier before an admission decision arrived.
         prefetch_requests: number of host-tier prefetch operations.
         prefetch_l1_bytes: requested bytes already resident in L1.
         prefetch_l2_bytes: requested bytes read from L2.
@@ -26,6 +29,8 @@ class TransferStats:
     l1_misses: int = 0
     l2_reads: int = 0
     l2_writes: int = 0
+    l2_write_bytes: int = 0
+    held_evict_persists: int = 0
     prefetch_requests: int = 0
     prefetch_l1_bytes: int = 0
     prefetch_l2_bytes: int = 0
@@ -62,6 +67,9 @@ class TransferLayer(ABC):
 
     #: When True the server coalesces adjacent store spans before dispatch.
     coalesce_store_spans: bool = False
+    #: When True, packed store spans carrying ``hold=True`` are published to
+    #: the memory tier only; their SSD write waits for ``persist_held``.
+    supports_held_stores: bool = False
 
     @property
     def stats(self) -> TransferStats:
@@ -275,6 +283,30 @@ class TransferLayer(ABC):
             race with load completion safely.
         """
         return None
+
+    def persist_held(self, ranges: list[tuple[int, int]]) -> None:  # noqa: B027
+        """Schedule SSD writes for held memory-tier ranges.
+
+        Args:
+            ranges: ``(file_offset, nbytes)`` keys returned by a held store.
+                Ranges no longer held are ignored.
+
+        Async/thread-safety:
+            Must be called on the server event loop. Does not await; the
+            writes run in the background and are covered by ``drain``.
+        """
+
+    def discard_held(self, ranges: list[tuple[int, int]]) -> None:  # noqa: B027
+        """Drop held ranges without writing them to the SSD tier.
+
+        Args:
+            ranges: ``(file_offset, nbytes)`` keys returned by a held store.
+                Ranges no longer held are ignored.
+
+        Async/thread-safety:
+            Must be called on the server event loop before the file range is
+            reused by another store. Does not await.
+        """
 
     async def drain(self) -> None:  # noqa: B027
         """Wait for any background transfer work to complete.
