@@ -36,6 +36,11 @@ _PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
 _CUDA_IPC_CACHE_LIMIT = 16
 _PACKED_IO_ALIGNMENT = 4096
 
+# Research switch: when set to "1", every storage format retries a lookup that
+# overlaps an in-flight store writer (the online-compressed default). Unset
+# keeps raw lookups on immediate-miss semantics.
+LOOKUP_WAIT_PENDING_ENV = "DASER_LOOKUP_WAIT_PENDING"
+
 
 def _packed_physical_slot(span: dict[str, Any]) -> int:
     """Return the DaseR ring slot represented by one packed span.
@@ -318,6 +323,17 @@ class IPCServer:
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._packed_layout = OnlinePackedLayout()
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot, so a successor lookup can observe the
+        # writer key during the short transfer/commit interval. Retry for this
+        # format; raw keeps immediate-miss semantics unless
+        # LOOKUP_WAIT_PENDING_ENV opts it in for a like-for-like comparison.
+        self._lookup_wait_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+            or os.environ.get(LOOKUP_WAIT_PENDING_ENV) == "1"
+        )
+        logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         if (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
@@ -606,20 +622,11 @@ class IPCServer:
             is limited to test doubles or older public core implementations
             that do not expose the keyword.
         """
-        # Online packed stores publish asynchronously after the worker has
-        # released its source snapshot.  A successor lookup can therefore
-        # observe the writer key during the short transfer/commit interval.
-        # Retry only for this format, using the core's bounded cooperative
-        # backoff; raw/master keeps its original immediate-miss semantics.
-        wait_for_pending = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=wait_for_pending,
+                wait_for_pending=self._lookup_wait_pending,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):

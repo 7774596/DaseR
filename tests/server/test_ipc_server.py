@@ -75,11 +75,26 @@ def make_core(total_slots: int = 64) -> ServerCore:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
+@pytest.mark.parametrize(
+    ("storage_format", "env_value", "expected"),
+    [
+        ("raw", None, False),
+        ("compressed-online", None, True),
+        ("raw", "1", True),
+        ("raw", "0", False),
+    ],
+)
 async def test_ipc_lookup_waits_only_for_online_packed_store(
     storage_format: str,
+    env_value: str | None,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only online packed lookup retries a writer that is still publishing."""
+    """Online packed lookup retries in-flight writers; raw only when opted in."""
+    if env_value is None:
+        monkeypatch.delenv("DASER_LOOKUP_WAIT_PENDING", raising=False)
+    else:
+        monkeypatch.setenv("DASER_LOOKUP_WAIT_PENDING", env_value)
 
     class LookupCore:
         def add_chunk_removal_listener(self, _listener: Any) -> None:
@@ -106,7 +121,7 @@ async def test_ipc_lookup_waits_only_for_online_packed_store(
     )
 
     assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
-    assert core.wait_arguments == [storage_format == "compressed-online"]
+    assert core.wait_arguments == [expected]
 
 
 def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
