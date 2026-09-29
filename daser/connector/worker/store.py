@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import os
 import threading
 import time
@@ -26,6 +26,7 @@ from daser.connector.worker.memory import (
     CudaStagingLease,
     FixedCudaStagingPool,
 )
+from daser.connector.worker.probe import SaveTimeline, StoreProbe
 from daser.connector.worker.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     copy_cross_layer_kv_cache_to_staging,
@@ -76,6 +77,7 @@ class _DeferredFinishedSave:
     producer_event_order: int = 0
     snapshot_done: bool = False
     completion_emitted: bool = False
+    timeline: SaveTimeline = field(default_factory=SaveTimeline)
 
 
 class StorePipeline:
@@ -131,6 +133,7 @@ class StorePipeline:
         self._storage_format = STORAGE_FORMAT_RAW
         self._online_packer: FusedOnlineKVPacker | None = None
         self._producer_event_order = 0
+        self._probe = StoreProbe.from_env()
         self._thread.start()
 
     def configure(
@@ -343,6 +346,7 @@ class StorePipeline:
             save = self._pending_finished_saves.get(req_id)
             if save is not None:
                 save.finished = True
+                self._stamp((save,), "finished", keep_first=True)
 
         for req_id, save in list(self._pending_finished_saves.items()):
             # Packed mode has a deliberate two-phase completion contract:
@@ -354,6 +358,7 @@ class StorePipeline:
             if packed_mode and save.snapshot_done and not save.completion_emitted:
                 save.completion_emitted = True
                 finished.add(req_id)
+                self._record_emitted(save)
 
             if save.future is not None and save.future.done():
                 try:
@@ -365,6 +370,7 @@ class StorePipeline:
                 # previous poll, so no duplicate request ID is returned here.
                 if not packed_mode:
                     finished.add(req_id)
+                    self._record_emitted(save)
 
         # Submit the entire finished FIFO after observing the current state.
         # This preserves the raw path's one-poll dispatch boundary while the
@@ -374,6 +380,7 @@ class StorePipeline:
             for save in self._pending_finished_saves.values()
             if save.finished and save.future is None
         ]
+        self._stamp(ready_saves, "submitted")
         if packed_mode:
             for group in self._group_packed_saves(ready_saves):
                 self._submit_packed_save_group(group)
@@ -469,6 +476,27 @@ class StorePipeline:
                     first_error = exc
         if first_error is not None:
             raise first_error
+
+    def _stamp(
+        self,
+        saves: Sequence[_DeferredFinishedSave],
+        point: str,
+        *,
+        keep_first: bool = False,
+    ) -> None:
+        """Set timeline ``point`` on ``saves`` when the store probe is on."""
+        if getattr(self, "_probe", None) is None:
+            return
+        now = time.monotonic()
+        for save in saves:
+            if not (keep_first and getattr(save.timeline, point)):
+                setattr(save.timeline, point, now)
+
+    def _record_emitted(self, save: _DeferredFinishedSave) -> None:
+        """Report a save whose blocks are being released to the probe."""
+        probe = getattr(self, "_probe", None)
+        if probe is not None:
+            probe.on_emitted(save.timeline, time.monotonic())
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -566,6 +594,7 @@ class StorePipeline:
             semaphore = asyncio.Semaphore(max(1, self._store_capacity))
             self._store_semaphore = semaphore
         async with semaphore:
+            self._stamp((save,), "admitted")
             await self._store_finished_save(save, producer_event)
 
     async def _run_bounded_save_group(
@@ -580,6 +609,7 @@ class StorePipeline:
             semaphore = asyncio.Semaphore(max(1, self._store_capacity))
             self._store_semaphore = semaphore
         async with semaphore:
+            self._stamp(members, "admitted")
             await self._store_finished_save(
                 merged,
                 producer_event,
@@ -629,6 +659,7 @@ class StorePipeline:
         batches = self._plan_finished_save(save)
         snapshot_saves = snapshot_targets or (save,)
         if not batches:
+            self._stamp(snapshot_saves, "ready")
             if getattr(self, "_online_packer", None) is not None:
                 for snapshot_save in snapshot_saves:
                     snapshot_save.snapshot_done = True
@@ -646,9 +677,10 @@ class StorePipeline:
                     block_ids, spans, producer_event
                 )
                 try:
-                    await self._write_cuda_buffer(staged)
+                    await self._write_staged(staged)
                 finally:
                     self._release_staged(staged)
+            self._stamp((save,), "ready")
             return
 
         overlap_batches = (
@@ -694,6 +726,7 @@ class StorePipeline:
             # All source blocks are now immutable snapshots in worker-owned
             # staging leases.  ``collect_finished`` can release vLLM blocks
             # while transfer tasks continue in the background.
+            self._stamp(snapshot_saves, "ready")
             for snapshot_save in snapshot_saves:
                 snapshot_save.snapshot_done = True
 
@@ -724,7 +757,7 @@ class StorePipeline:
             staging pool or leave pinned memory retained indefinitely.
         """
         try:
-            return await self._write_cuda_buffer(staged)
+            return await self._write_staged(staged)
         finally:
             self._release_staged(staged)
 
@@ -756,7 +789,9 @@ class StorePipeline:
             depth = pool.depth if pool is not None else self._store_capacity
             lease_semaphore = asyncio.Semaphore(max(1, depth))
             self._staging_lease_semaphore = lease_semaphore
+        wait_started = time.monotonic()
         await lease_semaphore.acquire()
+        stage_started = time.monotonic()
         try:
             staged = await asyncio.to_thread(
                 self._stage_batch_serialized,
@@ -772,6 +807,8 @@ class StorePipeline:
             spans=staged.spans,
             lease=staged.lease,
             lease_permit=lease_semaphore,
+            lease_wait_s=stage_started - wait_started,
+            stage_s=time.monotonic() - stage_started,
         )
 
     async def _drain_staged_task(
@@ -905,6 +942,20 @@ class StorePipeline:
             block_index,
         )
 
+    async def _write_staged(self, staged: "StagedStoreBatch") -> list[str]:
+        """Write one staged batch and report its phases to the store probe."""
+        started = time.monotonic()
+        chunk_keys = await self._write_cuda_buffer(staged)
+        probe = getattr(self, "_probe", None)
+        if probe is not None:
+            probe.on_batch(
+                staged.lease_wait_s,
+                staged.stage_s,
+                time.monotonic() - started,
+                int(staged.buffer.numel() * staged.buffer.element_size()),
+            )
+        return chunk_keys
+
     async def _write_cuda_buffer(self, staged: "StagedStoreBatch") -> list[str]:
         transfer_started = time.perf_counter()
         slot_size = getattr(self, "_local_slot_size", 0)
@@ -1014,6 +1065,8 @@ class StagedStoreBatch:
     spans: list[StoreWriteSpan]
     lease: CudaStagingLease
     lease_permit: asyncio.Semaphore | None = None
+    lease_wait_s: float = 0.0
+    stage_s: float = 0.0
 
 
 def _store_payload_nbytes(
