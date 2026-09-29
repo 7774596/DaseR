@@ -558,8 +558,23 @@ class IPCServer:
             ).observe(elapsed, labels=ipc_labels)
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
+        """Handle a ``lookup`` request, recording external prefix counters.
+
+        ``defer_pending`` selects how a lookup that a pending writer may
+        extend is answered when pending waits are enabled: absent keeps the
+        server-side wait, True replies ``{"pending": True}`` at once so a
+        synchronous caller can retry later, and False resolves immediately.
+        """
+        tokens = self._lookup_tokens(msg)
+        defer_pending = msg.get("defer_pending")
+        if self._lookup_wait_pending and defer_pending is not None:
+            chunks = await self._lookup_now(
+                tokens, msg["model_id"], defer=bool(defer_pending)
+            )
+            if chunks is None:
+                return {"chunks": [], "pending": True}
+        else:
+            chunks = await self._lookup_core(tokens, msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -666,16 +681,50 @@ class IPCServer:
             if "wait_for_pending" not in str(exc):
                 raise
             chunks = await self._core.lookup(tokens, model_id)
-        if self._admission is not None:
-            hit_keys = [
-                key
-                for chunk in chunks
-                for key in self._core.packed_slot_owners(
-                    chunk.start_slot, chunk.num_slots
-                )
-            ]
-            await self._apply_admission(self._admission.mark_hit(hit_keys))
+        await self._mark_admission_hits(chunks)
         return chunks
+
+    async def _lookup_now(
+        self, tokens: TokenSequence, model_id: str, *, defer: bool
+    ) -> list[ChunkInfo] | None:
+        """Run a lookup that never waits for pending writers.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+            defer: Return None instead of chunks when a pending writer may
+                extend the match.
+
+        Returns:
+            Retrieval chunks, or None for a deferred lookup.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping, so a
+            synchronous scheduler RPC is never held for a writer commit.
+        """
+        if defer:
+            chunks = await self._core.lookup_unless_pending(tokens, model_id)
+            if chunks is None:
+                return None
+        else:
+            chunks = await self._core.lookup(tokens, model_id)
+        await self._mark_admission_hits(chunks)
+        return chunks
+
+    async def _mark_admission_hits(self, chunks: list[ChunkInfo]) -> None:
+        """Report resolved lookup hits to finish-time admission, if enabled.
+
+        Args:
+            chunks: Chunks returned by a resolved lookup.
+        """
+        if self._admission is None:
+            return
+        hit_keys = [
+            key
+            for chunk in chunks
+            for key in self._core.packed_slot_owners(chunk.start_slot, chunk.num_slots)
+        ]
+        await self._apply_admission(self._admission.mark_hit(hit_keys))
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
