@@ -26,6 +26,7 @@ logger = init_logger(__name__)
 # writer are recorded so commit can report how long that lookup was early.
 # Off by default because it hashes every prompt's candidate keys.
 PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
+ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
 # Writer claims happen at scheduling time, so publication latency spans the
 # request's queueing and prefill (seconds) as well as the save window (ms).
 _PUBLISH_BUCKETS = (
@@ -263,6 +264,11 @@ class ServerCore:
         self._packed_slots_by_owner: dict[str, set[int]] = {}
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
+        self._second_chance = os.environ.get(ARENA_SECOND_CHANCE_ENV) == "1"
+        # CLOCK state for second-chance arena eviction: chunks hit by a lookup
+        # since the hand last passed them, and the hand's logical slot.
+        self._referenced: set[str] = set()
+        self._clock_hand: int | None = None
         self._record_capacity_metrics()
 
     @property
@@ -403,6 +409,8 @@ class ServerCore:
         if matches:
             self._lookup_hits += 1
         chunks = [self._chunk_info(match) for match in matches]
+        if self._second_chance:
+            self._referenced.update(chunk.chunk_key for chunk in chunks)
         self._metrics.counter(
             "daser_cache_lookup_total",
             "Cache lookup requests by result.",
@@ -1007,28 +1015,19 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        await self._ri.remove(chunk_key)
-        self._clear_packed_refs(chunk_key)
-        meta = self._cm.store.get(chunk_key)
-        if meta is not None:
-            self._mark_chunk_evicted_in_docs(meta)
-            self._cm.store.remove(chunk_key)
-            self._notify_chunk_removed(chunk_key)
-        self._lifecycle.mark_evicted(chunk_key)
-        self._metrics.counter(
-            "daser_cache_evicted_chunks_total",
-            "Chunks evicted from cache metadata.",
-        ).inc(labels={"reason": "explicit"})
-        self._record_capacity_metrics()
-        logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
+        await self._remove_chunk(chunk_key, reason="explicit")
 
     async def evict_oldest_chunk(self, protected_keys: set[str]) -> ChunkMeta | None:
-        """Evict the FIFO-oldest chunk to relieve physical byte pressure.
+        """Evict a chunk to relieve physical byte pressure.
 
         Compressed-online stores over-provision logical slots, so the packed
-        arena can fill before the ring runs out of slots. This advances the
-        ring tail past skip blocks and evicts the first chunk found, using the
-        same cleanup as automatic ring eviction.
+        arena can fill before the ring runs out of slots. By default this
+        advances the ring tail past skip blocks and evicts the first chunk
+        found (FIFO), using the same cleanup as automatic ring eviction. With
+        ``DASER_ARENA_SECOND_CHANCE=1`` a CLOCK hand walks the ring from the
+        tail instead: a chunk hit by a lookup since its last pass keeps its
+        bytes and loses its reference bit, and the first unreferenced chunk is
+        removed in place. Its slots become a skip block, so no data moves.
 
         Args:
             protected_keys: Chunk keys that must stay resident, e.g. the
@@ -1036,11 +1035,13 @@ class ServerCore:
 
         Returns:
             Metadata of the evicted chunk, or None when the ring is empty or
-            the oldest chunk is protected.
+            only protected chunks remain in reach.
 
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
+        if self._second_chance:
+            return await self._evict_second_chance(protected_keys)
         store = self._cm.store
         while len(store):
             entry = store.get_slot_entry(self._cm.tail_slot)
@@ -1288,8 +1289,82 @@ class ServerCore:
 
     def _notify_chunk_removed(self, chunk_key: str) -> None:
         """Tell registered listeners that a chunk left the metadata store."""
+        self._referenced.discard(chunk_key)
         for listener in self._removal_listeners:
             listener(chunk_key)
+
+    async def _remove_chunk(self, chunk_key: str, *, reason: str) -> None:
+        """Remove one chunk from retrieval, metadata and lifecycle state.
+
+        Args:
+            chunk_key: cache key for the chunk.
+            reason: ``daser_cache_evicted_chunks_total`` label value.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        await self._ri.remove(chunk_key)
+        self._clear_packed_refs(chunk_key)
+        meta = self._cm.store.get(chunk_key)
+        if meta is not None:
+            self._mark_chunk_evicted_in_docs(meta)
+            self._cm.store.remove(chunk_key)
+            self._notify_chunk_removed(chunk_key)
+        self._lifecycle.mark_evicted(chunk_key)
+        self._metrics.counter(
+            "daser_cache_evicted_chunks_total",
+            "Chunks evicted from cache metadata.",
+        ).inc(labels={"reason": reason})
+        self._record_capacity_metrics()
+        logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
+
+    async def _evict_second_chance(self, protected_keys: set[str]) -> ChunkMeta | None:
+        """Evict the first unreferenced chunk under the CLOCK hand.
+
+        The hand walks occupied logical slots from the ring tail towards the
+        head and wraps back to the tail, so chunks are visited in allocation
+        order. A referenced chunk loses its bit and is passed over; protected
+        chunks are passed over untouched. Two passes clear every bit, so the
+        walk is bounded by twice the occupied slot count.
+
+        Args:
+            protected_keys: Chunk keys that must stay resident.
+
+        Returns:
+            Metadata of the evicted chunk, or None when every chunk in the
+            ring is protected.
+        """
+        cm = self._cm
+        total = cm.total_slots
+        used = total - cm.free_slots
+        if used <= 0:
+            return None
+        tail = cm.tail_slot
+        hand = self._clock_hand
+        if hand is None or (hand - tail) % total >= used:
+            hand = tail
+        walked = 0
+        while walked < 2 * used:
+            entry = cm.store.get_slot_entry(hand)
+            step = max(1, entry.num_slots) if entry.kind != "cont" else 1
+            meta = cm.store.get(entry.chunk_key) if entry.kind == "chunk" else None
+            advance = (hand - tail) % total + step
+            hand = tail if advance >= used else (hand + step) % total
+            walked += step
+            if meta is None or meta.chunk_key in protected_keys:
+                continue
+            if meta.chunk_key in self._referenced:
+                self._referenced.discard(meta.chunk_key)
+                self._metrics.counter(
+                    "daser_arena_second_chances_total",
+                    "Referenced chunks passed over by the arena CLOCK hand.",
+                ).inc()
+                continue
+            self._clock_hand = hand
+            await self._remove_chunk(meta.chunk_key, reason="second_chance")
+            return meta
+        self._clock_hand = hand
+        return None
 
     def _has_store_owner(
         self,
@@ -1392,6 +1467,9 @@ class ServerCore:
             raise RuntimeError(
                 f"allocation succeeded at slot {start_slot} but metadata is missing"
             )
+        # A new generation of a key starts unreferenced even if a lookup hit
+        # an earlier generation that left through a path without a listener.
+        self._referenced.discard(chunk_key)
         return meta
 
     def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:

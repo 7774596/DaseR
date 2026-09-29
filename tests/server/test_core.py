@@ -930,3 +930,81 @@ async def test_online_lookup_waits_for_pending_gap_block() -> None:
 
     chunks = await lookup_task
     assert sum(chunk.token_count for chunk in chunks) == 2 * BLOCK_TOKENS
+
+
+async def _committed_blocks(core: ServerCore, count: int) -> list[list[int]]:
+    """Allocate and commit ``count`` single-block chunks with distinct tokens."""
+    blocks = [[10 * i + j for j in range(BLOCK_TOKENS)] for i in range(count)]
+    for tokens in blocks:
+        key = first_rolling_key(tokens)
+        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+        await core.commit_chunk(key)
+    return blocks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_chance", [False, True])
+async def test_evict_oldest_chunk_second_chance(
+    second_chance: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup hit spares the oldest chunk only with second chance enabled."""
+    if second_chance:
+        monkeypatch.setenv("DASER_ARENA_SECOND_CHANCE", "1")
+    else:
+        monkeypatch.delenv("DASER_ARENA_SECOND_CHANCE", raising=False)
+    core = make_core()
+    blocks = await _committed_blocks(core, 3)
+    assert len(await core.lookup(blocks[0], "m")) == 1
+
+    evicted = await core.evict_oldest_chunk(set())
+
+    assert evicted is not None
+    expected = blocks[1] if second_chance else blocks[0]
+    assert evicted.chunk_key == first_rolling_key(expected)
+    assert await core.lookup(expected, "m") == []
+    survivor = blocks[0] if second_chance else blocks[1]
+    assert len(await core.lookup(survivor, "m")) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_chance_clears_bit_and_wraps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each chunk is spared once per hit; the hand wraps in allocation order."""
+    monkeypatch.setenv("DASER_ARENA_SECOND_CHANCE", "1")
+    core = make_core()
+    blocks = await _committed_blocks(core, 3)
+    for tokens in blocks:
+        await core.lookup(tokens, "m")
+
+    first = await core.evict_oldest_chunk(set())
+    second = await core.evict_oldest_chunk(set())
+
+    assert first is not None and second is not None
+    assert first.chunk_key == first_rolling_key(blocks[0])
+    assert second.chunk_key == first_rolling_key(blocks[1])
+    # The survivor was never hit again, so it is the next victim.
+    third = await core.evict_oldest_chunk(set())
+    assert third is not None
+    assert third.chunk_key == first_rolling_key(blocks[2])
+    assert await core.evict_oldest_chunk(set()) is None
+
+
+@pytest.mark.asyncio
+async def test_second_chance_skips_protected_and_new_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protected chunks stay; a re-allocated key starts without a reference."""
+    monkeypatch.setenv("DASER_ARENA_SECOND_CHANCE", "1")
+    core = make_core()
+    blocks = await _committed_blocks(core, 2)
+    keys = [first_rolling_key(tokens) for tokens in blocks]
+    assert await core.evict_oldest_chunk(set(keys)) is None
+
+    await core.lookup(blocks[1], "m")
+    await core.evict_chunk(keys[1])
+    await core.alloc_chunk(keys[1], token_count=BLOCK_TOKENS, model_id="m")
+    await core.commit_chunk(keys[1])
+
+    evicted = await core.evict_oldest_chunk({keys[0]})
+    assert evicted is not None and evicted.chunk_key == keys[1]
