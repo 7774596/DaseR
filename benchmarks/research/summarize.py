@@ -165,20 +165,65 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
     }
 
 
+def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
+    """Compare per-request TTFT on the first ``first`` shared trace requests.
+
+    Requests are matched by ``trace_index`` across arms, so runs of different
+    lengths over the same trace prefix can be compared on identical requests.
+
+    Args:
+        arm_dirs: Arm directories; the first one is the reference.
+        first: Number of lowest shared trace indices to compare.
+
+    Returns:
+        Formatted lines: one per arm with the request count, summed and
+        median TTFT, the ratio of summed TTFT to the reference, and the TTFT
+        of the first four requests.
+    """
+    ttft_by_arm = [
+        {
+            int(record["trace_index"]): float(record["ttft_ms"])
+            for record in map(json.loads, (d / "requests.jsonl").open())
+            if record["status"] == "completed"
+        }
+        for d in arm_dirs
+    ]
+    shared = sorted(set.intersection(*(set(t) for t in ttft_by_arm)))[:first]
+    reference = sum(ttft_by_arm[0][i] for i in shared) or 1.0
+    lines = [f"paired first {len(shared)} shared requests (TTFT ms)"]
+    for arm_dir, ttft in zip(arm_dirs, ttft_by_arm, strict=True):
+        values = [ttft[i] for i in shared]
+        head = "/".join(f"{v:.0f}" for v in values[:4])
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: n={len(values)} "
+            f"sum_s={sum(values) / 1e3:.0f} p50={_p(values, 50):.0f} "
+            f"ratio={sum(values) / reference:.2f} first4={head}"
+        )
+    return lines
+
+
 def main() -> None:
-    """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``."""
+    """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``.
+
+    ``--first N`` adds a paired TTFT comparison over the first ``N`` shared
+    trace requests, using the first arm found as the reference.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifacts", nargs="+", type=Path)
+    parser.add_argument("--first", type=int, default=0)
     args = parser.parse_args()
-    rows = [
-        arm_row(summary.parent)
+    arm_dirs = [
+        summary.parent
         for artifact in args.artifacts
         for summary in sorted(artifact.glob("*/summary.json"))
     ]
+    rows = [arm_row(arm_dir) for arm_dir in arm_dirs]
     widths = {c: max([len(c)] + [len(r[c]) for r in rows]) for c in _COLUMNS}
     print("  ".join(c.rjust(widths[c]) for c in _COLUMNS))
     for row in rows:
         print("  ".join(row[c].rjust(widths[c]) for c in _COLUMNS))
+    if args.first > 0:
+        print("\n".join(paired_rows(arm_dirs, args.first)))
 
 
 if __name__ == "__main__":

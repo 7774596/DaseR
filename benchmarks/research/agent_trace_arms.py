@@ -32,7 +32,7 @@ from benchmarks.utils.servers import (
 from benchmarks.utils.sizing import parse_size_bytes
 from daser.connector.ipc_client import IPCClientSync
 
-ARMS = ("native-apc", "vllm-offload", "daser-raw", "daser-compressed")
+ARMS = ("native-apc", "noop-connector", "vllm-offload", "daser-raw", "daser-compressed")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -139,6 +139,33 @@ class CPUOffloadServer(MatchedServer):
         await self._start_vllm("vllm_offload.log", self.offload_config())
 
 
+class NoopConnectorServer(MatchedServer):
+    """Start vLLM with a KV connector that never loads or saves."""
+
+    def offload_config(self) -> dict[str, Any]:
+        """Return the no-op connector config.
+
+        Returns:
+            kv-transfer-config mapping.
+        """
+        return {
+            "kv_connector": "NoopConnector",
+            "kv_connector_module_path": "benchmarks.research.noop_connector",
+            "kv_role": "kv_both",
+        }
+
+    async def start_vllm_only(self) -> None:
+        """Start vLLM with the no-op connector."""
+        await self._start_vllm("vllm_noop.log", self.offload_config())
+
+
+# Arms whose vLLM runs a non-DaseR connector given by ``offload_config()``.
+_SERVER_TYPES: dict[str, type[MatchedServer]] = {
+    "vllm-offload": CPUOffloadServer,
+    "noop-connector": NoopConnectorServer,
+}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse runner arguments.
 
@@ -189,7 +216,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
     """Build the service manager for one arm."""
-    manager_type = CPUOffloadServer if arm == "vllm-offload" else MatchedServer
+    manager_type = _SERVER_TYPES.get(arm, MatchedServer)
     return manager_type(
         run_id=f"agent-{arm}",
         backend="daser" if arm.startswith("daser") else "vllm",
@@ -328,7 +355,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
             "vllm_command": manager.vllm_command(
                 manager.daser_kv_transfer_config()
                 if arm.startswith("daser")
-                else (manager.offload_config() if arm == "vllm-offload" else None)
+                else (manager.offload_config() if arm in _SERVER_TYPES else None)
             ),
             "runtime_config": runtime_config,
             "warmup_seconds": warmup_s,
