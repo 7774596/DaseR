@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any
 
-from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE
+from daser.config import EXCLUSIVE_TIERS_ENV, STORAGE_FORMAT_COMPRESSED_ONLINE
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
 
@@ -349,6 +349,8 @@ class IPCServer:
         )
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         self._admission: FinishAdmission | None = None
+        # Held L1 ranges per chunk under exclusive tiers; None when disabled.
+        self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
         if (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
@@ -376,6 +378,13 @@ class IPCServer:
                 self._runtime_config["finish_admission"] = True
                 # Held bytes of a removed chunk must never reach L2.
                 core.add_chunk_removal_listener(self._forget_admission)
+            if os.environ.get(EXCLUSIVE_TIERS_ENV) == "1" and self._admission is None:
+                # Exclusive tiers: every packed record is held in L1 and only
+                # reaches L2 when L1 evicts it; a removed chunk's held bytes
+                # are dropped so L2 never stores a record L1 still owns.
+                self._exclusive_held = {}
+                self._runtime_config["exclusive_tiers"] = True
+                core.add_chunk_removal_listener(self._forget_exclusive)
         logger.info(
             "finish admission min_output=%s admit_ghosts=%s",
             None if self._admission is None else self._admission.min_output_tokens,
@@ -1060,7 +1069,9 @@ class IPCServer:
                     }
                 )
 
-            holding = self._admission is not None and transfer.supports_held_stores
+            holding = (
+                self._admission is not None or self._exclusive_held is not None
+            ) and transfer.supports_held_stores
             if holding:
                 live_spans = [
                     {**span, "hold": True, "hold_key": str(span["chunk_key"])}
@@ -1355,9 +1366,10 @@ class IPCServer:
         """Register held ranges per chunk and apply any early decisions.
 
         A chunk that was evicted while its store was in flight has already
-        been forgotten, so its ranges are discarded instead of held.
+        been forgotten, so its ranges are discarded instead of held. Under
+        exclusive tiers the ranges stay held until L1 evicts them (written to
+        L2) or the chunk is removed (dropped).
         """
-        assert self._admission is not None
         ranges: dict[str, list[tuple[int, int]]] = {}
         for span in store_spans:
             if span.get("hold"):
@@ -1376,6 +1388,10 @@ class IPCServer:
                 num_slots=int(span.get("num_slots", 0)),
             ):
                 transfer.discard_held(held)
+                continue
+            if self._admission is None:
+                assert self._exclusive_held is not None
+                self._exclusive_held.setdefault(chunk_key, []).extend(held)
                 continue
             actions.extend(self._admission.hold(chunk_key, held))
         self._metrics.counter(
@@ -1406,6 +1422,13 @@ class IPCServer:
         """Removal listener: discard a removed chunk's held ranges."""
         assert self._admission is not None
         held = self._admission.forget(chunk_key)
+        if held and self._transfer is not None:
+            self._transfer.discard_held(held)
+
+    def _forget_exclusive(self, chunk_key: str) -> None:
+        """Removal listener: drop a removed chunk's still-held L1 ranges."""
+        assert self._exclusive_held is not None
+        held = self._exclusive_held.pop(chunk_key, None)
         if held and self._transfer is not None:
             self._transfer.discard_held(held)
 
@@ -1462,6 +1485,15 @@ class IPCServer:
         self._metrics.gauge(
             "daser_l1_bytes_capacity", "L1 memory cache total capacity."
         ).set(l1_capacity)
+        if self._admission is not None or self._exclusive_held is not None:
+            # SSD-resident packed bytes = arena - free - held.
+            self._metrics.gauge(
+                "daser_held_bytes", "Held L1 bytes not yet written to L2."
+            ).set(transfer.held_bytes)
+            self._metrics.gauge(
+                "daser_packed_arena_free_bytes",
+                "Unreserved bytes of the rank-0 packed arena lane.",
+            ).set(self._packed_layout.free_bytes())
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use.

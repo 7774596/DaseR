@@ -1490,12 +1490,17 @@ async def test_online_store_evicts_oldest_when_packed_arena_is_full(tmp_path) ->
         await server.stop()
 
 
-def _l2_write_bytes(registry: MetricsRegistry) -> float:
-    """Return the rendered ``daser_l2_write_bytes_total`` value (0 if absent)."""
+def _metric_value(registry: MetricsRegistry, name: str) -> float:
+    """Return one rendered unlabelled metric value (0 if absent)."""
     for line in registry.render_prometheus().splitlines():
-        if line.startswith("daser_l2_write_bytes_total "):
+        if line.startswith(f"{name} "):
             return float(line.split()[1])
     return 0.0
+
+
+def _l2_write_bytes(registry: MetricsRegistry) -> float:
+    """Return the rendered ``daser_l2_write_bytes_total`` value (0 if absent)."""
+    return _metric_value(registry, "daser_l2_write_bytes_total")
 
 
 @pytest.mark.asyncio
@@ -1592,6 +1597,52 @@ async def test_finish_admission_writes_only_admitted_chunks(
         if meta is not None:
             assert core.packed_slot_owners(meta.start_slot, meta.num_slots) == ["a"]
         assert _l2_write_bytes(registry) == written * local_slot_size
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arena_slots", "kept", "written"),
+    [
+        # The arena outlasts L1: the two records L1 evicts are written back.
+        (4, ["a", "b", "c", "d"], 2),
+        # The arena evicts records L1 still holds: they never reach L2.
+        (2, ["c", "d"], 0),
+    ],
+)
+async def test_exclusive_tiers_write_records_only_when_l1_evicts_them(
+    tmp_path, monkeypatch, arena_slots, kept, written
+) -> None:
+    """Exclusive tiers keep new records in L1 and write only L1 evictions."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    registry = MetricsRegistry()
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path,
+        logical_slots=8,
+        arena_slots=arena_slots,
+        metrics_registry=registry,
+        l1_slots=2,
+    )
+    await server.start()
+    try:
+        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
+        assert config["runtime_config"]["exclusive_tiers"] is True
+        for key in ("a", "b", "c"):
+            assert "error" not in await _store_online_record(
+                socket_path, key, local_slot_size
+            )
+        await server.drain_transfer()
+        # The last store also refreshes the tier metrics.
+        assert "error" not in await _store_online_record(
+            socket_path, "d", local_slot_size
+        )
+        await server.drain_transfer()
+        present = [k for k in "abcd" if core.chunk_manager.store.get(k) is not None]
+        assert present == kept
+        assert _l2_write_bytes(registry) == written * local_slot_size
+        assert _metric_value(registry, "daser_held_bytes") == 2 * local_slot_size
     finally:
         await server.drain_transfer()
         await server.stop()

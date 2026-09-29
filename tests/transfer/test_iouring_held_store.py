@@ -59,10 +59,12 @@ def test_discard_held_drops_l1_without_l2_write(tmp_path: Path) -> None:
     async def scenario() -> None:
         layer = _layer(tmp_path, 4)
         await layer.store_bytes_grouped(b"a" * PAGE, [_span(0, hold=True)])
+        assert layer.held_bytes == PAGE
         layer.discard_held([(0, PAGE)])
         await layer.drain()
         assert layer.stats.l2_writes == 0
         assert layer.l1_bytes_used == 0
+        assert layer.held_bytes == 0
         layer.close()
 
     asyncio.run(scenario())
@@ -77,6 +79,7 @@ def test_held_range_evicted_from_l1_is_written_back(tmp_path: Path) -> None:
         await layer.drain()
         assert layer.stats.held_evict_persists == 1
         assert layer.stats.l2_writes == 2
+        assert layer.held_bytes == 0
         dst = bytearray(PAGE)
         assert await layer.load_bytes(dst, 0, PAGE) == PAGE
         assert bytes(dst) == b"a" * PAGE

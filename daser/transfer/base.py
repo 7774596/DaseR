@@ -92,6 +92,15 @@ class TransferLayer(ABC):
         """
         return int(getattr(self, "_l1_used", 0))
 
+    @property
+    def held_bytes(self) -> int:
+        """Return held memory-tier bytes that have not been written to L2.
+
+        Returns:
+            Held bytes, or 0 for backends without held stores.
+        """
+        return 0
+
     @abstractmethod
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
         """Load bytes into ``dst``.

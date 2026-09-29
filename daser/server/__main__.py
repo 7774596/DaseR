@@ -25,6 +25,7 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    EXCLUSIVE_TIERS_ENV,
     L1_ACCOUNTING_MODES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
@@ -352,6 +353,15 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         else int(args.l1_size or 0)
     )
     total_store_bytes = l1_size if skip_l2 else int(args.l2_size)
+    storage_format = str(getattr(args, "storage_format", STORAGE_FORMAT_RAW))
+    if (
+        os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
+        and storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
+        and not skip_l2
+    ):
+        # Write-back L1 records never occupy SSD bytes, so the packed arena
+        # addresses L1 + L2 while live SSD bytes stay within --l2-size.
+        total_store_bytes += l1_size
     cfg = DaserConfig(
         model_path=model_path,
         vllm_model_id=model_id,
@@ -365,7 +375,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         l1_size_bytes=l1_size,
         skip_l2=skip_l2,
         tensor_parallel_size=int(args.tensor_parallel_size),
-        storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
+        storage_format=storage_format,
         bip_enabled=bool(args.bip_enabled),
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
     )

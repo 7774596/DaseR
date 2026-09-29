@@ -457,6 +457,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         # L1-only packed ranges waiting for an admission decision. They stay
         # pinned; leaving L1 before a decision writes them back to L2.
         self._held: dict[tuple[int, int], PinnedMemorySlice] = {}
+        self._held_bytes = 0
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
         self._cache_epoch = 0
@@ -1012,7 +1013,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                         self._record_cache_mutation_locked(*key)
                     for (key, child), hold in zip(children, holds, strict=True):
                         if hold:
+                            self._pop_held(key)
                             self._held[key] = child
+                            self._held_bytes += key[1]
                         else:
                             self._persist_locked(key, child)
                     data.close()
@@ -1251,7 +1254,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             atomic with respect to every locked metadata section.
         """
         for key in ranges:
-            data = self._held.pop(key, None)
+            data = self._pop_held(key)
             if data is not None:
                 self._persist_locked(key, data)
 
@@ -1266,7 +1269,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             It does not await, so it is atomic with respect to locked sections.
         """
         for key in ranges:
-            data = self._held.pop(key, None)
+            data = self._pop_held(key)
             if data is None:
                 continue
             if self._l1.get(key) is data:
@@ -1310,6 +1313,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._pending_l2_buffers.clear()
         # Held ranges are L1 residents; the L1 close below frees them.
         self._held.clear()
+        self._held_bytes = 0
         if self._l2 is not None:
             self._l2.close()
         for pending_buffer in pending_buffers:
@@ -1324,12 +1328,19 @@ class TieredIOUringTransferLayer(TransferLayer):
         written to L2, so it is written back here and the new writer owns it.
         """
         if self._held.get(key) is data:
-            del self._held[key]
+            self._pop_held(key)
             self._stats.held_evict_persists += 1
             self._persist_locked(key, data)
         return (
             self._pending_l2_buffers.get(key) is data or id(data) in self._leased_slices
         )
+
+    def _pop_held(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
+        """Remove one held range and return its slice, if still held."""
+        data = self._held.pop(key, None)
+        if data is not None:
+            self._held_bytes -= key[1]
+        return data
 
     def _persist_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Schedule one L2 write for a published L1 range and pin its buffer."""
@@ -1343,6 +1354,11 @@ class TieredIOUringTransferLayer(TransferLayer):
     def l1_bytes_used(self) -> int:
         """Return resident L1 memory-tier bytes."""
         return self._l1.bytes_used
+
+    @property
+    def held_bytes(self) -> int:
+        """Return held L1 bytes that have not been written to L2."""
+        return self._held_bytes
 
     def _accounted_nbytes(self, span: dict[str, Any], nbytes: int) -> int:
         """Return the configured L1 capacity charge for one physical span.

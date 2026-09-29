@@ -30,6 +30,10 @@ ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
 #: behind the hand, so the ring must outlast the byte arena or its FIFO
 #: allocation eviction removes referenced chunks before the hand sees them.
 ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
+#: Research switch for exclusive L1/L2 tiers under compressed-online storage.
+#: New packed records live only in L1 and reach L2 when L1 evicts them, so the
+#: packed arena spans L1 + L2 while L2 holds only records that left L1.
+EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 
 
 @dataclass(frozen=True)

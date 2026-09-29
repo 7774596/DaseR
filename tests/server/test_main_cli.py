@@ -815,3 +815,15 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
 
     assert events == ["stop_accepting", "close"]
     assert not Path(index_path).exists()
+
+
+def test_exclusive_tiers_extend_the_arena_by_l1(tmp_path: Path, monkeypatch) -> None:
+    """Exclusive tiers size the compressed arena as L1 + L2."""
+    (tmp_path / "base").mkdir()
+    (tmp_path / "exclusive").mkdir()
+    base = _build_daser_config(_compressed_args(tmp_path / "base"))
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    exclusive = _build_daser_config(_compressed_args(tmp_path / "exclusive"))
+
+    assert exclusive.l1_size_bytes == base.l1_size_bytes
+    assert exclusive.total_store_bytes == (base.total_store_bytes + base.l1_size_bytes)
