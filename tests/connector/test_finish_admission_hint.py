@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from daser.config import CACHE_REUSE_CHUNK
+from daser.config import CACHE_REUSE_CHUNK, CACHE_REUSE_PREFIX
 from daser.connector.scheduler.lifecycle import RequestLifecycle
 
 BLOCK_TOKENS = 4
@@ -15,8 +15,9 @@ BLOCK_TOKENS = 4
 class _FakeIPC:
     """Synchronous IPC stub recording allocation and finish calls."""
 
-    def __init__(self, finish_admission: bool) -> None:
+    def __init__(self, finish_admission: bool, reuse_mode: str) -> None:
         self.finish_admission = finish_admission
+        self.reuse_mode = reuse_mode
         self.finish_calls: list[tuple[list[str], int]] = []
 
     def get_runtime_config(self) -> dict[str, Any]:
@@ -25,7 +26,7 @@ class _FakeIPC:
             "slot_size": 32,
             "block_tokens": BLOCK_TOKENS,
             "model_id": "m",
-            "cache_reuse_mode": CACHE_REUSE_CHUNK,
+            "cache_reuse_mode": self.reuse_mode,
             "finish_admission": self.finish_admission,
         }
 
@@ -54,7 +55,7 @@ def _run_store_request(ipc: _FakeIPC) -> None:
         block_tokens=BLOCK_TOKENS,
         slot_size=32,
         model_id="m",
-        cache_reuse_mode=CACHE_REUSE_CHUNK,
+        cache_reuse_mode=ipc.reuse_mode,
         runtime_config_ready=False,
     )
     lifecycle.refresh_runtime_config()
@@ -69,14 +70,21 @@ def _run_store_request(ipc: _FakeIPC) -> None:
     lifecycle.request_finished(request, [0, 1, 2])
 
 
+@pytest.mark.parametrize(
+    ("reuse_mode", "num_chunks"), [(CACHE_REUSE_CHUNK, 1), (CACHE_REUSE_PREFIX, 3)]
+)
 @pytest.mark.parametrize("enabled", [True, False])
-def test_request_finished_reports_written_chunks(enabled: bool) -> None:
-    ipc = _FakeIPC(finish_admission=enabled)
+def test_request_finished_reports_written_chunks(
+    enabled: bool, reuse_mode: str, num_chunks: int
+) -> None:
+    # Prefix stores allocate one chunk per block under synthetic intent IDs;
+    # all of them must be reported for the owning request.
+    ipc = _FakeIPC(finish_admission=enabled, reuse_mode=reuse_mode)
     _run_store_request(ipc)
     if not enabled:
         assert ipc.finish_calls == []
         return
     assert len(ipc.finish_calls) == 1
     chunk_keys, output_tokens = ipc.finish_calls[0]
-    assert len(chunk_keys) == 1
+    assert len(chunk_keys) == num_chunks
     assert output_tokens == 600

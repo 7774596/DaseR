@@ -1009,7 +1009,9 @@ class RequestLifecycle:
                 alloc["block_ids"] = intent.block_ids
                 self._pending_stores[intent.req_id] = alloc
                 if getattr(self, "_finish_admission", False):
-                    self._written_chunks.setdefault(intent.req_id, []).append(
+                    # Prefix stores use synthetic "<req>:store:<i>" intent IDs;
+                    # the finish hint is keyed by the owning vLLM request.
+                    self._written_chunks.setdefault(req_id, []).append(
                         alloc["chunk_key"]
                     )
         pending_store.rolling_key = plan.next_key
