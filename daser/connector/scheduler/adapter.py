@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -21,10 +22,15 @@ class SchedulerConnectorMixin:
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         """Return DaseR cache credit for one request."""
-        return self._request_lifecycle.get_num_new_matched_tokens(
+        probe = getattr(self, "_scheduler_probe", None)
+        started = time.perf_counter()
+        result = self._request_lifecycle.get_num_new_matched_tokens(
             request,
             num_computed_tokens,
         )
+        if probe is not None:
+            probe.on_lookup(request.request_id, time.perf_counter() - started, result)
+        return result
 
     def update_state_after_alloc(
         self,
@@ -33,6 +39,9 @@ class SchedulerConnectorMixin:
         num_external_tokens: int,
     ) -> None:
         """Bind allocated vLLM blocks to pending lifecycle work."""
+        probe = getattr(self, "_scheduler_probe", None)
+        if probe is not None:
+            probe.on_alloc(request.request_id, len(blocks.blocks[0]))
         self._request_lifecycle.update_state_after_alloc(
             request,
             blocks,
@@ -52,8 +61,18 @@ class SchedulerConnectorMixin:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Return whether worker save completion still holds request blocks."""
-        return self._request_lifecycle.request_finished(request, block_ids)
+        result = self._request_lifecycle.request_finished(request, block_ids)
+        probe = getattr(self, "_scheduler_probe", None)
+        if probe is not None:
+            probe.on_request_finished(request.request_id, len(block_ids), result[0])
+        return result
 
     def update_connector_output(self, connector_output: Any) -> None:
         """Apply worker transfer completions to request lifecycle state."""
         self._request_lifecycle.update_connector_output(connector_output)
+        probe = getattr(self, "_scheduler_probe", None)
+        if probe is not None:
+            probe.on_connector_output(
+                getattr(connector_output, "finished_sending", None) or (),
+                getattr(connector_output, "finished_recving", None) or (),
+            )

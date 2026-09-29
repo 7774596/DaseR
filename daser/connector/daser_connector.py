@@ -21,6 +21,7 @@ from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler.adapter import SchedulerConnectorMixin
 from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.scheduler.probe import SchedulerProbe
 from daser.connector.worker.adapter import WorkerConnectorMixin
 from daser.connector.worker.runtime import WorkerRuntime
 from daser.connector.worker.staging import (
@@ -118,6 +119,7 @@ class DaserConnector(
                 storage_format=storage_format,
             )
             self._request_lifecycle.refresh_runtime_config()
+            self._scheduler_probe = SchedulerProbe.from_env()
         else:
             parallel_config = getattr(vllm_config, "parallel_config", None)
             tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
