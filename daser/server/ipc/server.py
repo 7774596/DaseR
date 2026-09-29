@@ -785,6 +785,8 @@ class IPCServer:
         total = 0
         stored_chunk_keys: list[str] = []
         accepted_spans: list[dict[str, Any]] = []
+        place_ms = 0.0
+        place_evictions = 0
         tp_rank = int(msg.get("tp_rank", 0))
         tp_size = int(msg.get("tp_size", 1))
         # The worker may export a compact view whose reported length ends at
@@ -883,6 +885,7 @@ class IPCServer:
                 # deficit is freed, then retry placement.
                 rank_base = tp_rank * rank_stride_bytes
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
+                place_started = time.perf_counter()
                 while True:
                     try:
                         live_spans = self._packed_layout.compact(
@@ -908,12 +911,14 @@ class IPCServer:
                             )
                             if evicted is None:
                                 raise
+                            place_evictions += 1
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,
                     local_slot_size=local_slot_size,
                     rank_base=tp_rank * rank_stride_bytes,
                 )
+                place_ms = (time.perf_counter() - place_started) * 1000
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -947,14 +952,20 @@ class IPCServer:
                 )
             else:
                 store_spans = live_spans
+            io_started = time.perf_counter()
+            total = await transfer.store_bytes_grouped(buffer, store_spans)
             logger.info(
-                "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d",
+                "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d "
+                "place_ms=%.1f evictions=%d io_ms=%.1f total_ms=%.1f",
                 len(live_spans),
                 sum(bool(span.get("packed", False)) for span in live_spans),
                 len(store_spans),
                 sum(int(span["nbytes"]) for span in store_spans),
+                place_ms,
+                place_evictions,
+                (time.perf_counter() - io_started) * 1000,
+                (time.perf_counter() - started) * 1000,
             )
-            total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
             if (
                 isinstance(buffer, _UncachedCudaArray)
