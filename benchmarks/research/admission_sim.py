@@ -13,6 +13,12 @@ same length, so the test window never informs its own policy.
 A compression ratio scales the bytes per block: both tiers hold
 ``1 / ratio`` times more blocks, and each L2 write costs ``ratio`` times the
 raw bytes.
+
+With ``--gpu-kv`` the first window is replayed cold through a GPU prefix cache
+in front of L1 and L2, with the server's finish-time admission semantics
+(denied-block FIFO budget, held write-back, ghost re-stores, optional packed
+arena FIFO). It also reports how well per-block signals separate reused from
+dead blocks (ROC AUC), for any reuse and for reuse after GPU eviction.
 """
 
 from __future__ import annotations
@@ -199,6 +205,341 @@ def simulate(
     return SimResult(hit_tokens / max(prompt_tokens, 1), written)
 
 
+def gpu_reuse_labels(
+    requests: Sequence[TraceRequest], gpu_blocks: int
+) -> tuple[set[BlockRef], set[BlockRef], list[float], list[float]]:
+    """Split block reuse into GPU-local and external reuse.
+
+    The GPU prefix cache is an LRU of ``gpu_blocks`` hash blocks. A later
+    prefix match on a block counts as local reuse when the block is still on
+    the GPU and as external reuse when it was evicted, i.e. the reuse only an
+    external tier with unbounded capacity can serve.
+
+    Args:
+        requests: trace rows in arrival order.
+        gpu_blocks: GPU prefix-cache capacity in hash blocks.
+
+    Returns:
+        ``(local, external, local_gaps_s, external_gaps_s)``: first-writer
+        references with at least one local or external reuse, and the time
+        since the block's previous access for every local or external reuse.
+    """
+    writer: dict[int, BlockRef] = {}
+    last_access: dict[int, float] = {}
+    gpu: OrderedDict[int, None] = OrderedDict()
+    local: set[BlockRef] = set()
+    external: set[BlockRef] = set()
+    local_gaps: list[float] = []
+    external_gaps: list[float] = []
+    for i, request in enumerate(requests):
+        now = request.timestamp_ms / 1000
+        on_gpu = True
+        for block in request.hash_ids:
+            if block not in writer:
+                break
+            on_gpu = on_gpu and block in gpu
+            gap = now - last_access[block]
+            if on_gpu:
+                local.add(writer[block])
+                local_gaps.append(gap)
+            else:
+                external.add(writer[block])
+                external_gaps.append(gap)
+        for j, block in enumerate(request.hash_ids):
+            writer.setdefault(block, (i, j))
+            last_access[block] = now
+            gpu[block] = None
+            gpu.move_to_end(block)
+        while len(gpu) > gpu_blocks:
+            gpu.popitem(last=False)
+    return local, external, local_gaps, external_gaps
+
+
+def auc(scores: Sequence[float], labels: Sequence[bool]) -> float:
+    """Return the ROC AUC of scores for binary labels, averaging ties.
+
+    Args:
+        scores: one score per sample; higher should mean positive.
+        labels: one label per sample.
+
+    Returns:
+        Probability that a random positive outranks a random negative; 0.5
+        when either class is empty.
+    """
+    order = sorted(range(len(scores)), key=lambda k: scores[k])
+    ranks = [0.0] * len(scores)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and scores[order[end + 1]] == scores[order[start]]:
+            end += 1
+        for k in order[start : end + 1]:
+            ranks[k] = (start + end) / 2 + 1
+        start = end + 1
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    if not positives or not negatives:
+        return 0.5
+    rank_sum = sum(rank for rank, label in zip(ranks, labels, strict=True) if label)
+    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+@dataclass(frozen=True)
+class TierPolicy:
+    """L2 admission policy of the three-tier simulator.
+
+    Attributes:
+        min_output: output length at or above which a request's new blocks are
+            written to L2 at once; 0 is write-through.
+        denied_budget_blocks: denied blocks kept in L1 under a FIFO budget;
+            None bounds them by L1 capacity only (plain LRU).
+        admit_ghosts: write a re-stored block to L2 when it was denied and
+            evicted before.
+        persist_evicted_denied: write a denied block back to L2 when L1 LRU
+            evicts it before the budget does (the server's held write-back).
+        fifo_arena: model the server's packed arena. Every stored block takes
+            arena space in store order whether or not it is written; a full
+            arena removes its oldest block from the index, L1 included, and
+            hits do not refresh arena order.
+    """
+
+    min_output: int = 0
+    denied_budget_blocks: int | None = None
+    admit_ghosts: bool = False
+    persist_evicted_denied: bool = True
+    fifo_arena: bool = False
+
+
+@dataclass(frozen=True)
+class TierResult:
+    """Outcome of one three-tier replay.
+
+    Attributes:
+        local_hit: GPU prefix-hit tokens over prompt tokens.
+        external_hit: L1/L2 prefix-hit tokens over prompt tokens.
+        l2_hit: part of ``external_hit`` from blocks found in L2 only.
+        l2_written_blocks: blocks written to L2.
+        ghosts: re-stores of denied blocks evicted by the budget.
+        denied: blocks refused L2 at store time.
+        rescued: denied blocks written to L2 because of an external hit.
+    """
+
+    local_hit: float
+    external_hit: float
+    l2_hit: float
+    l2_written_blocks: int
+    ghosts: int
+    denied: int
+    rescued: int
+
+
+def simulate_tiers(
+    requests: Sequence[TraceRequest],
+    *,
+    gpu_blocks: int,
+    l1_blocks: int,
+    l2_blocks: int,
+    policy: TierPolicy,
+) -> TierResult:
+    """Replay requests through a GPU prefix cache, L1 and L2.
+
+    Every request's blocks enter the GPU LRU. The external tiers serve the
+    prefix continuation after the GPU match. A new block enters L1 and, when
+    admitted, L2. A denied block stays in L1 only; any external prefix match
+    on it rescues it to L2. Re-stored blocks are judged again by their writer's
+    output length, as in the server.
+
+    Args:
+        requests: trace rows in arrival order; all rows are counted.
+        gpu_blocks: GPU prefix-cache capacity in hash blocks.
+        l1_blocks: L1 capacity in hash blocks.
+        l2_blocks: L2 capacity in hash blocks.
+        policy: L2 admission policy.
+
+    Returns:
+        Local and external hit rates, L2 writes and ghost count.
+    """
+    gpu: OrderedDict[int, None] = OrderedDict()
+    l1: OrderedDict[int, None] = OrderedDict()
+    l2: OrderedDict[int, None] = OrderedDict()
+    denied: OrderedDict[int, None] = OrderedDict()
+    ghosts: set[int] = set()
+    # Store order of arena-resident blocks (fifo_arena only).
+    arena: OrderedDict[int, None] = OrderedDict()
+
+    def remove(block: int) -> None:
+        arena.pop(block, None)
+        l1.pop(block, None)
+        l2.pop(block, None)
+        denied.pop(block, None)
+
+    local_tokens = external_tokens = prompt_tokens = written = ghost_count = 0
+    denied_count = rescued = l2_only_blocks = 0
+
+    def write_l2(block: int) -> None:
+        nonlocal written
+        l2[block] = None
+        l2.move_to_end(block)
+        written += 1
+
+    for request in requests:
+        blocks = request.hash_ids
+        prompt_tokens += request.input_length
+        n_local = 0
+        while n_local < len(blocks) and blocks[n_local] in gpu:
+            n_local += 1
+        n_ext = 0
+        while n_ext < len(blocks) and (blocks[n_ext] in l1 or blocks[n_ext] in l2):
+            block = blocks[n_ext]
+            if block in l1:
+                l1.move_to_end(block)
+            else:
+                if not policy.fifo_arena:
+                    l2.move_to_end(block)
+                l2_only_blocks += n_ext >= n_local
+            if block in denied:
+                del denied[block]
+                write_l2(block)
+                rescued += 1
+            n_ext += 1
+        local = min(n_local * MOONCAKE_BLOCK_TOKENS, request.input_length)
+        matched = min(max(n_local, n_ext) * MOONCAKE_BLOCK_TOKENS, request.input_length)
+        local_tokens += local
+        external_tokens += matched - local
+        admit = request.output_length >= policy.min_output
+        for block in blocks:
+            gpu[block] = None
+            gpu.move_to_end(block)
+            if block in l1 or block in l2:
+                continue
+            l1[block] = None
+            if policy.fifo_arena:
+                arena[block] = None
+            ghost = block in ghosts
+            ghosts.discard(block)
+            ghost_count += ghost
+            if admit or (ghost and policy.admit_ghosts):
+                write_l2(block)
+                continue
+            denied[block] = None
+            denied_count += 1
+            budget = policy.denied_budget_blocks
+            while budget is not None and len(denied) > budget:
+                oldest = next(iter(denied))
+                remove(oldest)
+                ghosts.add(oldest)
+        while len(gpu) > gpu_blocks:
+            gpu.popitem(last=False)
+        while len(l1) > l1_blocks:
+            block, _ = l1.popitem(last=False)
+            if block in denied:
+                del denied[block]
+                if policy.persist_evicted_denied:
+                    write_l2(block)
+                else:
+                    arena.pop(block, None)
+                    ghosts.add(block)
+        if policy.fifo_arena:
+            while len(arena) > l2_blocks:
+                remove(next(iter(arena)))
+        while len(l2) > l2_blocks:
+            l2.popitem(last=False)
+    return TierResult(
+        local_tokens / max(prompt_tokens, 1),
+        external_tokens / max(prompt_tokens, 1),
+        l2_only_blocks * MOONCAKE_BLOCK_TOKENS / max(prompt_tokens, 1),
+        written,
+        ghost_count,
+        denied_count,
+        rescued,
+    )
+
+
+def tier_report(
+    requests: Sequence[TraceRequest],
+    *,
+    gpu_blocks_list: Sequence[int],
+    l1_blocks: int,
+    l2_blocks: int,
+    block_gib: float,
+) -> None:
+    """Log reuse-label AUCs and three-tier policy results per GPU capacity.
+
+    Args:
+        requests: trace rows in arrival order.
+        gpu_blocks_list: GPU prefix-cache capacities to report.
+        l1_blocks: L1 capacity in stored blocks.
+        l2_blocks: L2 capacity in stored blocks.
+        block_gib: GiB written per stored block.
+    """
+    reused = reused_blocks(requests)
+    features = block_features(requests, use_output=False)
+    refs = sorted(features)
+    signals: dict[str, Callable[[BlockRef], float]] = {
+        "output": lambda ref: requests[ref[0]].output_length,
+        "input": lambda ref: requests[ref[0]].input_length,
+        "gen": lambda ref: features[ref][0],
+        "pos": lambda ref: ref[1] / len(requests[ref[0]].hash_ids),
+    }
+    half = l1_blocks // 2
+    policies = {
+        "wt": TierPolicy(),
+        "a1b": TierPolicy(min_output=500, denied_budget_blocks=half),
+        "a1b+g": TierPolicy(
+            min_output=500, denied_budget_blocks=half, admit_ghosts=True
+        ),
+        "hitonly": TierPolicy(min_output=1 << 30, persist_evicted_denied=False),
+    }
+    policies.update(
+        {
+            f"{name}/fifo": TierPolicy(
+                min_output=policy.min_output,
+                denied_budget_blocks=policy.denied_budget_blocks,
+                admit_ghosts=policy.admit_ghosts,
+                persist_evicted_denied=policy.persist_evicted_denied,
+                fifo_arena=True,
+            )
+            for name, policy in list(policies.items())
+        }
+    )
+    for gpu_blocks in gpu_blocks_list:
+        local, external, local_gaps, ext_gaps = gpu_reuse_labels(requests, gpu_blocks)
+        cells = []
+        for label_name, positives in (("any", reused), ("ext", external)):
+            labels = [ref in positives for ref in refs]
+            aucs = " ".join(
+                f"{name}={auc([fn(ref) for ref in refs], labels):.2f}"
+                for name, fn in signals.items()
+            )
+            cells.append(f"{label_name}[{sum(labels)}] {aucs}")
+        local_labels = [float(ref in local) for ref in refs]
+        cells.append(
+            f"ext|local {auc(local_labels, [ref in external for ref in refs]):.2f}"
+        )
+        for name, gaps in (("gap_local", local_gaps), ("gap_ext", ext_gaps)):
+            ordered = sorted(gaps) or [0.0]
+            p50 = ordered[len(ordered) // 2]
+            p90 = ordered[int(len(ordered) * 0.9)]
+            cells.append(f"{name} p50={p50:.0f}s p90={p90:.0f}s")
+        print(f"gpu={gpu_blocks} " + "  ".join(cells))
+        results = []
+        for name, policy in policies.items():
+            result = simulate_tiers(
+                requests,
+                gpu_blocks=gpu_blocks,
+                l1_blocks=l1_blocks,
+                l2_blocks=l2_blocks,
+                policy=policy,
+            )
+            results.append(
+                f"{name} loc={result.local_hit:.3f} ext={result.external_hit:.3f}"
+                f"(l2 {result.l2_hit:.3f})"
+                f" w={result.l2_written_blocks * block_gib:.0f}"
+                f" g={result.ghosts} d={result.denied} r={result.rescued}"
+            )
+        print(f"gpu={gpu_blocks}   " + "  ".join(results))
+
+
 def main() -> None:
     """CLI entry point: one line per (L2 capacity, storage format)."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -211,7 +552,28 @@ def main() -> None:
     parser.add_argument("--l2", nargs="+", default=["128gib", "256gib"])
     parser.add_argument("--compress-ratio", type=float, default=0.704)
     parser.add_argument("--thresholds", nargs="+", type=float, default=[0.2, 0.3])
+    parser.add_argument(
+        "--gpu-kv",
+        nargs="+",
+        default=[],
+        help="GPU prefix-cache sizes (raw KV). When set, replay the first "
+        "--window requests cold through GPU, L1 and L2 and report reuse-label "
+        "AUCs and the compressed three-tier policies instead.",
+    )
     args = parser.parse_args()
+    raw_block_bytes = MOONCAKE_BLOCK_TOKENS * args.kv_bytes_per_token
+    if args.gpu_kv:
+        block_bytes = raw_block_bytes * args.compress_ratio
+        tier_report(
+            load_trace(args.trace, args.window, 0, 0),
+            gpu_blocks_list=[
+                int(parse_size_bytes(size) / raw_block_bytes) for size in args.gpu_kv
+            ],
+            l1_blocks=int(parse_size_bytes(args.l1) / block_bytes),
+            l2_blocks=int(parse_size_bytes(args.l2[0]) / block_bytes),
+            block_gib=block_bytes / 2**30,
+        )
+        return
     requests = list(load_trace(args.trace, 2 * args.window, 0, 0))
     reused = reused_blocks(requests)
     tables = {
@@ -235,7 +597,6 @@ def main() -> None:
         policies.append((f"finish{threshold}", table_policy(True, threshold)))
     policies.append(("oracle", lambda i, j: (i, j) in reused))
 
-    raw_block_bytes = MOONCAKE_BLOCK_TOKENS * args.kv_bytes_per_token
     for l2_text in args.l2:
         for name, ratio in (("raw", 1.0), ("cmp", args.compress_ratio)):
             block_bytes = raw_block_bytes * ratio

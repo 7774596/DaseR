@@ -2,10 +2,14 @@
 
 from benchmarks.mooncake.benchmark import MOONCAKE_BLOCK_TOKENS, TraceRequest
 from benchmarks.research.admission_sim import (
+    TierPolicy,
+    auc,
     block_features,
+    gpu_reuse_labels,
     learn_reuse_table,
     reused_blocks,
     simulate,
+    simulate_tiers,
 )
 
 
@@ -87,3 +91,64 @@ def test_warmup_requests_are_not_counted() -> None:
     result = simulate(TRACE, test_start=3, l1_blocks=100, l2_blocks=100, admit=None)
     assert result.hit_rate == 1 / 2
     assert result.l2_written_blocks == 1
+
+
+def test_auc_ranks_and_ties() -> None:
+    assert auc([0.1, 0.2, 0.8, 0.9], [False, False, True, True]) == 1.0
+    assert auc([1.0, 1.0, 1.0, 1.0], [False, True, False, True]) == 0.5
+    assert auc([0.3, 0.4], [True, True]) == 0.5
+
+
+def test_gpu_reuse_labels_split_by_gpu_residency() -> None:
+    local, external, _, _ = gpu_reuse_labels(TRACE, gpu_blocks=100)
+    assert external == set()
+    assert (0, 0) in local and (1, 2) in local
+    local, external, _, _ = gpu_reuse_labels(TRACE, gpu_blocks=0)
+    assert local == set()
+    assert {(0, 0), (0, 1), (1, 2)} <= external
+
+
+def test_tiers_serve_gpu_misses_from_external_tier() -> None:
+    result = simulate_tiers(
+        TRACE, gpu_blocks=0, l1_blocks=100, l2_blocks=100, policy=TierPolicy()
+    )
+    prompt = sum(r.input_length for r in TRACE)
+    assert result.local_hit == 0.0
+    assert result.external_hit == 6 * MOONCAKE_BLOCK_TOKENS / prompt
+    assert result.l2_written_blocks == 5
+
+
+def test_zero_denied_budget_loses_reuse_and_counts_ghosts() -> None:
+    policy = TierPolicy(min_output=1000, denied_budget_blocks=0)
+    result = simulate_tiers(
+        TRACE, gpu_blocks=0, l1_blocks=100, l2_blocks=100, policy=policy
+    )
+    assert result.external_hit == 0.0
+    assert result.l2_written_blocks == 0
+    # Every re-store of an evicted block is a ghost and is denied again.
+    assert (result.denied, result.ghosts) == (11, 6)
+
+
+def test_denied_hit_is_rescued_to_l2() -> None:
+    policy = TierPolicy(min_output=1000, denied_budget_blocks=100)
+    result = simulate_tiers(
+        TRACE, gpu_blocks=0, l1_blocks=100, l2_blocks=100, policy=policy
+    )
+    assert result.rescued == 3
+    assert result.l2_written_blocks == 3
+
+
+def test_full_fifo_arena_removes_oldest_block_from_every_tier() -> None:
+    trace = [_req(0, (7,)), _req(1, (8,)), _req(2, (7,))]
+    lru = simulate_tiers(
+        trace, gpu_blocks=0, l1_blocks=100, l2_blocks=1, policy=TierPolicy()
+    )
+    fifo = simulate_tiers(
+        trace,
+        gpu_blocks=0,
+        l1_blocks=100,
+        l2_blocks=1,
+        policy=TierPolicy(fifo_arena=True),
+    )
+    assert lru.external_hit > 0.0
+    assert fifo.external_hit == 0.0
