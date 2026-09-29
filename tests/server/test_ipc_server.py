@@ -1381,6 +1381,7 @@ def _online_arena_server(
     logical_slots: int,
     arena_slots: int,
     metrics_registry: MetricsRegistry | None = None,
+    l1_slots: int = 1,
 ) -> tuple[ServerCore, IPCServer, str, int]:
     """Build a compressed-online server whose arena is smaller than its ring."""
     local_slot_size = 4 * SLOT_SIZE
@@ -1396,7 +1397,7 @@ def _online_arena_server(
         "slot_size": local_slot_size,
         "storage_format": "compressed-online",
         "bip_enabled": True,
-        "l1_size_bytes": local_slot_size,
+        "l1_size_bytes": l1_slots * local_slot_size,
         "l2_size_bytes": arena_slots * local_slot_size,
     }
     socket_path = str(tmp_path / "arena.sock")
@@ -1471,17 +1472,41 @@ def _l2_write_bytes(registry: MetricsRegistry) -> float:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("output_tokens", "finish_first", "kept", "written"),
-    [(600, False, True, 1), (10, False, False, 0), (10, True, False, 0)],
+    ("output_tokens", "finish_first", "denied_fraction", "l1_slots", "kept", "written"),
+    [
+        (600, False, "0.5", 1, True, 1),
+        (10, False, "0.5", 1, False, 0),
+        (10, True, "0.5", 1, False, 0),
+        (10, False, "1", 2, True, 0),
+        (10, False, "1", 1, True, 1),
+    ],
 )
 async def test_finish_admission_writes_only_admitted_chunks(
-    tmp_path, monkeypatch, output_tokens, finish_first, kept, written
+    tmp_path,
+    monkeypatch,
+    output_tokens,
+    finish_first,
+    denied_fraction,
+    l1_slots,
+    kept,
+    written,
 ) -> None:
-    """Long outputs reach L2; short outputs are evicted without an L2 write."""
+    """Long outputs reach L2; short outputs reach it only if L1 evicts them.
+
+    A denied fraction of 0.5 of a one-record L1 evicts a denied chunk at
+    once. A fraction of 1.0 keeps it resident without an L2 write while L1
+    has room; when the later store pushes it out of L1 it is written back
+    rather than lost.
+    """
     monkeypatch.setenv("DASER_FINISH_ADMIT_MIN_OUTPUT", "500")
+    monkeypatch.setenv("DASER_FINISH_ADMIT_DENIED_L1_FRACTION", denied_fraction)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path, logical_slots=8, arena_slots=4, metrics_registry=registry
+        tmp_path,
+        logical_slots=8,
+        arena_slots=4,
+        metrics_registry=registry,
+        l1_slots=l1_slots,
     )
     await server.start()
     try:
@@ -1534,7 +1559,10 @@ async def test_finish_admission_writes_only_admitted_chunks(
         await server.drain_transfer()
         # Any later transfer refreshes the tier counters.
         await _store_online_record(socket_path, "z", local_slot_size)
-        assert (core.chunk_manager.store.get("a") is not None) is kept
+        meta = core.chunk_manager.store.get("a")
+        assert (meta is not None) is kept
+        if meta is not None:
+            assert core.packed_slot_owners(meta.start_slot, meta.num_slots) == ["a"]
         assert _l2_write_bytes(registry) == written * local_slot_size
     finally:
         await server.drain_transfer()

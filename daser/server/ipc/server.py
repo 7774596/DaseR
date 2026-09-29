@@ -19,6 +19,8 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.admission import (
+    DEFAULT_DENIED_L1_FRACTION,
+    FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
     FINISH_ADMIT_MIN_OUTPUT_ENV,
     AdmissionActions,
     FinishAdmission,
@@ -358,7 +360,16 @@ class IPCServer:
             )
             min_output = os.environ.get(FINISH_ADMIT_MIN_OUTPUT_ENV, "")
             if min_output:
-                self._admission = FinishAdmission(int(min_output))
+                denied_fraction = float(
+                    os.environ.get(
+                        FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
+                        DEFAULT_DENIED_L1_FRACTION,
+                    )
+                )
+                l1_bytes = int(self._runtime_config.get("l1_size_bytes", 0))
+                self._admission = FinishAdmission(
+                    int(min_output), int(l1_bytes * denied_fraction)
+                )
                 self._runtime_config["finish_admission"] = True
                 # Held bytes of a removed chunk must never reach L2.
                 core.add_chunk_removal_listener(self._forget_admission)
@@ -656,7 +667,14 @@ class IPCServer:
                 raise
             chunks = await self._core.lookup(tokens, model_id)
         if self._admission is not None:
-            self._admission.mark_hit([chunk.chunk_key for chunk in chunks])
+            hit_keys = [
+                key
+                for chunk in chunks
+                for key in self._core.packed_slot_owners(
+                    chunk.start_slot, chunk.num_slots
+                )
+            ]
+            await self._apply_admission(self._admission.mark_hit(hit_keys))
         return chunks
 
     async def _op_record_external_prefix_cache(
@@ -1306,18 +1324,14 @@ class IPCServer:
             ):
                 transfer.discard_held(held)
                 continue
-            part = self._admission.hold(chunk_key, held)
-            actions.persist.extend(part.persist)
-            actions.evict.extend(part.evict)
-            actions.admitted += part.admitted
-            actions.rescued += part.rescued
+            actions.extend(self._admission.hold(chunk_key, held))
         self._metrics.counter(
             "daser_admission_chunks_total", "Finish-admission chunk outcomes."
         ).inc(len(ranges), labels={"outcome": "held"})
         await self._apply_admission(actions)
 
     async def _apply_admission(self, actions: AdmissionActions) -> None:
-        """Persist admitted held ranges and evict denied chunks."""
+        """Persist admitted held ranges and evict over-budget denied chunks."""
         if actions.persist and self._transfer is not None:
             self._transfer.persist_held(actions.persist)
         for chunk_key in actions.evict:
@@ -1328,7 +1342,8 @@ class IPCServer:
         for outcome, count in (
             ("admitted", actions.admitted),
             ("rescued", actions.rescued),
-            ("denied", len(actions.evict)),
+            ("denied", actions.denied),
+            ("evicted", len(actions.evict)),
         ):
             if count:
                 counter.inc(count, labels={"outcome": outcome})

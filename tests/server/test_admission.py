@@ -24,6 +24,7 @@ def test_short_output_evicts_and_forget_returns_ranges() -> None:
     actions = policy.finish(["a"], output_tokens=10)
     assert actions.persist == []
     assert actions.evict == ["a"]
+    assert actions.denied == 1
     # The core's removal listener then asks for the ranges to discard.
     assert policy.forget("a") == R1
     assert policy.held_chunks == 0
@@ -51,3 +52,29 @@ def test_decision_before_store_applies_on_hold() -> None:
 
 def test_forget_unknown_chunk_is_empty() -> None:
     assert FinishAdmission(1).forget("missing") == []
+
+
+def test_denied_chunk_stays_resident_until_hit_rescues_it() -> None:
+    policy = FinishAdmission(500, denied_budget_bytes=4096)
+    policy.hold("a", R1)
+    actions = policy.finish(["a"], output_tokens=10)
+    assert actions.evict == [] and actions.denied == 1
+    assert policy.denied_bytes == 4096
+    rescued = policy.mark_hit(["a"])
+    assert rescued.persist == R1
+    assert rescued.rescued == 1
+    assert policy.denied_bytes == 0
+    assert policy.held_chunks == 0
+
+
+def test_denied_budget_evicts_oldest_first() -> None:
+    policy = FinishAdmission(500, denied_budget_bytes=8192)
+    policy.hold("a", R1)
+    policy.hold("b", R2)
+    assert policy.finish(["a"], output_tokens=10).evict == []
+    # "b" brings denied bytes to 12 KiB, over the 8 KiB budget.
+    assert policy.finish(["b"], output_tokens=10).evict == ["a"]
+    assert policy.forget("a") == R1
+    assert policy.denied_bytes == 8192
+    assert policy.forget("b") == R2
+    assert policy.denied_bytes == 0

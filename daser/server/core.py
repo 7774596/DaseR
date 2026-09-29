@@ -751,6 +751,31 @@ class ServerCore:
                 return []
         return [dict(ref) for ref in refs if ref is not None]
 
+    def packed_slot_owners(self, start_slot: int, num_slots: int) -> list[str]:
+        """Return the chunks owning online packed records in a slot interval.
+
+        A coalesced prefix match reports only its last key; this recovers
+        every stored chunk it spans.
+
+        Args:
+            start_slot: First logical store slot.
+            num_slots: Number of slots in the interval.
+
+        Returns:
+            Distinct owner chunk keys in slot order; slots without a packed
+            record are skipped.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop. It performs no
+            blocking I/O.
+        """
+        owners: dict[str, None] = {}
+        for slot in range(start_slot, start_slot + max(0, num_slots)):
+            owner = self._packed_slot_owners.get(slot)
+            if owner is not None:
+                owners[owner] = None
+        return list(owners)
+
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.
 
