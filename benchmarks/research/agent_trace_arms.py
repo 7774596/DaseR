@@ -167,6 +167,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
+        "--vllm-port",
+        type=int,
+        default=8001,
+        help="vLLM API port; give concurrent runs distinct ports.",
+    )
+    parser.add_argument(
+        "--daser-port",
+        type=int,
+        default=2026,
+        help="DaseR server port; give concurrent runs distinct ports.",
+    )
+    parser.add_argument(
         "--abort-after-failures",
         type=int,
         default=5,
@@ -196,6 +208,8 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         trust_remote_code=True,
         storage_format="compressed-online" if arm == "daser-compressed" else "raw",
         gpu_kv_bytes=args.gpu_kv_size,
+        vllm_port=args.vllm_port,
+        daser_port=args.daser_port,
     )
 
 
