@@ -4,8 +4,8 @@
 
 Columns: request counts, wall time, TTFT/queue/latency percentiles, total,
 local, and external prefix-hit rates from ``vllm:prompt_tokens_by_source``,
-preemptions, and DaseR L1 hits plus load/store bytes (deltas between the
-before/after Prometheus snapshots).
+preemptions, summed vLLM queue/prefill/TTFT seconds, and DaseR L1 hits plus
+load/store bytes (deltas between the before/after Prometheus snapshots).
 """
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ _COLUMNS = (
     "loc_hit",
     "ext_hit",
     "preempt",
+    "sum_q_s",
+    "sum_pf_s",
+    "sum_ttft_s",
     "l1_hits",
     "load_gib",
     "store_gib",
@@ -77,6 +80,18 @@ def _source_tokens(
     return sources
 
 
+def _histogram_sum(
+    before: dict[str, float], after: dict[str, float], name: str
+) -> float:
+    """Return the ``<name>_sum`` increase summed over all label sets."""
+    prefix = f"{name}_sum"
+    return sum(
+        value - before.get(key, 0.0)
+        for key, value in after.items()
+        if key == prefix or key.startswith(prefix + "{")
+    )
+
+
 def _rate(part: float, total: float) -> str:
     """Format ``part / total`` or ``-`` when vLLM metrics were not captured."""
     return f"{part / total:.3f}" if total else "-"
@@ -118,6 +133,10 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         if key.startswith("vllm:num_preemptions_total")
     )
     gib = 2**30
+
+    def hist(name: str) -> float:
+        return _histogram_sum(vllm_before, vllm_after, f"vllm:{name}_seconds")
+
     return {
         "arm": f"{arm_dir.parent.name}/{arm_dir.name}",
         "ok": str(summary["completed_requests"]),
@@ -137,6 +156,9 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         "loc_hit": _rate(sources.get("local_cache_hit", 0.0), total),
         "ext_hit": _rate(sources.get("external_kv_transfer", 0.0), total),
         "preempt": f"{preempt:.0f}" if vllm_after else "-",
+        "sum_q_s": f"{hist('request_queue_time'):.0f}",
+        "sum_pf_s": f"{hist('request_prefill_time'):.0f}",
+        "sum_ttft_s": f"{hist('time_to_first_token'):.0f}",
         "l1_hits": f"{_delta(before, after, 'daser_l1_hits_total'):.0f}",
         "load_gib": f"{_delta(before, after, _LOAD) / gib:.1f}",
         "store_gib": f"{_delta(before, after, _STORE) / gib:.1f}",
