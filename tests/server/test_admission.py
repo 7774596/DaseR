@@ -78,3 +78,44 @@ def test_denied_budget_evicts_oldest_first() -> None:
     assert policy.denied_bytes == 8192
     assert policy.forget("b") == R2
     assert policy.denied_bytes == 0
+
+
+def test_restored_evicted_chunk_counts_as_ghost() -> None:
+    policy = FinishAdmission(500)
+    policy.hold("a", R1)
+    assert policy.finish(["a"], output_tokens=10).evict == ["a"]
+    policy.forget("a")
+    # The same prefix is recomputed and stored again under the same key.
+    actions = policy.hold("a", R1)
+    assert actions.ghost == 1
+    assert actions.persist == []
+    assert policy.held_chunks == 1
+    # Without ghost admission the finish rule still decides.
+    assert policy.finish(["a"], output_tokens=10).evict == ["a"]
+
+
+def test_ghost_admission_writes_restored_chunk_to_l2() -> None:
+    policy = FinishAdmission(500, admit_ghosts=True)
+    policy.hold("a", R1)
+    policy.finish(["a"], output_tokens=10)
+    policy.forget("a")
+    policy.finish(["a"], output_tokens=10)  # early decision for the re-store
+    actions = policy.hold("a", R1)
+    assert actions.ghost == 1
+    assert actions.persist == R1
+    assert policy.held_chunks == 0
+    # The ghost is consumed: a later store of the key is decided normally.
+    assert policy.hold("a", R1).ghost == 0
+
+
+def test_rescued_or_admitted_chunks_leave_no_ghost() -> None:
+    policy = FinishAdmission(500, denied_budget_bytes=4096, admit_ghosts=True)
+    policy.hold("a", R1)
+    policy.finish(["a"], output_tokens=10)
+    policy.mark_hit(["a"])
+    policy.hold("b", R1)
+    policy.finish(["b"], output_tokens=900)
+    policy.forget("a")
+    policy.forget("b")
+    assert policy.hold("a", R1).ghost == 0
+    assert policy.hold("b", R1).ghost == 0

@@ -21,6 +21,7 @@ from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.admission import (
     DEFAULT_DENIED_L1_FRACTION,
     FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
+    FINISH_ADMIT_GHOST_ENV,
     FINISH_ADMIT_MIN_OUTPUT_ENV,
     AdmissionActions,
     FinishAdmission,
@@ -368,14 +369,17 @@ class IPCServer:
                 )
                 l1_bytes = int(self._runtime_config.get("l1_size_bytes", 0))
                 self._admission = FinishAdmission(
-                    int(min_output), int(l1_bytes * denied_fraction)
+                    int(min_output),
+                    int(l1_bytes * denied_fraction),
+                    admit_ghosts=os.environ.get(FINISH_ADMIT_GHOST_ENV) == "1",
                 )
                 self._runtime_config["finish_admission"] = True
                 # Held bytes of a removed chunk must never reach L2.
                 core.add_chunk_removal_listener(self._forget_admission)
         logger.info(
-            "finish admission min_output=%s",
+            "finish admission min_output=%s admit_ghosts=%s",
             None if self._admission is None else self._admission.min_output_tokens,
+            None if self._admission is None else self._admission.admit_ghosts,
         )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
@@ -1393,6 +1397,7 @@ class IPCServer:
             ("rescued", actions.rescued),
             ("denied", actions.denied),
             ("evicted", len(actions.evict)),
+            ("ghost", actions.ghost),
         ):
             if count:
                 counter.inc(count, labels={"outcome": outcome})

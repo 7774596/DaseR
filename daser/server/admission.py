@@ -32,8 +32,17 @@ FINISH_ADMIT_MIN_OUTPUT_ENV = "DASER_FINISH_ADMIT_MIN_OUTPUT"
 FINISH_ADMIT_DENIED_L1_FRACTION_ENV = "DASER_FINISH_ADMIT_DENIED_L1_FRACTION"
 DEFAULT_DENIED_L1_FRACTION = 0.5
 
+# Research switch: "1" writes a re-stored chunk straight to L2 when it was
+# denied and then evicted from the denied budget. The chunk key is a rolling
+# prefix key, so the same prefix recomputed later reuses it; the re-store
+# shows the finish-time denial was wrong. Unset only counts such re-stores.
+FINISH_ADMIT_GHOST_ENV = "DASER_FINISH_ADMIT_GHOST"
+
 # Decisions that arrive before their chunk's store are kept for this many keys.
 _MAX_EARLY_DECISIONS = 65536
+
+# Keys of denied chunks evicted from the budget, kept to recognize re-stores.
+_MAX_GHOST_KEYS = 65536
 
 Range = tuple[int, int]
 
@@ -49,6 +58,8 @@ class AdmissionActions:
         rescued: chunks written to L2 because they were hit while held or
             denied.
         denied: chunks refused L2 by a short output.
+        ghost: re-stored chunks that had been denied and evicted, i.e. reuse
+            lost to the denied budget.
     """
 
     persist: list[Range] = field(default_factory=list)
@@ -56,6 +67,7 @@ class AdmissionActions:
     admitted: int = 0
     rescued: int = 0
     denied: int = 0
+    ghost: int = 0
 
     def extend(self, other: AdmissionActions) -> None:
         """Append another event's actions to this one.
@@ -68,6 +80,7 @@ class AdmissionActions:
         self.admitted += other.admitted
         self.rescued += other.rescued
         self.denied += other.denied
+        self.ghost += other.ghost
 
 
 class FinishAdmission:
@@ -77,18 +90,29 @@ class FinishAdmission:
         min_output_tokens: output length at or above which a finished
             request's chunks are admitted to L2.
         denied_budget_bytes: bytes of denied chunks kept resident in memory.
+        admit_ghosts: write a re-stored chunk to L2 at once when it was denied
+            and evicted from the budget earlier. Re-stores are counted either
+            way.
 
     Async/thread-safety:
         Not synchronized; call only from the server event loop.
     """
 
-    def __init__(self, min_output_tokens: int, denied_budget_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        min_output_tokens: int,
+        denied_budget_bytes: int = 0,
+        *,
+        admit_ghosts: bool = False,
+    ) -> None:
         if min_output_tokens < 0:
             raise ValueError("min_output_tokens must be nonnegative")
         if denied_budget_bytes < 0:
             raise ValueError("denied_budget_bytes must be nonnegative")
         self.min_output_tokens = min_output_tokens
         self.denied_budget_bytes = denied_budget_bytes
+        self.admit_ghosts = admit_ghosts
+        self._ghosts: OrderedDict[str, None] = OrderedDict()
         self._held: dict[str, list[Range]] = {}
         self._hit: set[str] = set()
         self._denied: OrderedDict[str, int] = OrderedDict()
@@ -113,13 +137,19 @@ class FinishAdmission:
             ranges: held ``(file_offset, nbytes)`` transfer keys.
 
         Returns:
-            Actions to apply now when the decision already arrived.
+            Actions to apply now when the decision already arrived, or when
+            ghost admission writes a re-stored evicted chunk to L2.
         """
+        ghost = self._ghosts.pop(chunk_key, False) is None
+        if ghost and self.admit_ghosts:
+            self._early.pop(chunk_key, None)
+            return AdmissionActions(persist=list(ranges), ghost=1)
         admit = self._early.pop(chunk_key, None)
         self._held[chunk_key] = list(ranges)
-        if admit is None:
-            return AdmissionActions()
-        return self._resolve(chunk_key, admit)
+        actions = AdmissionActions(ghost=int(ghost))
+        if admit is not None:
+            actions.extend(self._resolve(chunk_key, admit))
+        return actions
 
     def mark_hit(self, chunk_keys: list[str]) -> AdmissionActions:
         """Record lookup hits; a hit on a denied chunk rescues it to L2.
@@ -197,6 +227,10 @@ class FinishAdmission:
             oldest = next(iter(self._denied))
             self._drop_denied(oldest)
             actions.evict.append(oldest)
+            self._ghosts[oldest] = None
+            self._ghosts.move_to_end(oldest)
+            while len(self._ghosts) > _MAX_GHOST_KEYS:
+                self._ghosts.popitem(last=False)
         return actions
 
     def _drop_denied(self, chunk_key: str) -> None:
