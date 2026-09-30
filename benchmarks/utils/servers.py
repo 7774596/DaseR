@@ -193,6 +193,7 @@ class ServerManager:
         daser_prefetch_max_requests: int = 0,
         daser_prefetch_lease_budget_bytes: int = 0,
         daser_l2_read_stripe_bytes: int = 0,
+        daser_l1_accounting: str = "stored",
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -226,6 +227,7 @@ class ServerManager:
                 (0 leaves the server default of no cap).
             daser_l2_read_stripe_bytes: DaseR ``--l2-read-stripe`` (0 leaves
                 the server default of one serial read per extent).
+            daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
             storage_format: DaseR physical KV storage format.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
@@ -264,6 +266,7 @@ class ServerManager:
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
         self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
         self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
+        self.daser_l1_accounting = daser_l1_accounting
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -525,6 +528,8 @@ class ServerManager:
             )
         if self.daser_l2_read_stripe_bytes:
             cmd.extend(["--l2-read-stripe", str(self.daser_l2_read_stripe_bytes)])
+        if self.daser_l1_accounting != "stored":
+            cmd.extend(["--l1-accounting", self.daser_l1_accounting])
         if self.trust_remote_code:
             cmd.append("--trust-remote-code")
         return cmd

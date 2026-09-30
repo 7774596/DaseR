@@ -32,7 +32,16 @@ from benchmarks.utils.servers import (
 from benchmarks.utils.sizing import parse_size_bytes
 from daser.connector.ipc_client import IPCClientSync
 
-ARMS = ("native-apc", "noop-connector", "vllm-offload", "daser-raw", "daser-compressed")
+ARMS = (
+    "native-apc",
+    "noop-connector",
+    "vllm-offload",
+    "daser-raw",
+    "daser-compressed",
+    # Compressed bytes on SSD and in L1, but L1 capacity and prefetch leases
+    # charged in raw bytes: a codec bolted onto a raw-sized cache.
+    "daser-compressed-raw-l1",
+)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -267,7 +276,10 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         startup_timeout=900.0,
         max_model_len=args.max_model_len,
         trust_remote_code=True,
-        storage_format="compressed-online" if arm == "daser-compressed" else "raw",
+        storage_format=(
+            "compressed-online" if arm.startswith("daser-compressed") else "raw"
+        ),
+        daser_l1_accounting=("raw" if arm == "daser-compressed-raw-l1" else "stored"),
         skip_l2=args.skip_l2 and arm.startswith("daser"),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0
