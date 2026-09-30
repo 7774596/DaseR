@@ -39,6 +39,29 @@ logger = init_logger(__name__)
 # one step.
 PENDING_LOOKUP_DEFER_S = 0.126
 
+# Upper bound on how long a request waits for an in-flight load of the same
+# prefix before loading its own copy (guards against a stalled leader).
+COALESCE_MAX_WAIT_S = 10.0
+
+# Scheduler steps an in-flight load stays joinable after its worker reported
+# completion: vLLM caches the landed blocks when it promotes the leader in the
+# next schedule() call, which may visit a follower first.
+COALESCE_LANDING_STEPS = 1
+
+
+def _prefix_digest(tokens: list[int], end: int) -> int:
+    """Return an in-process digest of ``tokens[:end]``.
+
+    Args:
+        tokens: request prompt token IDs.
+        end: prefix length in tokens.
+
+    Returns:
+        Hash of the prefix. A collision only makes a request wait for a load
+        it cannot reuse; vLLM's own block hashes decide what is actually hit.
+    """
+    return hash(tuple(tokens[:end]))
+
 
 def _prefetch_external_spans(
     socket_path: str,
@@ -75,6 +98,7 @@ class RequestLifecycle:
         socket_path: str = "",
         prefetch_max_requests: int = 0,
         storage_format: str | None = None,
+        coalesce_loads: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
         self._block_tokens = block_tokens
@@ -104,6 +128,17 @@ class RequestLifecycle:
         self._leased_request_ids: set[str] = set()
         self._finish_admission = False
         self._written_chunks: dict[str, list[str]] = {}
+        # In-flight load coalescing: vLLM only publishes externally loaded
+        # blocks to its prefix cache after the load lands, so a concurrent
+        # request for the same prefix would allocate and load its own copy.
+        # Leaders map to (prefix end, prefix digest, landing steps left; -1
+        # while the load is still in flight); followers map to (awaited end,
+        # first deferral time).
+        self._coalesce_loads = coalesce_loads
+        self._inflight_loads: dict[str, tuple[int, int, int]] = {}
+        self._coalesce_followers: dict[str, tuple[int, float]] = {}
+        self._follower_digests: dict[str, dict[int, int]] = {}
+        self._coalesce_stats = {"followers": 0, "joined": 0, "missed": 0}
 
     def get_num_new_matched_tokens(
         self,
@@ -163,6 +198,17 @@ class RequestLifecycle:
                 self._release_transfer_lease(request.request_id, force=True)
                 prefetch_lookup_result = None
             prefetch_futures.pop(request.request_id, None)
+
+        if getattr(self, "_coalesce_loads", False) and prefetch_lookup_result is None:
+            # A fresh lookup supersedes any load this request registered
+            # before (for example when vLLM could not allocate its blocks).
+            self._inflight_loads.pop(request.request_id, None)
+            if self._wait_for_inflight_load(
+                request.request_id, tokens, num_computed_tokens
+            ):
+                # vLLM keeps the request waiting; once the in-flight load lands
+                # its blocks are a local prefix hit instead of a second load.
+                return None, False
 
         start = num_computed_tokens
         available = len(tokens) - start
@@ -269,6 +315,16 @@ class RequestLifecycle:
                 self._release_transfer_lease(request.request_id)
                 return 0, False
 
+        if getattr(self, "_coalesce_loads", False):
+            end = num_computed_tokens + extra_tokens
+            current = self._inflight_loads.get(request.request_id)
+            if current is None or current[0] != end:
+                self._inflight_loads[request.request_id] = (
+                    end,
+                    _prefix_digest(tokens, end),
+                    -1,
+                )
+
         if (
             prefetch_enabled
             and prefetch_lookup_result is not None
@@ -368,6 +424,8 @@ class RequestLifecycle:
             self._release_transfer_lease(req_id, force=True)
         getattr(self, "_prefetch_lookup_results", {}).clear()
         getattr(self, "_prefetch_signatures", {}).clear()
+        if getattr(self, "_coalesce_loads", False):
+            self._log_coalesce_stats()
 
     def update_state_after_alloc(
         self,
@@ -449,6 +507,7 @@ class RequestLifecycle:
             DaserConnectorMeta with reqs_to_load and reqs_to_store.
         """
         meta = DaserConnectorMeta()
+        self._age_landed_loads()
         # Published stores have left _pending_stores but still reference model
         # blocks on the worker. Capture their cancellation before dropping the
         # scheduler hold; the worker must discard those unsent specifications.
@@ -1117,6 +1176,9 @@ class RequestLifecycle:
         """
         del block_ids
         self._defer_deadlines().pop(request.request_id, None)
+        getattr(self, "_inflight_loads", {}).pop(request.request_id, None)
+        getattr(self, "_coalesce_followers", {}).pop(request.request_id, None)
+        getattr(self, "_follower_digests", {}).pop(request.request_id, None)
         self._report_finish(request)
         if request.request_id in self._pending_async_save_ids():
             return True, None
@@ -1139,7 +1201,15 @@ class RequestLifecycle:
             pending_async_saves.discard(req_id)
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)
+        inflight_loads = getattr(self, "_inflight_loads", {})
         for req_id in getattr(connector_output, "finished_recving", None) or ():
+            landed = inflight_loads.get(req_id)
+            if landed is not None:
+                inflight_loads[req_id] = (
+                    landed[0],
+                    landed[1],
+                    COALESCE_LANDING_STEPS,
+                )
             getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
             self._release_transfer_lease(req_id)
             if req_id not in self._pending_alloc:
@@ -1147,3 +1217,73 @@ class RequestLifecycle:
             for pending_req_id in list(self._pending_loads):
                 if _matches_request_or_store_id(pending_req_id, req_id):
                     self._pending_loads.pop(pending_req_id, None)
+
+    def _wait_for_inflight_load(
+        self,
+        req_id: str,
+        tokens: list[int],
+        num_computed_tokens: int,
+    ) -> bool:
+        """Return whether a request should wait for another request's load.
+
+        A request waits while another request is loading the same prompt
+        prefix beyond this request's local hit; after that load lands, vLLM's
+        prefix cache serves the prefix and this request loads nothing twice.
+
+        Args:
+            req_id: vLLM request ID asking for external matches.
+            tokens: request prompt token IDs.
+            num_computed_tokens: tokens already hit in vLLM's local cache.
+
+        Returns:
+            True when the caller should keep the request waiting this step.
+
+        Async/thread-safety:
+            Runs on vLLM's scheduler thread only.
+        """
+        now = time.monotonic()
+        followers = self._coalesce_followers
+        waiting = followers.get(req_id)
+        if waiting is None or now - waiting[1] < COALESCE_MAX_WAIT_S:
+            digests = self._follower_digests.setdefault(req_id, {})
+            for leader_id, (end, digest, _) in self._inflight_loads.items():
+                if leader_id == req_id or not num_computed_tokens < end < len(tokens):
+                    continue
+                if end not in digests:
+                    digests[end] = _prefix_digest(tokens, end)
+                if digests[end] != digest:
+                    continue
+                if waiting is None:
+                    followers[req_id] = (num_computed_tokens, now)
+                    self._coalesce_stats["followers"] += 1
+                    if self._coalesce_stats["followers"] % 64 == 0:
+                        self._log_coalesce_stats()
+                return True
+        if waiting is not None:
+            followers.pop(req_id, None)
+            outcome = "joined" if num_computed_tokens > waiting[0] else "missed"
+            self._coalesce_stats[outcome] += 1
+        self._follower_digests.pop(req_id, None)
+        return False
+
+    def _age_landed_loads(self) -> None:
+        """Forget landed loads once vLLM has had a step to cache their blocks."""
+        inflight_loads = getattr(self, "_inflight_loads", {})
+        for req_id, (end, digest, steps) in list(inflight_loads.items()):
+            if steps < 0:
+                continue
+            if steps == 0:
+                inflight_loads.pop(req_id, None)
+            else:
+                inflight_loads[req_id] = (end, digest, steps - 1)
+
+    def _log_coalesce_stats(self) -> None:
+        """Log cumulative in-flight load coalescing counters."""
+        stats = self._coalesce_stats
+        logger.info(
+            "[CONNECTOR] load coalescing: followers=%d joined=%d missed=%d inflight=%d",
+            stats["followers"],
+            stats["joined"],
+            stats["missed"],
+            len(self._inflight_loads),
+        )

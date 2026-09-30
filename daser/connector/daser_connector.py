@@ -117,6 +117,7 @@ class DaserConnector(
                 socket_path=socket_path,
                 prefetch_max_requests=prefetch_max_requests,
                 storage_format=storage_format,
+                coalesce_loads=bool(extra.get("coalesce_loads", False)),
             )
             self._request_lifecycle.refresh_runtime_config()
             self._scheduler_probe = SchedulerProbe.from_env()

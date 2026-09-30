@@ -246,6 +246,7 @@ class ServerManager:
         daser_prefetch_lease_budget_bytes: int = 0,
         daser_l2_read_stripe_bytes: int = 0,
         daser_l1_accounting: str = "stored",
+        daser_coalesce_loads: bool = False,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -280,6 +281,8 @@ class ServerManager:
             daser_l2_read_stripe_bytes: DaseR ``--l2-read-stripe`` (0 leaves
                 the server default of one serial read per extent).
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
+            daser_coalesce_loads: let the connector hold back requests whose
+                prefix another request is already loading.
             storage_format: DaseR physical KV storage format.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
@@ -319,6 +322,7 @@ class ServerManager:
         self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
         self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
         self.daser_l1_accounting = daser_l1_accounting
+        self.daser_coalesce_loads = daser_coalesce_loads
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -514,6 +518,8 @@ class ServerManager:
         }
         if self.online_pack_batch_slots is not None:
             extra_config["online_pack_batch_slots"] = self.online_pack_batch_slots
+        if self.daser_coalesce_loads:
+            extra_config["coalesce_loads"] = True
         return {
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",

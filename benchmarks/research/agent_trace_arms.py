@@ -42,6 +42,10 @@ ARMS = (
     # Compressed bytes on SSD and in L1, but L1 capacity and prefetch leases
     # charged in raw bytes: a codec bolted onto a raw-sized cache.
     "daser-compressed-raw-l1",
+    # Concurrent requests for a prefix that is already loading wait for that
+    # load instead of loading their own copy.
+    "daser-raw-coalesce",
+    "daser-compressed-coalesce",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -281,6 +285,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
             "compressed-online" if arm.startswith("daser-compressed") else "raw"
         ),
         daser_l1_accounting=("raw" if arm == "daser-compressed-raw-l1" else "stored"),
+        daser_coalesce_loads=arm.endswith("-coalesce"),
         skip_l2=args.skip_l2 and arm.startswith("daser"),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0
