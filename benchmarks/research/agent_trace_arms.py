@@ -185,6 +185,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument("--l1-size", type=parse_size_bytes, default="64gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="256gib")
+    parser.add_argument(
+        "--skip-l2",
+        action="store_true",
+        help="Run DaseR arms memory-only: the store lives in L1 (--l1-size).",
+    )
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--max-num-seqs", type=int, default=16)
@@ -234,6 +239,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         max_model_len=args.max_model_len,
         trust_remote_code=True,
         storage_format="compressed-online" if arm == "daser-compressed" else "raw",
+        skip_l2=args.skip_l2 and arm.startswith("daser"),
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,

@@ -397,8 +397,6 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         violations = []
         if cfg.transfer_mode != "iouring":
             violations.append("--transfer-mode=iouring")
-        if cfg.skip_l2:
-            violations.append("L2 enabled")
         if cfg.cache_reuse_mode != CACHE_REUSE_PREFIX:
             violations.append("--cache-reuse-mode=prefix")
         if cfg.tensor_parallel_size != 1:

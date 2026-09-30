@@ -361,8 +361,11 @@ class IPCServer:
                     chunk_key, core.chunk_manager
                 )
             )
+            # L2 admission and exclusive tiers decide what reaches L2, so a
+            # memory-only store has nothing for them to control.
+            has_l2 = not bool(self._runtime_config.get("skip_l2", False))
             min_output = os.environ.get(FINISH_ADMIT_MIN_OUTPUT_ENV, "")
-            if min_output:
+            if min_output and has_l2:
                 denied_fraction = float(
                     os.environ.get(
                         FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
@@ -378,7 +381,11 @@ class IPCServer:
                 self._runtime_config["finish_admission"] = True
                 # Held bytes of a removed chunk must never reach L2.
                 core.add_chunk_removal_listener(self._forget_admission)
-            if os.environ.get(EXCLUSIVE_TIERS_ENV) == "1" and self._admission is None:
+            if (
+                os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
+                and has_l2
+                and self._admission is None
+            ):
                 # Exclusive tiers: every packed record is held in L1 and only
                 # reaches L2 when L1 evicts it; a removed chunk's held bytes
                 # are dropped so L2 never stores a record L1 still owns.
@@ -694,6 +701,7 @@ class IPCServer:
             if "wait_for_pending" not in str(exc):
                 raise
             chunks = await self._core.lookup(tokens, model_id)
+        chunks = await self._memory_resident_chunks(chunks)
         await self._mark_admission_hits(chunks)
         return chunks
 
@@ -721,8 +729,64 @@ class IPCServer:
                 return None
         else:
             chunks = await self._core.lookup(tokens, model_id)
+        chunks = await self._memory_resident_chunks(chunks)
         await self._mark_admission_hits(chunks)
         return chunks
+
+    async def _memory_resident_chunks(self, chunks: list[ChunkInfo]) -> list[ChunkInfo]:
+        """Trim a memory-only lookup to the chunks whose bytes are still in L1.
+
+        With ``skip_l2`` the index and L1 replacement are independent: pinned
+        pool pressure can evict a committed range that the index still lists,
+        and nothing can refill it. Advertising such a chunk makes the worker
+        load fail, so the match stops at the first chunk that left memory.
+
+        Args:
+            chunks: Lookup chunks covering the prompt prefix.
+
+        Returns:
+            The leading chunks that are fully L1-resident; all chunks when L2
+            is enabled.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop. Residency is checked and
+            refreshed atomically in the transfer layer; a store racing the
+            later load can still evict a counted chunk.
+        """
+        if not chunks or not self._runtime_config.get("skip_l2", False):
+            return chunks
+        block_tokens = int(self._runtime_config.get("block_tokens", 0))
+        compressed = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
+        ordered = sorted(chunks, key=lambda item: int(item.target_token_start))
+        groups: list[list[dict[str, int]]] = []
+        for chunk in ordered:
+            window = {
+                "external_start": int(chunk.target_token_start),
+                "external_tokens": int(chunk.token_count),
+                "block_tokens": block_tokens,
+            }
+            if compressed:
+                spans = self._online_compressed_prefetch_spans([chunk], **window)
+            else:
+                spans = _prefetch_spans_from_chunks(
+                    [chunk],
+                    **window,
+                    slot_size=int(self._runtime_config.get("slot_size", 0)),
+                    tensor_parallel_size=int(
+                        self._runtime_config.get("tensor_parallel_size", 1)
+                    ),
+                    rank_stride_bytes=int(
+                        self._runtime_config.get("rank_stride_bytes", 0)
+                    ),
+                )
+            if not spans:
+                break
+            groups.append(spans)
+        resident = await self._ensure_transfer().resident_prefix(groups)
+        return ordered[:resident]
 
     async def _mark_admission_hits(self, chunks: list[ChunkInfo]) -> None:
         """Report resolved lookup hits to finish-time admission, if enabled.

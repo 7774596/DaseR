@@ -1280,6 +1280,75 @@ async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_only_lookup_skips_chunks_evicted_from_l1(tmp_path) -> None:
+    """Without L2, a chunk L1 evicted is a miss even while the ring indexes it."""
+    runtime_config = make_runtime_config(tmp_path)
+    runtime_config.update(skip_l2=True, store_path="", l1_size_bytes=SLOT_SIZE)
+    core = make_core(total_slots=8)
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, runtime_config)
+    await server.start()
+    prompts = {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8]}
+    try:
+        for fill, tokens in prompts.items():
+            key = first_rolling_key(tokens)
+            alloc = await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": len(tokens),
+                    "model_id": "m",
+                },
+            )
+            store = await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_store",
+                    "payload": {"data": fill.encode() * SLOT_SIZE},
+                    "spans": [
+                        {
+                            "source_offset": 0,
+                            "nbytes": SLOT_SIZE,
+                            "file_offset": alloc["file_offset"],
+                            "chunk_key": key,
+                            "start_slot": alloc["start_slot"],
+                            "num_slots": alloc["num_slots"],
+                        }
+                    ],
+                },
+            )
+            assert store["chunk_keys"] == [key]
+        # The one-slot L1 kept only "b"; the eight-slot ring still has "a".
+        assert core.chunk_manager.store.get(first_rolling_key(prompts["a"]))
+        lookups = {
+            fill: await _send_recv(
+                socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+            )
+            for fill, tokens in prompts.items()
+        }
+        assert lookups["a"]["chunks"] == []
+        (chunk,) = lookups["b"]["chunks"]
+        load = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [
+                    {
+                        "target_offset": 0,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": chunk["file_offset"],
+                    }
+                ],
+            },
+        )
+        assert load["data"] == b"b" * SLOT_SIZE
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
     """IPC publishes relocated references and restores them byte-exactly."""
     local_slot_size = 4 * SLOT_SIZE
@@ -1410,8 +1479,12 @@ def _online_arena_server(
     arena_slots: int,
     metrics_registry: MetricsRegistry | None = None,
     l1_slots: int = 1,
+    skip_l2: bool = False,
 ) -> tuple[ServerCore, IPCServer, str, int]:
-    """Build a compressed-online server whose arena is smaller than its ring."""
+    """Build a compressed-online server whose arena is smaller than its ring.
+
+    With ``skip_l2`` the arena addresses L1 only, as ``--skip-l2`` configures.
+    """
     local_slot_size = 4 * SLOT_SIZE
     core = ServerCore(
         ChunkManager(logical_slots, MetadataStore(logical_slots)),
@@ -1428,6 +1501,12 @@ def _online_arena_server(
         "l1_size_bytes": l1_slots * local_slot_size,
         "l2_size_bytes": arena_slots * local_slot_size,
     }
+    if skip_l2:
+        config.update(
+            skip_l2=True,
+            store_path="",
+            l1_size_bytes=arena_slots * local_slot_size,
+        )
     socket_path = str(tmp_path / "arena.sock")
     server = IPCServer(socket_path, core, config, metrics_registry=metrics_registry)
     return core, server, socket_path, local_slot_size
@@ -1643,6 +1722,55 @@ async def test_exclusive_tiers_write_records_only_when_l1_evicts_them(
         assert present == kept
         assert _l2_write_bytes(registry) == written * local_slot_size
         assert _metric_value(registry, "daser_held_bytes") == 2 * local_slot_size
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_memory_only_online_store_keeps_packed_records_in_l1(
+    tmp_path, monkeypatch
+) -> None:
+    """Without L2 the packed arena spans L1: records load back, none reach SSD."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    registry = MetricsRegistry()
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path,
+        logical_slots=8,
+        arena_slots=2,
+        metrics_registry=registry,
+        skip_l2=True,
+    )
+    await server.start()
+    try:
+        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
+        assert "exclusive_tiers" not in config["runtime_config"]
+        for key in ("a", "b", "c"):
+            assert "error" not in await _store_online_record(
+                socket_path, key, local_slot_size
+            )
+            await server.drain_transfer()
+        present = [k for k in "abc" if core.chunk_manager.store.get(k) is not None]
+        assert present == ["b", "c"]
+        record = core.chunk_manager.store.get("c")
+        assert record is not None
+        (ref,) = core.packed_slot_refs(record.start_slot, 1)
+        load = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [
+                    {
+                        "target_offset": 0,
+                        "file_offset": int(ref["file_offset"]),
+                        "nbytes": int(ref["stored_length"]),
+                    }
+                ],
+            },
+        )
+        assert load["data"] == b"x" * local_slot_size
+        assert _l2_write_bytes(registry) == 0
     finally:
         await server.drain_transfer()
         await server.stop()

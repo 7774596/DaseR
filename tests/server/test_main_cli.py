@@ -478,6 +478,18 @@ def test_compressed_online_rejects_unsupported_runtime_modes(
         _build_daser_config(args)
 
 
+def test_compressed_online_accepts_memory_only_store(tmp_path: Path) -> None:
+    args = _compressed_args(tmp_path, extra=["--skip-l2", "--l1-size", "64mib"])
+
+    cfg = _build_daser_config(args)
+
+    assert cfg.skip_l2 is True
+    assert cfg.storage_format == "compressed-online"
+    # The arena addresses L1 only; sizes round to whole slots.
+    assert 0 < cfg.l1_size_bytes == cfg.l2_size_bytes <= 64 * 1024**2
+    assert cfg.persists_index is False
+
+
 def test_compressed_online_rejects_fp16_model(tmp_path: Path) -> None:
     args = _compressed_args(tmp_path, dtype="float16")
 
