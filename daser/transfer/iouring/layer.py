@@ -1822,6 +1822,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     key,
                     nbytes,
                     accounted_nbytes,
+                    own_promotions={read[2] for read in reads},
                 )
                 reads.append((span, pinned, promotion_id, epoch))
                 if pending_writes:
@@ -2234,6 +2235,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         key: tuple[int, int],
         nbytes: int,
         accounted_nbytes: int,
+        own_promotions: set[int],
     ) -> tuple[
         PinnedMemorySlice,
         int,
@@ -2246,6 +2248,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             key: L2 range being promoted.
             nbytes: Number of bytes to reserve.
             accounted_nbytes: L1 capacity charge for the range.
+            own_promotions: Reservation identifiers the caller already holds
+                in the same read batch. Those finish only after this call
+                returns, so waiting on them would never wake.
 
         Returns:
             The pinned slice, reservation identifier, cache mutation epoch, and
@@ -2286,8 +2291,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                     wait_for = next(
                         (
                             future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            for promotion_id, future in (
+                                self._pending_l1_promotions.items()
+                            )
+                            if promotion_id not in own_promotions and not future.done()
                         ),
                         None,
                     )
