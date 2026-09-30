@@ -1614,6 +1614,9 @@ class IPCServer:
                     l1_accounting=str(
                         self._runtime_config.get("l1_accounting", "stored")
                     ),
+                    prefetch_lease_budget_bytes=int(
+                        self._runtime_config.get("prefetch_lease_budget_bytes", 0)
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

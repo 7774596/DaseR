@@ -2426,6 +2426,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "skip_l2": True,
             "bip_enabled": False,
             "l1_accounting": "stored",
+            "prefetch_lease_budget_bytes": 0,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2476,5 +2477,6 @@ async def test_bip_setting_is_forwarded(
             "skip_l2": False,
             "bip_enabled": bip_enabled,
             "l1_accounting": "stored",
+            "prefetch_lease_budget_bytes": 0,
         }
     ]

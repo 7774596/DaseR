@@ -1166,6 +1166,88 @@ def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_prefetch_lease_budget_waits_for_release(tmp_path) -> None:
+    """A prefetch lease over the budget waits until an earlier lease drops."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * 2, l2_bytes=ALIGNMENT * 2
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+            prefetch_lease_budget_bytes=ALIGNMENT,
+        )
+        first = [{"file_offset": 0, "nbytes": ALIGNMENT}]
+        second = [{"file_offset": ALIGNMENT, "nbytes": ALIGNMENT}]
+        try:
+            await layer.prefetch_bytes_grouped(first, lease_id="first")
+            blocked = asyncio.create_task(
+                layer.prefetch_bytes_grouped(second, lease_id="second")
+            )
+            await asyncio.sleep(0.05)
+            assert not blocked.done()
+
+            await layer.release_lease("first")
+            result = await asyncio.wait_for(blocked, timeout=1.0)
+            assert result.requested_bytes == ALIGNMENT
+            dst = bytearray(ALIGNMENT)
+            load = [{"target_offset": 0, **second[0]}]
+            assert await layer.load_leased_bytes_grouped(dst, load, "second") == (
+                ALIGNMENT
+            )
+            assert bytes(dst) == bytes(_block(b"b"))
+        finally:
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_prefetch_lease_budget_rejects_oversized_lease(tmp_path) -> None:
+    """A single prefetch lease larger than the budget fails immediately."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+            prefetch_lease_budget_bytes=ALIGNMENT,
+        )
+        try:
+            with pytest.raises(MemoryError, match="lease budget"):
+                await layer.prefetch_bytes_grouped(
+                    [{"file_offset": 0, "nbytes": ALIGNMENT * 2}], lease_id="big"
+                )
+        finally:
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_prefetch_lease_budget_must_fit_l1(tmp_path) -> None:
+    """The prefetch lease budget cannot exceed L1 capacity."""
+    with pytest.raises(ValueError, match="prefetch_lease_budget_bytes"):
+        TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+            prefetch_lease_budget_bytes=ALIGNMENT * 2,
+        )
+
+
 def test_iouring_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = TieredIOUringTransferLayer(

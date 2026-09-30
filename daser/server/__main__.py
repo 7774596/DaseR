@@ -244,6 +244,14 @@ def _parse_args() -> argparse.Namespace:
         help="Enable BIP replacement for the iouring L1 cache (default: on).",
     )
     parser.add_argument(
+        "--prefetch-lease-budget",
+        type=_parse_size_bytes,
+        default=0,
+        help="Cap on L1 bytes retained by in-flight scheduler prefetch leases "
+        "for --transfer-mode=iouring, charged in --l1-accounting units; a "
+        "prefetch over the cap waits for earlier leases (default 0: no cap).",
+    )
+    parser.add_argument(
         "--l1-accounting",
         choices=L1_ACCOUNTING_MODES,
         default="stored",
@@ -378,6 +386,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         storage_format=storage_format,
         bip_enabled=bool(args.bip_enabled),
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
+        prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -392,6 +401,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         raise ValueError("--l1-size must be positive for iouring transfer")
     if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --l2-size")
+    if cfg.prefetch_lease_budget_bytes > cfg.l1_size_bytes:
+        raise ValueError("--prefetch-lease-budget must not exceed --l1-size")
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
         geometry = model_geometry_from_path(cfg.model_path)
         violations = []

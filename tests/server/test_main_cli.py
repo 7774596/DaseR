@@ -199,6 +199,32 @@ def test_bip_flag_overrides_default(tmp_path: Path) -> None:
     assert cfg.runtime_config()["bip_enabled"] is False
 
 
+def test_prefetch_lease_budget_flag_populates_runtime_config(tmp_path: Path) -> None:
+    """``--prefetch-lease-budget`` reaches config and runtime config."""
+    base = [
+        "--model-path",
+        str(tmp_path / "model"),
+        "--store-dir",
+        str(tmp_path / "store"),
+        "--vllm-base-url",
+        "http://127.0.0.1:8001",
+        "--l1-size",
+        "2GiB",
+        "--l2-size",
+        "4GiB",
+    ]
+    _write_model_config(tmp_path / "model")
+
+    default_cfg = _build_daser_config(_run_parse(base))
+    cfg = _build_daser_config(_run_parse([*base, "--prefetch-lease-budget", "1GiB"]))
+
+    assert default_cfg.runtime_config()["prefetch_lease_budget_bytes"] == 0
+    assert cfg.prefetch_lease_budget_bytes == 1 << 30
+    assert cfg.runtime_config()["prefetch_lease_budget_bytes"] == 1 << 30
+    with pytest.raises(ValueError, match="--prefetch-lease-budget"):
+        _build_daser_config(_run_parse([*base, "--prefetch-lease-budget", "3GiB"]))
+
+
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
     """The server defaults to iouring unless a transfer mode is specified."""
     model_path = tmp_path / "model"

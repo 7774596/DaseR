@@ -208,6 +208,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Real-text .npy token corpus passed to the replay (see longdoc_trace).",
     )
+    parser.add_argument(
+        "--daser-prefetch-max-requests",
+        type=int,
+        default=0,
+        help="DaseR scheduler prefetch workers (0 disables; DaseR arms only).",
+    )
+    parser.add_argument(
+        "--daser-prefetch-lease-budget",
+        type=parse_size_bytes,
+        default="0",
+        help="DaseR --prefetch-lease-budget (0 = no cap; DaseR arms only).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -251,6 +263,12 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         trust_remote_code=True,
         storage_format="compressed-online" if arm == "daser-compressed" else "raw",
         skip_l2=args.skip_l2 and arm.startswith("daser"),
+        daser_prefetch_max_requests=(
+            args.daser_prefetch_max_requests if arm.startswith("daser") else 0
+        ),
+        daser_prefetch_lease_budget_bytes=(
+            args.daser_prefetch_lease_budget if arm.startswith("daser") else 0
+        ),
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,

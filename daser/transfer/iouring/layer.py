@@ -81,6 +81,7 @@ class _RequestLease:
     released: asyncio.Future[None]
     active_loads: int = 0
     release_all: bool = False
+    budget_bytes: int = 0
 
 
 def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
@@ -416,6 +417,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         bip_enabled: Enable BIP replacement for L1 allocations.
         l1_accounting: Capacity unit for L1 residency, either stored bytes or
             raw-equivalent bytes carried by each exact record.
+        prefetch_lease_budget_bytes: Maximum accounted bytes retained by
+            in-flight prefetch leases (0 disables the budget). A prefetch that
+            would exceed it waits until earlier leases are released, so staged
+            requests never outgrow L1 and lose their retained slices.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -434,6 +439,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         skip_l2: bool = False,
         bip_enabled: bool = False,
         l1_accounting: str = "stored",
+        prefetch_lease_budget_bytes: int = 0,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -445,6 +451,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("io_workers must be positive")
         if l1_accounting not in ("stored", "raw"):
             raise ValueError("l1_accounting must be 'stored' or 'raw'")
+        if not 0 <= prefetch_lease_budget_bytes <= l1_bytes:
+            raise ValueError("prefetch_lease_budget_bytes must be in [0, l1_bytes]")
         self._l2: L2IoEngine | None = None
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
@@ -452,6 +460,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self.l1_accounting = l1_accounting
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
+        self._prefetch_lease_budget = prefetch_lease_budget_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         # L1-only packed ranges waiting for an admission decision. They stay
@@ -477,10 +486,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
+        # Signalled under ``_lock`` whenever a lease is dropped.
+        self._lease_released = asyncio.Condition(self._lock)
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
-            "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s",
+            "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
+            "prefetch_lease_budget=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -489,6 +501,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             skip_l2,
             self.bip_enabled,
             self.l1_accounting,
+            prefetch_lease_budget_bytes,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1077,14 +1090,31 @@ class TieredIOUringTransferLayer(TransferLayer):
                 f"request lease needs {requested_bytes} bytes but L1 capacity is "
                 f"{self._l1_bytes}"
             )
+        budget = self._prefetch_lease_budget if lease_id is not None else 0
+        charge = sum(span["accounted_nbytes"] for span in normalized_spans)
+        if budget and charge > budget:
+            raise MemoryError(
+                f"prefetch lease needs {charge} accounted bytes but the lease "
+                f"budget is {budget}"
+            )
         l1_bytes = 0
         misses: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
         try:
             async with self._lock:
+                if budget:
+                    await self._lease_released.wait_for(
+                        lambda: (
+                            self._leased_budget_bytes_locked(lease_id) + charge
+                            <= budget
+                        )
+                    )
                 self._raise_l2_error_locked()
                 if lease_id is not None:
                     self._replace_request_lease_locked(lease_id, requested_ranges, [])
+                    self._request_leases[lease_id].budget_bytes = (
+                        charge if budget else 0
+                    )
                 for span in normalized_spans:
                     file_offset = span["file_offset"]
                     nbytes = span["nbytes"]
@@ -2311,6 +2341,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not lease.released.done():
             lease.released.set_result(None)
         self._l1.notify_pool_waiters()
+        self._lease_released.notify_all()
 
     def _release_request_lease_locked(
         self,
@@ -2331,6 +2362,23 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not lease.released.done():
             lease.released.set_result(None)
         self._l1.notify_pool_waiters()
+        self._lease_released.notify_all()
+
+    def _leased_budget_bytes_locked(self, exclude: str | None) -> int:
+        """Return accounted bytes charged by live prefetch leases.
+
+        Args:
+            exclude: Lease ID left out of the sum, because a prefetch for the
+                same request replaces that lease's charge.
+
+        Returns:
+            Sum of ``budget_bytes`` over the remaining request leases.
+        """
+        return sum(
+            lease.budget_bytes
+            for lease_id, lease in self._request_leases.items()
+            if lease_id != exclude
+        )
 
     def _release_slice_reference_locked(self, data_id: int) -> None:
         """Release one request's reference to a retained pinned slice."""

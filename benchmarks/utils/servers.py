@@ -191,6 +191,7 @@ class ServerManager:
         tensor_parallel_size: int = 1,
         trust_remote_code: bool = False,
         daser_prefetch_max_requests: int = 0,
+        daser_prefetch_lease_budget_bytes: int = 0,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -220,6 +221,8 @@ class ServerManager:
             tensor_parallel_size: vLLM tensor-parallel rank count.
             trust_remote_code: allow model/tokenizer repository Python code.
             daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
+            daser_prefetch_lease_budget_bytes: DaseR ``--prefetch-lease-budget``
+                (0 leaves the server default of no cap).
             storage_format: DaseR physical KV storage format.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
@@ -229,6 +232,8 @@ class ServerManager:
             raise ValueError("tensor_parallel_size must be positive")
         if daser_prefetch_max_requests < 0:
             raise ValueError("daser_prefetch_max_requests must be non-negative")
+        if daser_prefetch_lease_budget_bytes < 0:
+            raise ValueError("daser_prefetch_lease_budget_bytes must be non-negative")
         if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
             raise ValueError("online_pack_batch_slots must be positive")
         self.run_id = run_id
@@ -252,6 +257,7 @@ class ServerManager:
         self.tensor_parallel_size = tensor_parallel_size
         self.trust_remote_code = trust_remote_code
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
+        self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -507,6 +513,10 @@ class ServerManager:
             cmd.extend(["--l2-size", str(self.l2_size_bytes)])
         if self.tensor_parallel_size > 1:
             cmd.extend(["--tensor-parallel-size", str(self.tensor_parallel_size)])
+        if self.daser_prefetch_lease_budget_bytes:
+            cmd.extend(
+                ["--prefetch-lease-budget", str(self.daser_prefetch_lease_budget_bytes)]
+            )
         if self.trust_remote_code:
             cmd.append("--trust-remote-code")
         return cmd

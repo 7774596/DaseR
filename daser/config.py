@@ -227,6 +227,8 @@ class DaserConfig:
             physical KV store layout.
         storage_format: startup-immutable raw or experimental compressed mode.
         bip_enabled: whether the L1 cache uses BIP replacement.
+        prefetch_lease_budget_bytes: cap on accounted bytes retained by
+            in-flight scheduler prefetch leases in iouring mode (0 = no cap).
     """
 
     model_path: str = ""
@@ -245,6 +247,7 @@ class DaserConfig:
     storage_format: str = STORAGE_FORMAT_RAW
     bip_enabled: bool = True
     l1_accounting: str = L1_ACCOUNTING_STORED
+    prefetch_lease_budget_bytes: int = 0
 
     def __post_init__(self) -> None:
         """Validate startup-immutable transfer settings."""
@@ -252,6 +255,8 @@ class DaserConfig:
             raise ValueError(
                 f"l1_accounting must be one of {', '.join(L1_ACCOUNTING_MODES)}"
             )
+        if self.prefetch_lease_budget_bytes < 0:
+            raise ValueError("prefetch_lease_budget_bytes must be non-negative")
 
     @property
     def store_path(self) -> str:
@@ -380,4 +385,5 @@ class DaserConfig:
             "storage_format": self.storage_format,
             "bip_enabled": self.bip_enabled,
             "l1_accounting": self.l1_accounting,
+            "prefetch_lease_budget_bytes": self.prefetch_lease_budget_bytes,
         }
