@@ -90,3 +90,26 @@ memory race checks cover the fused count/prefix boundaries.
 Performance acceptance requires a complete endpoint workload in addition to
 the real-KV microbenchmark and concurrent-compute screen. A kernel speedup
 alone does not establish a TTFT improvement.
+
+## Measured effect
+
+All numbers are for GLM-4-9B-chat-1m (80 KiB of KV per token) on a single
+H800.
+
+- **Ratio.** Stored bytes are about 0.737 of raw (generic codec, 256-token
+  tiles). The ratio is content-independent: real text gives 0.736–0.737.
+- **Decode throughput.** The fused decoder restores about 270 GB/s of
+  raw-equivalent KV. That is well above both the H2D rate (about 55 GB/s)
+  and the SSD rate (about 6.5 GB/s), so decoding is not on the critical path
+  of an L1 or L2 load.
+- **Long-context agent replay.** Setup: 300k–545k-token sessions, GPU KV 48 GiB,
+  L1 64 GiB, L2 512 GiB. Summed TTFT over cache-hit turns fell from 357 s to
+  319 s (1.12×). Wall-clock time barely moved because cold prefill dominates
+  it.
+- **Long-document benchmark near saturation.** Setup: GPU KV 24 GiB, L1 8 GiB,
+  L2 160 GiB. Peak SLO goodput rose from 4.84 to 6.57 requests/s (1.36×),
+  because the same L1/L2 capacity holds about 1.36× more KV.
+
+Bytes only become visible when KV loading is a large share of the request
+time. When prefill compute or decode dominates, the gain approaches
+`1 / (1 - 0.263 * load_share)`.
