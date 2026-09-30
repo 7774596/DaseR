@@ -152,3 +152,15 @@ def test_full_fifo_arena_removes_oldest_block_from_every_tier() -> None:
     )
     assert lru.external_hit > 0.0
     assert fifo.external_hit == 0.0
+
+
+def test_exclusive_tiers_hold_l1_blocks_out_of_l2() -> None:
+    trace = [_req(0, (7,)), _req(1, (8,)), _req(2, (7,))]
+    kwargs = {"gpu_blocks": 0, "l1_blocks": 1, "l2_blocks": 1}
+    inclusive = simulate_tiers(trace, policy=TierPolicy(), **kwargs)
+    exclusive = simulate_tiers(trace, policy=TierPolicy(exclusive=True), **kwargs)
+    # Inclusive L2 already holds 8 when 7 returns; exclusive L2 holds only the
+    # block L1 evicted, so 7 hits there and 8 is not written yet.
+    assert inclusive.external_hit == 0
+    assert exclusive.external_hit == 1 / 3
+    assert exclusive.l2_written_blocks == 1

@@ -301,6 +301,9 @@ class TierPolicy:
             arena space in store order whether or not it is written; a full
             arena removes its oldest block from the index, L1 included, and
             hits do not refresh arena order.
+        exclusive: keep admitted blocks in L1 only and write them to L2 when
+            L1 evicts them (the server's exclusive tiers), instead of writing
+            them at store time.
     """
 
     min_output: int = 0
@@ -308,6 +311,7 @@ class TierPolicy:
     admit_ghosts: bool = False
     persist_evicted_denied: bool = True
     fifo_arena: bool = False
+    exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -363,6 +367,8 @@ def simulate_tiers(
     l1: OrderedDict[int, None] = OrderedDict()
     l2: OrderedDict[int, None] = OrderedDict()
     denied: OrderedDict[int, None] = OrderedDict()
+    # Admitted blocks held in L1 until it evicts them (exclusive only).
+    pending: set[int] = set()
     ghosts: set[int] = set()
     # Store order of arena-resident blocks (fifo_arena only).
     arena: OrderedDict[int, None] = OrderedDict()
@@ -372,6 +378,7 @@ def simulate_tiers(
         l1.pop(block, None)
         l2.pop(block, None)
         denied.pop(block, None)
+        pending.discard(block)
 
     local_tokens = external_tokens = prompt_tokens = written = ghost_count = 0
     denied_count = rescued = l2_only_blocks = 0
@@ -399,7 +406,10 @@ def simulate_tiers(
                 l2_only_blocks += n_ext >= n_local
             if block in denied:
                 del denied[block]
-                write_l2(block)
+                if policy.exclusive:
+                    pending.add(block)
+                else:
+                    write_l2(block)
                 rescued += 1
             n_ext += 1
         local = min(n_local * MOONCAKE_BLOCK_TOKENS, request.input_length)
@@ -419,7 +429,10 @@ def simulate_tiers(
             ghosts.discard(block)
             ghost_count += ghost
             if admit or (ghost and policy.admit_ghosts):
-                write_l2(block)
+                if policy.exclusive:
+                    pending.add(block)
+                else:
+                    write_l2(block)
                 continue
             denied[block] = None
             denied_count += 1
@@ -432,7 +445,10 @@ def simulate_tiers(
             gpu.popitem(last=False)
         while len(l1) > l1_blocks:
             block, _ = l1.popitem(last=False)
-            if block in denied:
+            if block in pending:
+                pending.discard(block)
+                write_l2(block)
+            elif block in denied:
                 del denied[block]
                 if policy.persist_evicted_denied:
                     write_l2(block)
@@ -489,6 +505,13 @@ def tier_report(
             min_output=500, denied_budget_blocks=half, admit_ghosts=True
         ),
         "hitonly": TierPolicy(min_output=1 << 30, persist_evicted_denied=False),
+        "ex": TierPolicy(exclusive=True),
+        "ex+a1b+g": TierPolicy(
+            min_output=500,
+            denied_budget_blocks=half,
+            admit_ghosts=True,
+            exclusive=True,
+        ),
     }
     policies.update(
         {
@@ -498,6 +521,7 @@ def tier_report(
                 admit_ghosts=policy.admit_ghosts,
                 persist_evicted_denied=policy.persist_evicted_denied,
                 fifo_arena=True,
+                exclusive=policy.exclusive,
             )
             for name, policy in list(policies.items())
         }
