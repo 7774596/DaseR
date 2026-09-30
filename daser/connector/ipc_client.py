@@ -690,7 +690,7 @@ class IPCClientAsync(_IPCClientBase):
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -704,7 +704,8 @@ class IPCClientAsync(_IPCClientBase):
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -721,7 +722,7 @@ class IPCClientAsync(_IPCClientBase):
                 "payload": {
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "nbytes": nbytes,
-                    "device_id": device_id,
+                    "device_pci_bus_id": device_pci_bus_id,
                     "device_ptr": device_ptr,
                     "allocation_base_ptr": allocation_base_ptr,
                     "allocation_offset": allocation_offset,
@@ -741,7 +742,7 @@ class IPCClientAsync(_IPCClientBase):
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -754,7 +755,8 @@ class IPCClientAsync(_IPCClientBase):
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -773,7 +775,7 @@ class IPCClientAsync(_IPCClientBase):
             "payload": {
                 "cuda_ipc_handle": cuda_ipc_handle,
                 "nbytes": nbytes,
-                "device_id": device_id,
+                "device_pci_bus_id": device_pci_bus_id,
                 "device_ptr": device_ptr,
                 "allocation_base_ptr": allocation_base_ptr,
                 "allocation_offset": allocation_offset,
@@ -791,7 +793,7 @@ class IPCClientAsync(_IPCClientBase):
         buffer_index: int,
         cuda_ipc_handle: bytes,
         allocation_bytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -804,7 +806,8 @@ class IPCClientAsync(_IPCClientBase):
             buffer_index: Worker-local fixed staging buffer index.
             cuda_ipc_handle: exported CUDA IPC memory handle.
             allocation_bytes: byte size of the CUDA allocation to map.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -826,7 +829,7 @@ class IPCClientAsync(_IPCClientBase):
                     "buffer_index": int(buffer_index),
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "allocation_bytes": int(allocation_bytes),
-                    "device_id": int(device_id),
+                    "device_pci_bus_id": str(device_pci_bus_id),
                     "device_ptr": int(device_ptr),
                     "allocation_base_ptr": int(allocation_base_ptr),
                     "allocation_offset": int(allocation_offset),

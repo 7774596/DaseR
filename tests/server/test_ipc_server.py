@@ -2030,7 +2030,7 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     payload = {
         "cuda_ipc_handle": b"h" * 64,
         "nbytes": 1024,
-        "device_id": 0,
+        "device_pci_bus_id": "0000:38:00.0",
         "device_ptr": 123456,
         "allocation_base_ptr": 122880,
         "allocation_offset": 576,
@@ -2056,7 +2056,7 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         {
             "handle": b"h" * 64,
             "nbytes": 1024,
-            "device_id": 0,
+            "pci_bus_id": "0000:38:00.0",
             "local_ptr": None,
             "allocation_offset": 576,
         }
@@ -2144,7 +2144,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
                             "buffer_index": 1,
                             "cuda_ipc_handle": b"h" * 64,
                             "allocation_bytes": 1024,
-                            "device_id": 0,
+                            "device_pci_bus_id": "0000:38:00.0",
                             "device_ptr": 123456,
                             "allocation_base_ptr": 122880,
                             "allocation_offset": 576,
@@ -2180,7 +2180,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
         {
             "handle": b"h" * 64,
             "nbytes": 1024,
-            "device_id": 0,
+            "pci_bus_id": "0000:38:00.0",
             "local_ptr": None,
             "allocation_offset": 576,
         }
@@ -2248,7 +2248,7 @@ async def test_registered_store_staging_reuses_regions_until_shutdown(
                         "producer_pid": producer_pid,
                         "cuda_ipc_handle": b"h" * 64,
                         "allocation_bytes": 256,
-                        "device_id": 0,
+                        "device_pci_bus_id": "0000:38:00.0",
                         "device_ptr": 4096,
                         "allocation_base_ptr": 4096,
                         "allocation_offset": 0,
