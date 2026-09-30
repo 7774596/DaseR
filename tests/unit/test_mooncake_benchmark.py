@@ -16,6 +16,7 @@ from benchmarks.mooncake.benchmark import (
     PromptBuilder,
     TraceRequest,
     load_trace,
+    prefix_predecessors,
     replay,
     scheduled_offset_seconds,
     select_requests,
@@ -256,3 +257,62 @@ def test_replay_aborts_after_failure_threshold(
     # Requests finishing in the same wakeup may overshoot the budget slightly.
     assert 3 <= len(results) < len(requests)
     assert summarise(selection, results, 1.0, 1.0, aborted=aborted)["aborted"]
+
+
+def test_prefix_predecessor_is_the_producer_of_the_deepest_shared_block() -> None:
+    """Turns chain to the previous turn; a shared system block does not serialize."""
+    requests = [
+        TraceRequest(0, 0, 10, 1, (1, 2)),  # session A turn 1
+        TraceRequest(1, 0, 10, 1, (1, 3)),  # session B turn 1, shares block 1
+        TraceRequest(2, 0, 10, 1, (1, 2, 4)),  # session A turn 2
+        TraceRequest(3, 0, 10, 1, (1, 5)),  # session C, shares block 1 only
+        TraceRequest(4, 0, 10, 1, (1, 2, 4, 6)),  # session A turn 3
+        TraceRequest(5, 0, 10, 1, (9,)),  # unrelated
+    ]
+
+    assert prefix_predecessors(requests) == [None, 0, 0, 0, 2, None]
+
+
+def test_replay_sends_request_after_its_prefix_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With prefix dependencies a later turn is sent only after the earlier one ends."""
+    events: list[tuple[str, int]] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        sample = args[2]
+        kwargs["on_send"]()
+        events.append(("send", sample.sample_id))
+        await asyncio.sleep(0.05 if sample.sample_id == 0 else 0.0)
+        events.append(("done", sample.sample_id))
+        # The first turn fails: its successor must still be released.
+        error = "boom" if sample.sample_id == 0 else None
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, error)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 10, 1, (1,)),
+        TraceRequest(1, 0, 10, 1, (1, 2)),
+        TraceRequest(2, 0, 10, 1, (7,)),
+    ]
+    results, _, _ = asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=8,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=0,
+            prefix_dependencies=True,
+        )
+    )
+
+    assert events.index(("done", 0)) < events.index(("send", 1))
+    # The independent request does not wait for the slow one.
+    assert events.index(("send", 2)) < events.index(("done", 0))
+    by_index = {record["trace_index"]: record for record in results}
+    assert by_index[1]["dependency_wait_ms"] > 0
+    assert by_index[2]["dependency_wait_ms"] == pytest.approx(0, abs=5)

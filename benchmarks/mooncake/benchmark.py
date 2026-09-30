@@ -249,6 +249,44 @@ def scheduled_offset_seconds(timestamp_ms: float, time_scale: float) -> float:
     return timestamp_ms / 1000.0 / time_scale
 
 
+def prefix_predecessors(requests: Sequence[TraceRequest]) -> list[int | None]:
+    """Find the earlier request that first stored each request's reusable prefix.
+
+    For every request, walk its ``hash_ids`` through a trie of earlier
+    requests. The deepest shared block was first produced by the request
+    that created that trie node; once it completes, the whole shared prefix
+    exists. Waiting on that creator keeps cross-request reuse intact when
+    arrival timestamps are ignored, without serializing requests that only
+    share an early block such as a common system prompt.
+
+    Args:
+        requests: Requests in replay order.
+
+    Returns:
+        Position (into ``requests``) of each request's predecessor, or None
+        when it shares no block with any earlier request.
+
+    Thread-safety:
+        Pure function.
+    """
+
+    root: dict[int, tuple[int, dict]] = {}
+    predecessors: list[int | None] = []
+    for position, request in enumerate(requests):
+        children = root
+        predecessor: int | None = None
+        for hash_id in request.hash_ids:
+            node = children.get(hash_id)
+            if node is None:
+                node = (position, {})
+                children[hash_id] = node
+            else:
+                predecessor = node[0]
+            children = node[1]
+        predecessors.append(predecessor)
+    return predecessors
+
+
 def summarise(
     selection: TraceSelection,
     results: Sequence[dict[str, Any]],
@@ -319,6 +357,7 @@ async def replay(
     time_scale: float,
     seed: int,
     abort_after_failures: int = 0,
+    prefix_dependencies: bool = False,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -334,6 +373,11 @@ async def replay(
         seed: Generation seed.
         abort_after_failures: Cancel all outstanding requests once this many
             requests have failed; zero disables early abort.
+        prefix_dependencies: Hold each request until its
+            :func:`prefix_predecessors` request completes, so closed-loop
+            replay (large ``time_scale``) keeps cross-request reuse. The wait
+            happens before the concurrency semaphore and is excluded from
+            client queue time and TTFT.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -356,6 +400,12 @@ async def replay(
         writer.write(_skipped_record(request))
 
     outer_sem = asyncio.Semaphore(max_inflight)
+    done_events = [asyncio.Event() for _ in selection.eligible]
+    predecessors: list[int | None] = (
+        prefix_predecessors(selection.eligible)
+        if prefix_dependencies
+        else [None] * len(selection.eligible)
+    )
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -378,9 +428,15 @@ async def replay(
                         time_scale=time_scale,
                         seed=seed,
                         writer=writer,
+                        wait_for=(
+                            None
+                            if predecessors[position] is None
+                            else done_events[predecessors[position]]
+                        ),
+                        done=done_events[position],
                     )
                 )
-                for request in selection.eligible
+                for position, request in enumerate(selection.eligible)
             ]
             results: list[dict[str, Any]] = []
             failures = 0
@@ -440,6 +496,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Cancel the replay once this many requests fail (0 disables).",
     )
     parser.add_argument("--overflow", choices=("skip", "error"), default="skip")
+    parser.add_argument(
+        "--prefix-dependencies",
+        action="store_true",
+        help=(
+            "Send each request only after the earlier request that first "
+            "stored its shared hash_ids prefix completes (closed-loop replay)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -492,6 +556,7 @@ async def main_async(args: argparse.Namespace) -> int:
         time_scale=args.time_scale,
         seed=args.seed,
         abort_after_failures=args.abort_after_failures,
+        prefix_dependencies=args.prefix_dependencies,
     )
     after_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))
     summary = summarise(
@@ -632,9 +697,49 @@ async def _run_request(
     time_scale: float,
     seed: int,
     writer: _ResultWriter,
+    wait_for: asyncio.Event | None,
+    done: asyncio.Event,
+) -> dict[str, Any]:
+    try:
+        return await _run_request_after_dependency(
+            request=request,
+            prompt_builder=prompt_builder,
+            client=client,
+            server_url=server_url,
+            served_model_name=served_model_name,
+            outer_sem=outer_sem,
+            started_at=started_at,
+            timeout_seconds=timeout_seconds,
+            time_scale=time_scale,
+            seed=seed,
+            writer=writer,
+            wait_for=wait_for,
+        )
+    finally:
+        # Failed or cancelled predecessors must not strand their successors.
+        done.set()
+
+
+async def _run_request_after_dependency(
+    *,
+    request: TraceRequest,
+    prompt_builder: PromptBuilder,
+    client: httpx.AsyncClient,
+    server_url: str,
+    served_model_name: str,
+    outer_sem: asyncio.Semaphore,
+    started_at: float,
+    timeout_seconds: float,
+    time_scale: float,
+    seed: int,
+    writer: _ResultWriter,
+    wait_for: asyncio.Event | None,
 ) -> dict[str, Any]:
     scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
     await asyncio.sleep(max(0.0, started_at + scheduled_offset - time.perf_counter()))
+    dependency_at = time.perf_counter()
+    if wait_for is not None:
+        await wait_for.wait()
     queued_at = time.perf_counter()
     async with outer_sem:
         admitted_at = time.perf_counter()
@@ -671,6 +776,7 @@ async def _run_request(
         request=request,
         result=result,
         scheduled_offset=scheduled_offset,
+        dependency_at=dependency_at,
         queued_at=queued_at,
         admitted_at=admitted_at,
         sent_at=sent_at,
@@ -686,6 +792,7 @@ def _result_record(
     request: TraceRequest,
     result: RequestResult,
     scheduled_offset: float,
+    dependency_at: float,
     queued_at: float,
     admitted_at: float,
     sent_at: float,
@@ -708,6 +815,7 @@ def _result_record(
         "admitted_offset_s": admitted_at - started_at,
         "send_offset_s": sent_at - started_at,
         "completion_offset_s": completed_at - started_at,
+        "dependency_wait_ms": (queued_at - dependency_at) * 1000.0,
         "client_queue_ms": (admitted_at - queued_at) * 1000.0,
         "arrival_to_send_ms": arrival_to_send_ms,
         "arrival_to_first_token_ms": arrival_to_send_ms + result.ttft_ms,

@@ -197,6 +197,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start-request", type=int, default=0)
     parser.add_argument("--max-inflight", type=int, default=16)
     parser.add_argument("--time-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--prefix-dependencies",
+        action="store_true",
+        help="Closed-loop replay: hold requests until their prefix producer finishes.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -341,6 +346,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 str(args.timeout),
                 "--abort-after-failures",
                 str(args.abort_after_failures),
+                *(["--prefix-dependencies"] if args.prefix_dependencies else []),
             ],
             cwd=REPO_ROOT,
             stdout=(out_dir / "replay.log").open("wb"),
