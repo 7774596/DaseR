@@ -12,6 +12,7 @@ import pytest
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 # First Party
+import daser.transfer.iouring.layer as layer_module
 import daser.transfer.iouring.native as native_iouring
 from daser.transfer.iouring.native import NativeIOUring
 
@@ -1164,6 +1165,57 @@ def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
             layer.close()
 
     _run(scenario())
+
+
+def test_iouring_striped_l2_read_matches_serial_read(tmp_path, monkeypatch) -> None:
+    """A striped large L2 read restores the same bytes as a serial read."""
+    # Treat anything over one block as a large extent so the test stays small.
+    monkeypatch.setattr(layer_module, "_PACKED_READ_BATCH_BYTES", ALIGNMENT)
+    nbytes = ALIGNMENT * 5
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(5))
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(path=path, l1_bytes=nbytes, l2_bytes=nbytes)
+        try:
+            await writer.store_bytes(payload, 0, nbytes)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        for stripe in (0, ALIGNMENT * 2):
+            layer = TieredIOUringTransferLayer(
+                path=path,
+                l1_bytes=nbytes,
+                l2_bytes=nbytes,
+                l2_read_stripe_bytes=stripe,
+            )
+            try:
+                span = [{"file_offset": 0, "nbytes": nbytes}]
+                await layer.prefetch_bytes_grouped(span, lease_id="req")
+                dst = bytearray(nbytes)
+                load = [{"target_offset": 0, **span[0]}]
+                assert await layer.load_leased_bytes_grouped(dst, load, "req") == (
+                    nbytes
+                )
+                assert bytes(dst) == payload
+            finally:
+                await layer.release_lease("req")
+                await layer.drain()
+                layer.close()
+
+    asyncio.run(scenario())
+
+
+def test_iouring_l2_read_stripe_must_be_aligned(tmp_path) -> None:
+    """The stripe size keeps every part on a direct-IO boundary."""
+    with pytest.raises(ValueError, match="l2_read_stripe_bytes"):
+        TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT,
+            l2_read_stripe_bytes=ALIGNMENT + 1,
+        )
 
 
 def test_iouring_prefetch_lease_budget_waits_for_release(tmp_path) -> None:

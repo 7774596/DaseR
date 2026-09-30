@@ -229,6 +229,8 @@ class DaserConfig:
         bip_enabled: whether the L1 cache uses BIP replacement.
         prefetch_lease_budget_bytes: cap on accounted bytes retained by
             in-flight scheduler prefetch leases in iouring mode (0 = no cap).
+        l2_read_stripe_bytes: part size for splitting one large iouring L2
+            read into concurrently submitted IOs (0 = one serial read).
     """
 
     model_path: str = ""
@@ -248,6 +250,7 @@ class DaserConfig:
     bip_enabled: bool = True
     l1_accounting: str = L1_ACCOUNTING_STORED
     prefetch_lease_budget_bytes: int = 0
+    l2_read_stripe_bytes: int = 0
 
     def __post_init__(self) -> None:
         """Validate startup-immutable transfer settings."""
@@ -257,6 +260,8 @@ class DaserConfig:
             )
         if self.prefetch_lease_budget_bytes < 0:
             raise ValueError("prefetch_lease_budget_bytes must be non-negative")
+        if self.l2_read_stripe_bytes < 0:
+            raise ValueError("l2_read_stripe_bytes must be non-negative")
 
     @property
     def store_path(self) -> str:
@@ -386,4 +391,5 @@ class DaserConfig:
             "bip_enabled": self.bip_enabled,
             "l1_accounting": self.l1_accounting,
             "prefetch_lease_budget_bytes": self.prefetch_lease_budget_bytes,
+            "l2_read_stripe_bytes": self.l2_read_stripe_bytes,
         }

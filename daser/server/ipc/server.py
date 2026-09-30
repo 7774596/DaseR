@@ -1617,6 +1617,9 @@ class IPCServer:
                     prefetch_lease_budget_bytes=int(
                         self._runtime_config.get("prefetch_lease_budget_bytes", 0)
                     ),
+                    l2_read_stripe_bytes=int(
+                        self._runtime_config.get("l2_read_stripe_bytes", 0)
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

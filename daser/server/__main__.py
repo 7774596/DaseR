@@ -252,6 +252,14 @@ def _parse_args() -> argparse.Namespace:
         "prefetch over the cap waits for earlier leases (default 0: no cap).",
     )
     parser.add_argument(
+        "--l2-read-stripe",
+        type=_parse_size_bytes,
+        default=0,
+        help="For --transfer-mode=iouring, split each large L2 read into parts "
+        "of about this size submitted together, keeping many IOs in flight per "
+        "request; must be a multiple of 4 KiB (default 0: one serial read).",
+    )
+    parser.add_argument(
         "--l1-accounting",
         choices=L1_ACCOUNTING_MODES,
         default="stored",
@@ -387,6 +395,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         bip_enabled=bool(args.bip_enabled),
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
         prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
+        l2_read_stripe_bytes=int(getattr(args, "l2_read_stripe", 0)),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:

@@ -84,6 +84,26 @@ class _RequestLease:
     budget_bytes: int = 0
 
 
+def _stripe_extents(nbytes: int, stripe_bytes: int) -> list[tuple[int, int]]:
+    """Split one aligned read into submission-sized ``(offset, size)`` parts.
+
+    Args:
+        nbytes: Length of the read in bytes.
+        stripe_bytes: Target part length; parts grow beyond it when the read
+            would otherwise need more than one ring submission batch.
+
+    Returns:
+        Contiguous parts covering ``[0, nbytes)``, each a multiple of the
+        direct-IO alignment except possibly the last.
+    """
+    per_part = max(stripe_bytes, -(-nbytes // _PACKED_READ_BATCH_COUNT))
+    per_part = -(-per_part // _DIRECT_IO_ALIGNMENT) * _DIRECT_IO_ALIGNMENT
+    return [
+        (offset, min(per_part, nbytes - offset))
+        for offset in range(0, nbytes, per_part)
+    ]
+
+
 def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     """Return sorted, merged positive physical ranges from transfer spans."""
     ranges = sorted(
@@ -421,6 +441,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             in-flight prefetch leases (0 disables the budget). A prefetch that
             would exceed it waits until earlier leases are released, so staged
             requests never outgrow L1 and lose their retained slices.
+        l2_read_stripe_bytes: Split an L2 read larger than the packed batch
+            limit into parts of about this many bytes submitted together on
+            one ring, so a single request keeps many IOs in flight (0 keeps
+            one serial read per extent).
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -440,6 +464,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         bip_enabled: bool = False,
         l1_accounting: str = "stored",
         prefetch_lease_budget_bytes: int = 0,
+        l2_read_stripe_bytes: int = 0,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -453,6 +478,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_accounting must be 'stored' or 'raw'")
         if not 0 <= prefetch_lease_budget_bytes <= l1_bytes:
             raise ValueError("prefetch_lease_budget_bytes must be in [0, l1_bytes]")
+        if l2_read_stripe_bytes < 0 or l2_read_stripe_bytes % _DIRECT_IO_ALIGNMENT:
+            raise ValueError(
+                "l2_read_stripe_bytes must be a non-negative multiple of "
+                f"{_DIRECT_IO_ALIGNMENT}"
+            )
         self._l2: L2IoEngine | None = None
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
@@ -461,6 +491,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._prefetch_lease_budget = prefetch_lease_budget_bytes
+        self._l2_read_stripe = l2_read_stripe_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         # L1-only packed ranges waiting for an admission decision. They stay
@@ -492,7 +523,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
-            "prefetch_lease_budget=%d",
+            "prefetch_lease_budget=%d l2_read_stripe=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -502,6 +533,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self.bip_enabled,
             self.l1_accounting,
             prefetch_lease_budget_bytes,
+            l2_read_stripe_bytes,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1742,13 +1774,28 @@ class TieredIOUringTransferLayer(TransferLayer):
                         submit_queued()
                     continue
                 submit_queued()
-                future = loop.run_in_executor(
-                    self._l2.executor,
-                    self._read_l2_into,
-                    int(span["file_offset"]),
-                    pinned,
-                    self._next_uring(),
-                )
+                if self._l2_read_stripe:
+                    # The batch job completes only after every part's CQE is
+                    # drained, and raises the first part error after that.
+                    view = pinned.view()
+                    file_offset = int(span["file_offset"])
+                    future, parts = self._l2.submit_read_batch(
+                        [
+                            (file_offset + offset, view[offset : offset + size])
+                            for offset, size in _stripe_extents(
+                                nbytes, self._l2_read_stripe
+                            )
+                        ]
+                    )
+                    batch_jobs.extend(parts)
+                else:
+                    future = loop.run_in_executor(
+                        self._l2.executor,
+                        self._read_l2_into,
+                        int(span["file_offset"]),
+                        pinned,
+                        self._next_uring(),
+                    )
                 future_to_read[future] = (span, pinned, promotion_id, epoch)
 
             submit_queued()

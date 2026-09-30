@@ -192,6 +192,7 @@ class ServerManager:
         trust_remote_code: bool = False,
         daser_prefetch_max_requests: int = 0,
         daser_prefetch_lease_budget_bytes: int = 0,
+        daser_l2_read_stripe_bytes: int = 0,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -223,6 +224,8 @@ class ServerManager:
             daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
             daser_prefetch_lease_budget_bytes: DaseR ``--prefetch-lease-budget``
                 (0 leaves the server default of no cap).
+            daser_l2_read_stripe_bytes: DaseR ``--l2-read-stripe`` (0 leaves
+                the server default of one serial read per extent).
             storage_format: DaseR physical KV storage format.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
@@ -234,6 +237,8 @@ class ServerManager:
             raise ValueError("daser_prefetch_max_requests must be non-negative")
         if daser_prefetch_lease_budget_bytes < 0:
             raise ValueError("daser_prefetch_lease_budget_bytes must be non-negative")
+        if daser_l2_read_stripe_bytes < 0:
+            raise ValueError("daser_l2_read_stripe_bytes must be non-negative")
         if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
             raise ValueError("online_pack_batch_slots must be positive")
         self.run_id = run_id
@@ -258,6 +263,7 @@ class ServerManager:
         self.trust_remote_code = trust_remote_code
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
         self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
+        self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -517,6 +523,8 @@ class ServerManager:
             cmd.extend(
                 ["--prefetch-lease-budget", str(self.daser_prefetch_lease_budget_bytes)]
             )
+        if self.daser_l2_read_stripe_bytes:
+            cmd.extend(["--l2-read-stripe", str(self.daser_l2_read_stripe_bytes)])
         if self.trust_remote_code:
             cmd.append("--trust-remote-code")
         return cmd

@@ -220,6 +220,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="0",
         help="DaseR --prefetch-lease-budget (0 = no cap; DaseR arms only).",
     )
+    parser.add_argument(
+        "--daser-l2-read-stripe",
+        type=parse_size_bytes,
+        default="0",
+        help="DaseR --l2-read-stripe (0 = serial reads; DaseR arms only).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -268,6 +274,9 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_prefetch_lease_budget_bytes=(
             args.daser_prefetch_lease_budget if arm.startswith("daser") else 0
+        ),
+        daser_l2_read_stripe_bytes=(
+            args.daser_l2_read_stripe if arm.startswith("daser") else 0
         ),
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
