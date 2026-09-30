@@ -27,6 +27,7 @@ _BLOCK_ID_DIGITS = 8
 # Marker tokens per corpus block; base >= 1e5 ordinary tokens covers 1e15 IDs.
 _CORPUS_ID_DIGITS = 3
 _WRITER_STOP = object()
+ROUTES = ("sticky", "least-work")
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class TraceRequest:
         input_length: Prompt length in tokens.
         output_length: Requested decode length in tokens.
         hash_ids: Remapped 512-token prefix block hashes.
+        session_id: Optional conversation/agent session the request belongs
+            to; used only for session-affine routing across instances.
 
     Thread-safety:
         Immutable and safe to share across replay tasks.
@@ -49,6 +52,132 @@ class TraceRequest:
     input_length: int
     output_length: int
     hash_ids: tuple[int, ...]
+    session_id: int | None = None
+
+
+@dataclass(frozen=True)
+class WorkModel:
+    """Per-request GPU-seconds estimate used to balance instances.
+
+    Prefill of ``n`` new tokens after ``c`` cached ones costs
+    ``n * (linear_flop + attention_flop * (c + n / 2)) / effective_flops``;
+    decoding ``o`` tokens at context ``L`` costs
+    ``o * (L * kv_bytes_per_token / decode_kv_bps + decode_step_s)``.
+    Defaults are calibrated for GLM-4-9B on one H800; only the ratio between
+    instances matters for routing.
+
+    Thread-safety:
+        Immutable.
+    """
+
+    linear_flop: float = 18e9
+    attention_flop: float = 655e3
+    effective_flops: float = 400e12
+    kv_bytes_per_token: float = 80 * 1024
+    decode_kv_bps: float = 1.43e12
+    decode_step_s: float = 0.003
+
+    def seconds(self, request: TraceRequest, cached_tokens: int) -> float:
+        """Return the estimated prefill plus decode GPU seconds of a request.
+
+        Args:
+            request: Trace request.
+            cached_tokens: Leading prompt tokens expected to be reused.
+
+        Returns:
+            Estimated GPU seconds.
+        """
+        new = request.input_length - cached_tokens
+        prefill = (
+            new
+            * (self.linear_flop + self.attention_flop * (cached_tokens + new / 2))
+            / self.effective_flops
+        )
+        decode = request.output_length * (
+            request.input_length * self.kv_bytes_per_token / self.decode_kv_bps
+            + self.decode_step_s
+        )
+        return prefill + decode
+
+
+class InstanceRouter:
+    """Choose a serving instance per request.
+
+    ``sticky`` pins a session to the instance with the least outstanding work
+    when its first request arrives, so later turns hit that instance's GPU
+    prefix cache (session affinity). ``least-work`` sends every request to the
+    instance with the least outstanding work, relying on a shared external
+    KV tier for reuse wherever the request lands. Outstanding work is the sum
+    of :class:`WorkModel` estimates of admitted, unfinished requests; cached
+    prefixes are predicted from ``hash_ids`` already sent to any instance.
+
+    Args:
+        server_urls: Instance base URLs.
+        route: One of :data:`ROUTES`.
+        work_model: Cost model for outstanding work.
+
+    Thread-safety:
+        Single asyncio event loop only; no internal locking.
+    """
+
+    def __init__(
+        self,
+        server_urls: Sequence[str],
+        route: str = "sticky",
+        work_model: WorkModel | None = None,
+    ) -> None:
+        if not server_urls:
+            raise ValueError("at least one server URL is required")
+        if route not in ROUTES:
+            raise ValueError(f"unknown route: {route}")
+        self.server_urls = tuple(url.rstrip("/") for url in server_urls)
+        self.route = route
+        self.work_model = work_model or WorkModel()
+        self._outstanding = [0.0] * len(self.server_urls)
+        self._sessions: dict[int, int] = {}
+        self._seen: set[int] = set()
+
+    def acquire(self, request: TraceRequest) -> tuple[int, float]:
+        """Pick an instance for ``request`` and charge its estimated work.
+
+        Args:
+            request: Admitted request.
+
+        Returns:
+            Instance index and the charged work, to pass to :meth:`release`.
+        """
+        cached_blocks = 0
+        for hash_id in request.hash_ids:
+            if hash_id not in self._seen:
+                break
+            cached_blocks += 1
+        cached = min(cached_blocks * MOONCAKE_BLOCK_TOKENS, request.input_length - 1)
+        work = self.work_model.seconds(request, max(0, cached))
+        instance = self._pick(request)
+        self._outstanding[instance] += work
+        self._seen.update(request.hash_ids)
+        return instance, work
+
+    def release(self, instance: int, work: float) -> None:
+        """Remove a finished request's work from its instance.
+
+        Args:
+            instance: Index returned by :meth:`acquire`.
+            work: Work returned by :meth:`acquire`.
+        """
+        self._outstanding[instance] = max(0.0, self._outstanding[instance] - work)
+
+    def _pick(self, request: TraceRequest) -> int:
+        if self.route == "sticky" and request.session_id is not None:
+            instance = self._sessions.get(request.session_id)
+            if instance is None:
+                instance = self._least_loaded()
+                self._sessions[request.session_id] = instance
+            return instance
+        return self._least_loaded()
+
+    def _least_loaded(self) -> int:
+        return min(range(len(self._outstanding)), key=self._outstanding.__getitem__)
 
 
 @dataclass(frozen=True)
@@ -371,6 +500,15 @@ def summarise(
     arrival_latencies = [
         float(result["arrival_to_completion_ms"]) for result in successful
     ]
+    tpots = [
+        float(result["tpot_ms"])
+        for result in successful
+        if result.get("tpot_ms") is not None
+    ]
+    instances: dict[str, int] = {}
+    for result in successful:
+        key = str(result.get("instance", 0))
+        instances[key] = instances.get(key, 0) + 1
     return {
         "selected_requests": len(selection.selected),
         "eligible_requests": len(selection.eligible),
@@ -390,6 +528,8 @@ def summarise(
         "client_queue_ms": _latency_summary(client_queues),
         "arrival_to_first_token_ms": _latency_summary(arrival_ttfts),
         "arrival_to_completion_ms": _latency_summary(arrival_latencies),
+        "tpot_ms": _latency_summary(tpots),
+        "requests_per_instance": instances,
         "prefix_cache": _prefix_cache_summary(prefix_cache_metrics or {}),
     }
 
@@ -398,7 +538,7 @@ async def replay(
     *,
     selection: TraceSelection,
     prompt_builder: PromptBuilder,
-    server_url: str,
+    server_url: str | Sequence[str],
     served_model_name: str,
     output_path: Path,
     max_inflight: int,
@@ -407,13 +547,15 @@ async def replay(
     seed: int,
     abort_after_failures: int = 0,
     prefix_dependencies: bool = False,
+    route: str = "sticky",
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
     Args:
         selection: Validated context-limit partition.
         prompt_builder: Deterministic token prompt builder.
-        server_url: OpenAI-compatible server base URL.
+        server_url: OpenAI-compatible server base URL, or several instance
+            URLs to route between.
         served_model_name: Model name sent in completion bodies.
         output_path: JSONL request-result destination.
         max_inflight: Maximum concurrent HTTP requests.
@@ -427,6 +569,7 @@ async def replay(
             replay (large ``time_scale``) keeps cross-request reuse. The wait
             happens before the concurrency semaphore and is excluded from
             client queue time and TTFT.
+        route: :class:`InstanceRouter` policy when several URLs are given.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -443,6 +586,9 @@ async def replay(
     if abort_after_failures < 0:
         raise ValueError("abort_after_failures must be non-negative")
     scheduled_offset_seconds(0, time_scale)
+    router = InstanceRouter(
+        [server_url] if isinstance(server_url, str) else server_url, route
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _ResultWriter(output_path)
     for request in selection.skipped:
@@ -469,7 +615,7 @@ async def replay(
                         request=request,
                         prompt_builder=prompt_builder,
                         client=client,
-                        server_url=server_url,
+                        router=router,
                         served_model_name=served_model_name,
                         outer_sem=outer_sem,
                         started_at=started_at,
@@ -527,7 +673,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--server-url", default="http://127.0.0.1:8001")
+    parser.add_argument(
+        "--server-url",
+        nargs="+",
+        default=["http://127.0.0.1:8001"],
+        help="One or more instance base URLs; several URLs enable --route.",
+    )
+    parser.add_argument(
+        "--route",
+        choices=ROUTES,
+        default="sticky",
+        help="Instance choice per request when several --server-url are given.",
+    )
     parser.add_argument("--served-model-name", default="")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-model-len", type=int, default=40960)
@@ -611,11 +768,12 @@ async def main_async(args: argparse.Namespace) -> int:
         )
     results_path = args.output_dir / "requests.jsonl"
     summary_path = args.output_dir / "summary.json"
-    before_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))
+    server_urls = [url.rstrip("/") for url in args.server_url]
+    before_metrics = await _metrics_snapshot(server_urls)
     results, wall_seconds, aborted = await replay(
         selection=selection,
         prompt_builder=prompt_builder,
-        server_url=args.server_url.rstrip("/"),
+        server_url=server_urls,
         served_model_name=args.served_model_name,
         output_path=results_path,
         max_inflight=args.max_inflight,
@@ -624,8 +782,9 @@ async def main_async(args: argparse.Namespace) -> int:
         seed=args.seed,
         abort_after_failures=args.abort_after_failures,
         prefix_dependencies=args.prefix_dependencies,
+        route=args.route,
     )
-    after_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))
+    after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
         selection,
         results,
@@ -678,12 +837,17 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
         )
     if any(hash_id < 0 for hash_id in hash_ids):
         raise ValueError(f"row {index}: hash IDs must be non-negative")
+    raw_session = payload.get("session_id")
+    session_id = (
+        None if raw_session is None else _integer(raw_session, index, "session_id")
+    )
     return TraceRequest(
         index=index,
         timestamp_ms=timestamp,
         input_length=input_length,
         output_length=output_length,
         hash_ids=hash_ids,
+        session_id=session_id,
     )
 
 
@@ -730,14 +894,19 @@ def _prefix_cache_summary(metrics: dict[str, float]) -> dict[str, float]:
     }
 
 
-async def _metrics_snapshot(server_url: str) -> dict[str, float]:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            response = await client.get(f"{server_url}/metrics")
-            response.raise_for_status()
-    except httpx.HTTPError:
-        return {}
-    return extract_prometheus_counters(response.text)
+async def _metrics_snapshot(server_urls: Sequence[str]) -> dict[str, float]:
+    """Sum Prometheus counters over every instance (missing ones count as 0)."""
+    totals: dict[str, float] = {}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        for server_url in server_urls:
+            try:
+                response = await client.get(f"{server_url}/metrics")
+                response.raise_for_status()
+            except httpx.HTTPError:
+                continue
+            for name, value in extract_prometheus_counters(response.text).items():
+                totals[name] = totals.get(name, 0.0) + value
+    return totals
 
 
 def _percentile(values: Sequence[float], percentile: float) -> float:
@@ -756,7 +925,7 @@ async def _run_request(
     request: TraceRequest,
     prompt_builder: PromptBuilder,
     client: httpx.AsyncClient,
-    server_url: str,
+    router: InstanceRouter,
     served_model_name: str,
     outer_sem: asyncio.Semaphore,
     started_at: float,
@@ -772,7 +941,7 @@ async def _run_request(
             request=request,
             prompt_builder=prompt_builder,
             client=client,
-            server_url=server_url,
+            router=router,
             served_model_name=served_model_name,
             outer_sem=outer_sem,
             started_at=started_at,
@@ -792,7 +961,7 @@ async def _run_request_after_dependency(
     request: TraceRequest,
     prompt_builder: PromptBuilder,
     client: httpx.AsyncClient,
-    server_url: str,
+    router: InstanceRouter,
     served_model_name: str,
     outer_sem: asyncio.Semaphore,
     started_at: float,
@@ -812,33 +981,37 @@ async def _run_request_after_dependency(
         admitted_at = time.perf_counter()
         prompt = prompt_builder.build(request)
         sent_at = admitted_at
+        instance, work = router.acquire(request)
 
         def record_send() -> None:
             nonlocal sent_at
             sent_at = time.perf_counter()
 
-        result = await vllm_completion_stream(
-            client,
-            server_url,
-            BenchmarkSample(
-                sample_id=request.index,
-                dataset="mooncake-toolagent",
-                context="",
-                question="",
-                answers=[],
-            ),
-            prompt,
-            {
-                "model": served_model_name,
-                "max_tokens": request.output_length,
-                "temperature": 0.0,
-                "ignore_eos": True,
-                "seed": seed,
-            },
-            asyncio.Semaphore(1),
-            timeout_seconds,
-            on_send=record_send,
-        )
+        try:
+            result = await vllm_completion_stream(
+                client,
+                router.server_urls[instance],
+                BenchmarkSample(
+                    sample_id=request.index,
+                    dataset="mooncake-toolagent",
+                    context="",
+                    question="",
+                    answers=[],
+                ),
+                prompt,
+                {
+                    "model": served_model_name,
+                    "max_tokens": request.output_length,
+                    "temperature": 0.0,
+                    "ignore_eos": True,
+                    "seed": seed,
+                },
+                asyncio.Semaphore(1),
+                timeout_seconds,
+                on_send=record_send,
+            )
+        finally:
+            router.release(instance, work)
     record = _result_record(
         request=request,
         result=result,
@@ -850,6 +1023,8 @@ async def _run_request_after_dependency(
         completed_at=time.perf_counter(),
         started_at=started_at,
     )
+    record["instance"] = instance
+    record["session_id"] = request.session_id
     writer.write(record)
     return record
 
@@ -869,6 +1044,12 @@ def _result_record(
     payload = asdict(result)
     payload.pop("generated_text", None)
     payload.pop("queue_ms", None)
+    decode_tokens = result.completion_tokens - 1
+    tpot_ms = (
+        (result.latency_ms - result.ttft_ms) / decode_tokens
+        if result.error is None and decode_tokens > 0
+        else None
+    )
     target_at = started_at + scheduled_offset
     arrival_to_send_ms = max(0.0, sent_at - target_at) * 1000.0
     return {
@@ -887,6 +1068,7 @@ def _result_record(
         "arrival_to_send_ms": arrival_to_send_ms,
         "arrival_to_first_token_ms": arrival_to_send_ms + result.ttft_ms,
         "arrival_to_completion_ms": max(0.0, completed_at - target_at) * 1000.0,
+        "tpot_ms": tpot_ms,
         **payload,
     }
 

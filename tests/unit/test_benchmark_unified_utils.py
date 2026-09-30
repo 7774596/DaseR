@@ -804,6 +804,7 @@ async def test_daser_benchmark_start_does_not_force_debug_logging(
         cmd: list[str],
         log_name: str,
         extra_env: dict[str, str] | None = None,
+        gpu_ids: str | None = None,
     ) -> subprocess.Popen[bytes]:
         observed["log_name"] = log_name
         observed["level"] = (
@@ -3797,3 +3798,117 @@ def test_runtime_check_rejects_other_daser_checkout(monkeypatch, tmp_path) -> No
 
     with pytest.raises(RuntimeError, match="import daser resolves to"):
         check_runtime_environment()
+
+
+def test_extra_vllm_instances_share_one_daser_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each extra GPU gets its own vLLM port; DaseR sees every instance GPU."""
+    started: list[tuple[list[str], str]] = []
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], env: dict[str, str], **_: Any) -> None:
+            started.append((cmd, env["CUDA_VISIBLE_DEVICES"]))
+            self.pid = len(started)
+            self.args = cmd
+
+    async def healthy(*_: Any) -> None:
+        return None
+
+    monkeypatch.setattr("benchmarks.utils.servers.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(
+        "benchmarks.utils.servers.check_runtime_environment", lambda: None
+    )
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=8,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        vllm_port=18001,
+        daser_port=12026,
+        extra_vllm_gpu_ids=("3",),
+    )
+    monkeypatch.setattr(manager, "_wait_healthy", healthy)
+
+    asyncio.run(manager.start())
+
+    ports = [cmd[cmd.index("--port") + 1] for cmd, _ in started]
+    assert manager.vllm_urls == ["http://127.0.0.1:18001", "http://127.0.0.1:18002"]
+    assert [visible for _, visible in started] == ["2", "3", "2,3"]
+    assert ports == ["18001", "18002", "12026"]
+    sockets = {
+        json.loads(cmd[cmd.index("--kv-transfer-config") + 1])[
+            "kv_connector_extra_config"
+        ]["socket_path"]
+        for cmd, _ in started[:2]
+    }
+    assert sockets == {str(manager.socket_path)}
+    pids = json.loads(manager.pid_file.read_text())
+    assert [item["cuda_visible_devices"] for item in pids] == ["2", "3", "2,3"]
+
+
+def test_failed_startup_still_records_started_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later instance failing health checks leaves earlier PIDs stoppable."""
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], **_: Any) -> None:
+            self.pid = 4242
+            self.args = cmd
+
+    calls = 0
+
+    async def second_fails(*_: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("startup process exited with code 1")
+
+    monkeypatch.setattr("benchmarks.utils.servers.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(
+        "benchmarks.utils.servers.check_runtime_environment", lambda: None
+    )
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=8,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        vllm_port=18001,
+        daser_port=12026,
+        extra_vllm_gpu_ids=("3",),
+    )
+    monkeypatch.setattr(manager, "_wait_healthy", second_fails)
+
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        asyncio.run(manager.start())
+
+    pids = json.loads(manager.pid_file.read_text())
+    assert [item["cuda_visible_devices"] for item in pids] == ["2", "3"]
+
+
+def test_extra_vllm_instances_require_daser_backend(tmp_path: Path) -> None:
+    """Only a DaseR server can be shared between vLLM instances."""
+    with pytest.raises(ValueError, match="daser backend"):
+        ServerManager(
+            run_id="run1",
+            backend="vllm",
+            model="/models/qwen",
+            store_dir=tmp_path,
+            gpu_id="2",
+            gpu_util=None,
+            max_num_seqs=8,
+            l1_size_bytes=1,
+            l2_size_bytes=1,
+            extra_vllm_gpu_ids=("3",),
+        )

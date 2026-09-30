@@ -250,6 +250,7 @@ class ServerManager:
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
+        extra_vllm_gpu_ids: tuple[str, ...] = (),
     ) -> None:
         """Initialize the service manager.
 
@@ -287,6 +288,10 @@ class ServerManager:
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
+            extra_vllm_gpu_ids: GPUs for additional vLLM instances that share
+                this service's DaseR server (DaseR backend only). Instance
+                ``i`` (1-based) listens on ``vllm_port + i``; the DaseR server
+                sees every instance's GPU.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -298,6 +303,8 @@ class ServerManager:
             raise ValueError("daser_l2_read_stripe_bytes must be non-negative")
         if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
             raise ValueError("online_pack_batch_slots must be positive")
+        if extra_vllm_gpu_ids and backend != "daser":
+            raise ValueError("extra vLLM instances require the daser backend")
         self.run_id = run_id
         self.backend = backend
         self.model = model
@@ -326,15 +333,24 @@ class ServerManager:
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
+        self.extra_vllm_gpu_ids = tuple(str(gpu) for gpu in extra_vllm_gpu_ids)
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
-        self._procs: list[subprocess.Popen[bytes]] = []
+        self._procs: list[tuple[subprocess.Popen[bytes], str]] = []
 
     @property
     def vllm_url(self) -> str:
         """Return the vLLM base URL."""
         return f"http://127.0.0.1:{self.vllm_port}"
+
+    @property
+    def vllm_urls(self) -> list[str]:
+        """Return every vLLM instance base URL, the primary instance first."""
+        return [
+            f"http://127.0.0.1:{self.vllm_port + offset}"
+            for offset in range(1 + len(self.extra_vllm_gpu_ids))
+        ]
 
     @property
     def daser_url(self) -> str:
@@ -496,8 +512,20 @@ class ServerManager:
         return {"PYTHONPATH": os.pathsep.join(entries)}
 
     async def start_vllm_daser(self) -> None:
-        """Start vLLM with DaseR connector."""
-        await self._start_vllm("vllm_daser.log", self.daser_kv_transfer_config())
+        """Start every vLLM instance with the DaseR connector.
+
+        All instances share one DaseR socket; the primary one runs on
+        ``gpu_id`` and ``extra_vllm_gpu_ids[i - 1]`` on ``vllm_port + i``.
+        """
+        kv_config = self.daser_kv_transfer_config()
+        await self._start_vllm("vllm_daser.log", kv_config)
+        for offset, gpu in enumerate(self.extra_vllm_gpu_ids, start=1):
+            await self._start_vllm(
+                f"vllm_daser_{offset}.log",
+                kv_config,
+                port=self.vllm_port + offset,
+                gpu_ids=gpu,
+            )
 
     def daser_kv_transfer_config(self) -> dict[str, Any]:
         """Return the vLLM KV transfer payload for a DaseR service.
@@ -530,7 +558,14 @@ class ServerManager:
     async def start_daser_server(self) -> None:
         """Start DaseR HTTP + IPC server."""
         cmd = self._daser_server_command()
-        proc = self._start(cmd, "daser.log")
+        proc = self._start(
+            cmd,
+            "daser.log",
+            # Instances may share a GPU; list each device once.
+            gpu_ids=",".join(
+                dict.fromkeys((str(self.gpu_id), *self.extra_vllm_gpu_ids))
+            ),
+        )
         await self._wait_healthy(self.daser_url, "/health", self.startup_timeout, proc)
 
     def _daser_server_command(self) -> list[str]:
@@ -598,22 +633,30 @@ class ServerManager:
         log_name: str,
         kv_transfer_config: dict[str, Any] | None,
         extra_env: dict[str, str] | None = None,
+        port: int | None = None,
+        gpu_ids: str | None = None,
     ) -> None:
+        port = self.vllm_port if port is None else port
         proc = self._start(
-            self.vllm_command(kv_transfer_config),
+            self.vllm_command(kv_transfer_config, port=port),
             log_name,
             extra_env=extra_env,
+            gpu_ids=gpu_ids,
         )
-        await self._wait_healthy(self.vllm_url, "/health", self.startup_timeout, proc)
+        await self._wait_healthy(
+            f"http://127.0.0.1:{port}", "/health", self.startup_timeout, proc
+        )
 
     def vllm_command(
         self,
         kv_transfer_config: dict[str, Any] | None,
+        port: int | None = None,
     ) -> list[str]:
         """Build the vLLM serve command for benchmark services.
 
         Args:
             kv_transfer_config: Optional KV transfer configuration.
+            port: HTTP port; defaults to the primary ``vllm_port``.
 
         Returns:
             Command list suitable for subprocess.Popen.
@@ -629,7 +672,7 @@ class ServerManager:
             Path(self.model).name,
             self.model,
             "--port",
-            str(self.vllm_port),
+            str(self.vllm_port if port is None else port),
             "--max-num-seqs",
             str(self.max_num_seqs),
             "--no-enable-prefix-caching",
@@ -664,13 +707,15 @@ class ServerManager:
         cmd: list[str],
         log_name: str,
         extra_env: dict[str, str] | None = None,
+        gpu_ids: str | None = None,
     ) -> subprocess.Popen[bytes]:
+        visible = str(self.gpu_id) if gpu_ids is None else gpu_ids
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / log_name
         fh = log_path.open("wb")
         env = os.environ.copy()
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        env["CUDA_VISIBLE_DEVICES"] = visible
         env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -684,7 +729,10 @@ class ServerManager:
             stderr=subprocess.STDOUT,
             env=env,
         )
-        self._procs.append(proc)
+        self._procs.append((proc, visible))
+        # Record every spawn at once so a later startup failure can still stop
+        # the services that already came up.
+        self._write_pids()
         return proc
 
     async def _wait_healthy(
@@ -774,14 +822,14 @@ class ServerManager:
             {
                 "pid": proc.pid,
                 "cmd": proc.args,
-                "cuda_visible_devices": str(self.gpu_id),
+                "cuda_visible_devices": visible,
             }
-            for proc in self._procs
+            for proc, visible in self._procs
         ]
         self.pid_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _ensure_ports_available(self) -> None:
-        ports = [self.vllm_port]
+        ports = [int(url.rsplit(":", 1)[1]) for url in self.vllm_urls]
         if self.backend == "lmcache":
             ports.extend([LMCACHE_MP_PORT, LMCACHE_HTTP_PORT])
         if self.backend == "daser":

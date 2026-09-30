@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from benchmarks.mooncake.benchmark import ROUTES
 from benchmarks.utils.servers import (
     ServerManager,
     check_runtime_environment,
@@ -112,16 +113,21 @@ class MatchedServer(ServerManager):
         super().__init__(*args, **kwargs)
         self.gpu_kv_bytes = gpu_kv_bytes
 
-    def vllm_command(self, kv_transfer_config: dict[str, Any] | None) -> list[str]:
+    def vllm_command(
+        self,
+        kv_transfer_config: dict[str, Any] | None,
+        port: int | None = None,
+    ) -> list[str]:
         """Return the vLLM command with APC enabled and a fixed KV budget.
 
         Args:
             kv_transfer_config: Optional connector configuration.
+            port: HTTP port; defaults to the primary ``vllm_port``.
 
         Returns:
             vLLM argv.
         """
-        command = super().vllm_command(kv_transfer_config)
+        command = super().vllm_command(kv_transfer_config, port=port)
         command[command.index("--no-enable-prefix-caching")] = "--enable-prefix-caching"
         command.extend(
             [
@@ -196,7 +202,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scratch", required=True, type=Path)
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     parser.add_argument("--gpu-id", default="3")
+    parser.add_argument(
+        "--extra-gpu-ids",
+        nargs="*",
+        default=[],
+        help=(
+            "GPUs for additional vLLM instances sharing one DaseR server "
+            "(DaseR arms only); requests are routed with --route."
+        ),
+    )
+    parser.add_argument("--route", choices=ROUTES, default="sticky")
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
+    parser.add_argument(
+        "--gpu-util",
+        type=float,
+        default=None,
+        help=(
+            "vLLM --gpu-memory-utilization; lower it when several instances "
+            "share one GPU (vLLM's default is used when omitted)"
+        ),
+    )
     parser.add_argument("--l1-size", type=parse_size_bytes, default="64gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="256gib")
     parser.add_argument(
@@ -271,7 +296,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         model=args.model,
         store_dir=args.scratch / arm,
         gpu_id=args.gpu_id,
-        gpu_util=None,
+        gpu_util=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
         l1_size_bytes=args.l1_size,
         l2_size_bytes=args.l2_size,
@@ -299,6 +324,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,
+        extra_vllm_gpu_ids=tuple(args.extra_gpu_ids) if arm.startswith("daser") else (),
     )
 
 
@@ -318,6 +344,14 @@ async def _daser_metrics(arm: str, manager: MatchedServer) -> str:
     if not arm.startswith("daser"):
         return ""
     return await _text(f"{manager.daser_url}/metrics")
+
+
+async def _vllm_metrics(manager: MatchedServer) -> str:
+    """Return the Prometheus text of every vLLM instance, one block each."""
+    blocks = []
+    for url in manager.vllm_urls:
+        blocks.append(f"# instance {url}\n" + await _text(f"{url}/metrics"))
+    return "\n".join(blocks)
 
 
 async def _warmup(vllm_url: str, model_name: str) -> float:
@@ -364,9 +398,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 runtime_config = ipc.get_runtime_config()
             finally:
                 ipc.close()
-        warmup_s = await _warmup(manager.vllm_url, model_name)
+        warmup_s = 0.0
+        for url in manager.vllm_urls:
+            warmup_s += await _warmup(url, model_name)
         daser_before = await _daser_metrics(arm, manager)
-        vllm_before = await _text(f"{manager.vllm_url}/metrics")
+        vllm_before = await _vllm_metrics(manager)
         replay = subprocess.run(
             [
                 sys.executable,
@@ -378,7 +414,9 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 args.model,
                 "--trust-remote-code",
                 "--server-url",
-                manager.vllm_url,
+                *manager.vllm_urls,
+                "--route",
+                args.route,
                 "--served-model-name",
                 model_name,
                 "--output-dir",
@@ -410,7 +448,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
             check=False,
         )
         daser_after = await _daser_metrics(arm, manager)
-        vllm_after = await _text(f"{manager.vllm_url}/metrics")
+        vllm_after = await _vllm_metrics(manager)
         (out_dir / "daser_metrics_before.prom").write_text(daser_before)
         (out_dir / "daser_metrics_after.prom").write_text(daser_after)
         (out_dir / "vllm_metrics_before.prom").write_text(vllm_before)

@@ -14,6 +14,7 @@ from benchmarks.mooncake import benchmark
 from benchmarks.mooncake.benchmark import (
     MOONCAKE_BLOCK_TOKENS,
     CorpusPromptBuilder,
+    InstanceRouter,
     PromptBuilder,
     TraceRequest,
     load_trace,
@@ -337,3 +338,93 @@ def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
     )
     assert wrapped[3:] == first[3:MOONCAKE_BLOCK_TOKENS]
     assert wrapped[:3] != first[:3]
+
+
+def test_load_trace_reads_optional_session_id(tmp_path: Path) -> None:
+    """Rows may carry a session_id; rows without one keep None."""
+    trace = tmp_path / "trace.jsonl"
+    base = {"input_length": 10, "output_length": 1, "hash_ids": [1]}
+    _write_trace(
+        trace,
+        [{"timestamp": 0, "session_id": 7, **base}, {"timestamp": 1, **base}],
+    )
+
+    assert [row.session_id for row in load_trace(trace)] == [7, None]
+
+
+def _session_request(index: int, session: int, blocks: int) -> TraceRequest:
+    hash_ids = tuple(session * 1000 + block for block in range(blocks))
+    return TraceRequest(
+        index, 0, blocks * MOONCAKE_BLOCK_TOKENS, 8, hash_ids, session_id=session
+    )
+
+
+def test_sticky_route_keeps_a_session_on_its_first_instance() -> None:
+    """Later turns stay put even when their instance carries more work."""
+    router = InstanceRouter(["http://a", "http://b"], route="sticky")
+    first, _ = router.acquire(_session_request(0, session=1, blocks=64))
+    other, _ = router.acquire(_session_request(1, session=2, blocks=1))
+    later, _ = router.acquire(_session_request(2, session=1, blocks=65))
+
+    assert (first, other, later) == (0, 1, 0)
+
+
+def test_least_work_route_follows_outstanding_work_across_sessions() -> None:
+    """A heavy in-flight request pushes the next turn of its session away."""
+    router = InstanceRouter(["http://a", "http://b"], route="least-work")
+    first, first_work = router.acquire(_session_request(0, session=1, blocks=64))
+    later, _ = router.acquire(_session_request(1, session=1, blocks=65))
+    router.release(first, first_work)
+    after, _ = router.acquire(_session_request(2, session=3, blocks=1))
+
+    assert (first, later, after) == (0, 1, 0)
+
+
+def test_router_charges_less_work_for_a_seen_prefix() -> None:
+    """A repeated prefix is predicted cached, so its prefill is not charged."""
+    router = InstanceRouter(["http://a"], route="least-work")
+    request = _session_request(0, session=1, blocks=32)
+    _, cold = router.acquire(request)
+    _, warm = router.acquire(_session_request(1, session=1, blocks=32))
+
+    assert warm < cold / 10
+
+
+def test_replay_routes_between_instances_and_records_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each request goes to its routed URL; records and summary name the instance."""
+    urls: list[str] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        urls.append(args[1])
+        kwargs["on_send"]()
+        await asyncio.sleep(0.01)
+        return RequestResult(args[2].sample_id, "d", "", 1.0, 5.0, 1, 3)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [_session_request(i, session=i % 2, blocks=1) for i in range(4)]
+    selection = select_requests(requests, max_model_len=10_000)
+    results, _, _ = asyncio.run(
+        replay(
+            selection=selection,
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url=["http://a", "http://b"],
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=4,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=0,
+            route="sticky",
+        )
+    )
+
+    by_index = {record["trace_index"]: record for record in results}
+    assert {by_index[i]["instance"] for i in (0, 2)} != {
+        by_index[i]["instance"] for i in (1, 3)
+    }
+    assert sorted(urls) == ["http://a", "http://a", "http://b", "http://b"]
+    assert by_index[0]["tpot_ms"] == pytest.approx(2.0)
+    summary = summarise(selection, results, 1.0, 1.0)
+    assert summary["requests_per_instance"] == {"0": 2, "1": 2}
