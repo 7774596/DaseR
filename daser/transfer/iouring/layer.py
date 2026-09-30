@@ -1151,11 +1151,21 @@ class TieredIOUringTransferLayer(TransferLayer):
         pending: list[asyncio.Task[None]] = []
         try:
             async with self._lock:
-                if budget:
+                if lease_id is not None:
+                    # Promotions reserve L1 one read batch at a time, so two
+                    # leases whose ranges exceed L1 together could each hold
+                    # part of the pool and wait for the other forever. Admit a
+                    # lease only once its physical bytes fit beside the others.
                     await self._lease_released.wait_for(
                         lambda: (
-                            self._leased_budget_bytes_locked(lease_id) + charge
-                            <= budget
+                            self._leased_physical_bytes_locked(lease_id)
+                            + requested_bytes
+                            <= self._l1_bytes
+                            and (
+                                not budget
+                                or self._leased_budget_bytes_locked(lease_id) + charge
+                                <= budget
+                            )
                         )
                     )
                 self._raise_l2_error_locked()
@@ -2450,6 +2460,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         for data_id in old_slice_ids - lease.slice_ids:
             self._release_slice_reference_locked(data_id)
         if lease.remaining:
+            # Consumed ranges no longer count against leased L1 capacity.
+            self._lease_released.notify_all()
             return
         self._request_leases.pop(lease_id, None)
         if not lease.released.done():
@@ -2477,6 +2489,23 @@ class TieredIOUringTransferLayer(TransferLayer):
             lease.released.set_result(None)
         self._l1.notify_pool_waiters()
         self._lease_released.notify_all()
+
+    def _leased_physical_bytes_locked(self, exclude: str | None) -> int:
+        """Return physical L1 bytes still retained by live request leases.
+
+        Args:
+            exclude: Lease ID left out of the sum, because a prefetch for the
+                same request replaces that lease.
+
+        Returns:
+            Sum of the unconsumed range sizes over the remaining leases.
+        """
+        return sum(
+            size
+            for lease_id, lease in self._request_leases.items()
+            if lease_id != exclude
+            for _start, size in lease.remaining
+        )
 
     def _leased_budget_bytes_locked(self, exclude: str | None) -> int:
         """Return accounted bytes charged by live prefetch leases.
