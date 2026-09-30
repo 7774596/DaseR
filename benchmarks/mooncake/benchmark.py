@@ -24,6 +24,8 @@ from benchmarks.utils.metrics import compute_metric_delta, extract_prometheus_co
 
 MOONCAKE_BLOCK_TOKENS = 512
 _BLOCK_ID_DIGITS = 8
+# Marker tokens per corpus block; base >= 1e5 ordinary tokens covers 1e15 IDs.
+_CORPUS_ID_DIGITS = 3
 _WRITER_STOP = object()
 
 
@@ -117,23 +119,70 @@ class PromptBuilder:
             raise ValueError(
                 f"hash ID {hash_id} exceeds deterministic encoding capacity"
             )
+        result = self._make_block(hash_id)
+        self._blocks[hash_id] = result
+        if len(self._blocks) > 8192:
+            self._blocks.popitem(last=False)
+        return result
+
+    def _id_tokens(self, hash_id: int, digits: int) -> list[int]:
         base = len(self._tokens)
         value = hash_id
-        block = []
-        for _ in range(_BLOCK_ID_DIGITS):
-            block.append(self._tokens[value % base])
+        tokens = []
+        for _ in range(digits):
+            tokens.append(self._tokens[value % base])
             value //= base
+        return tokens
+
+    def _make_block(self, hash_id: int) -> tuple[int, ...]:
+        block = self._id_tokens(hash_id, _BLOCK_ID_DIGITS)
+        base = len(self._tokens)
         state = (hash_id + 1) & ((1 << 64) - 1)
         for position in range(_BLOCK_ID_DIGITS, MOONCAKE_BLOCK_TOKENS):
             state = (state * 6364136223846793005 + 1442695040888963407 + position) & (
                 (1 << 64) - 1
             )
             block.append(self._tokens[state % base])
-        result = tuple(block)
-        self._blocks[hash_id] = result
-        if len(self._blocks) > 8192:
-            self._blocks.popitem(last=False)
-        return result
+        return tuple(block)
+
+
+class CorpusPromptBuilder(PromptBuilder):
+    """Build prompts whose blocks carry real text from a tokenized corpus.
+
+    Block ``h`` holds the corpus window ``h mod W`` (W = corpus length / 512),
+    so consecutive hash IDs read as consecutive text and equal hash prefixes
+    still give equal token prefixes. The first ``_CORPUS_ID_DIGITS`` tokens of
+    each block encode ``h`` so distinct hash IDs never collide, even when the
+    corpus wraps.
+
+    Args:
+        vocab_size: Model vocabulary size.
+        special_token_ids: Token IDs excluded from the hash-ID marker.
+        corpus: 1-D sequence of real token IDs (for example a memory-mapped
+            ``numpy`` array) at least one block long.
+
+    Thread-safety:
+        Same as :class:`PromptBuilder`.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        special_token_ids: Iterable[int],
+        corpus: Sequence[int],
+    ) -> None:
+        super().__init__(vocab_size, special_token_ids)
+        self._windows = len(corpus) // MOONCAKE_BLOCK_TOKENS
+        if self._windows < 1:
+            raise ValueError("corpus must hold at least one 512-token block")
+        self._corpus = corpus
+
+    def _make_block(self, hash_id: int) -> tuple[int, ...]:
+        start = (hash_id % self._windows) * MOONCAKE_BLOCK_TOKENS
+        text = self._corpus[start + _CORPUS_ID_DIGITS : start + MOONCAKE_BLOCK_TOKENS]
+        return tuple(self._id_tokens(hash_id, _CORPUS_ID_DIGITS)) + tuple(
+            int(token) for token in text
+        )
 
 
 def load_trace(
@@ -497,6 +546,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--overflow", choices=("skip", "error"), default="skip")
     parser.add_argument(
+        "--corpus-tokens",
+        type=Path,
+        default=None,
+        help=(
+            "Optional .npy array of real token IDs (same tokenizer); blocks "
+            "then carry real text instead of synthetic tokens."
+        ),
+    )
+    parser.add_argument(
         "--prefix-dependencies",
         action="store_true",
         help=(
@@ -538,10 +596,19 @@ async def main_async(args: argparse.Namespace) -> int:
         args.tokenizer,
         trust_remote_code=args.trust_remote_code,
     )
-    prompt_builder = PromptBuilder(
-        vocab_size=len(tokenizer),
-        special_token_ids=tokenizer.all_special_ids,
-    )
+    if args.corpus_tokens is None:
+        prompt_builder = PromptBuilder(
+            vocab_size=len(tokenizer),
+            special_token_ids=tokenizer.all_special_ids,
+        )
+    else:
+        import numpy as np
+
+        prompt_builder = CorpusPromptBuilder(
+            vocab_size=len(tokenizer),
+            special_token_ids=tokenizer.all_special_ids,
+            corpus=np.load(args.corpus_tokens, mmap_mode="r"),
+        )
     results_path = args.output_dir / "requests.jsonl"
     summary_path = args.output_dir / "summary.json"
     before_metrics = await _metrics_snapshot(args.server_url.rstrip("/"))

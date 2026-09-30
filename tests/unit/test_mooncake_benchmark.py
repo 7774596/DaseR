@@ -13,6 +13,7 @@ import pytest
 from benchmarks.mooncake import benchmark
 from benchmarks.mooncake.benchmark import (
     MOONCAKE_BLOCK_TOKENS,
+    CorpusPromptBuilder,
     PromptBuilder,
     TraceRequest,
     load_trace,
@@ -316,3 +317,23 @@ def test_replay_sends_request_after_its_prefix_predecessor(
     by_index = {record["trace_index"]: record for record in results}
     assert by_index[1]["dependency_wait_ms"] > 0
     assert by_index[2]["dependency_wait_ms"] == pytest.approx(0, abs=5)
+
+
+def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
+    """Blocks carry corpus text; equal hashes match and distinct hashes differ."""
+    corpus = list(range(5000, 5000 + 3 * MOONCAKE_BLOCK_TOKENS))
+    builder = CorpusPromptBuilder(
+        vocab_size=1024, special_token_ids={0, 1, 2}, corpus=corpus
+    )
+    first = builder.build(TraceRequest(0, 0, 1024, 1, (0, 1)))
+    again = builder.build(TraceRequest(1, 0, 700, 1, (0, 1)))
+    wrapped = builder.build(TraceRequest(2, 0, 512, 1, (3,)))  # same window as 0
+
+    assert first[:700] == again
+    # After the hash marker the block is the corpus window verbatim.
+    assert first[3:MOONCAKE_BLOCK_TOKENS] == corpus[3:MOONCAKE_BLOCK_TOKENS]
+    assert (
+        first[MOONCAKE_BLOCK_TOKENS + 3 :] == corpus[MOONCAKE_BLOCK_TOKENS + 3 : 1024]
+    )
+    assert wrapped[3:] == first[3:MOONCAKE_BLOCK_TOKENS]
+    assert wrapped[:3] != first[:3]

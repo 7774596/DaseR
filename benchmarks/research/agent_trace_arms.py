@@ -202,6 +202,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Closed-loop replay: hold requests until their prefix producer finishes.",
     )
+    parser.add_argument(
+        "--corpus-tokens",
+        type=Path,
+        default=None,
+        help="Real-text .npy token corpus passed to the replay (see longdoc_trace).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -347,6 +353,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 "--abort-after-failures",
                 str(args.abort_after_failures),
                 *(["--prefix-dependencies"] if args.prefix_dependencies else []),
+                *(
+                    ["--corpus-tokens", str(args.corpus_tokens)]
+                    if args.corpus_tokens is not None
+                    else []
+                ),
             ],
             cwd=REPO_ROOT,
             stdout=(out_dir / "replay.log").open("wb"),

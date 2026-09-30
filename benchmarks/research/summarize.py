@@ -93,14 +93,19 @@ def _histogram_sum(
 
 
 def _bucket_quantile(
-    before: dict[str, float], after: dict[str, float], name: str, q: float
+    before: dict[str, float],
+    after: dict[str, float],
+    name: str,
+    q: float,
+    labels: str = "",
 ) -> float:
     """Return the smallest ``<name>`` bucket bound holding quantile ``q``.
 
-    Returns ``inf`` when the quantile falls past the largest finite bucket and
-    0 when the histogram has no observations.
+    ``labels`` selects one label set, rendered as it precedes ``le`` (for
+    example ``'op="load",'``). Returns ``inf`` when the quantile falls past
+    the largest finite bucket and 0 when the histogram has no observations.
     """
-    prefix = f'{name}_bucket{{le="'
+    prefix = f'{name}_bucket{{{labels}le="'
     buckets = sorted(
         (float(key[len(prefix) : -2]), value - before.get(key, 0.0))
         for key, value in after.items()
@@ -225,6 +230,75 @@ def publish_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def load_rows(arm_dirs: list[Path]) -> list[str]:
+    """Summarize DaseR load transfers per arm.
+
+    Args:
+        arm_dirs: Arm artifact directories.
+
+    Returns:
+        One line per arm that loaded anything: load operation count, mean and
+        bucket p90 latency, and effective throughput (bytes over summed
+        latency, so concurrent loads count once each).
+    """
+    lines = []
+    name = "daser_transfer_duration_seconds"
+    for arm_dir in arm_dirs:
+        before = _counters(arm_dir / "daser_metrics_before.prom")
+        after = _counters(arm_dir / "daser_metrics_after.prom")
+        count = _delta(before, after, f'{name}_count{{op="load"}}')
+        if count <= 0:
+            continue
+        seconds = _delta(before, after, f'{name}_sum{{op="load"}}')
+        nbytes = _delta(before, after, _LOAD)
+        p90 = _bucket_quantile(before, after, name, 0.9, labels='op="load",')
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
+            f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "
+            f"per_op_GBps={nbytes / seconds / 1e9 if seconds else 0:.2f}"
+        )
+    return lines
+
+
+def stage_rows(arm_dirs: list[Path], stages_path: Path, slo_ms: float) -> list[str]:
+    """Report TTFT and goodput per workload stage.
+
+    Args:
+        arm_dirs: Arm artifact directories.
+        stages_path: ``stages.json`` from ``longdoc_trace trace``: a list of
+            ``{"name", "start", "end", "qps"}`` row ranges (end exclusive).
+        slo_ms: TTFT SLO; goodput counts completed requests at or under it.
+
+    Returns:
+        One line per (arm, stage): requests sent, completed, TTFT p50/p90/p99,
+        SLO attainment, and goodput in requests per second of stage time
+        (first to last scheduled arrival of the stage's completed requests).
+    """
+    stages = json.loads(stages_path.read_text())
+    lines = [f"stages (TTFT ms, SLO {slo_ms:.0f} ms)"]
+    for arm_dir in arm_dirs:
+        records = [json.loads(line) for line in (arm_dir / "requests.jsonl").open()]
+        for stage in stages:
+            chosen = [
+                r
+                for r in records
+                if stage["start"] <= int(r["trace_index"]) < stage["end"]
+            ]
+            done = [r for r in chosen if r["status"] == "completed"]
+            ttft = [float(r["ttft_ms"]) for r in done]
+            good = sum(value <= slo_ms for value in ttft)
+            arrivals = [float(r["scheduled_offset_s"]) for r in done]
+            span = max(arrivals) - min(arrivals) if len(arrivals) > 1 else 0.0
+            lines.append(
+                f"  {arm_dir.parent.name}/{arm_dir.name} {stage['name']}: "
+                f"n={len(chosen)} ok={len(done)} p50={_p(ttft, 50):.0f} "
+                f"p90={_p(ttft, 90):.0f} p99={_p(ttft, 99):.0f} "
+                f"slo={_rate(good, len(done))} "
+                f"goodput={good / span if span else 0:.3f}/s"
+            )
+    return lines
+
+
 def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
     """Compare per-request TTFT on the first ``first`` shared trace requests.
 
@@ -266,11 +340,16 @@ def main() -> None:
     """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``.
 
     ``--first N`` adds a paired TTFT comparison over the first ``N`` shared
-    trace requests, using the first arm found as the reference.
+    trace requests, using the first arm found as the reference. ``--stages``
+    adds per-stage TTFT and goodput under ``--slo-ms``.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifacts", nargs="+", type=Path)
     parser.add_argument("--first", type=int, default=0)
+    parser.add_argument(
+        "--stages", type=Path, default=None, help="stages.json for per-stage rows"
+    )
+    parser.add_argument("--slo-ms", type=float, default=2000.0)
     args = parser.parse_args()
     arm_dirs = [
         summary.parent
@@ -286,8 +365,14 @@ def main() -> None:
     if publish:
         print("store publication (DaseR)")
         print("\n".join(publish))
+    loads = load_rows(arm_dirs)
+    if loads:
+        print("load transfers (DaseR)")
+        print("\n".join(loads))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first)))
+    if args.stages is not None:
+        print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
 
 
 if __name__ == "__main__":

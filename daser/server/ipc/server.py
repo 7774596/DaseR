@@ -1401,7 +1401,21 @@ class IPCServer:
         self._metrics.histogram(
             "daser_transfer_duration_seconds",
             "Transfer operation latency by operation.",
-            buckets=(0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+            buckets=(
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+            ),
         ).observe(elapsed_s, labels=labels)
         self._metrics.histogram(
             "daser_transfer_chunk_size_bytes",
