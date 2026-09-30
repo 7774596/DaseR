@@ -27,6 +27,7 @@ import httpx
 
 from benchmarks.utils.servers import (
     ServerManager,
+    check_runtime_environment,
     stop_from_pid_file,
 )
 from benchmarks.utils.sizing import parse_size_bytes
@@ -461,7 +462,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
-    asyncio.run(main_async(parse_args(argv)))
+    args = parse_args(argv)
+    check_runtime_environment()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
