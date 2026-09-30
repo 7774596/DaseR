@@ -1256,13 +1256,15 @@ class RequestLifecycle:
                 if waiting is None:
                     followers[req_id] = (num_computed_tokens, now)
                     self._coalesce_stats["followers"] += 1
-                    if self._coalesce_stats["followers"] % 64 == 0:
+                    if self._coalesce_stats["followers"] % 16 == 1:
                         self._log_coalesce_stats()
                 return True
         if waiting is not None:
             followers.pop(req_id, None)
             outcome = "joined" if num_computed_tokens > waiting[0] else "missed"
             self._coalesce_stats[outcome] += 1
+            if outcome == "missed" or self._coalesce_stats["joined"] % 16 == 1:
+                self._log_coalesce_stats()
         self._follower_digests.pop(req_id, None)
         return False
 
