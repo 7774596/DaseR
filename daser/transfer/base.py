@@ -306,6 +306,34 @@ class TransferLayer(ABC):
         """
         return await self.load_bytes_grouped(dst, spans)
 
+    async def load_leased_runs(
+        self,
+        dst: Any,
+        file_offsets: Any,
+        target_offsets: Any,
+        nbytes: Any,
+        lease_id: str,
+    ) -> int:
+        """Copy many small runs retained by a request lease in one call.
+
+        Args:
+            dst: Flat CUDA byte destination.
+            file_offsets: ``int64`` array of physical run starts.
+            target_offsets: ``int64`` array of destination offsets.
+            nbytes: ``int64`` array of run lengths.
+            lease_id: Request lease retaining every run.
+
+        Returns:
+            Bytes copied, after the copies completed on the device.
+
+        Raises:
+            NotImplementedError: If this backend has no host-memory tier.
+
+        Async/thread-safety:
+            Runs on the owning event loop; the lease ranges are not consumed.
+        """
+        raise NotImplementedError("transfer backend does not support leased runs")
+
     async def release_lease_ranges(
         self,
         lease_id: str,

@@ -494,6 +494,42 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
 
 
 @pytest.mark.asyncio
+async def test_async_client_packs_leased_runs_as_one_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leased runs travel as one (3, n) int64 table, not per-span dicts."""
+
+    recorded: list[dict] = []
+
+    async def fake_call(self, payload: dict) -> dict:
+        del self
+        recorded.append(payload)
+        return {"ok": True, "bytes": 48}
+
+    monkeypatch.setattr(IPCClientAsync, "call", fake_call)
+    client = IPCClientAsync("/tmp/daser.sock")
+
+    response = await client.transfer_load_runs(
+        buffer_index=1,
+        producer_pid=43,
+        file_offsets=[4096, 8192],
+        target_offsets=[0, 32],
+        nbytes=[16, 32],
+        lease_id="request-runs",
+    )
+
+    assert response == {"ok": True, "bytes": 48}
+    assert recorded == [
+        {
+            "op": "transfer_load_runs",
+            "payload": {"load_staging_buffer_index": 1, "producer_pid": 43},
+            "lease_id": "request-runs",
+            "runs": array.array("q", [4096, 8192, 0, 32, 16, 32]).tobytes(),
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_clients_transfer_drain(tmp_path):
     """Sync and async clients can drain server-owned transfer work."""
     server = make_server(tmp_path)

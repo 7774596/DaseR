@@ -1982,6 +1982,17 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
                 )
             with pytest.raises(KeyError):
                 await layer.load_leased_runs(dst, files, targets, sizes, "missing")
+            # Consumed ranges leave the lease: later runs over them fail,
+            # runs over the still-leased records keep copying.
+            await layer.release_lease_ranges("runs", [spans[0]])
+            with pytest.raises(KeyError):
+                await layer.load_leased_runs(dst, files, targets, sizes, "runs")
+            assert (
+                await layer.load_leased_runs(
+                    dst, files[1:], targets[1:], sizes[1:], "runs"
+                )
+                == (records - 1) * size
+            )
         finally:
             await layer.release_lease("runs")
             layer.close()

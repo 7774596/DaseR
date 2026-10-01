@@ -2591,3 +2591,110 @@ async def test_bip_setting_is_forwarded(
             "gather_min_runs": 0,
         }
     ]
+
+
+class _RunsTransfer(TransferLayer):
+    """Transfer double recording leased run tables."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, list[int], list[int], list[int], str]] = []
+
+    async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
+        return nbytes
+
+    async def store_bytes(
+        self,
+        _src: Any,
+        _file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
+    ) -> int:
+        return nbytes
+
+    async def load_leased_runs(
+        self,
+        dst: Any,
+        file_offsets: Any,
+        target_offsets: Any,
+        nbytes: Any,
+        lease_id: str,
+    ) -> int:
+        self.calls.append(
+            (
+                dst,
+                list(file_offsets),
+                list(target_offsets),
+                list(nbytes),
+                lease_id,
+            )
+        )
+        return int(sum(nbytes))
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_transfer_load_runs_decodes_run_table_into_registered_buffer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One packed (3, n) table becomes one leased-runs copy into the buffer."""
+    server = IPCServer(
+        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
+    )
+    transfer = _RunsTransfer()
+    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
+    buffers = {(7, 1): "staging-1"}
+    monkeypatch.setattr(
+        server,
+        "_payload_buffer",
+        lambda payload: buffers[
+            (payload["producer_pid"], payload["load_staging_buffer_index"])
+        ],
+    )
+    runs = np.array([[4096, 90112], [0, 8192], [512, 1024]], dtype=np.int64)
+
+    response = await server._transfer_load_runs(  # noqa: SLF001
+        {
+            "payload": {"load_staging_buffer_index": 1, "producer_pid": 7},
+            "lease_id": "req",
+            "runs": runs.tobytes(),
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["bytes"] == 1536
+    assert transfer.calls == [
+        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "msg",
+    [
+        {"lease_id": "req", "runs": b"\0" * 24},
+        {"payload": {"load_staging_buffer_index": 0}, "runs": b"\0" * 24},
+        {"payload": {"load_staging_buffer_index": 0}, "lease_id": "req"},
+        {
+            "payload": {"load_staging_buffer_index": 0},
+            "lease_id": "req",
+            "runs": b"\0" * 20,
+        },
+    ],
+)
+async def test_transfer_load_runs_rejects_malformed_requests(
+    tmp_path, msg: dict[str, Any]
+) -> None:
+    """Missing buffers, leases or a non-(3, n) table fail before copying."""
+    server = IPCServer(
+        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
+    )
+    transfer = _RunsTransfer()
+    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
+
+    with pytest.raises(ValueError):
+        await server._transfer_load_runs(msg)  # noqa: SLF001
+    assert transfer.calls == []

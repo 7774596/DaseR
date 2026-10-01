@@ -792,6 +792,55 @@ class IPCClientAsync(_IPCClientBase):
             request["lease_id"] = lease_id
         return await self.call(request)
 
+    async def transfer_load_runs(
+        self,
+        buffer_index: int,
+        producer_pid: int,
+        file_offsets: Any,
+        target_offsets: Any,
+        nbytes: Any,
+        lease_id: str,
+    ) -> dict[str, Any]:
+        """Copy leased runs into a registered fixed CUDA staging buffer.
+
+        Args:
+            buffer_index: Worker-local registered load staging buffer index.
+            producer_pid: Process ID that registered the staging buffer.
+            file_offsets: Physical run starts (int64-convertible sequence).
+            target_offsets: Destination offsets inside the staging buffer.
+            nbytes: Run lengths.
+            lease_id: Request lease from ``lookup_prefetch`` retaining every
+                run in L1.
+
+        Returns:
+            Server response with ``bytes`` and ``transfer_ms`` after the
+            copies completed on the device.
+
+        Async/thread-safety:
+            Serializes with other calls on this client's connection; use one
+            client per staging buffer to overlap groups.
+        """
+        import numpy
+
+        runs = numpy.stack(
+            [
+                numpy.asarray(file_offsets, dtype=numpy.int64),
+                numpy.asarray(target_offsets, dtype=numpy.int64),
+                numpy.asarray(nbytes, dtype=numpy.int64),
+            ]
+        )
+        return await self.call(
+            {
+                "op": "transfer_load_runs",
+                "payload": {
+                    "load_staging_buffer_index": int(buffer_index),
+                    "producer_pid": int(producer_pid),
+                },
+                "lease_id": lease_id,
+                "runs": runs.tobytes(),
+            }
+        )
+
     async def register_staging_cuda(
         self,
         direction: str,

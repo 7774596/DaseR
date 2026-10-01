@@ -108,6 +108,9 @@ class _RequestLease:
     active_loads: int = 0
     release_all: bool = False
     budget_bytes: int = 0
+    # (starts, ends, host bases) of ``hits`` for vectorized run lookup;
+    # rebuilt lazily and cleared whenever ``hits`` changes.
+    run_index: tuple[Any, Any, Any] | None = None
 
 
 @dataclass
@@ -1762,16 +1765,24 @@ class TieredIOUringTransferLayer(TransferLayer):
             lease = self._request_leases.get(lease_id)
             if lease is None:
                 raise KeyError(f"unknown transfer lease: {lease_id}")
-            hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
-            starts = numpy.array([hit.file_offset for hit in hits], dtype=numpy.int64)
-            ends = starts + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64)
-            bases = numpy.array(
-                [hit.data.ptr_at(hit.source_offset) for hit in hits],
-                dtype=numpy.uint64,
-            )
+            if lease.run_index is None:
+                hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
+                starts = numpy.array(
+                    [hit.file_offset for hit in hits], dtype=numpy.int64
+                )
+                lease.run_index = (
+                    starts,
+                    starts
+                    + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64),
+                    numpy.array(
+                        [hit.data.ptr_at(hit.source_offset) for hit in hits],
+                        dtype=numpy.uint64,
+                    ),
+                )
+            starts, ends, bases = lease.run_index
             index = numpy.searchsorted(starts, files, side="right") - 1
             if (
-                not len(hits)
+                not len(starts)
                 or (index < 0).any()
                 or (files + sizes > ends[numpy.maximum(index, 0)]).any()
             ):
@@ -2913,6 +2924,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 new_ids.add(data_id)
                 lease.slice_ids.add(data_id)
         lease.hits.sort(key=lambda item: item.file_offset)
+        lease.run_index = None
         for data_id in new_ids:
             data = next(hit.data for hit in hits if id(hit.data) == data_id)
             existing = self._leased_slices.get(data_id)
@@ -2985,6 +2997,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         old_slice_ids = set(lease.slice_ids)
         lease.remaining = _subtract_ranges(lease.remaining, removals)
         lease.hits = _subtract_leased_hits(lease.hits, removals)
+        lease.run_index = None
         lease.slice_ids = {id(hit.data) for hit in lease.hits}
         for data_id in old_slice_ids - lease.slice_ids:
             self._release_slice_reference_locked(data_id)

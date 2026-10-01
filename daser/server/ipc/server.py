@@ -460,6 +460,7 @@ class IPCServer:
             "init_transfer": self._op_init_transfer,
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
+            "transfer_load_runs": self._transfer_load_runs,
             "register_load_staging": self._register_load_staging,
             "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
@@ -1349,6 +1350,57 @@ class IPCServer:
                     total,
                     close_ms,
                 )
+
+    async def _transfer_load_runs(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Copy a leased run table into a registered load staging buffer.
+
+        Layer-wise delivery copies one plane group of every record of a
+        request per call. ``runs`` packs the group as one ``(3, n)`` int64
+        array (file offsets, target offsets, lengths) so the request costs
+        O(1) Python regardless of the record count.
+
+        Args:
+            msg: IPC request with ``payload`` (registered staging buffer),
+                ``lease_id`` and ``runs`` bytes.
+
+        Returns:
+            ``{"ok": True, "bytes": n, "transfer_ms": ms}`` once the copies
+            completed on the device.
+
+        Raises:
+            ValueError: If the run table is malformed or the buffer unknown.
+
+        Async/thread-safety:
+            Runs on the IPC event loop. The lease is retained, not consumed;
+            the worker releases it with ``release_transfer_lease`` after the
+            last group, so concurrent groups on different staging buffers
+            overlap.
+        """
+        import numpy
+
+        started = time.perf_counter()
+        lease_id = str(msg.get("lease_id", ""))
+        packed = msg.get("runs")
+        payload = msg.get("payload", {})
+        if not lease_id:
+            raise ValueError("transfer_load_runs requires lease_id")
+        if "load_staging_buffer_index" not in payload:
+            raise ValueError("transfer_load_runs requires a registered buffer")
+        if not isinstance(packed, bytes) or not packed or len(packed) % 24:
+            raise ValueError("transfer_load_runs runs must be (3, n) int64 bytes")
+        runs = numpy.frombuffer(packed, dtype=numpy.int64).reshape(3, -1)
+        total = await self._ensure_transfer().load_leased_runs(
+            self._payload_buffer(payload), runs[0], runs[1], runs[2], lease_id
+        )
+        elapsed_s = time.perf_counter() - started
+        self._record_transfer_metrics(
+            op="load",
+            backend=str(self._runtime_config.get("transfer_mode", "gds")),
+            status="ok",
+            nbytes=total,
+            elapsed_s=elapsed_s,
+        )
+        return {"ok": True, "bytes": total, "transfer_ms": elapsed_s * 1000}
 
     async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Register one fixed CUDA load staging buffer for indexed reuse.
