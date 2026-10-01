@@ -233,6 +233,7 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "l1_accounting": "stored",
         "prefetch_lease_budget_bytes": 0,
         "l2_read_stripe_bytes": 0,
+        "l1_split_fraction": 0.0,
     }
 
 

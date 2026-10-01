@@ -299,7 +299,7 @@ def stage_rows(arm_dirs: list[Path], stages_path: Path, slo_ms: float) -> list[s
     return lines
 
 
-def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
+def paired_rows(arm_dirs: list[Path], first: int, warm_ms: float = 0.0) -> list[str]:
     """Compare per-request TTFT on the first ``first`` shared trace requests.
 
     Requests are matched by ``trace_index`` across arms, so runs of different
@@ -308,6 +308,8 @@ def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
     Args:
         arm_dirs: Arm directories; the first one is the reference.
         first: Number of lowest shared trace indices to compare.
+        warm_ms: When positive, keep only requests whose reference TTFT is
+            below this bound, so cold full prefills do not mask load changes.
 
     Returns:
         Formatted lines: one per arm with the request count, summed and
@@ -323,8 +325,11 @@ def paired_rows(arm_dirs: list[Path], first: int) -> list[str]:
         for d in arm_dirs
     ]
     shared = sorted(set.intersection(*(set(t) for t in ttft_by_arm)))[:first]
+    if warm_ms > 0:
+        shared = [i for i in shared if ttft_by_arm[0][i] < warm_ms]
     reference = sum(ttft_by_arm[0][i] for i in shared) or 1.0
-    lines = [f"paired first {len(shared)} shared requests (TTFT ms)"]
+    warm = f", reference TTFT < {warm_ms:.0f} ms" if warm_ms > 0 else ""
+    lines = [f"paired first {len(shared)} shared requests{warm} (TTFT ms)"]
     for arm_dir, ttft in zip(arm_dirs, ttft_by_arm, strict=True):
         values = [ttft[i] for i in shared]
         head = "/".join(f"{v:.0f}" for v in values[:4])
@@ -350,6 +355,12 @@ def main() -> None:
         "--stages", type=Path, default=None, help="stages.json for per-stage rows"
     )
     parser.add_argument("--slo-ms", type=float, default=2000.0)
+    parser.add_argument(
+        "--warm-ms",
+        type=float,
+        default=0.0,
+        help="with --first, keep requests whose reference TTFT is below this",
+    )
     args = parser.parse_args()
     arm_dirs = [
         summary.parent
@@ -370,7 +381,7 @@ def main() -> None:
         print("load transfers (DaseR)")
         print("\n".join(loads))
     if args.first > 0:
-        print("\n".join(paired_rows(arm_dirs, args.first)))
+        print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
     if args.stages is not None:
         print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
 

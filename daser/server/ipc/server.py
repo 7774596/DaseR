@@ -1649,6 +1649,9 @@ class IPCServer:
                     l2_read_stripe_bytes=int(
                         self._runtime_config.get("l2_read_stripe_bytes", 0)
                     ),
+                    l1_split_fraction=float(
+                        self._runtime_config.get("l1_split_fraction", 0.0)
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

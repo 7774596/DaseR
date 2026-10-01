@@ -7,6 +7,7 @@ from typing import Any
 
 # First Party
 from daser.logging import init_logger
+from daser.replacement import ReplacementPolicy, SplitResidencyPolicy
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.base import (
     PrefetchResult,
@@ -41,6 +42,29 @@ _PACKED_L1_BIP_INTERVAL = 32
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+
+
+def _l1_replacement_policy(
+    bip_enabled: bool, split_fraction: float, l1_bytes: int
+) -> ReplacementPolicy[int] | None:
+    """Select the L1 allocation replacement policy.
+
+    Args:
+        bip_enabled: Use BIP when split residency is off.
+        split_fraction: Split-residency protected byte budget as a share of
+            L1; 0 disables it.
+        l1_bytes: L1 capacity in accounted bytes.
+
+    Returns:
+        The policy instance, or None for the L1 cache's default LRU.
+    """
+    if split_fraction > 0.0:
+        return SplitResidencyPolicy[int](
+            protect_fraction=split_fraction, capacity_bytes=l1_bytes
+        )
+    if bip_enabled:
+        return BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
+    return None
 
 
 async def _drain_destination_copies(copies: list[asyncio.Task[None]]) -> None:
@@ -453,6 +477,12 @@ class TieredIOUringTransferLayer(TransferLayer):
             limit into parts of about this many bytes submitted together on
             one ring, so a single request keeps many IOs in flight (0 keeps
             one serial read per extent).
+        l1_split_fraction: Research switch. When in ``(0, 1)``, L1 uses
+            split residency: a protected segment of this share of L1, filled
+            by offset hash and evicted only after all other allocations, so
+            every active prefix keeps a stable L1 share and its loads read
+            memory and SSD concurrently. 0 keeps the BIP/LRU policy selected
+            by ``bip_enabled``.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -473,6 +503,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         l1_accounting: str = "stored",
         prefetch_lease_budget_bytes: int = 0,
         l2_read_stripe_bytes: int = 0,
+        l1_split_fraction: float = 0.0,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -482,6 +513,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
+        if not 0.0 <= l1_split_fraction < 1.0:
+            raise ValueError("l1_split_fraction must be in [0, 1)")
         if l1_accounting not in ("stored", "raw"):
             raise ValueError("l1_accounting must be 'stored' or 'raw'")
         if not 0 <= prefetch_lease_budget_bytes <= l1_bytes:
@@ -520,10 +553,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
-            replacement_policy=(
-                BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
-                if self.bip_enabled
-                else None
+            replacement_policy=_l1_replacement_policy(
+                self.bip_enabled, l1_split_fraction, l1_bytes
             ),
         )
         self._l2_errors: list[BaseException] = []
@@ -534,7 +565,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
-            "prefetch_lease_budget=%d l2_read_stripe=%d",
+            "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f",
             path,
             l1_bytes,
             l2_bytes,
@@ -545,6 +576,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self.l1_accounting,
             prefetch_lease_budget_bytes,
             l2_read_stripe_bytes,
+            l1_split_fraction,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:

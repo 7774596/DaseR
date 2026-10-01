@@ -480,7 +480,7 @@ class L1Cache:
         allocation = data.allocation_id
         self._allocation_keys.setdefault(allocation, {})[key] = None
         self._charges[key] = charge
-        self._policy.insert(allocation)
+        self._policy.insert_range(allocation, key[0], charge)
         self._used += charge
         self.notify_pool_waiters()
         while self._used > self._l1_bytes:

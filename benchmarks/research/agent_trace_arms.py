@@ -47,6 +47,9 @@ ARMS = (
     # load instead of loading their own copy.
     "daser-raw-coalesce",
     "daser-compressed-coalesce",
+    # L1 split residency (--daser-l1-split-fraction) on raw / compressed stores.
+    "daser-raw-split",
+    "daser-compressed-split",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -265,6 +268,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="0",
         help="DaseR --l2-read-stripe (0 = serial reads; DaseR arms only).",
     )
+    parser.add_argument(
+        "--daser-l1-split-fraction",
+        type=float,
+        default=0.6,
+        help="DaseR --l1-split-fraction for the *-split arms only.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -320,6 +329,9 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_l2_read_stripe_bytes=(
             args.daser_l2_read_stripe if arm.startswith("daser") else 0
+        ),
+        daser_l1_split_fraction=(
+            args.daser_l1_split_fraction if arm.endswith("-split") else 0.0
         ),
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,

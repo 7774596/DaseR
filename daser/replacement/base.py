@@ -25,6 +25,19 @@ class ReplacementPolicy(ABC, Generic[K]):
             key: Cache key to track.
         """
 
+    def insert_range(self, key: K, file_offset: int, nbytes: int = 0) -> None:
+        """Insert or refresh a key together with its placement and size.
+
+        Policies that ignore placement inherit plain ``insert`` behavior.
+
+        Args:
+            key: Cache key to track.
+            file_offset: L2 byte offset of the key's first cached range.
+            nbytes: Bytes this insert adds to the key's resident size.
+        """
+        del file_offset, nbytes
+        self.insert(key)
+
     @abstractmethod
     def access(self, key: K) -> None:
         """Mark an existing key as recently used.
