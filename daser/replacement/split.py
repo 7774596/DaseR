@@ -24,7 +24,10 @@ from collections import OrderedDict
 from typing import Generic, TypeVar
 
 # First Party
+from daser.logging import init_logger
 from daser.replacement.base import ReplacementPolicy
+
+logger = init_logger(__name__)
 
 K = TypeVar("K")
 
@@ -89,6 +92,9 @@ class SplitResidencyPolicy(ReplacementPolicy[K], Generic[K]):
         self._classes: dict[K, float] = {}
         self._protected_bytes = 0
         self._clock = 0
+        self._capacity = capacity_bytes
+        self._next_report = capacity_bytes
+        self._counts = {"stale": 0, "yield": 0, "evict_protected": 0}
 
     @property
     def eligibility(self) -> float:
@@ -119,6 +125,16 @@ class SplitResidencyPolicy(ReplacementPolicy[K], Generic[K]):
             nbytes: Bytes added to the key's resident size by this insert.
         """
         self._clock += nbytes
+        if self._clock >= self._next_report:
+            self._next_report += self._capacity
+            logger.info(
+                "split residency: inserted=%.1f GiB protected=%.1f GiB "
+                "eligibility=%.3f demotions=%s",
+                self._clock / (1 << 30),
+                self._protected_bytes / (1 << 30),
+                self._eligibility,
+                self._counts,
+            )
         if key in self._sizes:
             self._sizes[key] += nbytes
             if key in self._protected:
@@ -168,6 +184,8 @@ class SplitResidencyPolicy(ReplacementPolicy[K], Generic[K]):
         for segment in (self._probation, self._protected):
             if segment:
                 key = next(iter(segment))
+                if segment is self._protected:
+                    self._counts["evict_protected"] += 1
                 self.remove(key)
                 return key
         return None
@@ -212,12 +230,14 @@ class SplitResidencyPolicy(ReplacementPolicy[K], Generic[K]):
                 self._clock - self._last_access[oldest] >= self._stale_age
             ):
                 self._demote(oldest, to_lru_end=True)
+                self._counts["stale"] += 1
                 continue
             self._eligibility = max(
                 _ELIGIBILITY_MIN, self._eligibility * _ELIGIBILITY_STEP
             )
             victim = max(self._protected, key=self._classes.__getitem__)
             self._demote(victim, to_lru_end=False)
+            self._counts["yield"] += 1
             if victim == key:
                 return
         if self._protected_bytes < 0.9 * self._budget:
