@@ -260,6 +260,53 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+_LOAD_TIMING = re.compile(
+    r"load timing req=\S+ wall_ms=([0-9.]+) batches=\d+ bytes=(\d+)"
+)
+
+
+def load_wall_rows(arm_dirs: list[Path]) -> list[str]:
+    """Summarize per-request worker load wall time per arm.
+
+    Args:
+        arm_dirs: Arm artifact directories.
+
+    Returns:
+        One line per arm whose ``vllm_daser.log`` has DEBUG ``load timing``
+        lines: request count, summed and median wall time, and the wall-time
+        throughput of requests above and below 15 GB loaded.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        log = arm_dir / "vllm_daser.log"
+        if not log.exists():
+            continue
+        rows = [
+            (float(m.group(1)), int(m.group(2)))
+            for m in _LOAD_TIMING.finditer(log.read_text(errors="replace"))
+        ]
+        if not rows:
+            continue
+        walls = [wall for wall, _nbytes in rows]
+        parts = []
+        for label, keep in (
+            ("big", lambda n: n > 15e9),
+            ("small", lambda n: n <= 15e9),
+        ):
+            picked = [(wall, nbytes) for wall, nbytes in rows if keep(nbytes)]
+            if picked:
+                seconds = sum(wall for wall, _ in picked) / 1000
+                gbps = sum(nbytes for _, nbytes in picked) / seconds / 1e9
+                p50 = _p([wall for wall, _ in picked], 50)
+                parts.append(f"{label} n={len(picked)} p50={p50:.0f}ms {gbps:.1f}GB/s")
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: n={len(rows)} "
+            f"sum_s={sum(walls) / 1000:.1f} p50={_p(walls, 50):.0f}ms "
+            + " ".join(parts)
+        )
+    return lines
+
+
 def stage_rows(arm_dirs: list[Path], stages_path: Path, slo_ms: float) -> list[str]:
     """Report TTFT and goodput per workload stage.
 
@@ -380,6 +427,10 @@ def main() -> None:
     if loads:
         print("load transfers (DaseR)")
         print("\n".join(loads))
+    walls = load_wall_rows(arm_dirs)
+    if walls:
+        print("per-request load wall (DEBUG load timing)")
+        print("\n".join(walls))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
     if args.stages is not None:
