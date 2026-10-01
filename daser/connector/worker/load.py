@@ -195,6 +195,17 @@ def _layerwise_records(
     return np.asarray(offsets, dtype=np.int64), block_ids, leases.pop()
 
 
+def _interval_union_ms(spans: list[tuple[float, float]]) -> float:
+    """Return the total length of the union of ``(begin, end)`` seconds in ms."""
+    total = 0.0
+    reach = float("-inf")
+    for begin, end in sorted(spans):
+        if end > reach:
+            total += end - max(begin, reach)
+            reach = end
+    return total * 1000
+
+
 @dataclass
 class _LayerwiseLoad:
     """One step's layer-wise restore shared by the worker and load threads.
@@ -220,6 +231,10 @@ class _LayerwiseLoad:
     # Server-side per-layer copy time, summed and worst layer.
     copy_ms: float = 0.0
     copy_max_ms: float = 0.0
+    # Worker-side time with at least one layer transfer in flight, and time
+    # spent waiting for a lane's decode before reissuing that lane.
+    busy_ms: float = 0.0
+    decode_wait_ms: float = 0.0
     started_at: float = field(default_factory=time.perf_counter)
 
 
@@ -1402,16 +1417,28 @@ class LoadPipeline:
                 end = (plan.source_end + 15) // 16 * 16
                 lane = group % 2
                 return asyncio.create_task(
-                    self._clients[lane].transfer_load_runs(
-                        lane,
-                        pid,
-                        files + begin,
-                        plan.data_offsets - skew,
-                        end - begin,
-                        lease_id,
-                        copy_mode=copy_mode,
+                    timed(
+                        group,
+                        self._clients[lane].transfer_load_runs(
+                            lane,
+                            pid,
+                            files + begin,
+                            plan.data_offsets - skew,
+                            end - begin,
+                            lease_id,
+                            copy_mode=copy_mode,
+                        ),
                     )
                 )
+
+            spans: list[tuple[float, float]] = []
+
+            async def timed(group: int, call: Any) -> dict[str, Any]:
+                begin = time.perf_counter()
+                try:
+                    return await call
+                finally:
+                    spans.append((begin, time.perf_counter()))
 
             copy_mode = os.environ.get(LAYERWISE_COPY_ENV, "gather")
             tasks = [transfer(group) for group in range(min(2, layers))]
@@ -1435,9 +1462,12 @@ class LoadPipeline:
                 if group + 2 < layers:
                     # The next group on this lane overwrites the buffer this
                     # decode reads.
+                    waited = time.perf_counter()
                     await self._wait_for_cuda_event(event)
+                    state.decode_wait_ms += (time.perf_counter() - waited) * 1000
                     tasks.append(transfer(group + 2))
             state.load_ms = (time.perf_counter() - state.started_at) * 1000
+            state.busy_ms = _interval_union_ms(spans)
             final = state.events[layers - 1]
             if final is not None:
                 await self._wait_for_cuda_event(final)
@@ -1471,7 +1501,8 @@ class LoadPipeline:
         """Log one finished layer-wise restore."""
         logger.info(
             "[CONNECTOR] layerwise load req=%s wall_ms=%.3f records=%d bytes=%d "
-            "header_ms=%.3f stall_ms=%.3f copy_ms=%.3f copy_max_ms=%.3f failed=%d",
+            "header_ms=%.3f stall_ms=%.3f copy_ms=%.3f copy_max_ms=%.3f busy_ms=%.3f "
+            "decode_wait_ms=%.3f failed=%d",
             ",".join(sorted(state.req_ids)),
             state.load_ms,
             state.records,
@@ -1480,6 +1511,8 @@ class LoadPipeline:
             state.stall_ms,
             state.copy_ms,
             state.copy_max_ms,
+            state.busy_ms,
+            state.decode_wait_ms,
             int(state.failed),
         )
 
