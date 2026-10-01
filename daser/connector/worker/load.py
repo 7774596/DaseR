@@ -228,6 +228,7 @@ class _InflightRequestLoad:
     active: _InflightLoadBatch | None
     completed: list[_LoadBatchTiming]
     lookahead: _InflightLoadBatch | None = None
+    started_at: float = field(default_factory=time.perf_counter)
 
 
 class LoadPipeline:
@@ -1133,12 +1134,14 @@ class LoadPipeline:
     def _log_request_timing(self, state: _InflightRequestLoad) -> None:
         rows = state.completed
         logger.debug(
-            "[CONNECTOR] load timing req=%s batches=%d bytes=%d copy_runs=%d "
+            "[CONNECTOR] load timing req=%s wall_ms=%.3f batches=%d bytes=%d "
+            "copy_runs=%d "
             "gpu_copies=%d ipc_ms=%.3f dispatcher_wait_ms=%.3f copy_ms=%.3f "
             "worker_sync_ms=%.3f transfer_open_ms=%.3f "
             "transfer_load_ms=%.3f transfer_sync_ms=%.3f l1_hits=%d "
             "l1_misses=%d l2_reads=%d",
             state.request.req_id,
+            (time.perf_counter() - state.started_at) * 1000,
             len(rows),
             sum(row.bytes for row in rows),
             sum(row.copy_runs for row in rows),
