@@ -1444,11 +1444,19 @@ def test_iouring_striped_l2_read_matches_serial_read(tmp_path, monkeypatch) -> N
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
-    tmp_path, monkeypatch, pipeline: bool
+    tmp_path, monkeypatch, pipeline: bool, device: str
 ) -> None:
-    """Pipelined stripe copies place every record byte, even across parts."""
+    """Pipelined stripe copies place every record byte, even across parts.
+
+    The CUDA destination releases each window's borrowed source only after
+    its device event, which must not close the still-unpublished extent.
+    """
+    cupy = pytest.importorskip("cupy") if device == "cuda" else None
+    if cupy is not None and cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
     monkeypatch.setattr(layer_module, "_PACKED_READ_BATCH_BYTES", ALIGNMENT)
     copies: list[int] = []
     original_copy = layer_module.copy_ops.copy_grouped_to_dst
@@ -1482,7 +1490,15 @@ def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
             stripe_pipeline=pipeline,
         )
         try:
-            dst = bytearray(nbytes)
+
+            def new_dst():
+                if cupy is None:
+                    return bytearray(nbytes)
+                return cupy.zeros(nbytes, dtype=cupy.uint8)
+
+            def host(buffer) -> bytes:
+                return bytes(buffer) if cupy is None else cupy.asnumpy(buffer).tobytes()
+
             spans = [
                 {
                     "target_offset": target * ALIGNMENT,
@@ -1491,14 +1507,16 @@ def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
                 }
                 for start, size, target in records
             ]
+            dst = new_dst()
             assert await layer.load_bytes_grouped(dst, spans) == nbytes
+            loaded = host(dst)
             for start, size, target in records:
                 src = payload[start * ALIGNMENT : (start + size) * ALIGNMENT]
-                assert dst[target * ALIGNMENT : (target + size) * ALIGNMENT] == src
+                assert loaded[target * ALIGNMENT : (target + size) * ALIGNMENT] == src
             # Reload from L1 to confirm the promoted extent stayed intact.
-            again = bytearray(nbytes)
+            again = new_dst()
             assert await layer.load_bytes_grouped(again, spans) == nbytes
-            assert again == dst
+            assert host(again) == loaded
         finally:
             await layer.drain()
             layer.close()

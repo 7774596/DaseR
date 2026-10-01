@@ -1831,6 +1831,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         stripe_parts = {}
         pipelined: set[asyncio.Future[int]] = set()
         copied: dict[asyncio.Future[int], list[tuple[int, int]]] = {}
+        retained: list[PinnedMemorySlice] = []
 
         def submit_queued() -> None:
             if not queued:
@@ -1922,6 +1923,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                     )
                     batch_jobs.extend(parts)
                     if self._stripe_pipeline and dst is not None:
+                        # Window copies borrow and release the unpublished
+                        # slice; hold one reference for the whole read so the
+                        # first finished DMA cannot close it before promotion.
+                        existing = self._leased_slices.get(id(pinned))
+                        self._leased_slices[id(pinned)] = (
+                            pinned,
+                            1 if existing is None else existing[1] + 1,
+                        )
+                        retained.append(pinned)
                         pipelined.add(future)
                         copied[future] = []
                         for part_future, (offset, size) in zip(
@@ -2114,6 +2124,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                     await _drain_destination_copies(copy_futures)
             finally:
                 async with self._lock:
+                    # Drop the pipelined-read references without closing: the
+                    # residency check below decides which buffers to close.
+                    for pinned in retained:
+                        data, count = self._leased_slices[id(pinned)]
+                        if count > 1:
+                            self._leased_slices[id(pinned)] = (data, count - 1)
+                        else:
+                            del self._leased_slices[id(pinned)]
                     live_buffers = self._l1.resident_slice_ids() | set(
                         self._leased_slices
                     )
