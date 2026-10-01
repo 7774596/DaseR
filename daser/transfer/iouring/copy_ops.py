@@ -9,6 +9,7 @@ as long as the caller owns the buffers passed in.
 """
 
 # Standard
+import ctypes
 from typing import Any
 
 # First Party
@@ -90,6 +91,87 @@ def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, 
             raise TypeError("grouped CUDA copy target lost CUDA array interface")
         runs.append((dst_ptr, source_ptr, nbytes))
     return runs
+
+
+#: Per-run copy modes for ``copy_pointer_runs_to_cuda_dst``.
+COPY_MODE_GATHER = "gather"
+COPY_MODE_MEMCPY = "memcpy"
+COPY_MODE_BATCH = "batch"
+COPY_MODES = (COPY_MODE_GATHER, COPY_MODE_MEMCPY, COPY_MODE_BATCH)
+#: ``cudaMemcpySrcAccessOrderStream``: sources are read in stream order.
+_SRC_ACCESS_ORDER_STREAM = 1
+
+
+class _MemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _MemcpyAttributes(ctypes.Structure):
+    _fields_ = [
+        ("src_access_order", ctypes.c_int),
+        ("src_loc_hint", _MemLocation),
+        ("dst_loc_hint", _MemLocation),
+        ("flags", ctypes.c_uint),
+    ]
+
+
+_memcpy_batch: Any = None
+
+
+def _batch_memcpy_fn() -> Any:
+    """Return ``cudaMemcpyBatchAsync`` from the process CUDA runtime.
+
+    CuPy and torch already load ``libcudart.so.12``, so this binds the same
+    runtime instead of a second copy. Requires CUDA 12.8+.
+    """
+    global _memcpy_batch
+    if _memcpy_batch is None:
+        fn = ctypes.CDLL("libcudart.so.12").cudaMemcpyBatchAsync
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p] * 3 + [
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        _memcpy_batch = fn
+    return _memcpy_batch
+
+
+def _launch_memcpy_batch(
+    dst_ptrs: Any, src_ptrs: Any, sizes: Any, stream_ptr: int
+) -> None:
+    """Queue every run as one ``cudaMemcpyBatchAsync`` on the copy engines.
+
+    One call replaces a Python loop of ``cudaMemcpyAsync`` launches, so the
+    submitting thread spends O(1) instead of O(runs) per group. The stream
+    must not be the legacy default stream.
+    """
+    import numpy
+
+    dsts = numpy.ascontiguousarray(dst_ptrs, dtype=numpy.uint64)
+    srcs = numpy.ascontiguousarray(src_ptrs, dtype=numpy.uint64)
+    lengths = numpy.ascontiguousarray(sizes, dtype=numpy.uint64)
+    attrs = _MemcpyAttributes(src_access_order=_SRC_ACCESS_ORDER_STREAM)
+    attrs_index = ctypes.c_size_t(0)
+    fail_index = ctypes.c_size_t(0)
+    err = _batch_memcpy_fn()(
+        dsts.ctypes.data,
+        srcs.ctypes.data,
+        lengths.ctypes.data,
+        len(lengths),
+        ctypes.addressof(attrs),
+        ctypes.addressof(attrs_index),
+        1,
+        ctypes.byref(fail_index),
+        stream_ptr,
+    )
+    if err:
+        raise RuntimeError(
+            f"cudaMemcpyBatchAsync failed with error {err} at run {fail_index.value}"
+        )
 
 
 def _launch_gather(meta: Any, stream_ptr: int) -> None:
@@ -212,6 +294,7 @@ def copy_pointer_runs_to_cuda_dst(
     source_ptrs: Any,
     nbytes: Any,
     gather_min_runs: int = 0,
+    copy_mode: str = COPY_MODE_GATHER,
 ) -> Any:
     """Queue host-pointer runs into a flat CUDA byte destination.
 
@@ -223,6 +306,13 @@ def copy_pointer_runs_to_cuda_dst(
         nbytes: ``int64`` array of run lengths.
         gather_min_runs: Use one zero-copy gather launch when at least this
             many runs are given and all are 16-byte aligned (0 disables).
+        copy_mode: ``gather`` applies ``gather_min_runs``; ``memcpy`` issues
+            one copy-engine ``cudaMemcpyAsync`` per run; ``batch`` submits
+            every run in one copy-engine ``cudaMemcpyBatchAsync`` (falls back
+            to ``memcpy`` on the legacy default stream).
+
+    Raises:
+        ValueError: If the runs are malformed or the copy mode is unknown.
 
     Returns:
         A CUDA event recorded on the destination stream after the copies.
@@ -241,6 +331,8 @@ def copy_pointer_runs_to_cuda_dst(
     sizes = numpy.asarray(nbytes, dtype=numpy.int64)
     if not (len(targets) == len(sources) == len(sizes)) or not len(targets):
         raise ValueError("pointer runs must be nonempty and of equal length")
+    if copy_mode not in COPY_MODES:
+        raise ValueError(f"unknown copy mode: {copy_mode}")
     end = int((targets + sizes).max())
     whole = slice_dst(dst, 0, end)
     base_ptr = cuda_array_ptr(whole)
@@ -253,11 +345,18 @@ def copy_pointer_runs_to_cuda_dst(
             numpy.bitwise_or.reduce(dst_ptrs | sources | sizes.astype(numpy.uint64))
             % 16
         )
-        if gather_min_runs and len(sizes) >= gather_min_runs and aligned:
+        if (
+            copy_mode == COPY_MODE_GATHER
+            and gather_min_runs
+            and len(sizes) >= gather_min_runs
+            and aligned
+        ):
             _launch_gather(
                 numpy.stack([dst_ptrs, sources, sizes.astype(numpy.uint64)]),
                 stream_ptr,
             )
+        elif copy_mode == COPY_MODE_BATCH and stream_ptr:
+            _launch_memcpy_batch(dst_ptrs, sources, sizes, stream_ptr)
         else:
             for d, s, n in zip(
                 dst_ptrs.tolist(), sources.tolist(), sizes.tolist(), strict=True

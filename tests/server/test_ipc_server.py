@@ -2597,7 +2597,7 @@ class _RunsTransfer(TransferLayer):
     """Transfer double recording leased run tables."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[Any, list[int], list[int], list[int], str, bool]] = []
+        self.calls: list[tuple[Any, list[int], list[int], list[int], str, str]] = []
 
     async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
         return nbytes
@@ -2620,7 +2620,7 @@ class _RunsTransfer(TransferLayer):
         nbytes: Any,
         lease_id: str,
         *,
-        gather: bool = True,
+        copy_mode: str = "gather",
     ) -> int:
         self.calls.append(
             (
@@ -2629,7 +2629,7 @@ class _RunsTransfer(TransferLayer):
                 list(target_offsets),
                 list(nbytes),
                 lease_id,
-                gather,
+                copy_mode,
             )
         )
         return int(sum(nbytes))
@@ -2671,16 +2671,16 @@ async def test_transfer_load_runs_decodes_run_table_into_registered_buffer(
             "payload": {"load_staging_buffer_index": 1, "producer_pid": 7},
             "lease_id": "req",
             "runs": runs.tobytes(),
-            "gather": False,
+            "copy_mode": "batch",
         }
     )
 
     assert response["ok"] is True
     assert response["bytes"] == 1536
-    # Gather stays the default; a request can force copy-engine memcpy.
+    # Gather stays the default; a request can pick copy-engine runs.
     assert transfer.calls == [
-        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", True),
-        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", False),
+        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", "gather"),
+        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", "batch"),
     ]
 
 

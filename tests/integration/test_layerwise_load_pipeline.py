@@ -102,10 +102,10 @@ class _FakeLoadClient:
         nbytes: Any,
         lease_id: str,
         *,
-        gather: bool = True,
+        copy_mode: str = "gather",
     ) -> dict[str, Any]:
         """Copy runs into the staging buffer like the server's L1 path."""
-        del producer_pid, gather
+        del producer_pid, copy_mode
         assert lease_id == "req"
         calls = type(self).calls
         calls.append(buffer_index)

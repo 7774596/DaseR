@@ -1728,7 +1728,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         nbytes: Any,
         lease_id: str,
         *,
-        gather: bool = True,
+        copy_mode: str = "gather",
     ) -> int:
         """Copy many leased L1 runs with one vectorized resolution.
 
@@ -1744,9 +1744,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             target_offsets: ``int64`` array of destination offsets.
             nbytes: ``int64`` array of run lengths.
             lease_id: Request lease retaining every run.
-            gather: Allow the configured gather kernel; False forces
-                copy-engine memcpy runs, which do not compete with a
-                concurrent forward pass for SMs.
+            copy_mode: ``gather`` uses the configured gather kernel;
+                ``memcpy`` and ``batch`` keep the copies on the copy engines,
+                so they do not compete with a concurrent forward pass for
+                SMs.
 
         Returns:
             Bytes copied, after the copies completed on the device.
@@ -1803,7 +1804,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                     target_offsets,
                     sources,
                     sizes,
-                    self._gather_min_runs if gather else 0,
+                    self._gather_min_runs,
+                    copy_mode,
                 )
             except BaseException:
                 lease.active_loads -= 1

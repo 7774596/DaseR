@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import itertools
 import os
 import threading
 import time
@@ -183,6 +184,23 @@ class FailingL2ReadCompletionProbe(TieredIOUringTransferLayer):
             self.read_started.set()
             self.release_read.wait(timeout=5.0)
         raise IOError("synthetic L2 read failure")
+
+
+class StreamDestination:
+    """CUDA destination that owns a private copy stream, like staging IPC."""
+
+    def __init__(self, array: object, stream: object) -> None:
+        self.array = array
+        self.stream = stream
+
+    def __getitem__(self, item: object) -> object:
+        """Return a CuPy slice of the destination."""
+        return self.array[item]
+
+    @property
+    def copy_stream_ptr(self) -> int:
+        """Return the non-default stream the copies are queued on."""
+        return int(self.stream.ptr)
 
 
 def _run(coro: object) -> object:
@@ -1964,11 +1982,17 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
             targets = order * 2048 + 16
             dst = cupy.zeros(records * 2048, dtype=cupy.uint8)
             sizes = np.full(records, size, dtype=np.int64)
-            for gather in (True, False):
+            # Stream zero exercises the batch fallback; a private stream the
+            # real cudaMemcpyBatchAsync submission.
+            streamed = StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
+            for target, copy_mode in itertools.product(
+                (dst, streamed), ("gather", "memcpy", "batch")
+            ):
                 dst.fill(0)
                 copied = await layer.load_leased_runs(
-                    dst, files, targets, sizes, "runs", gather=gather
+                    target, files, targets, sizes, "runs", copy_mode=copy_mode
                 )
+                streamed.stream.synchronize()
                 assert copied == records * size
                 result = cupy.asnumpy(dst).tobytes()
                 for i, slot in enumerate(order.tolist()):

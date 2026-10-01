@@ -1361,8 +1361,8 @@ class IPCServer:
 
         Args:
             msg: IPC request with ``payload`` (registered staging buffer),
-                ``lease_id``, ``runs`` bytes and optional ``gather`` (default
-                True; False forces copy-engine memcpy runs).
+                ``lease_id``, ``runs`` bytes and optional ``copy_mode``
+                (``gather`` default, ``memcpy`` or ``batch``).
 
         Returns:
             ``{"ok": True, "bytes": n, "transfer_ms": ms}`` once the copies
@@ -1396,7 +1396,7 @@ class IPCServer:
             runs[1],
             runs[2],
             lease_id,
-            gather=bool(msg.get("gather", True)),
+            copy_mode=str(msg.get("copy_mode", "gather")),
         )
         elapsed_s = time.perf_counter() - started
         self._record_transfer_metrics(

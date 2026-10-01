@@ -1409,11 +1409,11 @@ class LoadPipeline:
                         plan.data_offsets - skew,
                         end - begin,
                         lease_id,
-                        gather=gather,
+                        copy_mode=copy_mode,
                     )
                 )
 
-            gather = os.environ.get(LAYERWISE_COPY_ENV, "gather") != "memcpy"
+            copy_mode = os.environ.get(LAYERWISE_COPY_ENV, "gather")
             tasks = [transfer(group) for group in range(min(2, layers))]
             for group in range(layers):
                 response = await tasks[group]
