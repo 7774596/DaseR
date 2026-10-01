@@ -53,6 +53,19 @@ def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, 
                 merged[-1] = (prev_target, prev_source, prev_nbytes + nbytes)
                 continue
         merged.append((target_offset, source_ptr, nbytes))
+    end = max(target + nbytes for target, _source, nbytes in merged)
+    whole = slice_dst(dst, 0, end)
+    base_ptr = cuda_array_ptr(whole)
+    if (
+        base_ptr is not None
+        and getattr(whole, "ndim", 0) == 1
+        and getattr(whole, "itemsize", 0) == 1
+        and getattr(getattr(whole, "flags", None), "c_contiguous", False)
+        and int(whole.size) >= end
+    ):
+        # A flat byte array: offsets are pointer arithmetic, so a copy with
+        # thousands of runs does not build one CuPy view per run.
+        return [(base_ptr + target, source, n) for target, source, n in merged]
     runs = []
     for target_offset, source_ptr, nbytes in merged:
         dst_ptr = cuda_array_ptr(slice_dst(dst, target_offset, nbytes))
