@@ -1361,7 +1361,8 @@ class IPCServer:
 
         Args:
             msg: IPC request with ``payload`` (registered staging buffer),
-                ``lease_id`` and ``runs`` bytes.
+                ``lease_id``, ``runs`` bytes and optional ``gather`` (default
+                True; False forces copy-engine memcpy runs).
 
         Returns:
             ``{"ok": True, "bytes": n, "transfer_ms": ms}`` once the copies
@@ -1390,7 +1391,12 @@ class IPCServer:
             raise ValueError("transfer_load_runs runs must be (3, n) int64 bytes")
         runs = numpy.frombuffer(packed, dtype=numpy.int64).reshape(3, -1)
         total = await self._ensure_transfer().load_leased_runs(
-            self._payload_buffer(payload), runs[0], runs[1], runs[2], lease_id
+            self._payload_buffer(payload),
+            runs[0],
+            runs[1],
+            runs[2],
+            lease_id,
+            gather=bool(msg.get("gather", True)),
         )
         elapsed_s = time.perf_counter() - started
         self._record_transfer_metrics(

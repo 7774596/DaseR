@@ -516,6 +516,7 @@ async def test_async_client_packs_leased_runs_as_one_table(
         target_offsets=[0, 32],
         nbytes=[16, 32],
         lease_id="request-runs",
+        gather=False,
     )
 
     assert response == {"ok": True, "bytes": 48}
@@ -525,6 +526,7 @@ async def test_async_client_packs_leased_runs_as_one_table(
             "payload": {"load_staging_buffer_index": 1, "producer_pid": 43},
             "lease_id": "request-runs",
             "runs": array.array("q", [4096, 8192, 0, 32, 16, 32]).tobytes(),
+            "gather": False,
         }
     ]
 

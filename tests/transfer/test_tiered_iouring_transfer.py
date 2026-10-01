@@ -1964,14 +1964,18 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
             targets = order * 2048 + 16
             dst = cupy.zeros(records * 2048, dtype=cupy.uint8)
             sizes = np.full(records, size, dtype=np.int64)
-            copied = await layer.load_leased_runs(dst, files, targets, sizes, "runs")
-            assert copied == records * size
-            result = cupy.asnumpy(dst).tobytes()
-            for i, slot in enumerate(order.tolist()):
-                start = slot * 2048 + 16
-                assert result[start : start + size] == bytes(
-                    payloads[i][begin : begin + size]
+            for gather in (True, False):
+                dst.fill(0)
+                copied = await layer.load_leased_runs(
+                    dst, files, targets, sizes, "runs", gather=gather
                 )
+                assert copied == records * size
+                result = cupy.asnumpy(dst).tobytes()
+                for i, slot in enumerate(order.tolist()):
+                    start = slot * 2048 + 16
+                    assert result[start : start + size] == bytes(
+                        payloads[i][begin : begin + size]
+                    )
             with pytest.raises(KeyError):
                 await layer.load_leased_runs(
                     dst,

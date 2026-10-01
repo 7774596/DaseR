@@ -19,7 +19,11 @@ import torch
 
 from daser.compression.format import IO_ALIGNMENT
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
-from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_RAW
+from daser.config import (
+    LAYERWISE_COPY_ENV,
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_RAW,
+)
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqLoadSpec
@@ -213,6 +217,9 @@ class _LayerwiseLoad:
     header_ms: float = 0.0
     load_ms: float = 0.0
     stall_ms: float = 0.0
+    # Server-side per-layer copy time, summed and worst layer.
+    copy_ms: float = 0.0
+    copy_max_ms: float = 0.0
     started_at: float = field(default_factory=time.perf_counter)
 
 
@@ -1402,13 +1409,18 @@ class LoadPipeline:
                         plan.data_offsets - skew,
                         end - begin,
                         lease_id,
+                        gather=gather,
                     )
                 )
 
+            gather = os.environ.get(LAYERWISE_COPY_ENV, "gather") != "memcpy"
             tasks = [transfer(group) for group in range(min(2, layers))]
             for group in range(layers):
                 response = await tasks[group]
                 state.nbytes += int(response.get("bytes", 0))
+                copy_ms = float(response.get("transfer_ms", 0.0))
+                state.copy_ms += copy_ms
+                state.copy_max_ms = max(state.copy_max_ms, copy_ms)
                 lane = group % 2
                 first, last = int(bounds[group]), int(bounds[group + 1])
                 with torch.cuda.stream(stream):
@@ -1459,13 +1471,15 @@ class LoadPipeline:
         """Log one finished layer-wise restore."""
         logger.info(
             "[CONNECTOR] layerwise load req=%s wall_ms=%.3f records=%d bytes=%d "
-            "header_ms=%.3f stall_ms=%.3f failed=%d",
+            "header_ms=%.3f stall_ms=%.3f copy_ms=%.3f copy_max_ms=%.3f failed=%d",
             ",".join(sorted(state.req_ids)),
             state.load_ms,
             state.records,
             state.nbytes,
             state.header_ms,
             state.stall_ms,
+            state.copy_ms,
+            state.copy_max_ms,
             int(state.failed),
         )
 

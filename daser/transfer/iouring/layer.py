@@ -1727,6 +1727,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
+        *,
+        gather: bool = True,
     ) -> int:
         """Copy many leased L1 runs with one vectorized resolution.
 
@@ -1742,6 +1744,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             target_offsets: ``int64`` array of destination offsets.
             nbytes: ``int64`` array of run lengths.
             lease_id: Request lease retaining every run.
+            gather: Allow the configured gather kernel; False forces
+                copy-engine memcpy runs, which do not compete with a
+                concurrent forward pass for SMs.
 
         Returns:
             Bytes copied, after the copies completed on the device.
@@ -1794,7 +1799,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             lease.active_loads += 1
             try:
                 event = copy_ops.copy_pointer_runs_to_cuda_dst(
-                    dst, target_offsets, sources, sizes, self._gather_min_runs
+                    dst,
+                    target_offsets,
+                    sources,
+                    sizes,
+                    self._gather_min_runs if gather else 0,
                 )
             except BaseException:
                 lease.active_loads -= 1

@@ -44,6 +44,10 @@ LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
+#: Research switch: copy engine (``memcpy``) instead of the SM gather kernel
+#: (``gather``, default) for layer-wise ``transfer_load_runs`` copies, which
+#: run while the forward pass occupies the SMs.
+LAYERWISE_COPY_ENV = "DASER_LAYERWISE_COPY"
 
 
 @dataclass(frozen=True)
