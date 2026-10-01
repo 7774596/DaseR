@@ -1461,9 +1461,9 @@ def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
     copies: list[int] = []
     original_copy = layer_module.copy_ops.copy_grouped_to_dst
 
-    def counting_copy(dst, chunks) -> None:
+    def counting_copy(dst, chunks, gather_min_runs=0) -> None:
         copies.append(len(chunks))
-        original_copy(dst, chunks)
+        original_copy(dst, chunks, gather_min_runs)
 
     monkeypatch.setattr(layer_module.copy_ops, "copy_grouped_to_dst", counting_copy)
     blocks = 6

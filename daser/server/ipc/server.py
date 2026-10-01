@@ -13,6 +13,7 @@ from typing import Any
 
 from daser.config import (
     EXCLUSIVE_TIERS_ENV,
+    GATHER_MIN_RUNS_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
@@ -1661,6 +1662,7 @@ class IPCServer:
                     readahead_window=int(
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
+                    gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

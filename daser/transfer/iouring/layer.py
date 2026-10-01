@@ -647,6 +647,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             them. The SSD queue depth then no longer depends on how many
             worker staging buffers are in flight. 0 disables readahead.
         readahead_window: Read groups in flight per readahead.
+        gather_min_runs: Research switch. When positive, an L1-to-CUDA copy
+            with at least this many discontiguous runs is issued as one
+            zero-copy gather kernel instead of one ``cudaMemcpyAsync`` per run,
+            so small scattered pieces still reach PCIe bandwidth. 0 disables.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -671,7 +675,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         stripe_pipeline: bool = False,
         readahead_piece_bytes: int = 0,
         readahead_window: int = 4,
+        gather_min_runs: int = 0,
     ) -> None:
+        if gather_min_runs < 0:
+            raise ValueError("gather_min_runs must be >= 0")
         if readahead_piece_bytes < 0 or readahead_window <= 0:
             raise ValueError(
                 "readahead_piece_bytes must be >= 0 and readahead_window > 0"
@@ -707,6 +714,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stripe_pipeline = bool(stripe_pipeline)
         self._readahead_piece = 0 if skip_l2 else readahead_piece_bytes
         self._readahead_window = readahead_window
+        self._gather_min_runs = gather_min_runs
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
@@ -744,7 +752,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
             "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
-            "stripe_pipeline=%s readahead_piece=%d readahead_window=%d",
+            "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
+            "gather_min_runs=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -759,6 +768,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._stripe_pipeline,
             self._readahead_piece,
             self._readahead_window,
+            self._gather_min_runs,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -2499,7 +2509,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         error: BaseException | None = None
         try:
-            copy_ops.copy_grouped_to_dst(dst, chunks)
+            copy_ops.copy_grouped_to_dst(dst, chunks, self._gather_min_runs)
         except BaseException as exc:
             error = exc
         finally:

@@ -17,6 +17,77 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 #: One grouped copy chunk: (target_offset, source_slice, source_offset, nbytes).
 CopyChunk = tuple[int, PinnedMemorySlice, int, int]
 
+#: Zero-copy gather: each thread block copies whole pieces with 16-byte loads
+#: straight from pinned host memory, so small scattered pieces reach PCIe
+#: bandwidth where one cudaMemcpyAsync per piece is launch-bound.
+_GATHER_SOURCE = r"""
+extern "C" __global__ void daser_gather16(
+    const unsigned long long* src, const unsigned long long* dst,
+    const unsigned long long* nbytes, int count) {
+  for (int piece = blockIdx.x; piece < count; piece += gridDim.x) {
+    const uint4* s = (const uint4*)src[piece];
+    uint4* d = (uint4*)dst[piece];
+    unsigned long long n = nbytes[piece] / 16;
+    for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
+  }
+}
+"""
+_GATHER_BLOCKS = 1056
+_GATHER_THREADS = 512
+_gather_kernel: Any = None
+
+
+def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, int]]:
+    """Return ``(dst_ptr, src_ptr, nbytes)`` runs with adjacent chunks merged."""
+    merged: list[tuple[int, int, int]] = []
+    for target_offset, data, source_offset, nbytes in sorted(
+        chunks, key=lambda item: item[0]
+    ):
+        source_ptr = data.ptr_at(source_offset)
+        if merged:
+            prev_target, prev_source, prev_nbytes = merged[-1]
+            if (
+                target_offset == prev_target + prev_nbytes
+                and source_ptr == prev_source + prev_nbytes
+            ):
+                merged[-1] = (prev_target, prev_source, prev_nbytes + nbytes)
+                continue
+        merged.append((target_offset, source_ptr, nbytes))
+    runs = []
+    for target_offset, source_ptr, nbytes in merged:
+        dst_ptr = cuda_array_ptr(slice_dst(dst, target_offset, nbytes))
+        if dst_ptr is None:
+            raise TypeError("grouped CUDA copy target lost CUDA array interface")
+        runs.append((dst_ptr, source_ptr, nbytes))
+    return runs
+
+
+def _launch_gather(runs: list[tuple[int, int, int]], stream_ptr: int) -> None:
+    """Queue one zero-copy gather kernel for 16-byte-aligned runs.
+
+    Must run under the destination's ``cupy.cuda.Device`` context.
+    """
+    global _gather_kernel
+    import cupy
+    import numpy
+
+    if _gather_kernel is None:
+        _gather_kernel = cupy.RawKernel(_GATHER_SOURCE, "daser_gather16")
+    meta = numpy.array(runs, dtype=numpy.uint64).T.copy()
+    stream = cupy.cuda.ExternalStream(stream_ptr)
+    with stream:
+        device_meta = cupy.asarray(meta)
+        _gather_kernel(
+            (min(_GATHER_BLOCKS, len(runs)),),
+            (_GATHER_THREADS,),
+            (
+                device_meta[1],
+                device_meta[0],
+                device_meta[2],
+                numpy.int32(len(runs)),
+            ),
+        )
+
 
 def destination_copy_event(dst: Any, chunks: list[CopyChunk]) -> Any | None:
     """Create an unrecorded event for a CUDA destination copy, or return None.
@@ -186,60 +257,62 @@ def coalesce_copy_chunks(chunks: list[CopyChunk]) -> list[CopyChunk]:
     return merged
 
 
-def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> None:
+def copy_grouped_to_cuda_dst(
+    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
+) -> int:
     """Copy grouped pinned ranges into a CUDA destination.
 
     Args:
         dst: CuPy ndarray destination.
         chunks: grouped copy chunks from the L1 tier.
+        gather_min_runs: Use one zero-copy gather kernel instead of one
+            ``cudaMemcpyAsync`` per run when at least this many merged runs
+            remain and every run is 16-byte aligned (0 disables).
+
+    Returns:
+        Number of merged runs copied.
+
+    Async/thread-safety:
+        Work is queued on the destination's copy stream. Gather metadata is a
+        stream-ordered CuPy allocation, so it stays valid until the kernel runs.
     """
     import cupy
     from cupy.cuda import runtime
 
-    ordered = sorted(chunks, key=lambda item: item[0])
-    merged: list[tuple[int, int, int]] = []
-    for target_offset, data, source_offset, nbytes in ordered:
-        source_ptr = data.ptr_at(source_offset)
-        if not merged:
-            merged.append((target_offset, source_ptr, nbytes))
-            continue
-        prev_target, prev_source, prev_nbytes = merged[-1]
-        if (
-            target_offset == prev_target + prev_nbytes
-            and source_ptr == prev_source + prev_nbytes
-        ):
-            merged[-1] = (prev_target, prev_source, prev_nbytes + nbytes)
-            continue
-        merged.append((target_offset, source_ptr, nbytes))
-
+    runs = _merge_cuda_runs(dst, chunks)
     stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
-    for target_offset, source_ptr, nbytes in merged:
-        target = slice_dst(dst, target_offset, nbytes)
-        dst_ptr = cuda_array_ptr(target)
-        if dst_ptr is None:
-            raise TypeError("grouped CUDA copy target lost CUDA array interface")
-        with cupy.cuda.Device(int(target.device.id)):
+    device_id = int(slice_dst(dst, 0, 0).device.id)
+    with cupy.cuda.Device(device_id):
+        if (
+            gather_min_runs
+            and len(runs) >= gather_min_runs
+            and all(not (d | s | n) % 16 for d, s, n in runs)
+        ):
+            _launch_gather(runs, stream_ptr)
+            return len(runs)
+        for dst_ptr, source_ptr, nbytes in runs:
             runtime.memcpyAsync(
-                dst_ptr,
-                source_ptr,
-                nbytes,
-                runtime.memcpyHostToDevice,
-                stream_ptr,
+                dst_ptr, source_ptr, nbytes, runtime.memcpyHostToDevice, stream_ptr
             )
+    return len(runs)
 
 
-def copy_grouped_to_dst(dst: Any, chunks: list[CopyChunk]) -> None:
+def copy_grouped_to_dst(
+    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
+) -> None:
     """Copy source chunks into the destination without staging repacks.
 
     Args:
         dst: writable buffer or CuPy ndarray destination.
         chunks: grouped copy chunks from the L1 tier.
+        gather_min_runs: CUDA destinations only; see
+            ``copy_grouped_to_cuda_dst``.
     """
     if not chunks:
         return
     first_target = slice_dst(dst, chunks[0][0], chunks[0][3])
     if cuda_array_ptr(first_target) is not None:
-        copy_grouped_to_cuda_dst(dst, chunks)
+        copy_grouped_to_cuda_dst(dst, chunks, gather_min_runs)
         return
 
     for target_offset, data, source_offset, nbytes in coalesce_copy_chunks(chunks):
