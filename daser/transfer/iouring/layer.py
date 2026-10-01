@@ -867,6 +867,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 if leased:
                     self._stats.l1_hits += len(leased)
+                    self._stats.readahead_served_bytes += sum(
+                        chunk[3] for chunk in leased
+                    )
                     merged_l1.extend(leased)
                 l1_hits = []
                 span_misses = []
@@ -3032,7 +3035,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 async with window:
                     if lease_id in self._request_leases:
                         await self._load_l2_miss_batch(None, group, lease_id=lease_id)
-                        read_bytes += sum(int(miss["nbytes"]) for miss in group)
+                        group_bytes = sum(int(miss["nbytes"]) for miss in group)
+                        read_bytes += group_bytes
+                        self._stats.readahead_read_bytes += group_bytes
             except Exception as exc:  # noqa: BLE001
                 # A dropped lease or a stale range only costs the readahead:
                 # the waiting load re-resolves through the normal path.
@@ -3111,6 +3116,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         to the released lease; their reads are closed by the normal cleanup.
         """
         self._readaheads.pop(lease_id, None)
+        lease = self._request_leases.get(lease_id)
+        if lease is not None:
+            self._stats.readahead_dropped_bytes += sum(hit.nbytes for hit in lease.hits)
         self._release_request_lease_locked(lease_id, force=True)
 
     def _prune_readaheads_locked(self) -> None:

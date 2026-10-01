@@ -23,6 +23,10 @@ class TransferStats:
         prefetch_requests: number of host-tier prefetch operations.
         prefetch_l1_bytes: requested bytes already resident in L1.
         prefetch_l2_bytes: requested bytes read from L2.
+        readahead_read_bytes: bytes read from L2 by lookup readahead.
+        readahead_served_bytes: load bytes served from readahead leases.
+        readahead_dropped_bytes: readahead bytes released before any load
+            used them (overlapping store or budget reclaim).
     """
 
     l1_hits: int = 0
@@ -34,6 +38,9 @@ class TransferStats:
     prefetch_requests: int = 0
     prefetch_l1_bytes: int = 0
     prefetch_l2_bytes: int = 0
+    readahead_read_bytes: int = 0
+    readahead_served_bytes: int = 0
+    readahead_dropped_bytes: int = 0
 
 
 @dataclass(frozen=True)

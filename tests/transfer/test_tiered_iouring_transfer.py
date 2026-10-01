@@ -1588,6 +1588,9 @@ def test_iouring_readahead_serves_load_and_releases_lease(
             await layer.drain()
             # Four 2-block readahead groups and no fallback L2 reads.
             assert layer.stats.l2_reads == 4
+            assert layer.stats.readahead_read_bytes == nbytes
+            assert layer.stats.readahead_served_bytes == nbytes
+            assert layer.stats.readahead_dropped_bytes == 0
             await asyncio.wait_for(
                 layer.store_bytes(bytes(_block(b"z")), 0, ALIGNMENT), timeout=5
             )
@@ -1621,6 +1624,7 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
             assert bytes(dst) == payload
             # One readahead read for the first half, one fallback read.
             assert layer.stats.l2_reads == 2
+            assert layer.stats.readahead_served_bytes == half
 
             # An unconsumed readahead must not block an overlapping store.
             assert await layer.start_readahead(
@@ -1630,6 +1634,10 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
             await asyncio.wait_for(
                 layer.store_bytes(bytes(_block(b"z")), half, ALIGNMENT), timeout=5
             )
+            # The fallback load promoted that block, so the second readahead
+            # attached it from L1 without reading L2; the store dropped it.
+            assert layer.stats.readahead_read_bytes == half
+            assert layer.stats.readahead_dropped_bytes == ALIGNMENT
             check = bytearray(ALIGNMENT)
             await layer.load_bytes_grouped(
                 check, [{"target_offset": 0, "file_offset": half, "nbytes": ALIGNMENT}]

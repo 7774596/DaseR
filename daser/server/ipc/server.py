@@ -385,6 +385,7 @@ class IPCServer:
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
+        self._prev_readahead_bytes: dict[str, int] = {}
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -1554,6 +1555,18 @@ class IPCServer:
                 "Finish-admission held-range outcomes.",
             ).inc(held_evicts, labels={"outcome": "l1_evicted"})
         self._prev_held_evict_persists = stats.held_evict_persists
+        for outcome, current in (
+            ("read", stats.readahead_read_bytes),
+            ("served", stats.readahead_served_bytes),
+            ("dropped", stats.readahead_dropped_bytes),
+        ):
+            delta = current - self._prev_readahead_bytes.get(outcome, 0)
+            if delta > 0:
+                self._metrics.counter(
+                    "daser_readahead_bytes_total",
+                    "Lookup readahead bytes by outcome.",
+                ).inc(delta, labels={"outcome": outcome})
+            self._prev_readahead_bytes[outcome] = current
         prev_hits = getattr(self, "_prev_l1_hits", 0)
         prev_misses = getattr(self, "_prev_l1_misses", 0)
         prev_l2_reads = getattr(self, "_prev_l2_reads", 0)
