@@ -754,6 +754,8 @@ class PreparedKVRestore:
         codebooks: Fixed device codebooks.
         destination: Registered KV tensor in the kernel's bitwise view.
         stream: Stream on which metadata was uploaded and kernels will launch.
+        plane_range: ``(first, count)`` layer/K-or-V planes to decode; the
+            default ``None`` decodes every plane.
 
     Async/thread-safety:
         The load thread exclusively owns this plan and its metadata ring. The
@@ -774,6 +776,7 @@ class PreparedKVRestore:
         codebooks: torch.Tensor,
         destination: torch.Tensor,
         stream: torch.cuda.Stream,
+        plane_range: tuple[int, int] | None = None,
     ) -> None:
         self._kernel = kernel
         self._staging = staging
@@ -784,6 +787,8 @@ class PreparedKVRestore:
         self._codebooks = codebooks
         self._destination = destination
         self._stream = stream
+        # Destination bits are [blocks, layers, rows, K/V, dim].
+        self._plane_range = plane_range or (0, 2 * destination.shape[1])
         self._submitted = False
 
     @property
@@ -812,9 +817,7 @@ class PreparedKVRestore:
                 self._modes,
                 self._codebooks,
                 self._destination,
-                0,
-                # Destination bits are [blocks, layers, rows, K/V, dim].
-                2 * self._destination.shape[1],
+                *self._plane_range,
             )
         return self._offsets.numel()
 
@@ -934,6 +937,7 @@ class FusedCompressedKVDecoder:
         modes: list[int],
         buffer_index: int,
         stream: torch.cuda.Stream,
+        plane_range: tuple[int, int] | None = None,
     ) -> PreparedKVRestore | None:
         """Validate and upload restore metadata without launching the decoder.
 
@@ -944,6 +948,11 @@ class FusedCompressedKVDecoder:
             modes: Matching zero/raw or one/packed record modes.
             buffer_index: Exclusively leased staging/metadata ring index.
             stream: Stream ordered after transfer completion.
+            plane_range: Optional ``(first, count)`` planes to decode. Packed
+                records may then be layer-major staged (see
+                ``daser.compression.layer_major``): only the header and the
+                planes in range need to be present. Raw records require the
+                full range.
         Returns:
             Restore plan sharing the original buffers, or None for empty input.
         Raises:
@@ -973,6 +982,12 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed restore destination blocks must be distinct")
         if any(mode not in (0, 1) for mode in modes):
             raise ValueError("compressed restore slot mode is invalid")
+        if plane_range is not None:
+            first, count = plane_range
+            if first < 0 or count <= 0 or first + count > self._num_planes:
+                raise ValueError("compressed restore plane range is invalid")
+            if count != self._num_planes and 0 in modes:
+                raise ValueError("raw restore records require every plane")
         if any(
             mode == 1 and offset + _SLOT_HEADER_BYTES > staging.numel()
             for offset, mode in zip(staging_offsets, modes, strict=True)
@@ -1055,6 +1070,7 @@ class FusedCompressedKVDecoder:
             codebooks=self._codebooks,
             destination=self._kv_bits,
             stream=stream,
+            plane_range=plane_range,
         )
 
     @staticmethod
