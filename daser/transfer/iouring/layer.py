@@ -1494,8 +1494,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Returns:
             True when a new readahead was registered. False when readahead is
-            disabled, the same ranges are already being read ahead, or the
-            request does not fit the readahead budget (half of L1).
+            disabled, the same ranges are already being read ahead, or not
+            even the first span fits the readahead budget (half of L1). A
+            request larger than the budget reads ahead its leading spans.
 
         Async/thread-safety:
             Registers under the transfer lock and returns without waiting for
@@ -1513,10 +1514,20 @@ class TieredIOUringTransferLayer(TransferLayer):
             for span in spans
             if int(span["nbytes"]) > 0
         ]
+        budget = self._l1_bytes // 2
+        # Spans arrive in load order: read ahead the leading spans that fit
+        # the budget and leave the tail to the normal load path.
+        kept: list[dict[str, int]] = []
+        total = 0
+        for span in accounted:
+            if total + span["nbytes"] > budget:
+                break
+            kept.append(span)
+            total += span["nbytes"]
+        accounted = kept
         ranges = _normalize_ranges(accounted)
         requested = sum(size for _start, size in ranges)
-        budget = self._l1_bytes // 2
-        if not ranges or requested > budget:
+        if not ranges:
             return False
         async with self._lock:
             self._raise_l2_error_locked()

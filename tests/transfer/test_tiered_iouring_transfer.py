@@ -1651,7 +1651,10 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
 
 
 def test_iouring_readahead_disabled_or_over_budget_is_skipped(tmp_path) -> None:
-    """Readahead is off by default and never takes more than half of L1."""
+    """Readahead is off by default and never takes more than half of L1.
+
+    A request over the budget reads ahead only its leading spans.
+    """
 
     async def scenario() -> None:
         path = str(tmp_path / "daser.store")
@@ -1672,6 +1675,15 @@ def test_iouring_readahead_disabled_or_over_budget_is_skipped(tmp_path) -> None:
         try:
             big = {"file_offset": 0, "nbytes": ALIGNMENT * 3}
             assert await on.start_readahead([big]) is False
+            # Load order puts offset 3 first: only the first two spans fit.
+            spans = [
+                {"file_offset": ALIGNMENT * 3, "nbytes": ALIGNMENT},
+                {"file_offset": 0, "nbytes": ALIGNMENT},
+                {"file_offset": ALIGNMENT, "nbytes": ALIGNMENT},
+            ]
+            assert await on.start_readahead(spans) is True
+            await on.drain()
+            assert on.stats.readahead_read_bytes == ALIGNMENT * 2
         finally:
             await on.drain()
             on.close()
