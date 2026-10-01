@@ -51,6 +51,46 @@ def test_aligned_scattered_copy_matches_source(gather_min_runs: int) -> None:
     assert result == expected
 
 
+def test_layer_gather_plan_copies_each_layer_group() -> None:
+    """Every layer-group copy lands each record's range in its block."""
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+    records, record_bytes, layers, layer_bytes = 5, 8192, 4, 1024
+    pool = PinnedMemoryPool(records * record_bytes)
+    try:
+        source = pool.allocate(records * record_bytes)
+        assert source is not None
+        view = source.view()
+        for i in range(len(view)):
+            view[i] = (i * 13 + 1) % 253
+        block = layers * layer_bytes
+        dst = cupy.zeros(records * block, dtype=cupy.uint8)
+        order = [3, 0, 4, 1, 2]
+        stream = cupy.cuda.Stream(non_blocking=True)
+        plan = copy_ops.LayerGatherPlan(
+            [source.ptr_at(i * record_bytes) for i in range(records)],
+            [int(dst.data.ptr) + slot * block for slot in order],
+            int(stream.ptr),
+            int(dst.device.id),
+        )
+        assert plan.count == records
+        header = 4096
+        for layer in range(layers):
+            plan.copy(header + layer * layer_bytes, layer * layer_bytes, layer_bytes)
+        stream.synchronize()
+        result = cupy.asnumpy(dst).tobytes()
+        for i, slot in enumerate(order):
+            start = i * record_bytes + header
+            assert result[slot * block : (slot + 1) * block] == bytes(
+                view[start : start + block]
+            )
+        with pytest.raises(ValueError):
+            plan.copy(header + 8, 0, layer_bytes)
+        source.close()
+    finally:
+        pool.close()
+
+
 def test_unaligned_pieces_fall_back_to_memcpy() -> None:
     """Pieces that are not 16-byte multiples still copy correctly."""
     expected, result, runs = _scattered_copy(4100, 2)

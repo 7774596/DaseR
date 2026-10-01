@@ -34,6 +34,43 @@ def _best(dst: cupy.ndarray, chunks: list, gather: int) -> tuple[float, float]:
     return best
 
 
+def _plan_rows(source: object, records: int, args: argparse.Namespace) -> None:
+    """Time ``LayerGatherPlan``: setup, per-launch host cost, pipelined GB/s."""
+    block = args.layers * args.layer_bytes
+    dst = cupy.empty(records * block, dtype=cupy.uint8)
+    stream = cupy.cuda.Stream(non_blocking=True)
+    start = time.perf_counter()
+    plan = copy_ops.LayerGatherPlan(
+        [source.ptr_at(i * args.record_bytes) for i in range(records)],
+        [int(dst.data.ptr) + i * block for i in range(records)],
+        int(stream.ptr),
+        int(dst.device.id),
+    )
+    stream.synchronize()
+    setup_ms = (time.perf_counter() - start) * 1e3
+    print(f"plan records={records} setup_ms={setup_ms:.2f}")
+    print("group launches host_us_per_launch pipelined_GBps")
+    for group in (1, 2, 4):
+        piece = group * args.layer_bytes
+        launches = args.layers // group
+        best_host, best_total = float("inf"), float("inf")
+        for _ in range(3):
+            stream.synchronize()
+            start = time.perf_counter()
+            for layer in range(launches):
+                plan.copy(4096 + layer * piece, layer * piece, piece)
+            enqueued = time.perf_counter()
+            stream.synchronize()
+            done = time.perf_counter()
+            best_host = min(best_host, enqueued - start)
+            best_total = min(best_total, done - start)
+        nbytes = records * piece * launches
+        print(
+            f"{group:5d} {launches:8d} {best_host / launches * 1e6:18.1f} "
+            f"{nbytes / best_total / 1e9:14.1f}"
+        )
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -66,6 +103,7 @@ def main() -> None:
             cells.append(f"{host_ms:14.2f} {nbytes / total_ms / 1e6:11.1f}")
         print(" ".join(cells))
         del dst
+    _plan_rows(source, records, args)
     source.close()
     pool.close()
 

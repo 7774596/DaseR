@@ -32,9 +32,26 @@ extern "C" __global__ void daser_gather16(
   }
 }
 """
+#: Layer-group gather: the same copy, but every record contributes the range
+#: at one shared offset, so the per-request record table is uploaded once and
+#: each layer group launches with scalar offsets only.
+_LAYER_GATHER_SOURCE = r"""
+extern "C" __global__ void daser_layer_gather16(
+    const unsigned long long* src, const unsigned long long* dst,
+    unsigned long long src_offset, unsigned long long dst_offset,
+    unsigned long long nbytes, int count) {
+  unsigned long long n = nbytes / 16;
+  for (int rec = blockIdx.x; rec < count; rec += gridDim.x) {
+    const uint4* s = (const uint4*)(src[rec] + src_offset);
+    uint4* d = (uint4*)(dst[rec] + dst_offset);
+    for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
+  }
+}
+"""
 _GATHER_BLOCKS = 1056
 _GATHER_THREADS = 512
 _gather_kernel: Any = None
+_layer_gather_kernel: Any = None
 
 
 def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, int]]:
@@ -100,6 +117,91 @@ def _launch_gather(runs: list[tuple[int, int, int]], stream_ptr: int) -> None:
                 numpy.int32(len(runs)),
             ),
         )
+
+
+class LayerGatherPlan:
+    """Per-request record table for layer-group copies into a CUDA buffer.
+
+    Record ``i`` starts at host address ``src_ptrs[i]`` (pinned, mapped) and
+    its packed destination block starts at ``dst_ptrs[i]``. The table is
+    uploaded once; each ``copy`` then moves ``[src_offset, src_offset +
+    nbytes)`` of every record to ``dst_offset`` of its destination block with
+    one kernel launch and no per-record host work.
+
+    Args:
+        src_ptrs: Host pointers of the record starts.
+        dst_ptrs: Device pointers of the destination blocks.
+        stream_ptr: CUDA stream the copies are queued on.
+        device_id: CUDA device owning the destination.
+
+    Async/thread-safety:
+        Not thread-safe. The caller keeps the source slices and destination
+        alive until the stream passes the last ``copy``; the table itself is
+        a stream-ordered allocation held by this object.
+    """
+
+    def __init__(
+        self,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        stream_ptr: int,
+        device_id: int,
+    ) -> None:
+        if len(src_ptrs) != len(dst_ptrs) or not src_ptrs:
+            raise ValueError("src_ptrs and dst_ptrs must be equal and nonempty")
+        if any((s | d) % 16 for s, d in zip(src_ptrs, dst_ptrs, strict=True)):
+            raise ValueError("record pointers must be 16-byte aligned")
+        global _layer_gather_kernel
+        import cupy
+        import numpy
+
+        self._count = len(src_ptrs)
+        self._stream_ptr = stream_ptr
+        self._device_id = device_id
+        with cupy.cuda.Device(device_id):
+            if _layer_gather_kernel is None:
+                _layer_gather_kernel = cupy.RawKernel(
+                    _LAYER_GATHER_SOURCE, "daser_layer_gather16"
+                )
+            with cupy.cuda.ExternalStream(stream_ptr):
+                self._src = cupy.asarray(numpy.array(src_ptrs, dtype=numpy.uint64))
+                self._dst = cupy.asarray(numpy.array(dst_ptrs, dtype=numpy.uint64))
+
+    @property
+    def count(self) -> int:
+        """Return the number of records in the plan."""
+        return self._count
+
+    def copy(self, src_offset: int, dst_offset: int, nbytes: int) -> None:
+        """Queue one layer-group copy from every record.
+
+        Args:
+            src_offset: Byte offset of the range inside each record.
+            dst_offset: Byte offset inside each destination block.
+            nbytes: Range length; offsets and length must be 16-byte multiples.
+
+        Returns:
+            None. The copy is queued on the plan's stream.
+        """
+        if (src_offset | dst_offset | nbytes) % 16:
+            raise ValueError("layer gather offsets and length must be 16-aligned")
+        import cupy
+        import numpy
+
+        with cupy.cuda.Device(self._device_id):
+            with cupy.cuda.ExternalStream(self._stream_ptr):
+                _layer_gather_kernel(
+                    (min(_GATHER_BLOCKS, self._count),),
+                    (_GATHER_THREADS,),
+                    (
+                        self._src,
+                        self._dst,
+                        numpy.uint64(src_offset),
+                        numpy.uint64(dst_offset),
+                        numpy.uint64(nbytes),
+                        numpy.int32(self._count),
+                    ),
+                )
 
 
 def destination_copy_event(dst: Any, chunks: list[CopyChunk]) -> Any | None:
