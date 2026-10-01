@@ -1444,6 +1444,72 @@ def test_iouring_striped_l2_read_matches_serial_read(tmp_path, monkeypatch) -> N
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
+    tmp_path, monkeypatch, pipeline: bool
+) -> None:
+    """Pipelined stripe copies place every record byte, even across parts."""
+    monkeypatch.setattr(layer_module, "_PACKED_READ_BATCH_BYTES", ALIGNMENT)
+    copies: list[int] = []
+    original_copy = layer_module.copy_ops.copy_grouped_to_dst
+
+    def counting_copy(dst, chunks) -> None:
+        copies.append(len(chunks))
+        original_copy(dst, chunks)
+
+    monkeypatch.setattr(layer_module.copy_ops, "copy_grouped_to_dst", counting_copy)
+    blocks = 6
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+    # Records of 1, 3 and 2 blocks with permuted destinations; stripe parts of
+    # 2 blocks split the 3-block record across a part boundary.
+    records = [(0, 1, 5), (1, 3, 0), (4, 2, 3)]
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(path=path, l1_bytes=nbytes, l2_bytes=nbytes)
+        try:
+            await writer.store_bytes(payload, 0, nbytes)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=nbytes,
+            l2_bytes=nbytes,
+            l2_read_stripe_bytes=ALIGNMENT * 2,
+            stripe_pipeline=pipeline,
+        )
+        try:
+            dst = bytearray(nbytes)
+            spans = [
+                {
+                    "target_offset": target * ALIGNMENT,
+                    "file_offset": start * ALIGNMENT,
+                    "nbytes": size * ALIGNMENT,
+                }
+                for start, size, target in records
+            ]
+            assert await layer.load_bytes_grouped(dst, spans) == nbytes
+            for start, size, target in records:
+                src = payload[start * ALIGNMENT : (start + size) * ALIGNMENT]
+                assert dst[target * ALIGNMENT : (target + size) * ALIGNMENT] == src
+            # Reload from L1 to confirm the promoted extent stayed intact.
+            again = bytearray(nbytes)
+            assert await layer.load_bytes_grouped(again, spans) == nbytes
+            assert again == dst
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+    # The L2 pass copies once per stripe part only when pipelining is on; the
+    # final copy is the single grouped L1 reload. The 3- and 2-block records
+    # are adjacent in file and destination, so load coalescing merges them.
+    assert sorted(copies[:-1]) == ([1, 1, 2] if pipeline else [2])
+
+
 def test_iouring_l2_read_stripe_must_be_aligned(tmp_path) -> None:
     """The stripe size keeps every part on a direct-IO boundary."""
     with pytest.raises(ValueError, match="l2_read_stripe_bytes"):

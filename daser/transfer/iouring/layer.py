@@ -128,6 +128,33 @@ def _stripe_extents(nbytes: int, stripe_bytes: int) -> list[tuple[int, int]]:
     ]
 
 
+def _clip_parts(
+    parts: list[tuple[int, int, int, int, int]],
+    window_start: int,
+    window_size: int,
+) -> list[tuple[int, int, int]]:
+    """Clip logical record parts of one physical read to a byte window.
+
+    Args:
+        parts: ``(target_offset, file_offset, nbytes, source_offset, charge)``
+            records of one read, with ``source_offset`` relative to the read.
+        window_start: Window start relative to the read.
+        window_size: Window length in bytes.
+
+    Returns:
+        ``(target_offset, source_offset, nbytes)`` destination copies covering
+        exactly the part bytes inside the window.
+    """
+    window_end = window_start + window_size
+    clipped = []
+    for target_offset, _file_offset, nbytes, source_offset, _charge in parts:
+        start = max(source_offset, window_start)
+        end = min(source_offset + nbytes, window_end)
+        if start < end:
+            clipped.append((target_offset + start - source_offset, start, end - start))
+    return clipped
+
+
 def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     """Return sorted, merged positive physical ranges from transfer spans."""
     ranges = sorted(
@@ -483,6 +510,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             every active prefix keeps a stable L1 share and its loads read
             memory and SSD concurrently. 0 keeps the BIP/LRU policy selected
             by ``bip_enabled``.
+        stripe_pipeline: Research switch. With striped L2 reads, copy each
+            stripe part to the load destination as soon as its completion
+            arrives, so host-to-device copies overlap the rest of the read
+            instead of starting after the whole extent.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -504,6 +535,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         prefetch_lease_budget_bytes: int = 0,
         l2_read_stripe_bytes: int = 0,
         l1_split_fraction: float = 0.0,
+        stripe_pipeline: bool = False,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -533,6 +565,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._prefetch_lease_budget = prefetch_lease_budget_bytes
         self._l2_read_stripe = l2_read_stripe_bytes
+        self._stripe_pipeline = bool(stripe_pipeline)
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         # L1-only packed ranges waiting for an admission decision. They stay
@@ -565,7 +598,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
-            "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f",
+            "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
+            "stripe_pipeline=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -577,6 +611,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             prefetch_lease_budget_bytes,
             l2_read_stripe_bytes,
             l1_split_fraction,
+            self._stripe_pipeline,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1789,6 +1824,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         batch_jobs: list[asyncio.Future[int]] = []
         copy_futures: list[asyncio.Task[None]] = []
         queued: list[tuple[dict[str, int], PinnedMemorySlice, int, int]] = []
+        # Stripe pipeline: per-part completion -> (owning read future, window
+        # relative to the read). Reads in ``pipelined`` copy part by part, and
+        # ``copied`` holds the windows already sent to ``dst``.
+        stripe_parts: dict[asyncio.Future[int], tuple[asyncio.Future[int], int, int]]
+        stripe_parts = {}
+        pipelined: set[asyncio.Future[int]] = set()
+        copied: dict[asyncio.Future[int], list[tuple[int, int]]] = {}
 
         def submit_queued() -> None:
             if not queued:
@@ -1871,15 +1913,21 @@ class TieredIOUringTransferLayer(TransferLayer):
                     # drained, and raises the first part error after that.
                     view = pinned.view()
                     file_offset = int(span["file_offset"])
+                    extents = _stripe_extents(nbytes, self._l2_read_stripe)
                     future, parts = self._l2.submit_read_batch(
                         [
                             (file_offset + offset, view[offset : offset + size])
-                            for offset, size in _stripe_extents(
-                                nbytes, self._l2_read_stripe
-                            )
+                            for offset, size in extents
                         ]
                     )
                     batch_jobs.extend(parts)
+                    if self._stripe_pipeline and dst is not None:
+                        pipelined.add(future)
+                        copied[future] = []
+                        for part_future, (offset, size) in zip(
+                            parts, extents, strict=True
+                        ):
+                            stripe_parts[part_future] = (future, offset, size)
                 else:
                     future = loop.run_in_executor(
                         self._l2.executor,
@@ -1891,7 +1939,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 future_to_read[future] = (span, pinned, promotion_id, epoch)
 
             submit_queued()
-            pending: set[asyncio.Future[int]] = set(future_to_read)
+            pending: set[asyncio.Future[int]] = set(future_to_read) | set(stripe_parts)
             while pending:
                 done, pending = await asyncio.wait(
                     pending,
@@ -1899,9 +1947,30 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 for future in done:
                     future.result()
+                    if future in stripe_parts:
+                        owner, offset, size = stripe_parts[future]
+                        if owner in copied:
+                            span, pinned, _promotion_id, _epoch = future_to_read[owner]
+                            self._copy_stripe_window(
+                                dst, pinned, parts_for(span), offset, size, copy_futures
+                            )
+                            copied[owner].append((offset, size))
+                        continue
                     span, pinned, promotion_id, epoch = future_to_read[future]
                     parts = parts_for(span)
-                    if dst is not None:
+                    if future in pipelined:
+                        # The extent is complete: copy any stripe windows whose
+                        # completion has not been processed yet, then stop
+                        # pipelining for this read.
+                        done_windows = set(copied.pop(future))
+                        for offset, size in _stripe_extents(
+                            int(span["nbytes"]), self._l2_read_stripe
+                        ):
+                            if (offset, size) not in done_windows:
+                                self._copy_stripe_window(
+                                    dst, pinned, parts, offset, size, copy_futures
+                                )
+                    elif dst is not None:
                         # One physical read can represent several disjoint
                         # logical records. Submit those records as one grouped
                         # destination copy so the CUDA IPC copy path records
@@ -2078,6 +2147,28 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             raise RuntimeError("io_uring rings are disabled when skip_l2 is true")
         return self._l2.next_uring()
+
+    def _copy_stripe_window(
+        self,
+        dst: Any,
+        pinned: PinnedMemorySlice,
+        parts: list[tuple[int, int, int, int, int]],
+        window_start: int,
+        window_size: int,
+        copy_futures: list[asyncio.Task[None]],
+    ) -> None:
+        """Copy the record bytes of one completed stripe window to ``dst``."""
+        chunks = [
+            (target_offset, pinned, source_offset, nbytes)
+            for target_offset, source_offset, nbytes in _clip_parts(
+                parts, window_start, window_size
+            )
+        ]
+        if not chunks:
+            return
+        copy_future = self._copy_grouped_to_dst(dst, chunks)
+        if copy_future is not None:
+            copy_futures.append(copy_future)
 
     def _copy_grouped_to_dst(
         self,

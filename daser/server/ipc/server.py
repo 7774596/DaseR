@@ -11,7 +11,11 @@ import threading
 import time
 from typing import Any
 
-from daser.config import EXCLUSIVE_TIERS_ENV, STORAGE_FORMAT_COMPRESSED_ONLINE
+from daser.config import (
+    EXCLUSIVE_TIERS_ENV,
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STRIPE_PIPELINE_ENV,
+)
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
 
@@ -1652,6 +1656,7 @@ class IPCServer:
                     l1_split_fraction=float(
                         self._runtime_config.get("l1_split_fraction", 0.0)
                     ),
+                    stripe_pipeline=os.environ.get(STRIPE_PIPELINE_ENV) == "1",
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
