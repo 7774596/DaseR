@@ -13,6 +13,8 @@ from typing import Any
 
 from daser.config import (
     EXCLUSIVE_TIERS_ENV,
+    LOAD_READAHEAD_ENV,
+    LOAD_READAHEAD_WINDOW_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STRIPE_PIPELINE_ENV,
 )
@@ -381,6 +383,8 @@ class IPCServer:
             or os.environ.get(LOOKUP_WAIT_PENDING_ENV) == "1"
         )
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
+        # Research switch: L2 readahead group size started by plain lookups.
+        self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -630,14 +634,17 @@ class IPCServer:
             chunks = await self._lookup_core(tokens, msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
-            await self._core.record_external_prefix_cache(
+            num_computed_tokens = int(msg.get("num_computed_tokens", 0))
+            hits = _external_prefix_hits(
+                chunks,
+                num_computed_tokens=num_computed_tokens,
                 queries=queries,
-                hits=_external_prefix_hits(
-                    chunks,
-                    num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
-                    queries=queries,
-                ),
             )
+            await self._core.record_external_prefix_cache(queries=queries, hits=hits)
+            if self._readahead_piece and chunks and hits > 0:
+                spans = self._external_spans(chunks, num_computed_tokens, hits)
+                if spans:
+                    await self._ensure_transfer().start_readahead(spans)
         return {"chunks": self._chunk_payloads(chunks)}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -653,27 +660,7 @@ class IPCServer:
         if not chunks or hits <= 0:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
 
-        block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        storage_format = self._runtime_config.get("storage_format")
-        if storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-            spans = self._online_compressed_prefetch_spans(
-                chunks,
-                external_start=num_computed_tokens,
-                external_tokens=hits,
-                block_tokens=block_tokens,
-            )
-        else:
-            spans = _prefetch_spans_from_chunks(
-                chunks,
-                external_start=num_computed_tokens,
-                external_tokens=hits,
-                block_tokens=block_tokens,
-                slot_size=int(self._runtime_config.get("slot_size", 0)),
-                tensor_parallel_size=int(
-                    self._runtime_config.get("tensor_parallel_size", 1)
-                ),
-                rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-            )
+        spans = self._external_spans(chunks, num_computed_tokens, hits)
         if not spans:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
         transfer = self._ensure_transfer()
@@ -1657,6 +1644,10 @@ class IPCServer:
                         self._runtime_config.get("l1_split_fraction", 0.0)
                     ),
                     stripe_pipeline=os.environ.get(STRIPE_PIPELINE_ENV) == "1",
+                    readahead_piece_bytes=self._readahead_piece,
+                    readahead_window=int(
+                        os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
@@ -1679,6 +1670,35 @@ class IPCServer:
                     payload["compressed_slots"] = online_refs
             payloads.append(payload)
         return payloads
+
+    def _external_spans(
+        self,
+        chunks: list[ChunkInfo],
+        num_computed_tokens: int,
+        hits: int,
+    ) -> list[dict[str, int]]:
+        """Return the physical spans a worker load of ``hits`` tokens reads."""
+        block_tokens = int(self._runtime_config.get("block_tokens", 0))
+        if self._runtime_config.get("storage_format") == (
+            STORAGE_FORMAT_COMPRESSED_ONLINE
+        ):
+            return self._online_compressed_prefetch_spans(
+                chunks,
+                external_start=num_computed_tokens,
+                external_tokens=hits,
+                block_tokens=block_tokens,
+            )
+        return _prefetch_spans_from_chunks(
+            chunks,
+            external_start=num_computed_tokens,
+            external_tokens=hits,
+            block_tokens=block_tokens,
+            slot_size=int(self._runtime_config.get("slot_size", 0)),
+            tensor_parallel_size=int(
+                self._runtime_config.get("tensor_parallel_size", 1)
+            ),
+            rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
+        )
 
     def _online_compressed_prefetch_spans(
         self,

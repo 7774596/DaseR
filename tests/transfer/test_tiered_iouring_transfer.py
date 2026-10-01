@@ -1528,6 +1528,149 @@ def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
     assert sorted(copies[:-1]) == ([1, 1, 2] if pipeline else [2])
 
 
+async def _cold_readahead_layer(
+    path: str, payload: bytes, **kwargs
+) -> TieredIOUringTransferLayer:
+    """Persist ``payload`` at offset 0, then reopen it with an empty L1."""
+    nbytes = len(payload)
+    writer = TieredIOUringTransferLayer(path=path, l1_bytes=nbytes, l2_bytes=nbytes)
+    try:
+        await writer.store_bytes(payload, 0, nbytes)
+        await writer.drain()
+    finally:
+        writer.close()
+    return TieredIOUringTransferLayer(
+        path=path, l1_bytes=nbytes * 4, l2_bytes=nbytes * 4, **kwargs
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_iouring_readahead_serves_load_and_releases_lease(
+    tmp_path, device: str
+) -> None:
+    """A load after readahead copies the retained bytes and reads L2 once.
+
+    Consuming the readahead releases its lease, so a later store to the same
+    range does not wait on it. The CUDA destination exercises the borrowed
+    source path, which must not close slices the lease just released.
+    """
+    cupy = pytest.importorskip("cupy") if device == "cuda" else None
+    if cupy is not None and cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT * 2,
+            readahead_window=1,
+        )
+        try:
+            span = {"file_offset": 0, "nbytes": nbytes}
+            assert await layer.start_readahead([span]) is True
+            # The same ranges are already being read ahead.
+            assert await layer.start_readahead([span]) is False
+            dst = (
+                bytearray(nbytes)
+                if cupy is None
+                else cupy.zeros(nbytes, dtype=cupy.uint8)
+            )
+            # Two staging-sized loads, as a worker splits one request.
+            half = nbytes // 2
+            for start in (0, half):
+                load = [{"target_offset": start, "file_offset": start, "nbytes": half}]
+                assert await layer.load_bytes_grouped(dst, load) == half
+            loaded = bytes(dst) if cupy is None else cupy.asnumpy(dst).tobytes()
+            assert loaded == payload
+            await layer.drain()
+            # Four 2-block readahead groups and no fallback L2 reads.
+            assert layer.stats.l2_reads == 4
+            await asyncio.wait_for(
+                layer.store_bytes(bytes(_block(b"z")), 0, ALIGNMENT), timeout=5
+            )
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
+    tmp_path,
+) -> None:
+    """Uncovered bytes use the normal path; a store drops a stale readahead."""
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=nbytes,
+        )
+        try:
+            half = nbytes // 2
+            assert await layer.start_readahead([{"file_offset": 0, "nbytes": half}])
+            dst = bytearray(nbytes)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": nbytes}]
+            assert await layer.load_bytes_grouped(dst, load) == nbytes
+            assert bytes(dst) == payload
+            # One readahead read for the first half, one fallback read.
+            assert layer.stats.l2_reads == 2
+
+            # An unconsumed readahead must not block an overlapping store.
+            assert await layer.start_readahead(
+                [{"file_offset": half, "nbytes": ALIGNMENT}]
+            )
+            await layer.drain()
+            await asyncio.wait_for(
+                layer.store_bytes(bytes(_block(b"z")), half, ALIGNMENT), timeout=5
+            )
+            check = bytearray(ALIGNMENT)
+            await layer.load_bytes_grouped(
+                check, [{"target_offset": 0, "file_offset": half, "nbytes": ALIGNMENT}]
+            )
+            assert bytes(check) == bytes(_block(b"z"))
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+def test_iouring_readahead_disabled_or_over_budget_is_skipped(tmp_path) -> None:
+    """Readahead is off by default and never takes more than half of L1."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        off = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 4
+        )
+        try:
+            span = {"file_offset": 0, "nbytes": ALIGNMENT}
+            assert await off.start_readahead([span]) is False
+        finally:
+            off.close()
+        on = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            big = {"file_offset": 0, "nbytes": ALIGNMENT * 3}
+            assert await on.start_readahead([big]) is False
+        finally:
+            await on.drain()
+            on.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_l2_read_stripe_must_be_aligned(tmp_path) -> None:
     """The stripe size keeps every part on a direct-IO boundary."""
     with pytest.raises(ValueError, match="l2_read_stripe_bytes"):

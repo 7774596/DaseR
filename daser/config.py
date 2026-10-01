@@ -37,6 +37,10 @@ EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
+#: Research switch for lookup-triggered L2 readahead: read group size in
+#: bytes (0 or unset disables), and the number of groups kept in flight.
+LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
+LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
 
 
 @dataclass(frozen=True)
