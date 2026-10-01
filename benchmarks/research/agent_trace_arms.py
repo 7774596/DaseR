@@ -50,6 +50,10 @@ ARMS = (
     # L1 split residency (--daser-l1-split-fraction) on raw / compressed stores.
     "daser-raw-split",
     "daser-compressed-split",
+    # Fully leased packed hits restored layer by layer inside the forward
+    # pass, and its PIECEWISE-graph baseline (needs prefetch for leases).
+    "daser-compressed-layerwise",
+    "daser-compressed-piecewise",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -320,6 +324,8 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_l1_accounting=("raw" if arm == "daser-compressed-raw-l1" else "stored"),
         daser_coalesce_loads=arm.endswith("-coalesce"),
+        daser_layerwise_load=arm.endswith("-layerwise"),
+        daser_piecewise_cudagraph=arm.endswith("-piecewise"),
         skip_l2=args.skip_l2 and arm.startswith("daser"),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0

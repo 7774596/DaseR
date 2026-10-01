@@ -841,6 +841,20 @@ class IPCClientAsync(_IPCClientBase):
             }
         )
 
+    async def release_transfer_lease(self, lease_id: str) -> dict[str, Any]:
+        """Release host-tier bytes retained for one request.
+
+        Args:
+            lease_id: Request lease from ``lookup_prefetch``.
+
+        Returns:
+            Server response.
+
+        Async/thread-safety:
+            Serializes with other calls on this client's connection.
+        """
+        return await self.call({"op": "release_transfer_lease", "lease_id": lease_id})
+
     async def register_staging_cuda(
         self,
         direction: str,

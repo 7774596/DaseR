@@ -17,6 +17,7 @@ from daser.compression.layer_major import (
     plan_layer_groups,
     rebased_headers,
     stage_layer_group,
+    staged_descriptor_patch,
 )
 
 
@@ -118,6 +119,25 @@ def test_shared_layout_keeps_header_pages_fixed() -> None:
         assert (plan.data_offsets % 16 == plan.source_begin % 16).all()
     with pytest.raises(ValueError):
         plan_layer_groups(headers, [])
+
+
+def test_descriptor_patch_turns_staged_headers_into_rebased_ones() -> None:
+    """Patching staged original pages yields the staged group image's pages."""
+    records = _records(_geometry())
+    headers = _headers(records)
+    for plan in plan_layer_groups(headers, [(0, 2), (2, 2), (4, 2)]):
+        staging = np.zeros(plan.staging_bytes, dtype=np.uint8)
+        for index, page in enumerate(plan.staging_offsets):
+            staging[page : page + IO_ALIGNMENT] = headers[index]
+        indices, values = staged_descriptor_patch(headers, plan)
+        assert values.dtype == np.int32
+        staging.view(np.int32)[indices] = values
+        image = np.frombuffer(stage_layer_group(records, plan), dtype=np.uint8)
+        for page in plan.staging_offsets:
+            assert np.array_equal(
+                staging[page : page + IO_ALIGNMENT],
+                image[page : page + IO_ALIGNMENT],
+            )
 
 
 def test_rejects_raw_records_and_bad_ranges() -> None:

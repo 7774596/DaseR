@@ -248,6 +248,8 @@ class ServerManager:
         daser_l1_split_fraction: float = 0.0,
         daser_l1_accounting: str = "stored",
         daser_coalesce_loads: bool = False,
+        daser_layerwise_load: bool = False,
+        daser_piecewise_cudagraph: bool = False,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -287,6 +289,10 @@ class ServerManager:
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
             daser_coalesce_loads: let the connector hold back requests whose
                 prefix another request is already loading.
+            daser_layerwise_load: restore fully leased packed hits layer by
+                layer inside the forward pass (forces PIECEWISE graphs).
+            daser_piecewise_cudagraph: force PIECEWISE graphs without
+                layer-wise loads, as the like-for-like baseline.
             storage_format: DaseR physical KV storage format.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
@@ -334,6 +340,8 @@ class ServerManager:
         self.daser_l1_split_fraction = daser_l1_split_fraction
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
+        self.daser_layerwise_load = daser_layerwise_load
+        self.daser_piecewise_cudagraph = daser_piecewise_cudagraph
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -552,6 +560,10 @@ class ServerManager:
             extra_config["online_pack_batch_slots"] = self.online_pack_batch_slots
         if self.daser_coalesce_loads:
             extra_config["coalesce_loads"] = True
+        if self.daser_layerwise_load:
+            extra_config["layerwise_load"] = True
+        if self.daser_piecewise_cudagraph:
+            extra_config["piecewise_cudagraph"] = True
         return {
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",

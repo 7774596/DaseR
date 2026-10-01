@@ -199,6 +199,39 @@ def rebased_headers(
     return shifted
 
 
+def staged_descriptor_patch(
+    headers: NDArray[np.uint8], plan: LayerGroupPlan
+) -> tuple[NDArray[np.int64], NDArray[np.int32]]:
+    """Return the words that turn staged original headers into rebased ones.
+
+    A staging buffer that already holds every record's original header page
+    at ``plan.staging_offsets`` reads like ``rebased_headers`` after writing
+    these words, so the production path patches a few bytes per record on
+    the GPU instead of uploading whole pages per group.
+
+    Args:
+        headers: The ``[records, 4096]`` pages passed to ``plan_layer_group``.
+        plan: Plan built from those headers.
+
+    Returns:
+        ``(indices, values)``: absolute 32-bit word indices into the staging
+        buffer and the rebased words, bit-cast to int32 for device tensors.
+
+    Thread-safety:
+        Pure computation; the input is not modified.
+    """
+    first, count = plan.plane_range
+    pages = rebased_headers(headers, plan)
+    words = _descriptor_words(pages)[:, first : first + count, list(_REBASED_WORDS)]
+    # Word index of each patched field relative to its header page.
+    plane = np.arange(first, first + count, dtype=np.int64)[:, None]
+    relative = (_FIXED_HEADER_BYTES + plane * _DESCRIPTOR_BYTES) // 4 + np.asarray(
+        _REBASED_WORDS, dtype=np.int64
+    )[None, :]
+    indices = plan.staging_offsets[:, None, None] // 4 + relative[None, :, :]
+    return indices.reshape(-1), words.reshape(-1).view(np.int32)
+
+
 def stage_layer_group(
     records: list[bytes | memoryview], plan: LayerGroupPlan
 ) -> bytearray:
@@ -239,4 +272,5 @@ __all__ = [
     "plan_layer_groups",
     "rebased_headers",
     "stage_layer_group",
+    "staged_descriptor_patch",
 ]

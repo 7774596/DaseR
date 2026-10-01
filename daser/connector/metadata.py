@@ -131,8 +131,12 @@ class DaserConnectorMeta(KVConnectorMetadata):
         reqs_to_store: req_id -> ReqStoreSpec for new chunks to persist.
         cancelled_store_req_ids: Preempted base IDs whose published, unsent
             worker stores must be discarded before this step's new stores.
+        layerwise_req_ids: Base IDs whose loads vLLM scheduled synchronously
+            in this step; the worker restores them layer by layer inside the
+            forward pass and owns their transfer leases.
     """
 
     reqs_to_load: dict[str, ReqLoadSpec] = field(default_factory=dict)
     reqs_to_store: dict[str, ReqStoreSpec] = field(default_factory=dict)
     cancelled_store_req_ids: set[str] = field(default_factory=set)
+    layerwise_req_ids: set[str] = field(default_factory=set)

@@ -23,6 +23,7 @@ from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
 )
+from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import (
     DaserConnectorMeta,
@@ -340,27 +341,43 @@ class WorkerRuntime:
             the load pipeline thread.
         """
         del forward_context, kwargs
-        if self._meta is None or not self._meta.reqs_to_load:
-            return
-        reqs_to_load = dict(self._meta.reqs_to_load)
-        if not self._ensure_transfer_ready():
+        meta = self._meta
+        reqs_to_load = dict(meta.reqs_to_load) if meta is not None else {}
+        layerwise_ids = meta.layerwise_req_ids if meta is not None else set()
+        layerwise = {
+            spec_id: spec
+            for spec_id, spec in reqs_to_load.items()
+            if base_req_id(spec_id) in layerwise_ids
+        }
+        for spec_id in layerwise:
+            del reqs_to_load[spec_id]
+        if (layerwise or reqs_to_load) and not self._ensure_transfer_ready():
+            # A layer-wise spec is still started so its failure invalidates
+            # the synchronously scheduled blocks and releases its lease.
+            self._load_pipeline.start_layerwise(layerwise)
             self._load_pipeline.mark_failed(
                 reqs_to_load,
                 "server transfer config is not ready",
             )
             return
-        self._load_pipeline.start(reqs_to_load)
+        # Called every step: this also retires the previous layer-wise state.
+        self._load_pipeline.start_layerwise(layerwise)
+        if reqs_to_load:
+            self._load_pipeline.start(reqs_to_load)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Return after request-level load completion restored every layer.
+        """Order one layer's attention after this step's layer-wise restore.
 
         Args:
-            layer_name: Layer reported by vLLM; no per-layer wait is required.
+            layer_name: Attention layer about to run.
 
         Async/thread-safety:
-            Called on the vLLM worker thread.
+            Called on the vLLM worker thread inside the forward pass. Returns
+            immediately unless the step carries a layer-wise load.
         """
-        del layer_name
+        layer = self._layer_idx_map.get(layer_name)
+        if layer is not None:
+            self._load_pipeline.wait_for_layer(layer)
 
     def save_kv_layer(
         self,

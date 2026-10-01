@@ -106,6 +106,7 @@ class RequestLifecycle:
         prefetch_max_requests: int = 0,
         storage_format: str | None = None,
         coalesce_loads: bool = False,
+        layerwise_load: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
         self._block_tokens = block_tokens
@@ -133,6 +134,11 @@ class RequestLifecycle:
         # paired with the vLLM computed-token count their spans start at.
         self._prefetch_lookup_results: dict[str, tuple[int, PrefetchLookupResult]] = {}
         self._leased_request_ids: set[str] = set()
+        # Research switch: fully leased packed hits load synchronously and are
+        # restored layer by layer inside the forward pass. The worker then
+        # owns the request lease, so these IDs never report finished_recving.
+        self._layerwise_load = layerwise_load
+        self._layerwise_request_ids: set[str] = set()
         self._finish_admission = False
         self._written_chunks: dict[str, list[str]] = {}
         # In-flight load coalescing: vLLM only publishes externally loaded
@@ -405,6 +411,11 @@ class RequestLifecycle:
             extra_tokens,
         )
         getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
+        layerwise_ids = getattr(self, "_layerwise_request_ids", set())
+        if self._layerwise_eligible(request.request_id, chunks):
+            layerwise_ids.add(request.request_id)
+            return extra_tokens, False
+        layerwise_ids.discard(request.request_id)
         return extra_tokens, True
 
     def shutdown(self) -> None:
@@ -527,6 +538,9 @@ class RequestLifecycle:
         self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunks in list(self._pending_loads.items()):
+            if req_id in getattr(self, "_layerwise_request_ids", set()):
+                self._hand_off_layerwise_load(req_id, chunks, meta)
+                continue
             if "chunk_key" in chunks:
                 chunk = chunks
                 if "block_ids" in chunk:
@@ -834,6 +848,51 @@ class RequestLifecycle:
             num_computed_tokens=num_computed_tokens,
         )
 
+    def _layerwise_eligible(self, req_id: str, chunks: list[dict[str, Any]]) -> bool:
+        """Return whether a hit can be restored layer by layer in-forward.
+
+        Only requests whose every record is packed and leased in L1 qualify:
+        the worker then reads each layer's plane bytes straight from L1.
+        """
+        if not getattr(self, "_layerwise_load", False):
+            return False
+        if req_id not in getattr(self, "_leased_request_ids", set()):
+            return False
+        return bool(chunks) and all(
+            chunk.get("compressed_slots")
+            and all(
+                slot.get("mode") == "compressed" for slot in chunk["compressed_slots"]
+            )
+            for chunk in chunks
+        )
+
+    def _hand_off_layerwise_load(
+        self,
+        req_id: str,
+        chunks: dict[str, Any],
+        meta: DaserConnectorMeta,
+    ) -> None:
+        """Publish a synchronous layer-wise load and its lease to the worker.
+
+        vLLM computes this request in the step it was scheduled, so every
+        allocated chunk is emitted now and nothing stays pending; trimmed
+        chunks were already dropped by ``update_state_after_alloc``.
+        """
+        del self._pending_loads[req_id]
+        self._layerwise_request_ids.discard(req_id)
+        pending = [chunks] if "chunk_key" in chunks else list(chunks.values())
+        specs = [
+            _load_spec_from_chunk(chunk) for chunk in pending if "block_ids" in chunk
+        ]
+        merged = _merge_adjacent_load_specs(specs, self._slot_size)
+        for idx, spec in enumerate(merged):
+            load_id = req_id if len(merged) == 1 else f"{req_id}:load:{idx}"
+            meta.reqs_to_load[load_id] = spec
+        # The worker releases the lease after its last layer; the scheduler
+        # must not release it while the forward pass still reads L1.
+        self._leased_request_ids.discard(req_id)
+        meta.layerwise_req_ids.add(req_id)
+
     def _release_transfer_lease(self, req_id: str, *, force: bool = False) -> None:
         """Best-effort idempotent cleanup for scheduler-owned lease state."""
         leased_ids: set[str] = getattr(self, "_leased_request_ids", set())
@@ -1070,6 +1129,7 @@ class RequestLifecycle:
             if pending_req_id.startswith(f"{req_id}:store:"):
                 self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
+        getattr(self, "_layerwise_request_ids", set()).discard(req_id)
         getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
         getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
         had_prefetch = self._cancel_prefetch_future(req_id)

@@ -118,6 +118,7 @@ class DaserConnector(
                 prefetch_max_requests=prefetch_max_requests,
                 storage_format=storage_format,
                 coalesce_loads=bool(extra.get("coalesce_loads", False)),
+                layerwise_load=bool(extra.get("layerwise_load", False)),
             )
             self._request_lifecycle.refresh_runtime_config()
             self._scheduler_probe = SchedulerProbe.from_env()
@@ -184,6 +185,25 @@ class DaserConnector(
             Always False.
         """
         return False
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """Return whether vLLM must run attention outside CUDA graphs.
+
+        Layer-wise loads wait in ``wait_for_layer_load``, which full-graph
+        replay would skip. ``piecewise_cudagraph`` applies the same graph
+        mode without layer-wise loads, as a like-for-like baseline.
+
+        Args:
+            extra_config: ``kv_connector_extra_config`` of the deployment.
+
+        Returns:
+            True when ``layerwise_load`` or ``piecewise_cudagraph`` is set.
+        """
+        return bool(
+            extra_config.get("layerwise_load", False)
+            or extra_config.get("piecewise_cudagraph", False)
+        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

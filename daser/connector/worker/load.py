@@ -14,8 +14,11 @@ from typing import Any
 
 # Third Party
 import cupy
+import numpy as np
 import torch
 
+from daser.compression.format import IO_ALIGNMENT
+from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_RAW
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
@@ -152,6 +155,67 @@ def _load_source_descriptor(
     )
 
 
+def _layerwise_records(
+    specs: dict[str, ReqLoadSpec],
+) -> tuple[np.ndarray, list[int], str]:
+    """Flatten one step's layer-wise loads into packed records.
+
+    Args:
+        specs: Synchronously scheduled load specs of this step.
+
+    Returns:
+        Record file offsets, matching destination blocks, and the single
+        request lease that retains every record in L1.
+
+    Raises:
+        ValueError: If a spec is not fully packed, carries no lease, the step
+            mixes leases, or two records target one block.
+
+    Async/thread-safety:
+        Pure planning on the load thread.
+    """
+    offsets: list[int] = []
+    block_ids: list[int] = []
+    leases = {spec.lease_id for spec in specs.values()}
+    if len(leases) != 1 or "" in leases:
+        raise ValueError(f"layer-wise load needs one request lease, got {leases}")
+    for spec in specs.values():
+        if len(spec.compressed_slots) != len(spec.block_ids) or any(
+            slot.mode != "compressed" for slot in spec.compressed_slots
+        ):
+            raise ValueError("layer-wise load requires packed records only")
+        offsets.extend(slot.file_offset for slot in spec.compressed_slots)
+        block_ids.extend(int(block) for block in spec.block_ids)
+    if not offsets or len(set(block_ids)) != len(block_ids):
+        raise ValueError("layer-wise load destinations must be distinct")
+    return np.asarray(offsets, dtype=np.int64), block_ids, leases.pop()
+
+
+@dataclass
+class _LayerwiseLoad:
+    """One step's layer-wise restore shared by the worker and load threads.
+
+    The load thread sets ``ready[layer]`` after enqueueing that layer's decode
+    and recording ``events[layer]``; it sets ``failed`` before any ready flag
+    it publishes after an error. ``future`` completes after every staging and
+    transfer lease is released.
+    """
+
+    req_ids: set[str]
+    block_ids: list[int]
+    ready: list[threading.Event]
+    events: list[torch.cuda.Event | None]
+    future: Future[None] | None = None
+    failed: bool = False
+    reported: bool = False
+    records: int = 0
+    nbytes: int = 0
+    header_ms: float = 0.0
+    load_ms: float = 0.0
+    stall_ms: float = 0.0
+    started_at: float = field(default_factory=time.perf_counter)
+
+
 @dataclass
 class _LoadRequest:
     """Own one or more coalesced base requests and their completion future."""
@@ -274,6 +338,10 @@ class LoadPipeline:
         self._cuda_stream: torch.cuda.Stream | None = None
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
+        self._layerwise: _LayerwiseLoad | None = None
+        # Pinned landing buffer for layer-wise header pages, grown on demand
+        # and touched only by the load thread.
+        self._header_host: torch.Tensor | None = None
         self._thread.start()
 
     def configure(
@@ -420,6 +488,72 @@ class LoadPipeline:
             )
         self._ensure_dispatcher()
 
+    def start_layerwise(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
+        """Begin this step's in-forward layer-wise restore.
+
+        Every record is fully leased in L1 and packed. The load thread reads
+        the header pages once, then streams one layer's plane bytes per
+        ``transfer_load_runs`` call over two staging buffers and decodes each
+        layer as soon as its bytes land, so attention of layer ``i`` waits
+        only for layer ``i``.
+
+        Args:
+            reqs_to_load: Synchronously scheduled load specs keyed by spec ID;
+                empty for steps without layer-wise loads.
+
+        Async/thread-safety:
+            Called on the worker thread from ``start_load_kv`` every step,
+            before that step's ``wait_for_layer`` calls. The previous step's
+            restore has passed every layer wait, so only its final lease
+            release can still be running; it is joined first.
+        """
+        previous = self._layerwise
+        self._layerwise = None
+        if previous is not None and previous.future is not None:
+            try:
+                previous.future.result(timeout=120.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[CONNECTOR] layer-wise load cleanup failed: %s", exc)
+            self._log_layerwise(previous)
+        if not reqs_to_load:
+            return
+        layers = (
+            int(next(iter(self._kv_caches.values())).shape[1]) if self._kv_caches else 1
+        )
+        state = _LayerwiseLoad(
+            req_ids={base_req_id(spec_id) for spec_id in reqs_to_load},
+            block_ids=[
+                int(block) for spec in reqs_to_load.values() for block in spec.block_ids
+            ],
+            ready=[threading.Event() for _ in range(layers)],
+            events=[None] * layers,
+        )
+        self._layerwise = state
+        state.future = self._submit(self._run_layerwise(state, dict(reqs_to_load)))
+
+    def wait_for_layer(self, layer: int) -> None:
+        """Order the current stream after this step's restore of one layer.
+
+        Args:
+            layer: Layer index in storage order.
+
+        Async/thread-safety:
+            Called on the worker thread before the layer's attention. Blocks
+            the host only until the load thread enqueued the layer's decode;
+            the GPU dependency is a stream-event wait.
+        """
+        state = self._layerwise
+        if state is None or not 0 <= layer < len(state.ready):
+            return
+        ready = state.ready[layer]
+        if not ready.is_set():
+            wait_start = time.perf_counter()
+            ready.wait()
+            state.stall_ms += (time.perf_counter() - wait_start) * 1000
+        event = state.events[layer]
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+
     def mark_failed(
         self,
         reqs_to_load: dict[str, ReqLoadSpec],
@@ -487,10 +621,17 @@ class LoadPipeline:
         """
         invalid = set(self._invalid_block_ids)
         self._invalid_block_ids.clear()
+        # A layer-wise failure is published before its ready flags, and the
+        # forward pass that precedes this poll waited on every layer.
+        layerwise = self._layerwise
+        if layerwise is not None and layerwise.failed and not layerwise.reported:
+            layerwise.reported = True
+            invalid.update(layerwise.block_ids)
         return invalid
 
     def shutdown(self) -> None:
         """Drain queue ownership, close IPC clients, and stop the load loop."""
+        self.start_layerwise({})
         for load in {id(item.future): item for item in self._pending.values()}.values():
             if not load.future.done():
                 try:
@@ -548,29 +689,34 @@ class LoadPipeline:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    async def _run_dispatcher(self) -> None:
+    def _ensure_cuda_streams(self) -> None:
+        """Bind the load thread to the KV device and create restore streams."""
         sample_tensor = next(iter(self._kv_caches.values()))
-        if sample_tensor.device.type == "cuda":
-            torch.cuda.set_device(sample_tensor.device)
-            if self._cuda_stream is None:
-                # CUDA current-stream state is thread-local.  Reuse the stream
-                # captured by the worker during KV registration when
-                # available; discovering it here would otherwise select the
-                # private load thread's stream and introduce implicit
-                # default-stream synchronization with model kernels.
-                self._cuda_stream = torch.cuda.current_stream(sample_tensor.device)
-            if (
-                self._compressed_decoder is not None
-                and self._compressed_cuda_stream is None
-            ):
-                # The request completion remains gated by the event recorded
-                # on this stream, so vLLM never consumes a partially restored
-                # KV block. The most urgent priority lets short restores avoid
-                # waiting behind already queued model work.
-                self._compressed_cuda_stream = torch.cuda.Stream(
-                    device=sample_tensor.device,
-                    priority=cuda_stream_priority("high"),
-                )
+        if sample_tensor.device.type != "cuda":
+            return
+        torch.cuda.set_device(sample_tensor.device)
+        if self._cuda_stream is None:
+            # CUDA current-stream state is thread-local.  Reuse the stream
+            # captured by the worker during KV registration when
+            # available; discovering it here would otherwise select the
+            # private load thread's stream and introduce implicit
+            # default-stream synchronization with model kernels.
+            self._cuda_stream = torch.cuda.current_stream(sample_tensor.device)
+        if (
+            self._compressed_decoder is not None
+            and self._compressed_cuda_stream is None
+        ):
+            # The request completion remains gated by the event recorded
+            # on this stream, so vLLM never consumes a partially restored
+            # KV block. The most urgent priority lets short restores avoid
+            # waiting behind already queued model work.
+            self._compressed_cuda_stream = torch.cuda.Stream(
+                device=sample_tensor.device,
+                priority=cuda_stream_priority("high"),
+            )
+
+    async def _run_dispatcher(self) -> None:
+        self._ensure_cuda_streams()
         queue = self._ensure_queue()
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
@@ -1130,6 +1276,198 @@ class LoadPipeline:
         event = torch.cuda.Event(blocking=False)
         event.record(self._cuda_stream)
         return copies, len(runs), event
+
+    async def _run_layerwise(
+        self, state: _LayerwiseLoad, specs: dict[str, ReqLoadSpec]
+    ) -> None:
+        """Stream and decode one step's packed records layer by layer.
+
+        Header pages land compactly at the tail of buffer 1, are planned on
+        the host and placed at every record's slot offset in both buffers.
+        Layer ``g`` then reads only its plane bytes into buffer ``g % 2``,
+        patches its descriptors in place and decodes through one shared
+        prepared plan.
+
+        Args:
+            state: Shared step state published to ``wait_for_layer``.
+            specs: The step's synchronously scheduled load specs.
+
+        Async/thread-safety:
+            Runs on the load event loop. GPU work is enqueued on the
+            compressed restore stream and host waits poll CUDA events, so the
+            loop keeps serving asynchronous loads. Staging buffers stay leased
+            until the last decode completes; the request transfer lease is
+            released here because the scheduler handed it to the worker.
+        """
+        leases: list[CudaStagingLease] = []
+        tasks: list[asyncio.Task[dict[str, Any]]] = []
+        stream: torch.cuda.Stream | None = None
+        try:
+            files, block_ids, lease_id = _layerwise_records(specs)
+            self._ensure_cuda_streams()
+            decoder = self._compressed_decoder
+            stream = self._compressed_cuda_stream
+            pool = self._staging_pool
+            if decoder is None or stream is None or pool is None:
+                raise RuntimeError("layer-wise load requires the compressed decoder")
+            if not self._staging_registered or pool.depth < 2 or len(self._clients) < 2:
+                raise RuntimeError("layer-wise load requires two registered buffers")
+            leases = [pool.acquire_index(index, pool.buffer_bytes) for index in (0, 1)]
+            buffers = [lease.view for lease in leases]
+            words = [
+                buffer[: buffer.numel() // 4 * 4].view(torch.int32)
+                for buffer in buffers
+            ]
+            rows = [
+                buffer[: buffer.numel() // IO_ALIGNMENT * IO_ALIGNMENT].view(
+                    -1, IO_ALIGNMENT
+                )
+                for buffer in buffers
+            ]
+            pid = os.getpid()
+            records = len(files)
+            header_bytes = records * IO_ALIGNMENT
+            tail = (pool.buffer_bytes - header_bytes) // IO_ALIGNMENT * IO_ALIGNMENT
+            if tail <= 0:
+                raise ValueError("layer-wise header pages exceed staging")
+            await self._clients[1].transfer_load_runs(
+                1,
+                pid,
+                files,
+                tail + np.arange(records, dtype=np.int64) * IO_ALIGNMENT,
+                np.full(records, IO_ALIGNMENT, dtype=np.int64),
+                lease_id,
+            )
+            host = self._header_host
+            if host is None or host.numel() < header_bytes:
+                host = torch.empty(header_bytes, dtype=torch.uint8, pin_memory=True)
+                self._header_host = host
+            with torch.cuda.stream(stream):
+                landed = buffers[1][tail : tail + header_bytes]
+                host[:header_bytes].copy_(landed, non_blocking=True)
+                pages = landed.clone().view(records, IO_ALIGNMENT)
+                copied = torch.cuda.Event()
+                copied.record(stream)
+            await self._wait_for_cuda_event(copied)
+            headers = host[:header_bytes].numpy().reshape(records, IO_ALIGNMENT)
+            layers = len(state.ready)
+            plans = plan_layer_groups(
+                headers, [(2 * layer, 2) for layer in range(layers)]
+            )
+            if plans[0].staging_bytes > tail:
+                raise ValueError("layer-wise staging exceeds the staging buffer")
+            patches = [staged_descriptor_patch(headers, plan) for plan in plans]
+            bounds = np.concatenate(([0], np.cumsum([len(p[0]) for p in patches])))
+            device = buffers[0].device
+            with torch.cuda.stream(stream):
+                slots = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
+                    device
+                )
+                for buffer_rows in rows:
+                    buffer_rows.index_copy_(0, slots, pages)
+                patch_index = torch.from_numpy(
+                    np.concatenate([p[0] for p in patches])
+                ).to(device)
+                patch_value = torch.from_numpy(
+                    np.concatenate([p[1] for p in patches])
+                ).to(device)
+                restore = decoder.prepare(
+                    staging=buffers[0],
+                    staging_offsets=plans[0].staging_offsets.tolist(),
+                    block_ids=block_ids,
+                    modes=[1] * records,
+                    buffer_index=0,
+                    stream=stream,
+                    plane_range=(0, 2 * layers),
+                )
+            if restore is None:
+                raise RuntimeError("layer-wise load prepared no records")
+            state.records = records
+            state.header_ms = (time.perf_counter() - state.started_at) * 1000
+
+            def transfer(group: int) -> asyncio.Task[dict[str, Any]]:
+                plan = plans[group]
+                # Gather copies need 16-byte runs. Records are 4 KiB aligned
+                # and staged congruently modulo 16, so widening to 16 stays
+                # inside the record and inside its staging footprint.
+                skew = plan.source_begin % 16
+                begin = plan.source_begin - skew
+                end = (plan.source_end + 15) // 16 * 16
+                lane = group % 2
+                return asyncio.create_task(
+                    self._clients[lane].transfer_load_runs(
+                        lane,
+                        pid,
+                        files + begin,
+                        plan.data_offsets - skew,
+                        end - begin,
+                        lease_id,
+                    )
+                )
+
+            tasks = [transfer(group) for group in range(min(2, layers))]
+            for group in range(layers):
+                response = await tasks[group]
+                state.nbytes += int(response.get("bytes", 0))
+                lane = group % 2
+                first, last = int(bounds[group]), int(bounds[group + 1])
+                with torch.cuda.stream(stream):
+                    words[lane].index_put_(
+                        (patch_index[first:last],), patch_value[first:last]
+                    )
+                    restore.submit_planes(2 * group, 2, buffers[lane])
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                state.events[group] = event
+                state.ready[group].set()
+                if group + 2 < layers:
+                    # The next group on this lane overwrites the buffer this
+                    # decode reads.
+                    await self._wait_for_cuda_event(event)
+                    tasks.append(transfer(group + 2))
+            state.load_ms = (time.perf_counter() - state.started_at) * 1000
+            final = state.events[layers - 1]
+            if final is not None:
+                await self._wait_for_cuda_event(final)
+        except Exception as exc:  # noqa: BLE001
+            state.failed = True
+            logger.warning(
+                "[CONNECTOR] layer-wise load failed reqs=%s: %s",
+                ",".join(sorted(state.req_ids)),
+                exc,
+            )
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if stream is not None:
+                await asyncio.to_thread(stream.synchronize)
+        finally:
+            for ready in state.ready:
+                ready.set()
+            for lease in leases:
+                lease.release()
+            for lease_id in sorted({spec.lease_id for spec in specs.values()} - {""}):
+                try:
+                    await self._clients[0].release_transfer_lease(lease_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[CONNECTOR] release_transfer_lease failed req=%s: %s",
+                        lease_id[:8],
+                        exc,
+                    )
+
+    def _log_layerwise(self, state: _LayerwiseLoad) -> None:
+        """Log one finished layer-wise restore."""
+        logger.info(
+            "[CONNECTOR] layerwise load req=%s wall_ms=%.3f records=%d bytes=%d "
+            "header_ms=%.3f stall_ms=%.3f failed=%d",
+            ",".join(sorted(state.req_ids)),
+            state.load_ms,
+            state.records,
+            state.nbytes,
+            state.header_ms,
+            state.stall_ms,
+            int(state.failed),
+        )
 
     def _log_request_timing(self, state: _InflightRequestLoad) -> None:
         rows = state.completed
