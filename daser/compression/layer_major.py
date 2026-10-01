@@ -30,6 +30,65 @@ _REBASED_WORDS = (3, 5, 6, 7, 8)
 _DATA_ALIGNMENT = 16
 
 
+def _descriptor_words(headers: NDArray[np.uint8]) -> NDArray[np.uint32]:
+    """View each header's descriptor table as ``[records, planes, 12]`` words."""
+    table = headers[:, _FIXED_HEADER_BYTES:]
+    planes = table.shape[1] // _DESCRIPTOR_BYTES
+    table = table[:, : planes * _DESCRIPTOR_BYTES]
+    return table.view(np.uint32).reshape(len(headers), planes, _DESCRIPTOR_BYTES // 4)
+
+
+def _group_bounds(
+    headers: NDArray[np.uint8], plane_range: tuple[int, int]
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Return per-record ``[begin, end)`` of one plane group's bytes."""
+    first, count = plane_range
+    if headers.ndim != 2 or headers.shape[1] != IO_ALIGNMENT or not len(headers):
+        raise ValueError("headers must be a nonempty [records, 4096] array")
+    if first < 0 or count <= 0:
+        raise ValueError("plane range is invalid")
+    last = first + count
+    if _FIXED_HEADER_BYTES + last * _DESCRIPTOR_BYTES > IO_ALIGNMENT:
+        raise ValueError("plane range exceeds the descriptor table")
+    magic = np.frombuffer(SLOT_MAGIC, dtype=np.uint8)
+    if not (headers[:, : len(magic)] == magic).all():
+        raise ValueError("layer-major staging requires packed record headers")
+    words = _descriptor_words(headers)
+    begin = words[:, first, _RECORD_OFFSET_WORD].astype(np.int64)
+    end = words[:, last - 1, _RECORD_OFFSET_WORD].astype(np.int64) + words[
+        :, last - 1, _RECORD_OFFSET_WORD + 1
+    ].astype(np.int64)
+    if (begin < IO_ALIGNMENT).any() or (end <= begin).any():
+        raise ValueError("packed record plane offsets are invalid")
+    return begin, end
+
+
+def _footprint(begin: NDArray[np.int64], end: NDArray[np.int64]) -> NDArray[np.int64]:
+    """Return 4 KiB-rounded per-record staging bytes for one group."""
+    footprint = IO_ALIGNMENT + begin % _DATA_ALIGNMENT + (end - begin)
+    return (footprint + IO_ALIGNMENT - 1) // IO_ALIGNMENT * IO_ALIGNMENT
+
+
+def _plan(
+    plane_range: tuple[int, int],
+    begin: NDArray[np.int64],
+    end: NDArray[np.int64],
+    footprint: NDArray[np.int64],
+) -> "LayerGroupPlan":
+    """Lay records out back-to-back with the given per-record footprints."""
+    staging_offsets = np.concatenate(([0], np.cumsum(footprint)[:-1])).astype(np.int64)
+    # Keep the source and staged copies of the group congruent modulo 16 so
+    # every per-record copy is a 16-byte aligned run.
+    return LayerGroupPlan(
+        plane_range=(plane_range[0], plane_range[1]),
+        source_begin=begin,
+        source_end=end,
+        staging_offsets=staging_offsets,
+        data_offsets=staging_offsets + IO_ALIGNMENT + begin % _DATA_ALIGNMENT,
+        staging_bytes=int(footprint.sum()),
+    )
+
+
 @dataclass(frozen=True)
 class LayerGroupPlan:
     """Byte ranges and staging layout for one plane group of many records.
@@ -72,38 +131,42 @@ def plan_layer_group(
     Thread-safety:
         Pure computation on caller-owned arrays.
     """
-    first, count = plane_range
-    if headers.ndim != 2 or headers.shape[1] != IO_ALIGNMENT or not len(headers):
-        raise ValueError("headers must be a nonempty [records, 4096] array")
-    if first < 0 or count <= 0:
-        raise ValueError("plane range is invalid")
-    last = first + count
-    if _FIXED_HEADER_BYTES + last * _DESCRIPTOR_BYTES > IO_ALIGNMENT:
-        raise ValueError("plane range exceeds the descriptor table")
-    magic = np.frombuffer(SLOT_MAGIC, dtype=np.uint8)
-    if not (headers[:, : len(magic)] == magic).all():
-        raise ValueError("layer-major staging requires packed record headers")
-    words = _descriptor_words(headers)
-    begin = words[:, first, _RECORD_OFFSET_WORD].astype(np.int64)
-    end = words[:, last - 1, _RECORD_OFFSET_WORD].astype(np.int64) + words[
-        :, last - 1, _RECORD_OFFSET_WORD + 1
-    ].astype(np.int64)
-    if (begin < IO_ALIGNMENT).any() or (end <= begin).any():
-        raise ValueError("packed record plane offsets are invalid")
-    # Keep the source and staged copies of the group congruent modulo 16 so
-    # every per-record copy is a 16-byte aligned run.
-    lead = begin % _DATA_ALIGNMENT
-    footprint = IO_ALIGNMENT + lead + (end - begin)
-    footprint = (footprint + IO_ALIGNMENT - 1) // IO_ALIGNMENT * IO_ALIGNMENT
-    staging_offsets = np.concatenate(([0], np.cumsum(footprint)[:-1])).astype(np.int64)
-    return LayerGroupPlan(
-        plane_range=(first, count),
-        source_begin=begin,
-        source_end=end,
-        staging_offsets=staging_offsets,
-        data_offsets=staging_offsets + IO_ALIGNMENT + lead,
-        staging_bytes=int(footprint.sum()),
-    )
+    begin, end = _group_bounds(headers, plane_range)
+    return _plan(plane_range, begin, end, _footprint(begin, end))
+
+
+def plan_layer_groups(
+    headers: NDArray[np.uint8], plane_ranges: list[tuple[int, int]]
+) -> list[LayerGroupPlan]:
+    """Plan layer-major staging of several plane groups with one slot layout.
+
+    Every group places each record's header page at the same staging offset,
+    sized for the record's largest group, so one decoder ``prepare`` serves
+    all groups and each group launches on its own staging buffer through
+    ``PreparedKVRestore.submit_planes``.
+
+    Args:
+        headers: ``[records, 4096]`` uint8 header pages of packed records.
+        plane_ranges: Nonempty ``(first, count)`` plane groups.
+
+    Returns:
+        One plan per group, all with equal ``staging_offsets`` and
+        ``staging_bytes``.
+
+    Raises:
+        ValueError: As ``plan_layer_group``, or if no group is given.
+
+    Thread-safety:
+        Pure computation on caller-owned arrays.
+    """
+    if not plane_ranges:
+        raise ValueError("at least one plane group is required")
+    bounds = [_group_bounds(headers, group) for group in plane_ranges]
+    footprint = np.max([_footprint(begin, end) for begin, end in bounds], axis=0)
+    return [
+        _plan(group, begin, end, footprint)
+        for group, (begin, end) in zip(plane_ranges, bounds, strict=True)
+    ]
 
 
 def rebased_headers(
@@ -170,17 +233,10 @@ def stage_layer_group(
     return staging
 
 
-def _descriptor_words(headers: NDArray[np.uint8]) -> NDArray[np.uint32]:
-    """View each header's descriptor table as ``[records, planes, 12]`` words."""
-    table = headers[:, _FIXED_HEADER_BYTES:]
-    planes = table.shape[1] // _DESCRIPTOR_BYTES
-    table = table[:, : planes * _DESCRIPTOR_BYTES]
-    return table.view(np.uint32).reshape(len(headers), planes, _DESCRIPTOR_BYTES // 4)
-
-
 __all__ = [
     "LayerGroupPlan",
     "plan_layer_group",
+    "plan_layer_groups",
     "rebased_headers",
     "stage_layer_group",
 ]

@@ -24,7 +24,11 @@ from daser.compression import (
     encode_slot,
 )
 from daser.compression.format import IO_ALIGNMENT, ONLINE_TILE_SCALARS
-from daser.compression.layer_major import plan_layer_group, stage_layer_group
+from daser.compression.layer_major import (
+    plan_layer_group,
+    plan_layer_groups,
+    stage_layer_group,
+)
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -77,6 +81,45 @@ def _time_restores(
             assert plan is not None
             plan.submit()
             host += time.perf_counter() - began
+        end.record(stream)
+        stream.synchronize()
+        best_host = min(best_host, host * 1e3 / len(stagings))
+        best_gpu = min(best_gpu, start.elapsed_time(end) / len(stagings))
+    return best_host, best_gpu
+
+
+def _time_grouped(
+    decoder: FusedCompressedKVDecoder,
+    stagings: list[tuple[torch.Tensor, list[int], tuple[int, int]]],
+    blocks: list[int],
+    stream: torch.cuda.Stream,
+    repeats: int,
+) -> tuple[float, float]:
+    """Time one ``prepare`` plus one ``submit_planes`` per group.
+
+    Returns best (host ms per group, GPU ms per group) over ``repeats``.
+    """
+    best_host, best_gpu = float("inf"), float("inf")
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    for _ in range(repeats):
+        stream.synchronize()
+        start.record(stream)
+        began = time.perf_counter()
+        plan = decoder.prepare(
+            staging=stagings[0][0],
+            staging_offsets=stagings[0][1],
+            block_ids=blocks,
+            modes=[1] * len(blocks),
+            buffer_index=0,
+            stream=stream,
+        )
+        assert plan is not None
+        for staging, _offsets, plane_range in stagings:
+            plan.submit_planes(*plane_range, staging)
+        host = time.perf_counter() - began
         end.record(stream)
         stream.synchronize()
         best_host = min(best_host, host * 1e3 / len(stagings))
@@ -152,7 +195,10 @@ def main() -> None:
         f"record-major all planes: host {host:.2f} ms gpu {gpu:.2f} ms "
         f"({record_bytes / gpu / 1e6:.0f} GB/s packed)"
     )
-    print("group_layers groups staged/record host_ms/group gpu_ms/group gpu_total_ms")
+    print(
+        "group_layers groups staged/record host_ms/group gpu_ms/group "
+        "gpu_total_ms | shared: staged/record host_ms/group gpu_ms/group"
+    )
     for group_layers in args.groups:
         stagings = []
         staged = 0
@@ -166,11 +212,37 @@ def main() -> None:
                 (tensor.cuda(), plan.staging_offsets.tolist(), plan.plane_range)
             )
         host, gpu = _time_restores(decoder, stagings, blocks, stream, args.repeats)
-        print(
-            f"{group_layers:12d} {len(stagings):6d} {staged / record_bytes:13.3f} "
-            f"{host:12.3f} {gpu:11.3f} {gpu * len(stagings):12.2f}"
-        )
         del stagings
+        ranges = [
+            (2 * first, 2 * min(group_layers, args.layers - first))
+            for first in range(0, args.layers, group_layers)
+        ]
+        shared = plan_layer_groups(headers, ranges)
+        # Each group's descriptors only cover its own planes, so every group
+        # needs its own staged image; production refills a two-buffer ring.
+        grouped = [
+            (
+                torch.from_numpy(
+                    np.frombuffer(
+                        stage_layer_group(payloads, plan), dtype=np.uint8
+                    ).copy()
+                ).cuda(),
+                plan.staging_offsets.tolist(),
+                plan.plane_range,
+            )
+            for plan in shared
+        ]
+        _time_grouped(decoder, grouped, blocks, stream, 1)
+        shared_host, shared_gpu = _time_grouped(
+            decoder, grouped, blocks, stream, args.repeats
+        )
+        print(
+            f"{group_layers:12d} {len(ranges):6d} {staged / record_bytes:13.3f} "
+            f"{host:12.3f} {gpu:11.3f} {gpu * len(ranges):12.2f} | "
+            f"{shared[0].staging_bytes * len(ranges) / record_bytes:13.3f} "
+            f"{shared_host:12.3f} {shared_gpu:11.3f}"
+        )
+        del grouped
 
 
 if __name__ == "__main__":

@@ -13,7 +13,11 @@ from daser.compression import (
     encode_slot,
 )
 from daser.compression.format import IO_ALIGNMENT
-from daser.compression.layer_major import plan_layer_group, stage_layer_group
+from daser.compression.layer_major import (
+    plan_layer_group,
+    plan_layer_groups,
+    stage_layer_group,
+)
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -136,6 +140,82 @@ def test_layer_groups_restore_like_whole_records(
         done = first_layer + group_layers
         assert torch.equal(actual[:, :done], expected[:, :done])
         assert not actual[:, done:].any()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("tile_scalars", [256, 1024])
+def test_one_prepare_restores_groups_from_separate_staging(tile_scalars: int) -> None:
+    """One prepared plan decodes each group from its own staging buffer."""
+    geometry = _geometry(tile_scalars)
+    codebooks = default_online_codebooks(geometry)
+    payloads = [
+        encode_slot(
+            _raw_slot(geometry, seed),
+            slot_id=seed,
+            geometry=geometry,
+            codebooks=codebooks,
+        ).payload
+        for seed in range(3)
+    ]
+    blocks = [1, 2, 0]
+    stream = torch.cuda.Stream()
+    with torch.inference_mode():
+        expected = _kv_cache(3, geometry)
+        actual = _kv_cache(3, geometry)
+        decoders = [
+            FusedCompressedKVDecoder(
+                kv_cache=cache,
+                codebooks=codebooks,
+                tile_scalars=tile_scalars,
+                ring_depth=1,
+                max_slots_per_buffer=3,
+            )
+            for cache in (expected, actual)
+        ]
+    whole = torch.from_numpy(
+        np.frombuffer(b"".join(payloads), dtype=np.uint8).copy()
+    ).cuda()
+    offsets = np.cumsum([0] + [len(p) for p in payloads[:-1]]).tolist()
+    reference = decoders[0].prepare(
+        staging=whole,
+        staging_offsets=offsets,
+        block_ids=blocks,
+        modes=[1, 1, 1],
+        buffer_index=0,
+        stream=stream,
+    )
+    assert reference is not None
+    reference.submit()
+
+    headers = np.stack(
+        [np.frombuffer(p, dtype=np.uint8, count=IO_ALIGNMENT) for p in payloads]
+    )
+    groups = plan_layer_groups(headers, [(0, 2), (2, 4), (6, 2)])
+    stagings = [
+        torch.from_numpy(
+            np.frombuffer(stage_layer_group(payloads, group), dtype=np.uint8).copy()
+        ).cuda()
+        for group in groups
+    ]
+    plan = decoders[1].prepare(
+        staging=stagings[0],
+        staging_offsets=groups[0].staging_offsets.tolist(),
+        block_ids=blocks,
+        modes=[1, 1, 1],
+        buffer_index=0,
+        stream=stream,
+    )
+    assert plan is not None
+    with pytest.raises(ValueError):
+        plan.submit_planes(2, 4, stagings[1])
+    for group, staging in zip(groups, stagings, strict=True):
+        assert plan.submit_planes(*group.plane_range, staging) == 3
+    assert plan.submit() == 0
+    with pytest.raises(ValueError):
+        plan.submit_planes(0, 2, stagings[0])
+    stream.synchronize()
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.integration

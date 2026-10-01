@@ -789,6 +789,7 @@ class PreparedKVRestore:
         self._stream = stream
         # Destination bits are [blocks, layers, rows, K/V, dim].
         self._plane_range = plane_range or (0, 2 * destination.shape[1])
+        self._next_plane = self._plane_range[0]
         self._submitted = False
 
     @property
@@ -799,6 +800,9 @@ class PreparedKVRestore:
     def submit(self) -> int:
         """Enqueue decode of every source on the prepared stream once.
 
+        After ``submit_planes`` groups, this decodes only the remaining planes
+        from the prepared staging buffer.
+
         Returns:
             Number of sources submitted, or zero if the plan was submitted.
         Async/thread-safety:
@@ -807,19 +811,70 @@ class PreparedKVRestore:
         """
         if self._submitted:
             return 0
+        first, count = self._plane_range
+        self._launch(self._staging, self._next_plane, first + count - self._next_plane)
         self._submitted = True
+        return self._offsets.numel()
+
+    def submit_planes(
+        self, first: int, count: int, staging: torch.Tensor | None = None
+    ) -> int:
+        """Enqueue decode of the next contiguous plane group of every source.
+
+        Layer-wise restore calls this once per group, in plane order, so all
+        groups share the metadata uploaded by one ``prepare``. Each group may
+        read its own staging buffer laid out with the prepared offsets (see
+        ``daser.compression.layer_major.plan_layer_groups``).
+
+        Args:
+            first: First plane; must be the next undecoded plane of the plan.
+            count: Planes in the group; must stay within the prepared range.
+            staging: Optional CUDA byte buffer for this group, at least as
+                large as the prepared staging; defaults to the prepared one.
+
+        Returns:
+            Number of sources submitted.
+
+        Raises:
+            ValueError: If the group is out of order, out of range, follows a
+                full ``submit``, or the staging buffer is unusable.
+
+        Async/thread-safety:
+            Called on the exclusive load thread. Does not wait for the GPU;
+            the caller keeps every group's staging buffer leased until a CUDA
+            event recorded after that group's launch completes.
+        """
+        begin, planes = self._plane_range
+        if self._submitted or first != self._next_plane:
+            raise ValueError("restore plane groups must be submitted in order")
+        if count <= 0 or first + count > begin + planes:
+            raise ValueError("restore plane group exceeds the prepared range")
+        source = self._staging if staging is None else staging
+        if (
+            source.device != self._staging.device
+            or source.dtype is not torch.uint8
+            or source.numel() < self._staging.numel()
+        ):
+            raise ValueError("restore group staging does not match the plan")
+        self._launch(source, first, count)
+        self._next_plane = first + count
+        self._submitted = self._next_plane == begin + planes
+        return self._offsets.numel()
+
+    def _launch(self, staging: torch.Tensor, first: int, count: int) -> None:
+        """Enqueue the decoder for planes ``[first, first + count)``."""
         with torch.cuda.stream(self._stream):
             self._kernel(
-                self._staging,
+                staging,
                 self._offsets,
                 self._blocks,
                 self._destination_offsets,
                 self._modes,
                 self._codebooks,
                 self._destination,
-                *self._plane_range,
+                first,
+                count,
             )
-        return self._offsets.numel()
 
 
 class FusedCompressedKVDecoder:

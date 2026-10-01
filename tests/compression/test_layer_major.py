@@ -14,6 +14,7 @@ from daser.compression import (
 from daser.compression.format import IO_ALIGNMENT
 from daser.compression.layer_major import (
     plan_layer_group,
+    plan_layer_groups,
     rebased_headers,
     stage_layer_group,
 )
@@ -100,6 +101,23 @@ def test_staged_group_reads_the_same_plane_bytes() -> None:
                 bytes(image[page + staged : page + staged + length])
                 == record[start : start + length]
             )
+
+
+def test_shared_layout_keeps_header_pages_fixed() -> None:
+    """Groups planned together share slot offsets sized for the largest group."""
+    records = _records(_geometry())
+    headers = _headers(records)
+    ranges = [(0, 2), (2, 2), (4, 2)]
+    shared = plan_layer_groups(headers, ranges)
+    alone = [plan_layer_group(headers, group) for group in ranges]
+    for plan, single in zip(shared, alone, strict=True):
+        assert np.array_equal(plan.staging_offsets, shared[0].staging_offsets)
+        assert plan.staging_bytes == shared[0].staging_bytes
+        assert plan.staging_bytes >= single.staging_bytes
+        assert np.array_equal(plan.source_begin, single.source_begin)
+        assert (plan.data_offsets % 16 == plan.source_begin % 16).all()
+    with pytest.raises(ValueError):
+        plan_layer_groups(headers, [])
 
 
 def test_rejects_raw_records_and_bad_ranges() -> None:
