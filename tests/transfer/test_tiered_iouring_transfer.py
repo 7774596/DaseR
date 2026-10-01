@@ -1926,3 +1926,64 @@ def test_iouring_rejects_l2_overflow(tmp_path) -> None:
         raise AssertionError("expected ValueError")
     finally:
         layer.close()
+
+
+@pytest.mark.parametrize("gather_min_runs", [0, 2])
+def test_iouring_leased_runs_copy_subranges_of_every_record(
+    tmp_path, gather_min_runs: int
+) -> None:
+    """Vectorized leased runs land each record's subrange at its target."""
+    cupy = pytest.importorskip("cupy")
+    np = pytest.importorskip("numpy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+
+    async def scenario() -> None:
+        records, record = 4, ALIGNMENT * 2
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=records * record,
+            l2_bytes=0,
+            skip_l2=True,
+            gather_min_runs=gather_min_runs,
+        )
+        payloads = [
+            bytearray((np.arange(record) * (i + 3) % 251).astype(np.uint8).tobytes())
+            for i in range(records)
+        ]
+        try:
+            for i, payload in enumerate(payloads):
+                await layer.store_bytes(payload, i * record, record)
+            spans = [
+                {"file_offset": i * record, "nbytes": record} for i in range(records)
+            ]
+            assert await layer.classify_and_acquire_lease("runs", spans) == "l1"
+            order = np.array([2, 0, 3, 1], dtype=np.int64)
+            begin, size = ALIGNMENT + 32, 1024
+            files = np.arange(records, dtype=np.int64) * record + begin
+            targets = order * 2048 + 16
+            dst = cupy.zeros(records * 2048, dtype=cupy.uint8)
+            sizes = np.full(records, size, dtype=np.int64)
+            copied = await layer.load_leased_runs(dst, files, targets, sizes, "runs")
+            assert copied == records * size
+            result = cupy.asnumpy(dst).tobytes()
+            for i, slot in enumerate(order.tolist()):
+                start = slot * 2048 + 16
+                assert result[start : start + size] == bytes(
+                    payloads[i][begin : begin + size]
+                )
+            with pytest.raises(KeyError):
+                await layer.load_leased_runs(
+                    dst,
+                    np.array([record - 512]),
+                    np.array([0]),
+                    np.array([1024]),
+                    "runs",
+                )
+            with pytest.raises(KeyError):
+                await layer.load_leased_runs(dst, files, targets, sizes, "missing")
+        finally:
+            await layer.release_lease("runs")
+            layer.close()
+
+    _run(scenario())

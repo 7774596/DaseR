@@ -1717,6 +1717,88 @@ class TieredIOUringTransferLayer(TransferLayer):
             await _drain_destination_copies([copy_future])
         return total
 
+    async def load_leased_runs(
+        self,
+        dst: Any,
+        file_offsets: Any,
+        target_offsets: Any,
+        nbytes: Any,
+        lease_id: str,
+    ) -> int:
+        """Copy many leased L1 runs with one vectorized resolution.
+
+        Layer-wise delivery copies one plane group of every record of a
+        request per call, i.e. thousands of small runs. Each run must lie in
+        one L1 slice retained by the lease; runs are mapped to their slices
+        with one sorted search instead of per-span metadata walks.
+
+        Args:
+            dst: Flat CUDA byte destination (optionally with
+                ``copy_stream_ptr``).
+            file_offsets: ``int64`` array of physical run starts.
+            target_offsets: ``int64`` array of destination offsets.
+            nbytes: ``int64`` array of run lengths.
+            lease_id: Request lease retaining every run.
+
+        Returns:
+            Bytes copied, after the copies completed on the device.
+
+        Raises:
+            KeyError: If the lease is unknown or a run is not inside one
+                retained slice.
+            ValueError: If the arrays are empty, unequal or out of bounds.
+
+        Async/thread-safety:
+            Runs on the owning event loop. The lease is pinned for the whole
+            call, so its slices cannot be released while copies are in flight;
+            the lease ranges are not consumed.
+        """
+        import numpy
+
+        files = numpy.asarray(file_offsets, dtype=numpy.int64)
+        sizes = numpy.asarray(nbytes, dtype=numpy.int64)
+        async with self._lock:
+            self._raise_l2_error_locked()
+            lease = self._request_leases.get(lease_id)
+            if lease is None:
+                raise KeyError(f"unknown transfer lease: {lease_id}")
+            hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
+            starts = numpy.array([hit.file_offset for hit in hits], dtype=numpy.int64)
+            ends = starts + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64)
+            bases = numpy.array(
+                [hit.data.ptr_at(hit.source_offset) for hit in hits],
+                dtype=numpy.uint64,
+            )
+            index = numpy.searchsorted(starts, files, side="right") - 1
+            if (
+                not len(hits)
+                or (index < 0).any()
+                or (files + sizes > ends[numpy.maximum(index, 0)]).any()
+            ):
+                raise KeyError("request lease does not cover every load run")
+            sources = bases[index] + (files - starts[index]).astype(numpy.uint64)
+            # Pin the lease before enqueueing: a partial submission still
+            # reads its slices, and the finally below releases the pin only
+            # after the device event completes.
+            lease.active_loads += 1
+            try:
+                event = copy_ops.copy_pointer_runs_to_cuda_dst(
+                    dst, target_offsets, sources, sizes, self._gather_min_runs
+                )
+            except BaseException:
+                lease.active_loads -= 1
+                raise
+            self._stats.l1_hits += len(files)
+        try:
+            while not event.done:
+                await asyncio.sleep(0.0005)
+        finally:
+            async with self._lock:
+                lease.active_loads -= 1
+                if lease.release_all and lease.active_loads == 0:
+                    self._release_request_lease_locked(lease_id, force=True)
+        return int(sizes.sum())
+
     async def release_lease_ranges(
         self,
         lease_id: str,

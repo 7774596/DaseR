@@ -92,10 +92,12 @@ def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, 
     return runs
 
 
-def _launch_gather(runs: list[tuple[int, int, int]], stream_ptr: int) -> None:
+def _launch_gather(meta: Any, stream_ptr: int) -> None:
     """Queue one zero-copy gather kernel for 16-byte-aligned runs.
 
-    Must run under the destination's ``cupy.cuda.Device`` context.
+    ``meta`` is a ``(3, runs)`` uint64 array of destination pointers, source
+    pointers and lengths. Must run under the destination's
+    ``cupy.cuda.Device`` context.
     """
     global _gather_kernel
     import cupy
@@ -103,18 +105,18 @@ def _launch_gather(runs: list[tuple[int, int, int]], stream_ptr: int) -> None:
 
     if _gather_kernel is None:
         _gather_kernel = cupy.RawKernel(_GATHER_SOURCE, "daser_gather16")
-    meta = numpy.array(runs, dtype=numpy.uint64).T.copy()
+    count = int(meta.shape[1])
     stream = cupy.cuda.ExternalStream(stream_ptr)
     with stream:
-        device_meta = cupy.asarray(meta)
+        device_meta = cupy.asarray(numpy.ascontiguousarray(meta, dtype=numpy.uint64))
         _gather_kernel(
-            (min(_GATHER_BLOCKS, len(runs)),),
+            (min(_GATHER_BLOCKS, count),),
             (_GATHER_THREADS,),
             (
                 device_meta[1],
                 device_meta[0],
                 device_meta[2],
-                numpy.int32(len(runs)),
+                numpy.int32(count),
             ),
         )
 
@@ -202,6 +204,68 @@ class LayerGatherPlan:
                         numpy.int32(self._count),
                     ),
                 )
+
+
+def copy_pointer_runs_to_cuda_dst(
+    dst: Any,
+    target_offsets: Any,
+    source_ptrs: Any,
+    nbytes: Any,
+    gather_min_runs: int = 0,
+) -> Any:
+    """Queue host-pointer runs into a flat CUDA byte destination.
+
+    Args:
+        dst: Flat CuPy-like byte destination, optionally exposing
+            ``copy_stream_ptr``.
+        target_offsets: ``int64`` array of destination byte offsets.
+        source_ptrs: ``uint64`` array of pinned, device-mapped host pointers.
+        nbytes: ``int64`` array of run lengths.
+        gather_min_runs: Use one zero-copy gather launch when at least this
+            many runs are given and all are 16-byte aligned (0 disables).
+
+    Returns:
+        A CUDA event recorded on the destination stream after the copies.
+
+    Async/thread-safety:
+        Enqueues work only. The caller keeps every source alive until the
+        returned event completes. Offsets are pointer arithmetic, so no
+        per-run destination view is built.
+    """
+    import cupy
+    from cupy.cuda import runtime
+    import numpy
+
+    targets = numpy.asarray(target_offsets, dtype=numpy.int64)
+    sources = numpy.asarray(source_ptrs, dtype=numpy.uint64)
+    sizes = numpy.asarray(nbytes, dtype=numpy.int64)
+    if not (len(targets) == len(sources) == len(sizes)) or not len(targets):
+        raise ValueError("pointer runs must be nonempty and of equal length")
+    end = int((targets + sizes).max())
+    whole = slice_dst(dst, 0, end)
+    base_ptr = cuda_array_ptr(whole)
+    if base_ptr is None or int(whole.size) < end or int(targets.min()) < 0:
+        raise ValueError("pointer runs exceed the CUDA destination")
+    dst_ptrs = targets.astype(numpy.uint64) + numpy.uint64(base_ptr)
+    stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
+    with cupy.cuda.Device(int(whole.device.id)):
+        aligned = not (
+            numpy.bitwise_or.reduce(dst_ptrs | sources | sizes.astype(numpy.uint64))
+            % 16
+        )
+        if gather_min_runs and len(sizes) >= gather_min_runs and aligned:
+            _launch_gather(
+                numpy.stack([dst_ptrs, sources, sizes.astype(numpy.uint64)]),
+                stream_ptr,
+            )
+        else:
+            for d, s, n in zip(
+                dst_ptrs.tolist(), sources.tolist(), sizes.tolist(), strict=True
+            ):
+                runtime.memcpyAsync(d, s, n, runtime.memcpyHostToDevice, stream_ptr)
+        event = cupy.cuda.Event(disable_timing=True)
+        event.record(cupy.cuda.ExternalStream(stream_ptr))
+    return event
 
 
 def destination_copy_event(dst: Any, chunks: list[CopyChunk]) -> Any | None:
@@ -403,7 +467,9 @@ def copy_grouped_to_cuda_dst(
             and len(runs) >= gather_min_runs
             and all(not (d | s | n) % 16 for d, s, n in runs)
         ):
-            _launch_gather(runs, stream_ptr)
+            import numpy
+
+            _launch_gather(numpy.array(runs, dtype=numpy.uint64).T, stream_ptr)
             return len(runs)
         for dst_ptr, source_ptr, nbytes in runs:
             runtime.memcpyAsync(
