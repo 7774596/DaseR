@@ -2808,3 +2808,71 @@ async def test_ipc_readahead_hint_reads_ahead_without_lookup_metrics(
     assert "daser_external_prefix_cache_queries_total" not in (
         registry.render_prometheus()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("compute_tokens_per_s", "expected_front"),
+    [(BLOCK_TOKENS / SLOT_SIZE, 2 * BLOCK_TOKENS), (1e-12, 0)],
+)
+async def test_ipc_split_prefill_reads_only_the_back_part(
+    tmp_path, monkeypatch, compute_tokens_per_s: float, expected_front: int
+) -> None:
+    """The split balances front compute against back reads at a block edge.
+
+    Computing one token costs as long as reading its stored bytes in the
+    first case, so four hit blocks split two/two and only the back two are
+    read ahead. When computing is far slower than reading the split rounds to
+    zero and nothing is read ahead.
+    """
+    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
+    _ReadaheadRecordingTransfer.readaheads = []
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        _ReadaheadRecordingTransfer,
+    )
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, make_core(), make_runtime_config(tmp_path))
+    await server.start()
+    blocks = 4
+    tokens = list(range(1, blocks * BLOCK_TOKENS + 1))
+    try:
+        key = ROLLING_PREFIX_SEED
+        for block in range(blocks):
+            key = rolling_prefix_key(
+                key, tokens[block * BLOCK_TOKENS : (block + 1) * BLOCK_TOKENS]
+            )
+            await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": BLOCK_TOKENS,
+                    "model_id": "m",
+                },
+            )
+            await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
+        resp = await _send_recv(
+            socket_path,
+            {
+                "op": "split_prefill",
+                "tokens": tokens,
+                "model_id": "m",
+                "external_prefix_queries": len(tokens) + 1,
+                "compute_tokens_per_s": compute_tokens_per_s,
+                "load_bytes_per_s": 1.0,
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert resp["hit_tokens"] == len(tokens)
+    assert resp["compute_tokens"] == expected_front
+    if expected_front:
+        assert resp["started"] is True
+        (spans,) = _ReadaheadRecordingTransfer.readaheads
+        back_blocks = blocks - expected_front // BLOCK_TOKENS
+        assert sum(int(span["nbytes"]) for span in spans) == back_blocks * SLOT_SIZE
+    else:
+        assert resp["started"] is False
+        assert _ReadaheadRecordingTransfer.readaheads == []

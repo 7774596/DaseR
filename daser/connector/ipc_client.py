@@ -891,6 +891,41 @@ class IPCClientAsync(_IPCClientBase):
         """
         return await self.call({"op": "release_transfer_lease", "lease_id": lease_id})
 
+    async def split_prefill(
+        self,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int,
+        compute_tokens_per_s: float,
+        load_bytes_per_s: float,
+    ) -> dict[str, Any]:
+        """Plan a bidirectional prefill and start reading its back part.
+
+        Args:
+            tokens: Block-aligned prompt token IDs.
+            model_id: Model identifier.
+            external_prefix_queries: Prompt token count vLLM will query.
+            compute_tokens_per_s: GPU prefill rate for the front part.
+            load_bytes_per_s: Stored-byte read rate for the back part.
+
+        Returns:
+            ``{"compute_tokens", "hit_tokens", "started"}`` from the server.
+
+        Async/thread-safety:
+            Serializes with other calls on this client's connection; the
+            server replies before the readahead completes.
+        """
+        return await self.call(
+            {
+                "op": "split_prefill",
+                "token_bytes": _pack_lookup_tokens(tokens),
+                "model_id": model_id,
+                "external_prefix_queries": int(external_prefix_queries),
+                "compute_tokens_per_s": float(compute_tokens_per_s),
+                "load_bytes_per_s": float(load_bytes_per_s),
+            }
+        )
+
     async def register_staging_cuda(
         self,
         direction: str,

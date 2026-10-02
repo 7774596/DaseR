@@ -454,6 +454,7 @@ class IPCServer:
             "lookup": self._op_lookup,
             "lookup_prefetch": self._op_lookup_prefetch,
             "readahead_hint": self._op_readahead_hint,
+            "split_prefill": self._op_split_prefill,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
             "alloc_chunk": self._op_alloc_chunk,
@@ -694,6 +695,53 @@ class IPCServer:
         )
         started = bool(spans) and await self._ensure_transfer().start_readahead(spans)
         return {"started": started}
+
+    async def _op_split_prefill(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Plan a bidirectional prefill: compute the front, read the back.
+
+        The external hit is split at a block boundary ``x`` so that computing
+        tokens ``[0, x)`` on the GPU takes as long as reading the stored bytes
+        of ``[x, hits)``; readahead for the back part starts before replying.
+        Compression shrinks the back part's bytes and so moves ``x`` forward.
+        Records no prefix-cache counters and never waits for pending writers.
+
+        Args:
+            msg: ``token_bytes`` (or ``tokens``), ``model_id``,
+                ``external_prefix_queries``, ``compute_tokens_per_s`` and
+                ``load_bytes_per_s``.
+
+        Returns:
+            ``{"compute_tokens": int, "hit_tokens": int, "started": bool}``;
+            ``compute_tokens`` is 0 when no split is worthwhile.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop; readahead reads run in the
+            background after the reply.
+        """
+        empty = {"compute_tokens": 0, "hit_tokens": 0, "started": False}
+        chunks = await self._lookup_now(
+            self._lookup_tokens(msg), msg["model_id"], defer=False
+        )
+        hits = _external_prefix_hits(
+            chunks,
+            num_computed_tokens=0,
+            queries=int(msg.get("external_prefix_queries", 0)),
+        )
+        block_tokens = int(self._runtime_config.get("block_tokens", 0))
+        if hits <= 0 or block_tokens <= 0:
+            return empty
+        spans = self._external_spans(chunks, 0, hits)
+        bytes_per_token = sum(int(span["nbytes"]) for span in spans) / hits
+        compute_s = 1.0 / float(msg["compute_tokens_per_s"])
+        load_s = bytes_per_token / float(msg["load_bytes_per_s"])
+        # Balance x * compute_s == (hits - x) * load_s.
+        split = int(hits * load_s / (compute_s + load_s))
+        split = (split // block_tokens) * block_tokens
+        if split <= 0 or split >= hits:
+            return {**empty, "hit_tokens": hits}
+        back = self._external_spans(chunks, split, hits - split)
+        started = bool(back) and await self._ensure_transfer().start_readahead(back)
+        return {"compute_tokens": split, "hit_tokens": hits, "started": started}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""

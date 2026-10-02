@@ -56,6 +56,7 @@ ARMS = (
     "daser-compressed-piecewise",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GATEWAY_MODES = ("none", "pass", "split")
 
 
 def _pid_running(pid: int) -> bool:
@@ -297,6 +298,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5,
         help="Abort an arm's replay after this many failed requests (0 disables).",
     )
+    parser.add_argument(
+        "--gateway",
+        choices=GATEWAY_MODES,
+        default="none",
+        help=(
+            "Replay DaseR arms through daser.gateway: 'pass' forwards unchanged, "
+            "'split' plans bidirectional prefill."
+        ),
+    )
+    parser.add_argument("--gateway-compute-tokens-per-s", type=float, default=30000.0)
+    parser.add_argument("--gateway-load-bytes-per-s", type=float, default=15e9)
+    parser.add_argument("--gateway-min-compute-tokens", type=int, default=4096)
     return parser.parse_args(argv)
 
 
@@ -393,6 +406,53 @@ async def _warmup(vllm_url: str, model_name: str) -> float:
     return time.perf_counter() - started
 
 
+async def _start_gateway(
+    args: argparse.Namespace, manager: MatchedServer, out_dir: Path
+) -> tuple[subprocess.Popen[bytes], str]:
+    """Start ``daser.gateway`` in front of the single vLLM instance.
+
+    Returns:
+        The gateway process and its base URL once it answers ``/metrics``.
+    """
+    if len(manager.vllm_urls) != 1:
+        raise ValueError("--gateway supports one vLLM instance")
+    port = args.vllm_port + 100
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "daser.gateway",
+            "--vllm-url",
+            manager.vllm_urls[0],
+            "--socket-path",
+            str(manager.socket_path),
+            "--port",
+            str(port),
+            "--compute-tokens-per-s",
+            str(args.gateway_compute_tokens_per_s),
+            "--load-bytes-per-s",
+            str(args.gateway_load_bytes_per_s),
+            "--min-compute-tokens",
+            str(args.gateway_min_compute_tokens),
+            *(["--split"] if args.gateway == "split" else []),
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        stdout=(out_dir / "gateway.log").open("wb"),
+        stderr=subprocess.STDOUT,
+    )
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"gateway exited with {proc.returncode}")
+        if await _text(f"{url}/metrics"):
+            return proc, url
+        await asyncio.sleep(0.5)
+    proc.terminate()
+    raise RuntimeError("gateway did not become ready")
+
+
 async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
     """Run one arm end to end and persist its artifacts.
 
@@ -407,6 +467,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
     out_dir = args.artifact / arm
     out_dir.mkdir(parents=True, exist_ok=True)
     model_name = Path(args.model).name
+    gateway: subprocess.Popen[bytes] | None = None
     try:
         manifest = await manager.start()
         runtime_config = None
@@ -421,6 +482,10 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
             warmup_s += await _warmup(url, model_name)
         daser_before = await _daser_metrics(arm, manager)
         vllm_before = await _vllm_metrics(manager)
+        server_urls = list(manager.vllm_urls)
+        if args.gateway != "none" and arm.startswith("daser"):
+            gateway, gateway_url = await _start_gateway(args, manager, out_dir)
+            server_urls = [gateway_url]
         replay = subprocess.run(
             [
                 sys.executable,
@@ -432,7 +497,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 args.model,
                 "--trust-remote-code",
                 "--server-url",
-                *manager.vllm_urls,
+                *server_urls,
                 "--route",
                 args.route,
                 "--served-model-name",
@@ -482,6 +547,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 else (manager.offload_config() if arm in _SERVER_TYPES else None)
             ),
             "runtime_config": runtime_config,
+            "gateway": args.gateway if gateway is not None else "none",
             "warmup_seconds": warmup_s,
             "summary": json.loads(summary_path.read_text())
             if summary_path.exists()
@@ -492,6 +558,9 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
         )
         return result
     finally:
+        if gateway is not None:
+            gateway.terminate()
+            gateway.wait(timeout=30)
         # Keep the service logs with the artifact; stores are scratch.
         for log in (manager.log_dir).glob("*.log"):
             (out_dir / log.name).write_bytes(log.read_bytes())
