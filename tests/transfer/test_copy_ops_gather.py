@@ -10,7 +10,26 @@ from daser.transfer.iouring.pinned_pool import PinnedMemoryPool
 cupy = pytest.importorskip("cupy")
 
 
-def _scattered_copy(piece: int, gather_min_runs: int) -> tuple[bytes, bytes, int]:
+class _StreamDestination:
+    """CUDA destination that owns a private copy stream, like staging IPC."""
+
+    def __init__(self, array: object, stream: object) -> None:
+        self.array = array
+        self.stream = stream
+
+    def __getitem__(self, item: object) -> object:
+        """Return a CuPy slice of the destination."""
+        return self.array[item]
+
+    @property
+    def copy_stream_ptr(self) -> int:
+        """Return the non-default stream the copies are queued on."""
+        return int(self.stream.ptr)
+
+
+def _scattered_copy(
+    piece: int, gather_min_runs: int, batch: bool = False
+) -> tuple[bytes, bytes, int]:
     """Copy eight scattered pinned pieces to permuted GPU offsets.
 
     Returns the expected bytes, the GPU result and the reported run count.
@@ -34,7 +53,8 @@ def _scattered_copy(piece: int, gather_min_runs: int) -> tuple[bytes, bytes, int
         for target, _data, offset, nbytes in chunks:
             expected[target : target + nbytes] = view[offset : offset + nbytes]
         dst = cupy.zeros(count * piece, dtype=cupy.uint8)
-        runs = copy_ops.copy_grouped_to_cuda_dst(dst, chunks, gather_min_runs)
+        target = _StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
+        runs = copy_ops.copy_grouped_to_cuda_dst(target, chunks, gather_min_runs, batch)
         cupy.cuda.Device().synchronize()
         result = cupy.asnumpy(dst).tobytes()
         source.close()
@@ -94,5 +114,13 @@ def test_layer_gather_plan_copies_each_layer_group() -> None:
 def test_unaligned_pieces_fall_back_to_memcpy() -> None:
     """Pieces that are not 16-byte multiples still copy correctly."""
     expected, result, runs = _scattered_copy(4100, 2)
+    assert runs == 8
+    assert result == expected
+
+
+@pytest.mark.parametrize("piece", [4096, 4100])
+def test_batched_scattered_copy_matches_source(piece: int) -> None:
+    """One batched submission of every run lands the same bytes."""
+    expected, result, runs = _scattered_copy(piece, 0, batch=True)
     assert runs == 8
     assert result == expected

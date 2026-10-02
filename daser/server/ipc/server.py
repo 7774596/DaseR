@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from daser.config import (
+    BATCH_DST_COPY_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
     L1_SPLIT_BYPASS_ENV,
@@ -394,6 +395,7 @@ class IPCServer:
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_l1_bypass_bytes = 0
         self._prev_load_phase_us: dict[str, int] = {}
+        self._prev_dst_copy: dict[str, int] = {}
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -1732,6 +1734,18 @@ class IPCServer:
                     "Grouped-load wall time by phase.",
                 ).inc(delta / 1_000_000, labels={"phase": phase})
             self._prev_load_phase_us[phase] = current
+        for unit, current in (
+            ("copies", stats.dst_copies),
+            ("runs", stats.dst_copy_runs),
+            ("bytes", stats.dst_copy_bytes),
+        ):
+            delta = current - self._prev_dst_copy.get(unit, 0)
+            if delta > 0:
+                self._metrics.counter(
+                    "daser_dst_copy_total",
+                    "L1-to-destination copy submissions, runs and bytes.",
+                ).inc(delta, labels={"unit": unit})
+            self._prev_dst_copy[unit] = current
         bypass_delta = stats.l1_bypass_bytes - self._prev_l1_bypass_bytes
         if bypass_delta > 0:
             self._metrics.counter(
@@ -1836,6 +1850,7 @@ class IPCServer:
                     readahead_stream=os.environ.get(LOAD_READAHEAD_STREAM_ENV) == "1",
                     gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
                     l1_split_bypass=os.environ.get(L1_SPLIT_BYPASS_ENV) == "1",
+                    batch_dst_copies=os.environ.get(BATCH_DST_COPY_ENV) == "1",
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

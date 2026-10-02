@@ -47,14 +47,17 @@ def test_delayed_h2d_preserves_unleased_source_during_pool_reuse(
         return dst if isinstance(dst, DeferredDestination) else None
 
     def enqueue(
-        dst: Any, chunks: list[copy_ops.CopyChunk], gather_min_runs: int = 0
-    ) -> None:
+        dst: Any,
+        chunks: list[copy_ops.CopyChunk],
+        gather_min_runs: int = 0,
+        batch: bool = False,
+    ) -> int:
         if isinstance(dst, DeferredDestination):
             dst.chunks.extend(chunks)
             if outcome == "submit_error":
                 raise RuntimeError("partial DMA submission")
-        else:
-            original_copy(dst, chunks, gather_min_runs)
+            return len(chunks)
+        return original_copy(dst, chunks, gather_min_runs, batch)
 
     def record(dst: DeferredDestination, completion: DeferredDestination) -> None:
         assert dst is completion
@@ -130,14 +133,17 @@ def test_failed_copy_drains_slow_sibling_before_load_returns(
         return completion
 
     def enqueue(
-        dst: Any, chunks: list[copy_ops.CopyChunk], gather_min_runs: int = 0
-    ) -> None:
+        dst: Any,
+        chunks: list[copy_ops.CopyChunk],
+        gather_min_runs: int = 0,
+        batch: bool = False,
+    ) -> int:
         if not isinstance(dst, DeferredDestination):
-            original_copy(dst, chunks, gather_min_runs)
-            return
+            return original_copy(dst, chunks, gather_min_runs, batch)
         events[-1].chunks.extend(chunks)
         if len(events) == 1:
             raise RuntimeError("first copy submission failed")
+        return len(chunks)
 
     def record(dst: DeferredDestination, completion: DeferredDestination) -> None:
         completion.submitted.set()

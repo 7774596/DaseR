@@ -807,6 +807,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             segment are read through transient pinned windows and copied to
             the destination without entering L1, so SSD traffic for the
             unprotected share of each prefix cannot evict protected ranges.
+        batch_dst_copies: Research switch. An L1-to-CUDA copy submits all
+            of its runs in one ``cudaMemcpyBatchAsync`` instead of one
+            ``cudaMemcpyAsync`` per run.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -834,6 +837,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         readahead_stream: bool = False,
         gather_min_runs: int = 0,
         l1_split_bypass: bool = False,
+        batch_dst_copies: bool = False,
     ) -> None:
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
@@ -876,6 +880,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readahead_window = readahead_window
         self._readahead_stream = bool(readahead_stream)
         self._gather_min_runs = gather_min_runs
+        self._batch_dst_copies = bool(batch_dst_copies)
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
@@ -942,7 +947,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
             "readahead_stream=%s "
-            "gather_min_runs=%d l1_split_bypass=%s",
+            "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -960,6 +965,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._readahead_stream,
             self._gather_min_runs,
             self._bypass_policy is not None,
+            self._batch_dst_copies,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -2871,7 +2877,12 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         error: BaseException | None = None
         try:
-            copy_ops.copy_grouped_to_dst(dst, chunks, self._gather_min_runs)
+            runs = copy_ops.copy_grouped_to_dst(
+                dst, chunks, self._gather_min_runs, self._batch_dst_copies
+            )
+            self._stats.dst_copies += 1
+            self._stats.dst_copy_runs += runs
+            self._stats.dst_copy_bytes += sum(chunk[3] for chunk in chunks)
         except BaseException as exc:
             error = exc
         finally:

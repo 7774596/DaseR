@@ -1569,9 +1569,9 @@ def test_iouring_stripe_pipeline_copies_records_across_part_boundaries(
     copies: list[int] = []
     original_copy = layer_module.copy_ops.copy_grouped_to_dst
 
-    def counting_copy(dst, chunks, gather_min_runs=0) -> None:
+    def counting_copy(dst, chunks, gather_min_runs=0, batch=False) -> int:
         copies.append(len(chunks))
-        original_copy(dst, chunks, gather_min_runs)
+        return original_copy(dst, chunks, gather_min_runs, batch)
 
     monkeypatch.setattr(layer_module.copy_ops, "copy_grouped_to_dst", counting_copy)
     blocks = 6
@@ -2238,6 +2238,56 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
             )
         finally:
             await layer.release_lease("runs")
+            layer.close()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_grouped_l1_copy_to_cuda_counts_runs(tmp_path, batch: bool) -> None:
+    """L1 hits copied to a CUDA destination land intact and are counted.
+
+    Records stored at scattered offsets and loaded into permuted targets
+    produce one destination copy per grouped load, one run per record, and
+    the same bytes whether the runs are submitted one by one or batched.
+    """
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+
+    async def scenario() -> None:
+        records, record = 4, ALIGNMENT
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=2 * records * record,
+            l2_bytes=0,
+            skip_l2=True,
+            batch_dst_copies=batch,
+        )
+        payloads = [bytearray(bytes([i + 1]) * record) for i in range(records)]
+        try:
+            for i, payload in enumerate(payloads):
+                await layer.store_bytes(payload, 2 * i * record, record)
+            order = [2, 0, 3, 1]
+            spans = [
+                {
+                    "file_offset": 2 * i * record,
+                    "nbytes": record,
+                    "target_offset": slot * record,
+                }
+                for i, slot in enumerate(order)
+            ]
+            dst = cupy.zeros(records * record, dtype=cupy.uint8)
+            streamed = StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
+            assert await layer.load_bytes_grouped(streamed, spans) == records * record
+            streamed.stream.synchronize()
+            result = cupy.asnumpy(dst).tobytes()
+            for i, slot in enumerate(order):
+                assert result[slot * record : (slot + 1) * record] == bytes(payloads[i])
+            assert layer.stats.dst_copies == 1
+            assert layer.stats.dst_copy_runs == records
+            assert layer.stats.dst_copy_bytes == records * record
+        finally:
             layer.close()
 
     _run(scenario())

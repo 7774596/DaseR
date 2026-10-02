@@ -272,11 +272,22 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             )
             > 0
         )
+        copies, runs, copied = (
+            _delta(before, after, f'daser_dst_copy_total{{unit="{unit}"}}')
+            for unit in ("copies", "runs", "bytes")
+        )
+        h2d = (
+            f" h2d[copies={copies:.0f} runs={runs:.0f} "
+            f"GB={copied / 1e9:.1f} KiB/run={copied / runs / 1024:.0f}]"
+            if runs > 0
+            else ""
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "
             f"per_op_GBps={nbytes / seconds / 1e9 if seconds else 0:.2f}"
             + (f" phases[{phases}]" if phases else "")
+            + h2d
         )
     return lines
 
