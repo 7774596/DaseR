@@ -282,6 +282,19 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             if runs > 0
             else ""
         )
+        evicted = {
+            kind: _delta(
+                before, after, f'daser_l1_evicted_bytes_total{{kind="{kind}"}}'
+            )
+            for kind in ("all", "pinned", "unread")
+        }
+        h2d += (
+            f" l1_evict[GB={evicted['all'] / 1e9:.1f} "
+            f"pinned={evicted['pinned'] / 1e9:.1f} "
+            f"unread={evicted['unread'] / 1e9:.1f}]"
+            if evicted["all"] > 0
+            else ""
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "

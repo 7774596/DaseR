@@ -41,6 +41,10 @@ class TransferStats:
         dst_copies: pinned-to-CUDA destination copy submissions.
         dst_copy_runs: contiguous runs those submissions issued.
         dst_copy_bytes: bytes those submissions copied.
+        l1_evicted_bytes: accounted bytes L1 replacement evicted.
+        l1_evicted_pinned_bytes: of those, still owned by an L2 writer or a
+            lease, so residency was dropped without freeing pool memory.
+        l1_evicted_unread_bytes: of those, never hit since insertion.
     """
 
     l1_hits: int = 0
@@ -64,6 +68,9 @@ class TransferStats:
     dst_copies: int = 0
     dst_copy_runs: int = 0
     dst_copy_bytes: int = 0
+    l1_evicted_bytes: int = 0
+    l1_evicted_pinned_bytes: int = 0
+    l1_evicted_unread_bytes: int = 0
 
 
 @dataclass(frozen=True)

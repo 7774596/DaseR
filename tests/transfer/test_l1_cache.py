@@ -242,3 +242,38 @@ def test_fragment_eviction_cannot_reuse_detached_writer_allocation() -> None:
     finally:
         original.close()
         cache.close()
+
+
+def test_eviction_counters_split_pinned_and_unread_bytes() -> None:
+    """Evictions count all, writer-pinned and never-read accounted bytes."""
+    pinned: set[int] = set()
+    cache = L1Cache(8192, 4096, lambda _key, data: id(data) in pinned)
+    try:
+        first = cache.reserve_untracked(4096)
+        second = cache.reserve_untracked(4096)
+        assert first is not None and second is not None
+        cache.put((0, 4096), first)
+        cache.put((4096, 4096), second)
+        hits, _misses = cache.resolve_subranges(
+            target_offset=0, file_offset=4096, nbytes=4096
+        )
+        cache.record_hits(hits)
+        pinned.add(id(first))
+        assert cache.eviction_bytes == {
+            "bytes": 0,
+            "pinned_bytes": 0,
+            "unread_bytes": 0,
+        }
+        # Evicts the pinned, unread first entry, then the read second one.
+        held = cache.reserve_untracked(8192)
+        assert cache.eviction_bytes == {
+            "bytes": 8192,
+            "pinned_bytes": 4096,
+            "unread_bytes": 4096,
+        }
+        if held is not None:
+            held.close()
+        pinned.clear()
+        cache.release((0, 4096), first)
+    finally:
+        cache.close()

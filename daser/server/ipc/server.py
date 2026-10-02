@@ -397,6 +397,7 @@ class IPCServer:
         self._prev_l1_bypass_bytes = 0
         self._prev_load_phase_us: dict[str, int] = {}
         self._prev_dst_copy: dict[str, int] = {}
+        self._prev_l1_evicted: dict[str, int] = {}
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -1735,6 +1736,18 @@ class IPCServer:
                     "Grouped-load wall time by phase.",
                 ).inc(delta / 1_000_000, labels={"phase": phase})
             self._prev_load_phase_us[phase] = current
+        for kind, current in (
+            ("all", stats.l1_evicted_bytes),
+            ("pinned", stats.l1_evicted_pinned_bytes),
+            ("unread", stats.l1_evicted_unread_bytes),
+        ):
+            delta = current - self._prev_l1_evicted.get(kind, 0)
+            if delta > 0:
+                self._metrics.counter(
+                    "daser_l1_evicted_bytes_total",
+                    "Bytes L1 replacement evicted: all, still pinned, never read.",
+                ).inc(delta, labels={"kind": kind})
+            self._prev_l1_evicted[kind] = current
         for unit, current in (
             ("copies", stats.dst_copies),
             ("runs", stats.dst_copy_runs),

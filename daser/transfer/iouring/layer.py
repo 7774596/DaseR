@@ -2092,6 +2092,19 @@ class TieredIOUringTransferLayer(TransferLayer):
                 return
             await _drain_destination_copies(pending)
 
+    @property
+    def stats(self) -> TransferStats:
+        """Return tiering counters, refreshing the L1 eviction totals.
+
+        Returns:
+            The live counters object; eviction fields mirror ``L1Cache``.
+        """
+        evicted = self._l1.eviction_bytes
+        self._stats.l1_evicted_bytes = evicted["bytes"]
+        self._stats.l1_evicted_pinned_bytes = evicted["pinned_bytes"]
+        self._stats.l1_evicted_unread_bytes = evicted["unread_bytes"]
+        return self._stats
+
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
         if self._pending_h2d:

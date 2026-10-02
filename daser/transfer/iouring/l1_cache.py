@@ -79,11 +79,26 @@ class L1Cache:
         )
         self._pool_waiters: list[object] = []
         self._is_pinned = pinned_predicate
+        # Keys read since insertion, to count evictions of never-read bytes.
+        self._read: set[tuple[int, int]] = set()
+        self._evicted = {"bytes": 0, "pinned_bytes": 0, "unread_bytes": 0}
 
     @property
     def bytes_used(self) -> int:
         """Return resident L1 bytes."""
         return self._used
+
+    @property
+    def eviction_bytes(self) -> dict[str, int]:
+        """Return cumulative replacement-eviction byte counters.
+
+        Returns:
+            Copy of ``bytes`` (accounted bytes evicted), ``pinned_bytes``
+            (of those, still owned by an L2 writer or lease, so residency was
+            dropped without freeing pool memory) and ``unread_bytes`` (evicted
+            without a hit since insertion).
+        """
+        return dict(self._evicted)
 
     def get(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
         """Return the resident slice for ``key`` or None."""
@@ -215,6 +230,7 @@ class L1Cache:
         for hit in hits:
             self._policy.access(hit.data.allocation_id)
             self._entries.move_to_end(hit.key)
+            self._read.add(hit.key)
 
     def touch(self, key: tuple[int, int]) -> None:
         """Refresh LRU recency for one resident key (used on in-place stores)."""
@@ -494,9 +510,16 @@ class L1Cache:
             return False
         for key in tuple(self._allocation_keys[allocation]):
             removed_charge = self._charges.get(key)
+            was_read = key in self._read
             removed = self._pop_entry(key)
             if removed is not None:
-                self._used -= len(removed) if removed_charge is None else removed_charge
+                charge = len(removed) if removed_charge is None else removed_charge
+                self._used -= charge
+                self._evicted["bytes"] += charge
+                if self._is_pinned(key, removed):
+                    self._evicted["pinned_bytes"] += charge
+                if not was_read:
+                    self._evicted["unread_bytes"] += charge
                 # An external writer/lease can outlive residency. Release
                 # retains that child's ownership until its existing barrier;
                 # replacement never makes in-flight pool bytes reusable.
@@ -507,6 +530,7 @@ class L1Cache:
         """Detach one resident from both indexes before releasing its ownership."""
         removed = self._entries.pop(key, None)
         self._remove_index(key)
+        self._read.discard(key)
         if removed is not None:
             self._slice_ids.remove(id(removed))
             self._charges.pop(key, None)
