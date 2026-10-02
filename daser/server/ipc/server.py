@@ -1965,9 +1965,19 @@ class IPCServer:
         before = predictor.predicted_returns
         if not predictor.observe(tokens, model_id):
             return
-        if predictor.predicted_returns > before:
+        returned = predictor.predicted_returns > before
+        if returned:
             self._session_prefetch_counter().inc(labels={"outcome": "returned"})
         self._session_prefetch = predictor.predict()
+        logger.info(
+            "[IPC] session request=%d tokens=%d predicted_return=%s next_tokens=%d",
+            predictor.requests,
+            len(tokens) // 4,
+            returned,
+            0
+            if self._session_prefetch is None
+            else len(self._session_prefetch[0]) // 4,
+        )
 
     def _start_session_prefetch(self) -> None:
         """Start the pending next-session readahead in the background."""
