@@ -262,12 +262,16 @@ class TransferLayer(ABC):
         """
         raise NotImplementedError("transfer backend does not support host prefetch")
 
-    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
+    async def start_readahead(
+        self, spans: list[dict[str, int]], *, speculative: bool = False
+    ) -> bool:
         """Begin reading a request's external spans ahead of its load.
 
         Args:
             spans: Storage spans containing ``file_offset``, ``nbytes`` and
                 optional ``accounted_nbytes``, in load order.
+            speculative: The spans belong to a predicted request; a later
+                request readahead may drop them when it does not overlap.
 
         Returns:
             True when background readahead was started; the default backend

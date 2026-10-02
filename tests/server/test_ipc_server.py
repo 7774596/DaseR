@@ -2748,7 +2748,10 @@ class _ReadaheadRecordingTransfer(TransferLayer):
     ) -> int:
         raise AssertionError("readahead hints must not store")
 
-    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
+    async def start_readahead(
+        self, spans: list[dict[str, int]], *, speculative: bool = False
+    ) -> bool:
+        del speculative
         type(self).readaheads.append(spans)
         return True
 

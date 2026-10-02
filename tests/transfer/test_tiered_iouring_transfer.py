@@ -1887,6 +1887,43 @@ def test_iouring_wait_readahead_idle_returns_after_reads(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("real_offset", "dropped"), [(4, True), (2, False)], ids=["miss", "hit"]
+)
+def test_iouring_request_readahead_drops_mispredicted_speculation(
+    tmp_path, real_offset: int, dropped: bool
+) -> None:
+    """A request readahead drops speculative readaheads it does not overlap.
+
+    A speculative readahead that overlaps the request is its prediction
+    coming true and is kept for the load.
+    """
+    blocks = 8
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            guess = [{"file_offset": 0, "nbytes": ALIGNMENT * 4}]
+            assert await layer.start_readahead(guess, speculative=True) is True
+            await layer.wait_readahead_idle()
+            real = [{"file_offset": ALIGNMENT * real_offset, "nbytes": ALIGNMENT * 4}]
+            assert await layer.start_readahead(real) is True
+            await layer.wait_readahead_idle()
+            assert layer.stats.readahead_dropped_bytes == (
+                ALIGNMENT * 4 if dropped else 0
+            )
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_readahead_keeps_live_readahead_and_trims_new_one(tmp_path) -> None:
     """A later readahead never evicts a live one; it uses the budget left.
 

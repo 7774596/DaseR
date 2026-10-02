@@ -2007,7 +2007,7 @@ class IPCServer:
             )
             spans = self._external_spans(chunks or [], 0, hits) if hits > 0 else []
             started = bool(spans) and await self._ensure_transfer().start_readahead(
-                spans
+                spans, speculative=True
             )
         except Exception:
             logger.exception("[IPC] session prefetch failed")

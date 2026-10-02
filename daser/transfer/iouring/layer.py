@@ -161,6 +161,7 @@ class _Readahead:
     ranges: list[tuple[int, int]]
     pieces: list[tuple[list[tuple[int, int]], asyncio.Future[None]]]
     started: float
+    speculative: bool = False
 
 
 @dataclass
@@ -286,6 +287,23 @@ def _ranges_overlap(left: list[tuple[int, int]], right: list[tuple[int, int]]) -
         for start, size in left
         for other, other_size in right
     )
+
+
+def _sorted_ranges_overlap(
+    left: list[tuple[int, int]], right: list[tuple[int, int]]
+) -> bool:
+    """Return whether two sorted, merged range lists intersect, in linear time."""
+    i = j = 0
+    while i < len(left) and j < len(right):
+        start, size = left[i]
+        other, other_size = right[j]
+        if start < other + other_size and other < start + size:
+            return True
+        if start + size <= other + other_size:
+            i += 1
+        else:
+            j += 1
+    return False
 
 
 def _resolve_from_hits(
@@ -1747,7 +1765,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         await self._readahead_idle.wait()
 
-    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
+    async def start_readahead(
+        self, spans: list[dict[str, int]], *, speculative: bool = False
+    ) -> bool:
         """Start reading a looked-up request's L2 spans into a retained lease.
 
         Resident bytes are retained at once; L2 misses are grouped into reads
@@ -1756,9 +1776,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         it and copies the retained bytes, falling back to the normal L1/L2
         path for anything the readahead did not cover.
 
+        A request readahead first drops speculative readaheads it does not
+        overlap: they predicted another request, and keeping them would trim
+        this one's budget.
+
         Args:
             spans: Storage spans with ``file_offset``, ``nbytes`` and optional
                 ``accounted_nbytes``.
+            speculative: The spans belong to a predicted request rather than
+                a looked-up one.
 
         Returns:
             True when a new readahead was registered. False when readahead is
@@ -1800,6 +1826,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if now - item.started > _READAHEAD_LIFETIME_S
             ]:
                 self._drop_readahead_locked(lease_id, "expired")
+            if not speculative:
+                wanted = _normalize_ranges(accounted)
+                for lease_id in [
+                    lease_id
+                    for lease_id, item in self._readaheads.items()
+                    if item.speculative
+                    and not _sorted_ranges_overlap(item.ranges, wanted)
+                ]:
+                    self._drop_readahead_locked(lease_id, "mispredicted")
             covered = [rng for item in self._readaheads.values() for rng in item.ranges]
             budget = self._l1_bytes // 2 - self._readahead_bytes_locked()
             # Spans arrive in load order: read ahead the leading spans that
@@ -1873,12 +1908,17 @@ class TieredIOUringTransferLayer(TransferLayer):
                     for group, _publish in groups
                 ],
                 started=time.perf_counter(),
+                speculative=speculative,
             )
             self._readaheads[lease_id] = readahead
         if groups:
+            # Count the readahead as reading from registration, so an idle
+            # wait right after start_readahead covers it.
+            self._readahead_running += 1
+            self._readahead_idle.clear()
             task = asyncio.create_task(self._run_readahead(lease_id, readahead, groups))
             self._readahead_tasks.add(task)
-            task.add_done_callback(self._readahead_tasks.discard)
+            task.add_done_callback(self._readahead_task_done)
         return True
 
     async def resident_prefix(self, groups: list[list[dict[str, int]]]) -> int:
@@ -3631,14 +3671,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         Each group carries whether its reads are published to L1 or retained
         by the readahead lease only (split-residency bypass).
         """
-        self._readahead_running += 1
-        self._readahead_idle.clear()
-        try:
-            await self._read_readahead_groups(lease_id, readahead, groups)
-        finally:
-            self._readahead_running -= 1
-            if not self._readahead_running:
-                self._readahead_idle.set()
+        await self._read_readahead_groups(lease_id, readahead, groups)
+
+    def _readahead_task_done(self, task: asyncio.Task[None]) -> None:
+        """Forget a finished readahead task and mark idleness when last."""
+        self._readahead_tasks.discard(task)
+        self._readahead_running -= 1
+        if not self._readahead_running:
+            self._readahead_idle.set()
 
     async def _read_readahead_groups(
         self,
