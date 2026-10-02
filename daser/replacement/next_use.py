@@ -29,7 +29,9 @@ class NextUseReplacementPolicy(ReplacementPolicy[K], Generic[K]):
     Args:
         region_bytes: L2 bytes per history region.
         overdue_factor: Idle intervals after which an allocation is dead.
-        clock: Monotonic time source in seconds.
+        clock: Monotonic time source. A logical clock (for example one tick
+            per request lookup) keeps long cold prefills from stretching
+            intervals the way wall time does.
 
     Async/thread-safety:
         The cache owner must serialize calls. The policy owns only keys; it

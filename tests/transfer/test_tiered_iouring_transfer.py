@@ -2291,3 +2291,57 @@ def test_grouped_l1_copy_to_cuda_counts_runs(tmp_path, batch: bool) -> None:
             layer.close()
 
     _run(scenario())
+
+
+@pytest.mark.parametrize("next_use", [False, True])
+def test_iouring_next_use_keeps_cyclic_sessions(tmp_path, next_use: bool) -> None:
+    """Round-robin sessions over an L1 that holds two of three.
+
+    LRU evicts the session needed next, so every readahead reads L2 again.
+    Next-use replacement counts intervals in readaheads and keeps the
+    sessions due soonest, so later rounds hit L1 for part of each cycle.
+    """
+    sessions, blocks, rounds = 3, 2, 6
+    span_bytes = ALIGNMENT * blocks
+    payload = bytes(range(256)) * (sessions * span_bytes // 256)
+
+    async def scenario() -> int:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=len(payload), l2_bytes=len(payload)
+        )
+        try:
+            await writer.store_bytes(payload, 0, len(payload))
+            await writer.drain()
+        finally:
+            writer.close()
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=2 * span_bytes,
+            l2_bytes=len(payload),
+            readahead_piece_bytes=span_bytes,
+            readahead_window=1,
+            next_use_replacement=next_use,
+        )
+        try:
+            for _ in range(rounds):
+                for session in range(sessions):
+                    span = {"file_offset": session * span_bytes, "nbytes": span_bytes}
+                    await layer.start_readahead([span])
+                    dst = bytearray(span_bytes)
+                    load = [{"target_offset": 0, **span}]
+                    assert await layer.load_bytes_grouped(dst, load) == span_bytes
+                    start = session * span_bytes
+                    assert bytes(dst) == payload[start : start + span_bytes]
+            await layer.drain()
+            return layer.stats.readahead_read_bytes // ALIGNMENT
+        finally:
+            await layer.drain()
+            layer.close()
+
+    read_blocks = asyncio.run(scenario())
+    total = sessions * blocks * rounds
+    if next_use:
+        assert read_blocks <= total * 2 // 3
+    else:
+        assert read_blocks == total

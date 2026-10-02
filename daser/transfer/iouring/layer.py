@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 import bisect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import time
 from typing import Any
@@ -53,6 +54,8 @@ _READAHEAD_LIFETIME_S = 120.0
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
+# Idle reuse intervals after which next-use replacement treats data as dead.
+_NEXT_USE_OVERDUE = 1.5
 
 logger = init_logger(__name__)
 
@@ -64,7 +67,8 @@ def _l1_replacement_policy(
     split_fraction: float,
     l1_bytes: int,
     split_granularity: int = _DIRECT_IO_ALIGNMENT,
-    next_use: bool = False,
+    next_use_clock: Callable[[], float] | None = None,
+    next_use_region: int = 0,
 ) -> ReplacementPolicy[int] | None:
     """Select the L1 allocation replacement policy.
 
@@ -74,8 +78,10 @@ def _l1_replacement_policy(
             L1; 0 disables it.
         l1_bytes: L1 capacity in accounted bytes.
         split_granularity: Bytes per split-residency offset class.
-        next_use: Use predicted-next-use replacement when split residency
-            is off; takes precedence over BIP.
+        next_use_clock: When given, use predicted-next-use replacement on
+            this clock when split residency is off; takes precedence over BIP.
+        next_use_region: L2 bytes per next-use history region; 0 keeps the
+            policy default.
 
     Returns:
         The policy instance, or None for the L1 cache's default LRU.
@@ -86,8 +92,12 @@ def _l1_replacement_policy(
             capacity_bytes=l1_bytes,
             granularity=split_granularity,
         )
-    if next_use:
-        return NextUseReplacementPolicy[int]()
+    if next_use_clock is not None:
+        return NextUseReplacementPolicy[int](
+            **({"region_bytes": next_use_region} if next_use_region > 0 else {}),
+            overdue_factor=_NEXT_USE_OVERDUE,
+            clock=next_use_clock,
+        )
     if bip_enabled:
         return BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
     return None
@@ -818,7 +828,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             ``cudaMemcpyAsync`` per run.
         next_use_replacement: Research switch. L1 evicts the allocation whose
             reuse-interval prediction of its next use is furthest away
-            (``NextUseReplacementPolicy``) instead of BIP/LRU.
+            (``NextUseReplacementPolicy``) instead of BIP/LRU. Intervals are
+            counted in registered readaheads (one per hitting lookup), not
+            wall time, so cold prefills do not stretch them.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -891,6 +903,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readahead_stream = bool(readahead_stream)
         self._gather_min_runs = gather_min_runs
         self._batch_dst_copies = bool(batch_dst_copies)
+        # Logical clock of the next-use policy: registered readaheads.
+        self._lookup_epoch = 0
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
@@ -921,7 +935,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             l1_split_fraction,
             l1_bytes,
             self._bypass_class,
-            next_use_replacement,
+            self._lookup_epoch_now if next_use_replacement else None,
+            # History follows the readahead piece, the unit L1 promotes.
+            self._readahead_piece,
         )
         # Split policy consulted for L1-bypass admission; None keeps every
         # L2 miss on the promotion path.
@@ -1725,6 +1741,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             if not ranges:
                 return False
             self._readahead_seq += 1
+            self._lookup_epoch += 1
             lease_id = f"readahead-{self._readahead_seq}"
             self._replace_request_lease_locked(lease_id, ranges, [])
             misses: list[dict[str, Any]] = []
@@ -3694,6 +3711,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             if lease is not None and _ranges_overlap(lease.remaining, removals):
                 self._consume_lease_ranges_locked(lease_id, removals)
         self._prune_readaheads_locked()
+
+    def _lookup_epoch_now(self) -> float:
+        """Return the next-use policy's logical time (readaheads so far)."""
+        return float(self._lookup_epoch)
 
     def _readahead_bytes_locked(self) -> int:
         """Return physical bytes still retained by readahead leases."""
