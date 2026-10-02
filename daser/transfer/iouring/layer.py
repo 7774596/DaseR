@@ -810,6 +810,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         # Windows in flight fit in the unprotected share of L1, so bounce
         # reservations evict probation rather than protected ranges.
         unprotected = int(l1_bytes * (1.0 - l1_split_fraction))
+        self._bypass_unprotected = unprotected
         self._bypass_window = max(
             _DIRECT_IO_ALIGNMENT,
             min(_BYPASS_WINDOW_BYTES, unprotected // _BYPASS_WINDOWS_IN_FLIGHT)
@@ -3399,7 +3400,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             return []
         admitted: list[dict[str, Any]] = []
         bypass: list[dict[str, Any]] = []
-        budget = self._bypass_in_flight * self._bypass_window // 2
+        budget = self._bypass_unprotected // 2
         for miss in misses:
             for fragment in _split_at_units(miss, self._bypass_class):
                 if self._bypass_policy.admits(fragment["file_offset"]):
