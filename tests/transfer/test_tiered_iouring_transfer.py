@@ -2670,3 +2670,108 @@ def test_iouring_promotion_wait_is_attributed_to_held_pool(tmp_path) -> None:
             layer.close()
 
     asyncio.run(scenario())
+
+
+def test_iouring_rejects_negative_device_stash_bytes(tmp_path) -> None:
+    """A negative device stash size is rejected at construction."""
+    with pytest.raises(ValueError, match="device_stash_bytes"):
+        TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT,
+            device_stash_bytes=-1,
+        )
+
+
+def test_iouring_device_stash_needs_a_cuda_load(tmp_path) -> None:
+    """Without a CUDA load fixing its device the stash stays empty.
+
+    CPU destinations keep loading through L1 exactly as without a stash.
+    """
+    blocks = 4
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+    span = {"file_offset": 0, "nbytes": len(payload)}
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            device_stash_bytes=len(payload),
+        )
+        try:
+            assert await layer.start_readahead([span]) is True
+            await layer.wait_readahead_idle()
+            assert await layer.fill_device_stash([span]) == 0
+            dst = bytearray(len(payload))
+            load = [{"target_offset": 0, **span}]
+            assert await layer.load_bytes_grouped(dst, load) == len(payload)
+            assert bytes(dst) == payload
+            assert layer.stats.device_stash_served_bytes == 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+def test_iouring_device_stash_serves_loads_and_drops_overwritten_bytes(
+    tmp_path,
+) -> None:
+    """Stashed bytes load device-to-device until a store overwrites them.
+
+    The fill takes spans in load order up to the stash capacity, so the
+    leading four of eight blocks are stashed. A later store to a stashed
+    block unpublishes it and its load returns the new bytes.
+    """
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    def load(start: int, count: int) -> list[dict[str, int]]:
+        return [
+            {
+                "target_offset": ALIGNMENT * i,
+                "file_offset": ALIGNMENT * i,
+                "nbytes": ALIGNMENT,
+            }
+            for i in range(start, start + count)
+        ]
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            device_stash_bytes=ALIGNMENT * 4,
+        )
+        try:
+            spans = [{"file_offset": 0, "nbytes": nbytes}]
+            assert await layer.start_readahead(spans) is True
+            await layer.wait_readahead_idle()
+            dst = cupy.zeros(nbytes, dtype=cupy.uint8)
+            # A CUDA load fixes the stash's device.
+            assert await layer.load_bytes_grouped(dst, load(7, 1)) == ALIGNMENT
+            assert await layer.fill_device_stash(load(0, blocks)) == ALIGNMENT * 4
+            assert layer.stats.device_stash_filled_bytes == ALIGNMENT * 4
+            assert await layer.load_bytes_grouped(dst, load(0, blocks)) == nbytes
+            assert cupy.asnumpy(dst).tobytes() == payload
+            assert layer.stats.device_stash_served_bytes == ALIGNMENT * 4
+            new = bytes(_block(b"z"))
+            await layer.store_bytes(new, file_offset=ALIGNMENT, nbytes=ALIGNMENT)
+            await layer.drain()
+            dst = cupy.zeros(nbytes, dtype=cupy.uint8)
+            assert await layer.load_bytes_grouped(dst, load(0, 2)) == ALIGNMENT * 2
+            assert (
+                cupy.asnumpy(dst[: ALIGNMENT * 2]).tobytes()
+                == payload[:ALIGNMENT] + new
+            )
+            assert layer.stats.device_stash_served_bytes == ALIGNMENT * 5
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

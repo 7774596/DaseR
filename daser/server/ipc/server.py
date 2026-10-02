@@ -13,6 +13,7 @@ from typing import Any
 
 from daser.config import (
     BATCH_DST_COPY_ENV,
+    DEVICE_STASH_BYTES_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
     L1_NEXT_USE_ENV,
@@ -410,6 +411,7 @@ class IPCServer:
             1, int(os.environ.get(SESSION_PREFETCH_DEPTH_ENV, "1") or 1)
         )
         self._session_prefetch: list[tuple[bytes, str]] = []
+        self._device_stash_bytes = int(os.environ.get(DEVICE_STASH_BYTES_ENV) or 0)
         self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
@@ -1756,6 +1758,8 @@ class IPCServer:
             ("dropped", stats.readahead_dropped_bytes),
             ("contended", stats.readahead_contended_bytes),
             ("write_contended", stats.l2_write_contended_bytes),
+            ("stashed", stats.device_stash_filled_bytes),
+            ("stash_served", stats.device_stash_served_bytes),
         ):
             delta = current - self._prev_readahead_bytes.get(outcome, 0)
             if delta > 0:
@@ -1909,6 +1913,7 @@ class IPCServer:
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
                     ),
+                    device_stash_bytes=self._device_stash_bytes,
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
@@ -2006,7 +2011,8 @@ class IPCServer:
         Speculative readaheads of sessions no longer predicted are dropped
         first. Each prediction then reads after the previous one finished,
         so the soonest session gets the SSD first and later ones take only
-        the budget left.
+        the budget left. With a device stash, the soonest session's bytes
+        are then copied to the GPU before later predictions read.
 
         Args:
             predictions: ``(last prompt, model id)`` per predicted session,
@@ -2024,7 +2030,7 @@ class IPCServer:
                 for tokens, model_id in predictions
             ]
             await transfer.drop_speculative_except([s for s in planned if s])
-            for spans in planned:
+            for index, spans in enumerate(planned):
                 # A grouped load spans several transfer calls fed by the
                 # current request's readahead; read only once that finished.
                 await transfer.wait_readahead_idle()
@@ -2032,6 +2038,12 @@ class IPCServer:
                     spans, speculative=True
                 )
                 counter.inc(labels={"outcome": "started" if started else "skipped"})
+                if index == 0 and spans and self._device_stash_bytes:
+                    # The soonest session's bytes are in L1 once its
+                    # readahead finished: copy them to the GPU before the
+                    # next readahead, while the current request computes.
+                    await transfer.wait_readahead_idle()
+                    await transfer.fill_device_stash(spans)
         except Exception:
             logger.exception("[IPC] session prefetch failed")
             counter.inc(labels={"outcome": "failed"})

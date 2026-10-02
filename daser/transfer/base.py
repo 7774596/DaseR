@@ -31,6 +31,8 @@ class TransferStats:
             another readahead also had a read in flight.
         l2_write_contended_bytes: L2 write bytes submitted while a
             readahead was still reading.
+        device_stash_filled_bytes: bytes published in the device stash.
+        device_stash_served_bytes: load bytes copied from the device stash.
         promotion_wait_l2_write_us: time L2 promotions waited for L1 space
             on a pending L2 write that holds pool memory.
         promotion_wait_promotion_us: same, on another in-flight promotion.
@@ -69,6 +71,8 @@ class TransferStats:
     readahead_dropped_bytes: int = 0
     readahead_contended_bytes: int = 0
     l2_write_contended_bytes: int = 0
+    device_stash_filled_bytes: int = 0
+    device_stash_served_bytes: int = 0
     promotion_wait_l2_write_us: int = 0
     promotion_wait_promotion_us: int = 0
     promotion_wait_pool_us: int = 0
@@ -294,6 +298,21 @@ class TransferLayer(ABC):
             readahead.
         """
         del keep
+        return 0
+
+    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
+        """Copy a predicted load's stored bytes to the GPU ahead of time.
+
+        Args:
+            spans: Storage spans of the predicted load, in load order.
+
+        Returns:
+            Bytes stashed; 0 for backends without a device stash.
+
+        Async/thread-safety:
+            Implementations run on the server event loop.
+        """
+        del spans
         return 0
 
     async def wait_readahead_idle(self) -> None:

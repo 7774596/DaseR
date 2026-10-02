@@ -21,6 +21,7 @@ from daser.transfer.base import (
     TransferTier,
 )
 from daser.transfer.iouring import copy_ops
+from daser.transfer.iouring.device_stash import DeviceStash, StashRange
 from daser.transfer.iouring.l1_cache import L1Cache, L1RangeHit
 from daser.transfer.iouring.l2_engine import L2IoEngine
 from daser.transfer.iouring.native import NativeIOUring
@@ -905,6 +906,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             load; the written slice stays pinned in L1 meanwhile.
         readahead_budget_fraction: Share of L1 that readahead leases may
             retain at once (default half).
+        device_stash_bytes: Research switch (0 disables). Size of a GPU
+            buffer that ``fill_device_stash`` fills with a predicted load's
+            stored bytes ahead of time; loads copy those bytes
+            device-to-device instead of host-to-device.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -938,9 +943,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         readahead_srpt: bool = False,
         l2_write_yield: bool = False,
         readahead_budget_fraction: float = 0.5,
+        device_stash_bytes: int = 0,
     ) -> None:
         if not 0.0 < readahead_budget_fraction < 1.0:
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
+        if device_stash_bytes < 0:
+            raise ValueError("device_stash_bytes must be >= 0")
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
         if gather_min_runs < 0:
@@ -1017,6 +1025,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._request_leases: dict[str, _RequestLease] = {}
         self._leased_slices: dict[int, tuple[PinnedMemorySlice, int]] = {}
         self._pending_h2d: set[asyncio.Task[None]] = set()
+        self._device_stash = (
+            DeviceStash(device_stash_bytes) if device_stash_bytes else None
+        )
+        # CUDA device of the load destinations, fixed by the first one.
+        self._stash_device: int | None = None
         # With the bypass, offset classes are whole aligned units so the
         # class of an L1 entry equals the admission class of its first unit.
         self._bypass_class = (
@@ -1774,6 +1787,93 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         await self._readahead_idle.wait()
 
+    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
+        """Replace the device stash with the L1-resident bytes of ``spans``.
+
+        Spans are taken in order (a load reads its prefix first) until the
+        stash is full; bytes not resident in L1 or in a readahead lease are
+        skipped. A later load on the stash's device copies stashed bytes
+        device-to-device. Stores that overlap a stashed range unpublish it,
+        including stores landing while this fill copies.
+
+        Args:
+            spans: Storage spans with ``file_offset`` and ``nbytes``.
+
+        Returns:
+            Bytes published in the stash; 0 when the stash is disabled or no
+            CUDA load has fixed its device yet.
+
+        Async/thread-safety:
+            Runs on the server event loop. It unpublishes the old ranges and
+            waits for in-flight destination copies (which may read the stash)
+            before overwriting it, then waits for its own host-to-device copy.
+        """
+        if self._device_stash is None or self._stash_device is None:
+            return 0
+        stash = self._device_stash
+        async with self._lock:
+            stash.clear()
+            draining = list(self._pending_h2d)
+        if draining:
+            await asyncio.gather(*draining, return_exceptions=True)
+        ranges: list[StashRange] = []
+        copy_future: asyncio.Task[None] | None = None
+        async with self._lock:
+            self._raise_l2_error_locked()
+            target, view = stash.target(self._stash_device)
+            readahead_hits = self._readahead_hits_locked()
+            chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
+            cursor = 0
+            for span in spans:
+                room = stash.capacity_bytes - cursor
+                if room <= 0:
+                    break
+                file_offset = int(span["file_offset"])
+                nbytes = min(int(span["nbytes"]), room)
+                if nbytes <= 0:
+                    continue
+                leased, uncovered = _resolve_from_hits(
+                    readahead_hits, 0, file_offset, nbytes
+                )
+                # (physical offset, grouped-copy chunk) of every resident piece.
+                found = [(file_offset + chunk[0], chunk) for chunk in leased]
+                for _sub_target, sub_offset, sub_nbytes in uncovered:
+                    hits, _misses = self._l1.resolve_subranges(
+                        target_offset=0, file_offset=sub_offset, nbytes=sub_nbytes
+                    )
+                    found.extend(
+                        (
+                            sub_offset + hit.target_offset,
+                            (
+                                hit.target_offset,
+                                hit.data,
+                                hit.source_offset,
+                                hit.nbytes,
+                            ),
+                        )
+                        for hit in hits
+                    )
+                for physical, (_target, data, source_offset, size) in sorted(
+                    found, key=lambda item: item[0]
+                ):
+                    chunks.append((cursor, data, source_offset, size))
+                    ranges.append(StashRange(physical, size, view, cursor))
+                    cursor += size
+            if chunks:
+                stash.begin_fill()
+                copy_future = self._copy_grouped_to_dst(target, chunks)
+        try:
+            if copy_future is not None:
+                await copy_future
+        except BaseException:
+            async with self._lock:
+                stash.publish([])
+            raise
+        async with self._lock:
+            published = stash.publish(ranges)
+            self._stats.device_stash_filled_bytes += published
+        return published
+
     async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
         """Drop speculative readaheads that no kept prediction overlaps.
 
@@ -2282,6 +2382,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             if not self._l1.contains_slice(pending_buffer):
                 pending_buffer.close()
         self._l1.close()
+        if self._device_stash is not None:
+            self._device_stash.close()
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
         """Return whether a writer, request lease or CUDA copy owns ``data``.
@@ -3629,8 +3731,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Readahead leases are speculative: an overlapping store drops them
         instead of waiting, so an unconsumed readahead never blocks a writer.
+        The store also unpublishes the device-stash bytes it overwrites.
         """
         end = file_offset + nbytes
+        if self._device_stash is not None:
+            self._device_stash.invalidate(file_offset, nbytes)
         for lease_id in [
             lease_id
             for lease_id in self._readaheads
@@ -3812,6 +3917,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         async with self._lock:
             self._raise_l2_error_locked()
             readahead_hits = self._readahead_hits_locked()
+            stash_hits = self._stash_hits_locked(dst)
             for span in spans:
                 target_offset = int(span.get("target_offset", 0))
                 file_offset = int(span["file_offset"])
@@ -3819,9 +3925,22 @@ class TieredIOUringTransferLayer(TransferLayer):
                 accounted_nbytes = self._accounted_nbytes(span, nbytes)
                 self._check_range(file_offset, nbytes)
                 plan.total += nbytes
-                leased, uncovered = _resolve_from_hits(
-                    readahead_hits, target_offset, file_offset, nbytes
+                stashed, gaps = _resolve_from_hits(
+                    stash_hits, target_offset, file_offset, nbytes
                 )
+                if stashed:
+                    self._stats.device_stash_served_bytes += sum(
+                        chunk[3] for chunk in stashed
+                    )
+                    merged_l1.extend(stashed)
+                leased = []
+                uncovered = []
+                for gap_target, gap_offset, gap_nbytes in gaps:
+                    gap_leased, gap_uncovered = _resolve_from_hits(
+                        readahead_hits, gap_target, gap_offset, gap_nbytes
+                    )
+                    leased.extend(gap_leased)
+                    uncovered.extend(gap_uncovered)
                 if leased:
                     self._stats.l1_hits += len(leased)
                     self._stats.readahead_served_bytes += sum(
@@ -3928,6 +4047,24 @@ class TieredIOUringTransferLayer(TransferLayer):
             getattr(self._stats, field) + int((now - mark) * 1_000_000),
         )
         return now
+
+    def _stash_hits_locked(self, dst: Any) -> tuple[list[int], list[StashRange]]:
+        """Return device-stash ranges usable for ``dst``, sorted by offset.
+
+        Only CUDA destinations on the stash's device read the stash; the
+        first CUDA destination fixes that device for later fills.
+        """
+        if self._device_stash is None:
+            return [], []
+        target = copy_ops.slice_dst(dst, 0, 0)
+        if copy_ops.cuda_array_ptr(target) is None:
+            return [], []
+        device_id = int(target.device.id)
+        if self._stash_device is None:
+            self._stash_device = device_id
+        if device_id != self._stash_device:
+            return [], []
+        return self._device_stash.hits()
 
     def _readahead_hits_locked(self) -> tuple[list[int], list[_LeasedSliceRange]]:
         """Return the retained readahead ranges sorted by physical offset."""

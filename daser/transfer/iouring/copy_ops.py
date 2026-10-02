@@ -563,7 +563,16 @@ def copy_grouped_to_cuda_dst(
     runs = _merge_cuda_runs(dst, chunks)
     stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
     device_id = int(slice_dst(dst, 0, 0).device.id)
+    # Device-resident sources (the device stash) copy device-to-device; the
+    # gather kernel and batch attributes assume pinned host sources.
+    on_device = any(getattr(chunk[1], "on_device", False) for chunk in chunks)
     with cupy.cuda.Device(device_id):
+        if on_device:
+            for dst_ptr, source_ptr, nbytes in runs:
+                runtime.memcpyAsync(
+                    dst_ptr, source_ptr, nbytes, runtime.memcpyDefault, stream_ptr
+                )
+            return len(runs)
         if (
             gather_min_runs
             and len(runs) >= gather_min_runs

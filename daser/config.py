@@ -80,6 +80,9 @@ SESSION_PREFETCH_DEPTH_ENV = "DASER_SESSION_PREFETCH_DEPTH"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).
 READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
+#: Research switch: bytes of a GPU buffer the next-session prefetch fills
+#: with the soonest predicted session's stored bytes (default 0 = off).
+DEVICE_STASH_BYTES_ENV = "DASER_DEVICE_STASH_BYTES"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.
