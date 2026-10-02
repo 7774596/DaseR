@@ -14,6 +14,7 @@ from typing import Any
 from daser.config import (
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
+    L1_SPLIT_BYPASS_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
@@ -387,6 +388,7 @@ class IPCServer:
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
         self._prev_readahead_bytes: dict[str, int] = {}
+        self._prev_l1_bypass_bytes = 0
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -1626,6 +1628,13 @@ class IPCServer:
                     "Lookup readahead bytes by outcome.",
                 ).inc(delta, labels={"outcome": outcome})
             self._prev_readahead_bytes[outcome] = current
+        bypass_delta = stats.l1_bypass_bytes - self._prev_l1_bypass_bytes
+        if bypass_delta > 0:
+            self._metrics.counter(
+                "daser_l1_bypass_bytes_total",
+                "L2 load bytes read around L1 by split-residency bypass.",
+            ).inc(bypass_delta)
+        self._prev_l1_bypass_bytes = stats.l1_bypass_bytes
         prev_hits = getattr(self, "_prev_l1_hits", 0)
         prev_misses = getattr(self, "_prev_l1_misses", 0)
         prev_l2_reads = getattr(self, "_prev_l2_reads", 0)
@@ -1721,6 +1730,7 @@ class IPCServer:
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
                     gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
+                    l1_split_bypass=os.environ.get(L1_SPLIT_BYPASS_ENV) == "1",
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

@@ -2532,6 +2532,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
             "gather_min_runs": 0,
+            "l1_split_bypass": False,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2589,6 +2590,7 @@ async def test_bip_setting_is_forwarded(
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
             "gather_min_runs": 0,
+            "l1_split_bypass": False,
         }
     ]
 

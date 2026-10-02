@@ -37,6 +37,14 @@ _PACKED_READ_BATCH_BYTES = 128 * 1024 * 1024
 # promotion. Large coalesced extents continue through the splitting single-IO
 # API; neither path reads the holes between immutable packed records.
 _PACKED_READ_BATCH_COUNT = 64
+# Split-residency bypass reads: transient window size and windows in flight
+# (bounds the pinned bounce memory to 512 MiB per grouped load).
+_BYPASS_WINDOW_BYTES = 32 * 1024 * 1024
+_BYPASS_WINDOWS_IN_FLIGHT = 16
+# Offset-class unit for the bypass: misses are split at these aligned
+# boundaries and each unit is admitted or bypassed as a whole, independent of
+# how request spans happen to coalesce.
+_BYPASS_CLASS_BYTES = 2 * 1024 * 1024
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -47,7 +55,10 @@ _DIRECT_IO_ALIGNMENT = 4096
 
 
 def _l1_replacement_policy(
-    bip_enabled: bool, split_fraction: float, l1_bytes: int
+    bip_enabled: bool,
+    split_fraction: float,
+    l1_bytes: int,
+    split_granularity: int = _DIRECT_IO_ALIGNMENT,
 ) -> ReplacementPolicy[int] | None:
     """Select the L1 allocation replacement policy.
 
@@ -56,13 +67,16 @@ def _l1_replacement_policy(
         split_fraction: Split-residency protected byte budget as a share of
             L1; 0 disables it.
         l1_bytes: L1 capacity in accounted bytes.
+        split_granularity: Bytes per split-residency offset class.
 
     Returns:
         The policy instance, or None for the L1 cache's default LRU.
     """
     if split_fraction > 0.0:
         return SplitResidencyPolicy[int](
-            protect_fraction=split_fraction, capacity_bytes=l1_bytes
+            protect_fraction=split_fraction,
+            capacity_bytes=l1_bytes,
+            granularity=split_granularity,
         )
     if bip_enabled:
         return BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
@@ -354,6 +368,38 @@ def _normalize_accounted_ranges(
             continue
         merged.append(span)
     return merged
+
+
+def _split_at_units(miss: dict[str, int], unit: int) -> list[dict[str, int]]:
+    """Cut one miss at ``unit``-aligned file offsets, splitting its charge.
+
+    Args:
+        miss: Miss span with target_offset, file_offset, nbytes and
+            accounted_nbytes.
+        unit: Positive alignment in bytes.
+
+    Returns:
+        Fragments covering the same bytes in order, none crossing a unit
+        boundary; the original miss when it already fits in one unit.
+    """
+    start = int(miss["file_offset"])
+    end = start + int(miss["nbytes"])
+    cuts = list(range((start // unit + 1) * unit, end, unit))
+    if not cuts:
+        return [miss]
+    bounds = [start, *cuts, end]
+    fragments = [
+        {
+            "target_offset": int(miss["target_offset"]) + lo - start,
+            "file_offset": lo,
+            "nbytes": hi - lo,
+        }
+        for lo, hi in zip(bounds, bounds[1:], strict=False)
+    ]
+    _assign_accounting_charges(
+        fragments, int(miss["accounted_nbytes"]), int(miss["nbytes"])
+    )
+    return fragments
 
 
 def _assign_accounting_charges(
@@ -654,6 +700,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             with at least this many discontiguous runs is issued as one
             zero-copy gather kernel instead of one ``cudaMemcpyAsync`` per run,
             so small scattered pieces still reach PCIe bandwidth. 0 disables.
+        l1_split_bypass: Research switch, requires ``l1_split_fraction``.
+            Grouped-load L2 misses whose offset class is outside the protected
+            segment are read through transient pinned windows and copied to
+            the destination without entering L1, so SSD traffic for the
+            unprotected share of each prefix cannot evict protected ranges.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -679,7 +730,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         readahead_piece_bytes: int = 0,
         readahead_window: int = 4,
         gather_min_runs: int = 0,
+        l1_split_bypass: bool = False,
     ) -> None:
+        if l1_split_bypass and l1_split_fraction <= 0.0:
+            raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
         if gather_min_runs < 0:
             raise ValueError("gather_min_runs must be >= 0")
         if readahead_piece_bytes < 0 or readahead_window <= 0:
@@ -738,13 +792,39 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._request_leases: dict[str, _RequestLease] = {}
         self._leased_slices: dict[int, tuple[PinnedMemorySlice, int]] = {}
         self._pending_h2d: set[asyncio.Task[None]] = set()
+        # With the bypass, offset classes are whole aligned units so the
+        # class of an L1 entry equals the admission class of its first unit.
+        self._bypass_class = (
+            _BYPASS_CLASS_BYTES if l1_split_bypass else _DIRECT_IO_ALIGNMENT
+        )
+        policy = _l1_replacement_policy(
+            self.bip_enabled, l1_split_fraction, l1_bytes, self._bypass_class
+        )
+        # Split policy consulted for L1-bypass admission; None keeps every
+        # L2 miss on the promotion path.
+        self._bypass_policy = (
+            policy
+            if l1_split_bypass and isinstance(policy, SplitResidencyPolicy)
+            else None
+        )
+        # Windows in flight fit in the unprotected share of L1, so bounce
+        # reservations evict probation rather than protected ranges.
+        unprotected = int(l1_bytes * (1.0 - l1_split_fraction))
+        self._bypass_window = max(
+            _DIRECT_IO_ALIGNMENT,
+            min(_BYPASS_WINDOW_BYTES, unprotected // _BYPASS_WINDOWS_IN_FLIGHT)
+            // _DIRECT_IO_ALIGNMENT
+            * _DIRECT_IO_ALIGNMENT,
+        )
+        self._bypass_in_flight = max(
+            1,
+            min(_BYPASS_WINDOWS_IN_FLIGHT, unprotected // self._bypass_window),
+        )
         self._l1 = L1Cache(
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
-            replacement_policy=_l1_replacement_policy(
-                self.bip_enabled, l1_split_fraction, l1_bytes
-            ),
+            replacement_policy=policy,
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
@@ -756,7 +836,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
             "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
-            "gather_min_runs=%d",
+            "gather_min_runs=%d l1_split_bypass=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -772,6 +852,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._readahead_piece,
             self._readahead_window,
             self._gather_min_runs,
+            self._bypass_policy is not None,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -861,6 +942,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         total = 0
         merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         misses: list[dict[str, int]] = []
+        bypass: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
         copy_future: asyncio.Task[None] | None = None
         if self._readaheads:
@@ -926,14 +1008,20 @@ class TieredIOUringTransferLayer(TransferLayer):
                             int(miss["nbytes"]),
                         )
                     )
-                    misses.append(
-                        {
-                            "target_offset": int(miss["target_offset"]),
-                            "file_offset": int(miss["file_offset"]),
-                            "nbytes": int(miss["nbytes"]),
-                            "accounted_nbytes": int(miss["accounted_nbytes"]),
-                        }
-                    )
+                    entry = {
+                        "target_offset": int(miss["target_offset"]),
+                        "file_offset": int(miss["file_offset"]),
+                        "nbytes": int(miss["nbytes"]),
+                        "accounted_nbytes": int(miss["accounted_nbytes"]),
+                    }
+                    if self._bypass_policy is None:
+                        misses.append(entry)
+                        continue
+                    for fragment in _split_at_units(entry, self._bypass_class):
+                        if self._bypass_policy.admits(fragment["file_offset"]):
+                            misses.append(fragment)
+                        else:
+                            bypass.append(fragment)
             if merged_l1:
                 copy_future = self._copy_grouped_to_dst(dst, merged_l1)
             if self._readaheads:
@@ -944,7 +1032,18 @@ class TieredIOUringTransferLayer(TransferLayer):
         try:
             if pending:
                 await asyncio.gather(*pending)
-            if misses:
+            if bypass:
+                # Both paths write disjoint destination ranges; collect every
+                # outcome so neither is still copying when an error surfaces.
+                results = await asyncio.gather(
+                    self._load_l2_misses_grouped(dst, misses),
+                    self._load_l2_bypass(dst, bypass),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+            elif misses:
                 await self._load_l2_misses_grouped(dst, misses)
         finally:
             if copy_future is not None:
@@ -2208,6 +2307,90 @@ class TieredIOUringTransferLayer(TransferLayer):
             batch = self._next_l2_miss_batch(misses, start)
             await self._load_l2_miss_batch(dst, batch, lease_id=lease_id)
             start += len(batch)
+
+    async def _load_l2_bypass(
+        self,
+        dst: Any,
+        misses: list[dict[str, Any]],
+    ) -> None:
+        """Read L2 misses through transient pinned windows that skip L1.
+
+        Each window is reserved untracked from the L1 pool (evicting
+        probation first), read, copied to ``dst`` and closed once the copy
+        completes, so it never becomes a resident allocation. At most
+        windows totalling at most the unprotected L1 share are pinned at a
+        time.
+        """
+        assert self._l2 is not None
+        windows = _coalesce_load_misses(
+            misses, self._bypass_window, preserve_targets=True
+        )
+        gate = asyncio.Semaphore(self._bypass_in_flight)
+
+        async def run(span: dict[str, Any]) -> None:
+            async with gate:
+                await self._load_bypass_window(dst, span)
+
+        results = await asyncio.gather(
+            *(run(span) for span in windows), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _load_bypass_window(self, dst: Any, span: dict[str, Any]) -> None:
+        """Read one coalesced bypass span into a transient slice and copy it."""
+        assert self._l2 is not None
+        loop = asyncio.get_event_loop()
+        start = int(span["file_offset"])
+        while True:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                pinned = self._l1.reserve_untracked(int(span["nbytes"]))
+                if pinned is not None:
+                    # Own the slice like a lease so cleanup elsewhere keeps it.
+                    self._leased_slices[id(pinned)] = (pinned, 1)
+                    break
+                waiter = loop.create_future()
+                self._l1.register_pool_waiter(waiter)
+            await waiter
+        read: asyncio.Future[int] | None = None
+        copy_future: asyncio.Task[None] | None = None
+        try:
+            read = loop.run_in_executor(
+                self._l2.executor,
+                self._read_l2_into,
+                start,
+                pinned,
+                self._next_uring(),
+            )
+            await read
+            parts = span.get("parts") or [span]
+            copy_future = self._copy_grouped_to_dst(
+                dst,
+                [
+                    (
+                        int(part["target_offset"]),
+                        pinned,
+                        int(part["file_offset"]) - start,
+                        int(part["nbytes"]),
+                    )
+                    for part in parts
+                ],
+            )
+            async with self._lock:
+                self._stats.l2_reads += 1
+                self._stats.l1_bypass_bytes += sum(int(p["nbytes"]) for p in parts)
+        finally:
+            # The executor thread may still own the pages after cancellation.
+            if read is not None and not read.done():
+                await asyncio.gather(read, return_exceptions=True)
+            try:
+                if copy_future is not None:
+                    await _drain_destination_copies([copy_future])
+            finally:
+                async with self._lock:
+                    self._release_slice_reference_locked(id(pinned))
 
     async def _load_l2_miss_batch(
         self,

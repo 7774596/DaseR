@@ -48,6 +48,10 @@ GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
 #: (SM gather kernel, default), ``memcpy`` or ``batch`` (copy engines). The
 #: copies run while the forward pass occupies the SMs.
 LAYERWISE_COPY_ENV = "DASER_LAYERWISE_COPY"
+#: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
+#: L2 misses outside the protected class through transient pinned windows that
+#: never enter L1, so SSD traffic cannot evict the protected segment.
+L1_SPLIT_BYPASS_ENV = "DASER_L1_SPLIT_BYPASS"
 
 
 @dataclass(frozen=True)

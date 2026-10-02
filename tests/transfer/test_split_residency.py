@@ -71,6 +71,17 @@ def _protected_keys(policy: SplitResidencyPolicy[int], keys: int) -> set[int]:
     return {key for key in order[order.index(marker) + 1 :] if key is not None}
 
 
+def test_admits_matches_protected_insert() -> None:
+    """``admits`` predicts whether a fresh insert enters the protected segment."""
+    policy = SplitResidencyPolicy[int](protect_fraction=0.5, capacity_bytes=1 << 40)
+    for key in range(64):
+        admitted = policy.admits(key * PAGE)
+        before = policy.protected_bytes
+        policy.insert_range(key, key * PAGE, PAGE)
+        assert (policy.protected_bytes > before) == admitted
+    assert 0 < policy.protected_bytes < 64 * PAGE
+
+
 @pytest.mark.parametrize("fraction", [0.0, 1.0, -0.1])
 def test_rejects_out_of_range_fraction(fraction: float) -> None:
     """The protected budget must be a proper share of capacity."""

@@ -106,6 +106,18 @@ class SplitResidencyPolicy(ReplacementPolicy[K], Generic[K]):
         """Return the bytes currently tracked in the protected segment."""
         return self._protected_bytes
 
+    def admits(self, file_offset: int) -> bool:
+        """Return whether a new range at ``file_offset`` would be protected.
+
+        Args:
+            file_offset: Stable L2 byte offset of the range's first byte.
+
+        Returns:
+            True when the offset class is below the current eligibility, so an
+            insert at this offset enters the protected segment.
+        """
+        return _offset_class(file_offset, self._granularity) < self._eligibility
+
     def insert(self, key: K) -> None:
         """Insert or refresh a key without placement hints (probation segment).
 

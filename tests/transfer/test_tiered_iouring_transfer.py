@@ -483,6 +483,74 @@ def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_split_bypass_requires_split_fraction(tmp_path) -> None:
+    """The L1 bypass is only defined on top of split residency."""
+    with pytest.raises(ValueError):
+        TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+            l1_split_bypass=True,
+        )
+
+
+def test_iouring_split_bypass_keeps_unprotected_misses_out_of_l1(
+    tmp_path, monkeypatch
+) -> None:
+    """Cyclic loads beyond L1: bypassed bytes stay off L1, protected ones hit."""
+    records = 32
+    # One offset class per page so the small store spans many classes.
+    monkeypatch.setattr(layer_module, "_BYPASS_CLASS_BYTES", ALIGNMENT)
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * records, l2_bytes=ALIGNMENT * records
+        )
+        try:
+            for index in range(records):
+                await writer.store_bytes(
+                    _block(bytes([index + 1])), index * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 24,
+            l2_bytes=ALIGNMENT * records,
+            l1_split_fraction=0.5,
+            l1_split_bypass=True,
+        )
+        spans = [
+            {
+                "target_offset": index * ALIGNMENT,
+                "file_offset": index * ALIGNMENT,
+                "nbytes": ALIGNMENT,
+            }
+            for index in range(records)
+        ]
+        expected = b"".join(bytes(_block(bytes([i + 1]))) for i in range(records))
+        try:
+            bypassed, hits = [], []
+            for _round in range(6):
+                dst = bytearray(ALIGNMENT * records)
+                assert await layer.load_bytes_grouped(dst, spans) == len(dst)
+                assert bytes(dst) == expected
+                bypassed.append(layer.stats.l1_bypass_bytes)
+                hits.append(layer.stats.l1_hits)
+            assert 0 < bypassed[0] < ALIGNMENT * records
+            # The working set exceeds L1, yet the last round still hits L1.
+            assert hits[-1] > hits[-2]
+            # Bypassed reads never became resident: the last round bypasses again.
+            assert bypassed[-1] > bypassed[-2]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_coalesces_adjacent_packed_misses(tmp_path) -> None:
     """Adjacent variable-length records use one bounded L2 read."""
 
