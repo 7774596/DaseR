@@ -38,13 +38,14 @@ _PACKED_READ_BATCH_BYTES = 128 * 1024 * 1024
 # API; neither path reads the holes between immutable packed records.
 _PACKED_READ_BATCH_COUNT = 64
 # Split-residency bypass reads: transient window size and windows in flight
-# (bounds the pinned bounce memory to 512 MiB per grouped load).
-_BYPASS_WINDOW_BYTES = 32 * 1024 * 1024
+# (bounds the pinned bounce memory to 4 GiB per grouped load; large windows
+# keep the bypass at a few hundred SSD reads per pass).
+_BYPASS_WINDOW_BYTES = 256 * 1024 * 1024
 _BYPASS_WINDOWS_IN_FLIGHT = 16
 # Offset-class unit for the bypass: misses are split at these aligned
 # boundaries and each unit is admitted or bypassed as a whole, independent of
 # how request spans happen to coalesce.
-_BYPASS_CLASS_BYTES = 2 * 1024 * 1024
+_BYPASS_CLASS_BYTES = 256 * 1024 * 1024
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
