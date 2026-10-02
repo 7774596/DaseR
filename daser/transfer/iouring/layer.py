@@ -11,6 +11,7 @@ from typing import Any
 from daser.logging import init_logger
 from daser.replacement import ReplacementPolicy, SplitResidencyPolicy
 from daser.replacement.bip import BIPReplacementPolicy
+from daser.replacement.next_use import NextUseReplacementPolicy
 from daser.transfer.base import (
     PrefetchResult,
     TransferLayer,
@@ -63,6 +64,7 @@ def _l1_replacement_policy(
     split_fraction: float,
     l1_bytes: int,
     split_granularity: int = _DIRECT_IO_ALIGNMENT,
+    next_use: bool = False,
 ) -> ReplacementPolicy[int] | None:
     """Select the L1 allocation replacement policy.
 
@@ -72,6 +74,8 @@ def _l1_replacement_policy(
             L1; 0 disables it.
         l1_bytes: L1 capacity in accounted bytes.
         split_granularity: Bytes per split-residency offset class.
+        next_use: Use predicted-next-use replacement when split residency
+            is off; takes precedence over BIP.
 
     Returns:
         The policy instance, or None for the L1 cache's default LRU.
@@ -82,6 +86,8 @@ def _l1_replacement_policy(
             capacity_bytes=l1_bytes,
             granularity=split_granularity,
         )
+    if next_use:
+        return NextUseReplacementPolicy[int]()
     if bip_enabled:
         return BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
     return None
@@ -810,6 +816,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         batch_dst_copies: Research switch. An L1-to-CUDA copy submits all
             of its runs in one ``cudaMemcpyBatchAsync`` instead of one
             ``cudaMemcpyAsync`` per run.
+        next_use_replacement: Research switch. L1 evicts the allocation whose
+            reuse-interval prediction of its next use is furthest away
+            (``NextUseReplacementPolicy``) instead of BIP/LRU.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -838,6 +847,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         gather_min_runs: int = 0,
         l1_split_bypass: bool = False,
         batch_dst_copies: bool = False,
+        next_use_replacement: bool = False,
     ) -> None:
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
@@ -907,7 +917,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             _BYPASS_CLASS_BYTES if l1_split_bypass else _DIRECT_IO_ALIGNMENT
         )
         policy = _l1_replacement_policy(
-            self.bip_enabled, l1_split_fraction, l1_bytes, self._bypass_class
+            self.bip_enabled,
+            l1_split_fraction,
+            l1_bytes,
+            self._bypass_class,
+            next_use_replacement,
         )
         # Split policy consulted for L1-bypass admission; None keeps every
         # L2 miss on the promotion path.
@@ -947,7 +961,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
             "readahead_stream=%s "
-            "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s",
+            "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
+            "next_use_replacement=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -966,6 +981,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._gather_min_runs,
             self._bypass_policy is not None,
             self._batch_dst_copies,
+            next_use_replacement,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:

@@ -2535,6 +2535,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "gather_min_runs": 0,
             "l1_split_bypass": False,
             "batch_dst_copies": False,
+            "next_use_replacement": False,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2595,6 +2596,7 @@ async def test_bip_setting_is_forwarded(
             "gather_min_runs": 0,
             "l1_split_bypass": False,
             "batch_dst_copies": False,
+            "next_use_replacement": False,
         }
     ]
 

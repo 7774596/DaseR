@@ -58,6 +58,9 @@ LAYERWISE_COPY_ENV = "DASER_LAYERWISE_COPY"
 #: Research switch: ``1`` submits each request-level L1-to-GPU copy as one
 #: ``cudaMemcpyBatchAsync`` over all its runs instead of one copy per run.
 BATCH_DST_COPY_ENV = "DASER_BATCH_DST_COPY"
+#: Research switch: ``1`` replaces the L1 policy with predicted-next-use
+#: eviction from per-L2-region reuse intervals.
+L1_NEXT_USE_ENV = "DASER_L1_NEXT_USE"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.
