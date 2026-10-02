@@ -319,6 +319,19 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             if any(waits.values())
             else ""
         )
+        session = {
+            outcome: _delta(
+                before,
+                after,
+                f'daser_session_prefetch_total{{outcome="{outcome}"}}',
+            )
+            for outcome in ("started", "skipped", "failed", "returned")
+        }
+        h2d += (
+            " sess_pf[" + " ".join(f"{k}={v:.0f}" for k, v in session.items()) + "]"
+            if any(session.values())
+            else ""
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "
