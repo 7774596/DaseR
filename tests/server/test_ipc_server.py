@@ -2715,3 +2715,96 @@ async def test_transfer_load_runs_rejects_malformed_requests(
     with pytest.raises(ValueError):
         await server._transfer_load_runs(msg)  # noqa: SLF001
     assert transfer.calls == []
+
+
+class _ReadaheadRecordingTransfer(TransferLayer):
+    """Transfer stub that records readahead spans instead of reading."""
+
+    readaheads: list[list[dict[str, int]]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        del kwargs
+
+    async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+        raise AssertionError("readahead hints must not load")
+
+    async def store_bytes(
+        self,
+        src: Any,
+        file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
+    ) -> int:
+        raise AssertionError("readahead hints must not store")
+
+    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
+        type(self).readaheads.append(spans)
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_ipc_readahead_hint_reads_ahead_without_lookup_metrics(
+    tmp_path, monkeypatch, enabled: bool
+) -> None:
+    """A hint starts readahead of the hit spans and records no hit counters.
+
+    Without the readahead switch the hint is a no-op.
+    """
+    if enabled:
+        monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
+    else:
+        monkeypatch.delenv("DASER_LOAD_READAHEAD", raising=False)
+    _ReadaheadRecordingTransfer.readaheads = []
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        _ReadaheadRecordingTransfer,
+    )
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(
+        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
+    )
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
+        resp = await _send_recv(
+            socket_path,
+            {
+                "op": "readahead_hint",
+                "tokens": tokens,
+                "model_id": "m",
+                "external_prefix_queries": 8,
+                "num_computed_tokens": 0,
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert resp == {"started": enabled}
+    if enabled:
+        assert len(_ReadaheadRecordingTransfer.readaheads) == 1
+        spans = _ReadaheadRecordingTransfer.readaheads[0]
+        assert sum(int(span["nbytes"]) for span in spans) == SLOT_SIZE
+    else:
+        assert _ReadaheadRecordingTransfer.readaheads == []
+    assert "daser_external_prefix_cache_queries_total" not in (
+        registry.render_prometheus()
+    )

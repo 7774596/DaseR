@@ -107,8 +107,10 @@ class RequestLifecycle:
         storage_format: str | None = None,
         coalesce_loads: bool = False,
         layerwise_load: bool = False,
+        arrival_readahead: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
+        self._arrival_readahead = arrival_readahead
         self._block_tokens = block_tokens
         self._slot_size = slot_size
         self._model_id = model_id
@@ -152,6 +154,44 @@ class RequestLifecycle:
         self._coalesce_followers: dict[str, tuple[int, float]] = {}
         self._follower_digests: dict[str, dict[int, int]] = {}
         self._coalesce_stats = {"followers": 0, "joined": 0, "missed": 0}
+
+    def on_new_request(self, request: "Request") -> None:
+        """Start SSD readahead for a request entering vLLM's waiting queue.
+
+        With ``arrival_readahead`` the block-aligned prompt is sent as a
+        readahead hint, so the server reads the request's external prefix
+        while earlier requests run; the scheduling lookup later finds those
+        bytes retained or in flight. The hint is best effort: failures are
+        logged and the request is scheduled normally.
+
+        Args:
+            request: vLLM Request with prompt_token_ids.
+
+        Thread-safety:
+            Runs on the scheduler thread through its synchronous IPC client.
+        """
+        if not self._arrival_readahead:
+            return
+        tokens = list(request.prompt_token_ids)
+        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+        if aligned == 0:
+            return
+        try:
+            started = self._ipc_sync.readahead_hint(
+                tokens[:aligned], self._model_id, len(tokens)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[CONNECTOR] readahead hint failed req=%s: %s",
+                request.request_id[:8],
+                exc,
+            )
+            return
+        logger.debug(
+            "[CONNECTOR] readahead hint req=%s started=%s",
+            request.request_id[:8],
+            started,
+        )
 
     def get_num_new_matched_tokens(
         self,

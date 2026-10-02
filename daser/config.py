@@ -44,6 +44,10 @@ LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
 #: Research switch: ``1`` makes a load copy each readahead piece as soon as it
 #: is retained, overlapping host-to-device copies with the remaining reads.
 LOAD_READAHEAD_STREAM_ENV = "DASER_LOAD_READAHEAD_STREAM"
+#: Research switch: ``1`` makes the scheduler connector send a readahead hint
+#: when a request enters vLLM's waiting queue, so its SSD read overlaps the
+#: requests ahead of it instead of starting when it is scheduled.
+ARRIVAL_READAHEAD_ENV = "DASER_ARRIVAL_READAHEAD"
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"

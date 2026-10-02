@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import os
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 # First Party
-from daser.config import STORAGE_FORMAT_RAW, STORAGE_FORMATS
+from daser.config import ARRIVAL_READAHEAD_ENV, STORAGE_FORMAT_RAW, STORAGE_FORMATS
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler.adapter import SchedulerConnectorMixin
@@ -119,6 +120,7 @@ class DaserConnector(
                 storage_format=storage_format,
                 coalesce_loads=bool(extra.get("coalesce_loads", False)),
                 layerwise_load=bool(extra.get("layerwise_load", False)),
+                arrival_readahead=os.environ.get(ARRIVAL_READAHEAD_ENV) == "1",
             )
             self._request_lifecycle.refresh_runtime_config()
             self._scheduler_probe = SchedulerProbe.from_env()

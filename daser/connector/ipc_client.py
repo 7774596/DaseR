@@ -202,6 +202,37 @@ class IPCClientSync(_IPCClientBase):
             return None
         return resp.get("chunks", [])
 
+    def readahead_hint(
+        self,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int,
+    ) -> bool:
+        """Ask the server to read ahead a queued request's external prefix.
+
+        Args:
+            tokens: Block-aligned prompt token IDs.
+            model_id: Model identifier.
+            external_prefix_queries: Prompt token count vLLM will query.
+
+        Returns:
+            True when the server started a new readahead.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls; the server replies before the reads complete.
+        """
+        resp = self.call(
+            {
+                "op": "readahead_hint",
+                "token_bytes": _pack_lookup_tokens(tokens),
+                "model_id": model_id,
+                "external_prefix_queries": int(external_prefix_queries),
+                "num_computed_tokens": 0,
+            }
+        )
+        return bool(resp.get("started", False))
+
     def lookup_with_prefetch(
         self,
         lease_id: str,
