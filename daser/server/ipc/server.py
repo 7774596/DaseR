@@ -14,6 +14,7 @@ from typing import Any
 from daser.config import (
     BATCH_DST_COPY_ENV,
     DEVICE_STASH_BYTES_ENV,
+    DEVICE_STASH_SESSIONS_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
     L1_NEXT_USE_ENV,
@@ -413,6 +414,9 @@ class IPCServer:
         )
         self._session_prefetch: list[tuple[bytes, str]] = []
         self._device_stash_bytes = int(os.environ.get(DEVICE_STASH_BYTES_ENV) or 0)
+        self._device_stash_sessions = max(
+            1, int(os.environ.get(DEVICE_STASH_SESSIONS_ENV, "1") or 1)
+        )
         self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
@@ -2015,8 +2019,9 @@ class IPCServer:
         Speculative readaheads of sessions no longer predicted are dropped
         first. Each prediction then reads after the previous one finished,
         so the soonest session gets the SSD first and later ones take only
-        the budget left. With a device stash, the soonest session's bytes
-        are then copied to the GPU before later predictions read.
+        the budget left. With a device stash, the bytes of the soonest
+        ``DASER_DEVICE_STASH_SESSIONS`` sessions (default 1) are then copied
+        to the GPU, soonest first, before later predictions read.
 
         Args:
             predictions: ``(last prompt, model id)`` per predicted session,
@@ -2034,6 +2039,7 @@ class IPCServer:
                 for tokens, model_id in predictions
             ]
             await transfer.drop_speculative_except([s for s in planned if s])
+            stash_last = min(self._device_stash_sessions, len(planned)) - 1
             for index, spans in enumerate(planned):
                 # A grouped load spans several transfer calls fed by the
                 # current request's readahead; read only once that finished.
@@ -2042,12 +2048,16 @@ class IPCServer:
                     spans, speculative=True
                 )
                 counter.inc(labels={"outcome": "started" if started else "skipped"})
-                if index == 0 and spans and self._device_stash_bytes:
-                    # The soonest session's bytes are in L1 once its
-                    # readahead finished: copy them to the GPU before the
-                    # next readahead, while the current request computes.
+                stash_spans = [
+                    span for session in planned[: index + 1] for span in session
+                ]
+                if index == stash_last and stash_spans and self._device_stash_bytes:
+                    # The stashed sessions' bytes are in L1 once their
+                    # readaheads finished: copy them to the GPU, soonest
+                    # first, before the next readahead, while the current
+                    # request computes.
                     await transfer.wait_readahead_idle()
-                    await transfer.fill_device_stash(spans)
+                    await transfer.fill_device_stash(stash_spans)
         except Exception:
             logger.exception("[IPC] session prefetch failed")
             counter.inc(labels={"outcome": "failed"})

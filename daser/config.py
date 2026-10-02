@@ -83,6 +83,9 @@ READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
 #: Research switch: bytes of a GPU buffer the next-session prefetch fills
 #: with the soonest predicted session's stored bytes (default 0 = off).
 DEVICE_STASH_BYTES_ENV = "DASER_DEVICE_STASH_BYTES"
+#: Research switch: predicted sessions the device stash holds, soonest first
+#: (default 1).
+DEVICE_STASH_SESSIONS_ENV = "DASER_DEVICE_STASH_SESSIONS"
 #: Research switch: readaheads skip spans the device stash holds whole.
 READAHEAD_SKIP_STASHED_ENV = "DASER_READAHEAD_SKIP_STASHED"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads

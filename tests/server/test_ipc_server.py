@@ -2920,6 +2920,105 @@ async def test_ipc_session_prefetch_reads_the_next_session_after_a_load(
     assert ('outcome="started"' in rendered) is enabled
 
 
+class _StashRecordingTransfer(_SessionPrefetchTransfer):
+    """Session prefetch stub that also records device stash fills."""
+
+    fills: list[list[dict[str, int]]] = []
+
+    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
+        type(self).fills.append(spans)
+        return sum(int(span["nbytes"]) for span in spans)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sessions", [1, 2])
+async def test_ipc_device_stash_holds_the_soonest_predicted_sessions(
+    tmp_path, monkeypatch, sessions: int
+) -> None:
+    """The stash fill takes the soonest ``sessions`` predictions, in order.
+
+    Sessions A, B and C take turns; when A returns, B then C are predicted.
+    One fill runs after the stashed predictions were read ahead and holds
+    B's stored block, followed by C's when two sessions are stashed.
+    """
+    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
+    monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
+    monkeypatch.setenv("DASER_SESSION_PREFETCH_DEPTH", "2")
+    monkeypatch.setenv("DASER_DEVICE_STASH_BYTES", str(4 * SLOT_SIZE))
+    monkeypatch.setenv("DASER_DEVICE_STASH_SESSIONS", str(sessions))
+    _ReadaheadRecordingTransfer.readaheads = []
+    _StashRecordingTransfer.fills = []
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        _StashRecordingTransfer,
+    )
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(
+        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
+    )
+    session_a = [11, 12, 13, 14]
+    session_b = [21, 22, 23, 24]
+    session_c = [31, 32, 33, 34]
+
+    async def lookup(tokens: list[int]) -> None:
+        await _send_recv(
+            socket_path,
+            {
+                "op": "lookup",
+                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
+                "model_id": "m",
+                "external_prefix_queries": len(tokens),
+                "num_computed_tokens": 0,
+            },
+        )
+
+    await server.start()
+    try:
+        offsets = []
+        for session in (session_b, session_c):
+            key = first_rolling_key(session)
+            reply = await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": len(session),
+                    "model_id": "m",
+                },
+            )
+            offsets.append(int(reply["file_offset"]))
+            await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
+        await lookup(session_a)
+        await lookup(session_b + [25])
+        await lookup(session_c + [35])
+        # A returns, so B (idle longest) and then C are predicted.
+        await lookup(session_a + [15])
+        await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+        for _ in range(100):
+            if _StashRecordingTransfer.fills and "daser_session_prefetch_total" in (
+                registry.render_prometheus()
+            ):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await server.stop()
+
+    assert [
+        [int(span["file_offset"]) for span in spans]
+        for spans in _StashRecordingTransfer.fills
+    ] == [offsets[:sessions]]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("compute_tokens_per_s", "expected_front"),
