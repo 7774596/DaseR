@@ -2820,6 +2820,97 @@ async def test_ipc_readahead_hint_reads_ahead_without_lookup_metrics(
     )
 
 
+class _SessionPrefetchTransfer(_ReadaheadRecordingTransfer):
+    """Readahead recorder that also serves loads without reading."""
+
+    async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+        del dst, file_offset
+        return nbytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_ipc_session_prefetch_reads_the_next_session_after_a_load(
+    tmp_path, monkeypatch, enabled: bool
+) -> None:
+    """After a load the predicted next session's stored prefix is read ahead.
+
+    Sessions A and B alternate. When A returns, B is the session idle the
+    longest, so A's load is followed by a readahead of B's stored block.
+    Without the switch only lookup hits are read ahead.
+    """
+    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
+    if enabled:
+        monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
+    else:
+        monkeypatch.delenv("DASER_SESSION_PREFETCH", raising=False)
+    _ReadaheadRecordingTransfer.readaheads = []
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        _SessionPrefetchTransfer,
+    )
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(
+        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
+    )
+    session_a = [11, 12, 13, 14]
+    session_b = [21, 22, 23, 24]
+    stored = first_rolling_key(session_b)
+
+    async def lookup(tokens: list[int]) -> None:
+        await _send_recv(
+            socket_path,
+            {
+                "op": "lookup",
+                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
+                "model_id": "m",
+                "external_prefix_queries": len(tokens),
+                "num_computed_tokens": 0,
+            },
+        )
+
+    await server.start()
+    try:
+        await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": stored,
+                "token_count": len(session_b),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": stored})
+        await lookup(session_a)
+        await lookup(session_b + [25])
+        # A returns, so B is predicted to return next.
+        await lookup(session_a + [15])
+        await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+        for _ in range(100):
+            if "daser_session_prefetch_total" in registry.render_prometheus():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await server.stop()
+
+    # B's own lookup hit its stored block; the prefetch reads it once more.
+    assert len(_ReadaheadRecordingTransfer.readaheads) == (2 if enabled else 1)
+    for spans in _ReadaheadRecordingTransfer.readaheads:
+        assert sum(int(span["nbytes"]) for span in spans) == SLOT_SIZE
+    rendered = registry.render_prometheus()
+    assert ('outcome="started"' in rendered) is enabled
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("compute_tokens_per_s", "expected_front"),

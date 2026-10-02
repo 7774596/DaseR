@@ -23,6 +23,7 @@ from daser.config import (
     LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     READAHEAD_SRPT_ENV,
+    SESSION_PREFETCH_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STRIPE_PIPELINE_ENV,
 )
@@ -42,6 +43,7 @@ from daser.server.admission import (
 )
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
+from daser.server.session_predictor import SessionPredictor
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -396,6 +398,14 @@ class IPCServer:
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
+        # Research switch: read the predicted next session's prefix ahead.
+        self._session_predictor = (
+            SessionPredictor()
+            if self._readahead_piece and os.environ.get(SESSION_PREFETCH_ENV) == "1"
+            else None
+        )
+        self._session_prefetch: tuple[bytes, str] | None = None
+        self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
         self._prev_l1_bypass_bytes = 0
@@ -661,6 +671,8 @@ class IPCServer:
                 queries=queries,
             )
             await self._core.record_external_prefix_cache(queries=queries, hits=hits)
+            if self._session_predictor is not None and isinstance(tokens, bytes):
+                self._observe_session(tokens, str(msg["model_id"]))
             if self._readahead_piece and chunks and hits > 0:
                 spans = self._external_spans(chunks, num_computed_tokens, hits)
                 if spans:
@@ -1436,6 +1448,7 @@ class IPCServer:
                 nbytes=total,
                 elapsed_s=time.perf_counter() - started_total,
             )
+            self._start_session_prefetch()
             return response
         except BaseException:
             if lease_id is not None:
@@ -1937,6 +1950,72 @@ class IPCServer:
                 self._runtime_config.get("tensor_parallel_size", 1)
             ),
             rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
+        )
+
+    def _observe_session(self, tokens: bytes, model_id: str) -> None:
+        """Feed a scheduler lookup to the session predictor.
+
+        A new request replaces the pending prediction with the session
+        expected after it; the prefetch starts once this request's load
+        finishes, so it does not compete with that load for the SSD.
+        """
+        predictor = self._session_predictor
+        assert predictor is not None
+        before = predictor.predicted_returns
+        if not predictor.observe(tokens, model_id):
+            return
+        if predictor.predicted_returns > before:
+            self._session_prefetch_counter().inc(labels={"outcome": "returned"})
+        self._session_prefetch = predictor.predict()
+
+    def _start_session_prefetch(self) -> None:
+        """Start the pending next-session readahead in the background."""
+        prediction = self._session_prefetch
+        if prediction is None:
+            return
+        running = self._session_prefetch_task
+        if running is not None and not running.done():
+            return
+        self._session_prefetch = None
+        self._session_prefetch_task = asyncio.create_task(
+            self._session_prefetch_readahead(*prediction)
+        )
+
+    async def _session_prefetch_readahead(self, tokens: bytes, model_id: str) -> None:
+        """Read a predicted session's stored prefix ahead into L1.
+
+        Args:
+            tokens: The session's last seen prompt.
+            model_id: Model the prompt belongs to.
+
+        Async/thread-safety:
+            Runs as a background task on the IPC event loop; failures are
+            logged and leave the regular load path unchanged.
+        """
+        counter = self._session_prefetch_counter()
+        try:
+            chunks = await self._lookup_now(tokens, model_id, defer=False)
+            hits = _external_prefix_hits(
+                chunks or [],
+                num_computed_tokens=0,
+                # The next prompt extends this one, so all of it may hit.
+                queries=len(tokens) // 4 + 1,
+            )
+            spans = self._external_spans(chunks or [], 0, hits) if hits > 0 else []
+            started = bool(spans) and await self._ensure_transfer().start_readahead(
+                spans
+            )
+        except Exception:
+            logger.exception("[IPC] session prefetch failed")
+            counter.inc(labels={"outcome": "failed"})
+            return
+        counter.inc(labels={"outcome": "started" if started else "skipped"})
+
+    def _session_prefetch_counter(self) -> Any:
+        """Return the counter of next-session prefetch outcomes."""
+        return self._metrics.counter(
+            "daser_session_prefetch_total",
+            "Predicted next-session readaheads by outcome.",
         )
 
     def _online_compressed_prefetch_spans(

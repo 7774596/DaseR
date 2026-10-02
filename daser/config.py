@@ -70,6 +70,10 @@ READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
 #: Research switch: ``1`` holds L2 writes while a readahead is reading (up to
 #: a bounded delay), so writeback does not share the SSD with the next load.
 L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
+#: Research switch: ``1`` predicts the agent session that returns next from
+#: the lookup stream and reads its stored prefix ahead after each load, so the
+#: SSD read overlaps the current request's prefill and decode.
+SESSION_PREFETCH_ENV = "DASER_SESSION_PREFETCH"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.
