@@ -494,10 +494,14 @@ def test_iouring_split_bypass_requires_split_fraction(tmp_path) -> None:
         )
 
 
+@pytest.mark.parametrize("readahead", [False, True])
 def test_iouring_split_bypass_keeps_unprotected_misses_out_of_l1(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, readahead: bool
 ) -> None:
-    """Cyclic loads beyond L1: bypassed bytes stay off L1, protected ones hit."""
+    """Cyclic loads beyond L1: bypassed bytes stay off L1, protected ones hit.
+
+    With readahead, bypassed units are retained by the readahead lease only.
+    """
     records = 32
     # One offset class per page so the small store spans many classes.
     monkeypatch.setattr(layer_module, "_BYPASS_CLASS_BYTES", ALIGNMENT)
@@ -522,6 +526,7 @@ def test_iouring_split_bypass_keeps_unprotected_misses_out_of_l1(
             l2_bytes=ALIGNMENT * records,
             l1_split_fraction=0.5,
             l1_split_bypass=True,
+            readahead_piece_bytes=ALIGNMENT * 4 if readahead else 0,
         )
         spans = [
             {
@@ -536,11 +541,15 @@ def test_iouring_split_bypass_keeps_unprotected_misses_out_of_l1(
             bypassed, hits = [], []
             for _round in range(6):
                 dst = bytearray(ALIGNMENT * records)
+                if readahead:
+                    assert await layer.start_readahead(spans)
                 assert await layer.load_bytes_grouped(dst, spans) == len(dst)
                 assert bytes(dst) == expected
                 bypassed.append(layer.stats.l1_bypass_bytes)
                 hits.append(layer.stats.l1_hits)
             assert 0 < bypassed[0] < ALIGNMENT * records
+            if readahead:
+                assert layer.stats.readahead_served_bytes > 0
             # The working set exceeds L1, yet the last round still hits L1.
             assert hits[-1] > hits[-2]
             # Bypassed reads never became resident: the last round bypasses again.

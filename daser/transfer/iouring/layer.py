@@ -1686,17 +1686,23 @@ class TieredIOUringTransferLayer(TransferLayer):
                             "accounted_nbytes": int(miss["accounted_nbytes"]),
                         }
                     )
-            groups = _group_by_bytes(
-                _coalesce_load_misses(
-                    misses, self._readahead_piece, preserve_targets=False
-                ),
-                self._readahead_piece,
-            )
+            bypass = self._take_bypass_readahead(misses)
+            groups = [
+                (group, publish)
+                for selected, publish in ((misses, True), (bypass, False))
+                for group in _group_by_bytes(
+                    _coalesce_load_misses(
+                        selected, self._readahead_piece, preserve_targets=False
+                    ),
+                    self._readahead_piece,
+                )
+            ]
             loop = asyncio.get_running_loop()
             readahead = _Readahead(
                 ranges=ranges,
                 pieces=[
-                    (_normalize_ranges(group), loop.create_future()) for group in groups
+                    (_normalize_ranges(group), loop.create_future())
+                    for group, _publish in groups
                 ],
                 started=time.perf_counter(),
             )
@@ -2397,8 +2403,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         dst: Any | None,
         misses: list[dict[str, int]],
         lease_id: str | None = None,
+        *,
+        publish: bool = True,
     ) -> None:
-        """Read one bounded L2 miss batch and promote it to L1."""
+        """Read one bounded L2 miss batch and promote it to L1.
+
+        With ``publish=False`` (requires ``lease_id``) the reads are retained
+        by the lease only and never inserted into L1.
+        """
+        if not publish and lease_id is None:
+            raise ValueError("unpublished L2 reads need a lease to retain them")
         loop = asyncio.get_event_loop()
         if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
@@ -2602,6 +2616,17 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 file_offset, nbytes, epoch
                             )
                         ]
+                        if not publish:
+                            assert lease_id is not None
+                            self._attach_unpublished_locked(
+                                lease_id,
+                                pinned,
+                                int(span["file_offset"]),
+                                parts,
+                                stale_parts,
+                            )
+                            self._finish_l1_promotion_locked(promotion_id)
+                            continue
                         # A contiguous coalesced extent is one immutable L1
                         # object. Keeping that parent instead of one child
                         # slice per packed record lets later grouped H2D loads
@@ -3127,6 +3152,40 @@ class TieredIOUringTransferLayer(TransferLayer):
             else:
                 self._leased_slices[data_id] = (existing[0], existing[1] + 1)
 
+    def _attach_unpublished_locked(
+        self,
+        lease_id: str,
+        pinned: PinnedMemorySlice,
+        read_offset: int,
+        parts: list[tuple[int, int, int, int, int]],
+        stale_parts: list[tuple[int, int]],
+    ) -> None:
+        """Retain one finished L2 read by a lease without inserting it in L1.
+
+        Parts overwritten by a newer store attach the resident copy instead.
+        """
+        hits: list[L1RangeHit] = []
+        fresh = 0
+        for _target, file_offset, nbytes, source_offset, _charge in parts:
+            if (file_offset, nbytes) in stale_parts:
+                resident, _missing = self._l1.resolve_subranges(
+                    target_offset=0, file_offset=file_offset, nbytes=nbytes
+                )
+                hits.extend(resident)
+                continue
+            hits.append(
+                L1RangeHit(
+                    target_offset=0,
+                    key=(read_offset, len(pinned)),
+                    data=pinned,
+                    source_offset=source_offset,
+                    nbytes=nbytes,
+                )
+            )
+            fresh += nbytes
+        self._attach_l1_hits_to_lease_locked(lease_id, hits)
+        self._stats.l1_bypass_bytes += fresh
+
     def _require_complete_lease_locked(self, lease_id: str) -> None:
         """Raise unless retained slice ranges cover the whole request lease."""
         lease = self._request_leases.get(lease_id)
@@ -3326,25 +3385,56 @@ class TieredIOUringTransferLayer(TransferLayer):
                 return
             await asyncio.gather(*waiters)
 
+    def _take_bypass_readahead(
+        self, misses: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Move bypassed readahead misses out of ``misses`` (in place).
+
+        Returns the leading bypassed fragments that fit half the unprotected
+        L1 share; they are read into lease-only slices that never enter L1.
+        Later bypassed fragments are dropped from the readahead and left to
+        the load path. Returns an empty list when the bypass is off.
+        """
+        if self._bypass_policy is None:
+            return []
+        admitted: list[dict[str, Any]] = []
+        bypass: list[dict[str, Any]] = []
+        budget = self._bypass_in_flight * self._bypass_window // 2
+        for miss in misses:
+            for fragment in _split_at_units(miss, self._bypass_class):
+                if self._bypass_policy.admits(fragment["file_offset"]):
+                    admitted.append(fragment)
+                elif budget >= int(fragment["nbytes"]):
+                    budget -= int(fragment["nbytes"])
+                    bypass.append(fragment)
+        misses[:] = admitted
+        return bypass
+
     async def _run_readahead(
         self,
         lease_id: str,
         readahead: _Readahead,
-        groups: list[list[dict[str, Any]]],
+        groups: list[tuple[list[dict[str, Any]], bool]],
     ) -> None:
-        """Read readahead groups in order with a bounded number in flight."""
+        """Read readahead groups in order with a bounded number in flight.
+
+        Each group carries whether its reads are published to L1 or retained
+        by the readahead lease only (split-residency bypass).
+        """
         window = asyncio.Semaphore(self._readahead_window)
         read_bytes = 0
         failed = 0
 
         async def read(
-            group: list[dict[str, Any]], future: asyncio.Future[None]
+            group: list[dict[str, Any]], publish: bool, future: asyncio.Future[None]
         ) -> None:
             nonlocal read_bytes, failed
             try:
                 async with window:
                     if lease_id in self._request_leases:
-                        await self._load_l2_miss_batch(None, group, lease_id=lease_id)
+                        await self._load_l2_miss_batch(
+                            None, group, lease_id=lease_id, publish=publish
+                        )
                         group_bytes = sum(int(miss["nbytes"]) for miss in group)
                         read_bytes += group_bytes
                         self._stats.readahead_read_bytes += group_bytes
@@ -3359,8 +3449,8 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         await asyncio.gather(
             *(
-                read(group, future)
-                for group, (_ranges, future) in zip(
+                read(group, publish, future)
+                for (group, publish), (_ranges, future) in zip(
                     groups, readahead.pieces, strict=True
                 )
             )
