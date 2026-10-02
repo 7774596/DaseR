@@ -780,11 +780,14 @@ class IPCServer:
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("lookup_prefetch requires lease_id")
-        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
+        tokens = self._lookup_tokens(msg)
+        chunks = await self._lookup_core(tokens, msg["model_id"])
         queries = int(msg.get("external_prefix_queries", 0))
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
+        if self._session_predictor is not None and isinstance(tokens, bytes):
+            self._observe_session(tokens, str(msg["model_id"]))
         if not chunks or hits <= 0:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
 

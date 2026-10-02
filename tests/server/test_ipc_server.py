@@ -2920,6 +2920,95 @@ async def test_ipc_session_prefetch_reads_the_next_session_after_a_load(
     assert ('outcome="started"' in rendered) is enabled
 
 
+class _LeasingSessionPrefetchTransfer(_SessionPrefetchTransfer):
+    """Session prefetch stub that also grants all-L1 request leases."""
+
+    async def classify_and_acquire_lease(
+        self, lease_id: str, spans: list[dict[str, int]]
+    ) -> str:
+        del lease_id, spans
+        return "l1"
+
+
+@pytest.mark.asyncio
+async def test_ipc_session_prefetch_observes_leased_lookups(
+    tmp_path, monkeypatch
+) -> None:
+    """Lookups that also take a request lease feed the session predictor.
+
+    The same A, B, A turn order as the plain-lookup case, sent as
+    ``lookup_prefetch``, predicts B after A's load and reads B ahead.
+    """
+    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
+    monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
+    _ReadaheadRecordingTransfer.readaheads = []
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        _LeasingSessionPrefetchTransfer,
+    )
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(
+        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
+    )
+    session_a = [11, 12, 13, 14]
+    session_b = [21, 22, 23, 24]
+    stored = first_rolling_key(session_b)
+
+    async def lookup(tokens: list[int]) -> None:
+        await _send_recv(
+            socket_path,
+            {
+                "op": "lookup_prefetch",
+                "lease_id": f"req-{tokens[0]}-{len(tokens)}",
+                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
+                "model_id": "m",
+                "external_prefix_queries": len(tokens),
+                "num_computed_tokens": 0,
+            },
+        )
+
+    await server.start()
+    try:
+        await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": stored,
+                "token_count": len(session_b),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": stored})
+        await lookup(session_a)
+        await lookup(session_b + [25])
+        # A returns, so B is predicted to return next.
+        await lookup(session_a + [15])
+        await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+        for _ in range(100):
+            if "daser_session_prefetch_total" in registry.render_prometheus():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await server.stop()
+
+    assert len(_ReadaheadRecordingTransfer.readaheads) == 1
+    assert (
+        sum(int(span["nbytes"]) for span in _ReadaheadRecordingTransfer.readaheads[0])
+        == SLOT_SIZE
+    )
+    assert 'outcome="started"' in registry.render_prometheus()
+
+
 class _StashRecordingTransfer(_SessionPrefetchTransfer):
     """Session prefetch stub that also records device stash fills."""
 
