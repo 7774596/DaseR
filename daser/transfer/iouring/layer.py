@@ -162,6 +162,9 @@ class _Readahead:
     pieces: list[tuple[list[tuple[int, int]], asyncio.Future[None]]]
     started: float
     speculative: bool = False
+    # A speculative readahead a request readahead overlapped: its prediction
+    # came true and it now serves that request.
+    confirmed: bool = False
 
 
 @dataclass
@@ -1806,9 +1809,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         it and copies the retained bytes, falling back to the normal L1/L2
         path for anything the readahead did not cover.
 
-        A request readahead first drops speculative readaheads it does not
-        overlap, furthest prediction first, until its own bytes fit the
-        budget; speculative readaheads that leave it room stay.
+        A request readahead confirms the speculative readaheads it overlaps
+        and releases earlier confirmed ones it does not (their request's load
+        is over). It then drops other speculative readaheads, furthest
+        prediction first, until its own bytes fit the budget; speculative
+        readaheads that leave it room stay.
 
         Args:
             spans: Storage spans with ``file_offset``, ``nbytes`` and optional
@@ -3953,17 +3958,27 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Drop speculative readaheads a request readahead needs room from.
 
         Speculative readaheads overlapping the request are its prediction
-        coming true: they stop being speculative, so neither this nor
-        ``drop_speculative_except`` drops them. Others are dropped newest
-        first (the furthest prediction) until the request's uncovered bytes
-        fit the budget.
+        coming true: they become confirmed, so neither this nor
+        ``drop_speculative_except`` drops them while their request loads.
+        Confirmed readaheads this request does not overlap are dropped: with
+        one request scheduled at a time the next request's arrival ends the
+        confirmed one's load, and its remainder would only hold budget.
+        Other speculative readaheads are dropped newest first (the furthest
+        prediction) until the request's uncovered bytes fit the budget.
         """
         wanted = _normalize_ranges(accounted)
-        for item in self._readaheads.values():
-            if item.speculative and _sorted_ranges_overlap(item.ranges, wanted):
-                # The prediction came true: the lease now serves this request
-                # and later prediction rounds (which exclude it) keep it.
-                item.speculative = False
+        for lease_id, item in list(self._readaheads.items()):
+            if _sorted_ranges_overlap(item.ranges, wanted):
+                if item.speculative:
+                    # The prediction came true: the lease now serves this
+                    # request and later prediction rounds (which exclude it)
+                    # keep it.
+                    item.speculative = False
+                    item.confirmed = True
+            elif item.confirmed:
+                # The next request arrived, so the confirmed request's load
+                # is over; what it left is prefix the GPU cache served.
+                self._drop_readahead_locked(lease_id, "spent")
         covered = [rng for item in self._readaheads.values() for rng in item.ranges]
         need = sum(size for _start, size in _subtract_ranges(wanted, covered))
         for lease_id in reversed(

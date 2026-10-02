@@ -1981,11 +1981,11 @@ def test_iouring_drop_speculative_except_keeps_expected_predictions(
 def test_iouring_request_readahead_confirms_overlapping_speculation(
     tmp_path,
 ) -> None:
-    """A request readahead overlapping speculation makes it non-speculative.
+    """A request readahead overlapping speculation confirms it.
 
     The next prediction round excludes the session being served, so a
-    confirmed lease must survive ``drop_speculative_except`` until its load
-    consumes it.
+    confirmed lease must survive ``drop_speculative_except`` while its load
+    runs; the next request's readahead releases its remainder.
     """
     blocks = 8
     payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
@@ -2008,6 +2008,12 @@ def test_iouring_request_readahead_confirms_overlapping_speculation(
             await layer.wait_readahead_idle()
             assert await layer.drop_speculative_except([]) == 0
             assert layer.stats.readahead_dropped_bytes == 0
+            # The next request ends the confirmed request's load: what the
+            # confirmed lease still retains is released.
+            following = [{"file_offset": ALIGNMENT * 6, "nbytes": ALIGNMENT * 2}]
+            assert await layer.start_readahead(following) is True
+            await layer.wait_readahead_idle()
+            assert layer.stats.readahead_dropped_bytes == ALIGNMENT * 4
         finally:
             await layer.drain()
             layer.close()
