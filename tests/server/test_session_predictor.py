@@ -25,6 +25,8 @@ def test_rejects_invalid_parameters() -> None:
         SessionPredictor(stale_factor=1.0)
     with pytest.raises(ValueError):
         SessionPredictor(max_sessions=0)
+    with pytest.raises(ValueError):
+        SessionPredictor(accuracy=1.5)
 
 
 def test_no_prediction_before_a_return_is_seen() -> None:
@@ -97,3 +99,32 @@ def test_deeper_prediction_lists_sessions_in_return_order() -> None:
     returned = predictor.predicted_returns
     predictor.observe(_prompt(1, 2), _MODEL)
     assert predictor.predicted_returns == returned + 1
+
+
+def _round_robin(predictor: SessionPredictor, sessions: int, turns: int) -> int:
+    """Replay a round-robin and return how many predictions were correct."""
+    order = [(turn, session) for turn in range(turns) for session in range(sessions)]
+    correct = 0
+    for index, (turn, session) in enumerate(order):
+        predictor.observe(_prompt(session, turn), _MODEL)
+        predicted = predictor.predict()
+        if predicted and index + 1 < len(order):
+            next_turn, next_session = order[index + 1]
+            correct += predicted == [(_prompt(next_session, next_turn - 1), _MODEL)]
+    return correct
+
+
+def test_zero_accuracy_never_predicts_the_returning_session() -> None:
+    """Accuracy 0 replaces every prediction by another remembered session."""
+    predictor = SessionPredictor(accuracy=0.0)
+    assert _round_robin(predictor, sessions=4, turns=4) == 0
+    # The wrong predictions still name real sessions with stored prompts.
+    assert len(predictor.predict()) == 1
+    assert predictor.predicted_returns == 0
+
+
+def test_partial_accuracy_keeps_about_that_share() -> None:
+    """Accuracy p keeps roughly a share p of correct predictions."""
+    exact = _round_robin(SessionPredictor(), sessions=4, turns=50)
+    kept = _round_robin(SessionPredictor(accuracy=0.5, seed=1), sessions=4, turns=50)
+    assert 0.35 * exact < kept < 0.65 * exact

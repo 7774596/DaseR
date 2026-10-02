@@ -27,6 +27,7 @@ from daser.config import (
     READAHEAD_BUDGET_FRACTION_ENV,
     READAHEAD_SKIP_STASHED_ENV,
     READAHEAD_SRPT_ENV,
+    SESSION_PREDICT_ACCURACY_ENV,
     SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
@@ -405,7 +406,9 @@ class IPCServer:
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
         # Research switch: read the predicted next session's prefix ahead.
         self._session_predictor = (
-            SessionPredictor()
+            SessionPredictor(
+                accuracy=float(os.environ.get(SESSION_PREDICT_ACCURACY_ENV, "1") or 1)
+            )
             if self._readahead_piece and os.environ.get(SESSION_PREFETCH_ENV) == "1"
             else None
         )

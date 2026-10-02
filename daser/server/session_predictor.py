@@ -2,6 +2,7 @@
 """Predict which agent session returns next from the lookup stream."""
 
 from collections import OrderedDict
+import random
 
 # Weight of a new return gap in the moving average.
 _GAP_EWMA_WEIGHT = 0.25
@@ -23,6 +24,11 @@ class SessionPredictor:
         stale_factor: A session idle for more than this many average return
             gaps is not predicted.
         max_sessions: Remembered sessions; the least recent are forgotten.
+        accuracy: Research knob: chance that each predicted session is kept.
+            Otherwise it is replaced by a random remembered session outside
+            the true prediction, so mispredictions read real stored bytes.
+            1.0 (default) never replaces.
+        seed: Seed of the replacement draws.
 
     Async/thread-safety:
         Not thread-safe; the owner (the IPC event loop) serializes calls.
@@ -33,14 +39,20 @@ class SessionPredictor:
         match_fraction: float = 0.95,
         stale_factor: float = 1.5,
         max_sessions: int = 64,
+        accuracy: float = 1.0,
+        seed: int = 0,
     ) -> None:
         if not 0.0 < match_fraction <= 1.0 or stale_factor <= 1.0 or max_sessions <= 0:
             raise ValueError(
                 "match_fraction must be in (0, 1], stale_factor > 1, max_sessions > 0"
             )
+        if not 0.0 <= accuracy <= 1.0:
+            raise ValueError("accuracy must be in [0, 1]")
         self._match_fraction = match_fraction
         self._stale_factor = stale_factor
         self._max_sessions = max_sessions
+        self._accuracy = accuracy
+        self._rng = random.Random(seed)
         # session -> (prompt bytes, model id, request sequence of last use)
         self._sessions: OrderedDict[int, tuple[bytes, str, int]] = OrderedDict()
         self._next_session = 0
@@ -96,7 +108,8 @@ class SessionPredictor:
         Returns:
             Up to ``depth`` live sessions other than the current one, least
             recently used (soonest expected) first; empty when no return gap
-            is known yet.
+            is known yet. With ``accuracy`` below 1, entries may be replaced
+            by wrong sessions; ``predicted_returns`` counts the returned list.
         """
         if self._gap <= 0.0:
             return []
@@ -106,8 +119,33 @@ class SessionPredictor:
             for session, (tokens, model_id, seq) in self._sessions.items()
             if session != self._current and self._seq - seq <= horizon
         ][:depth]
+        if self._accuracy < 1.0:
+            predicted = self._degrade(predicted)
         self._predicted = {session for session, _tokens, _model in predicted}
         return [(tokens, model_id) for _session, tokens, model_id in predicted]
+
+    def _degrade(
+        self, predicted: list[tuple[int, bytes, str]]
+    ) -> list[tuple[int, bytes, str]]:
+        """Replace each prediction by a wrong session with chance 1 - accuracy."""
+        true = {session for session, _tokens, _model in predicted}
+        out: list[tuple[int, bytes, str]] = []
+        for entry in predicted:
+            if self._rng.random() >= self._accuracy:
+                taken = {session for session, _tokens, _model in out}
+                wrong = [
+                    session
+                    for session in self._sessions
+                    if session != self._current
+                    and session not in true
+                    and session not in taken
+                ]
+                if wrong:
+                    session = self._rng.choice(wrong)
+                    tokens, model_id, _seq = self._sessions[session]
+                    entry = (session, tokens, model_id)
+            out.append(entry)
+        return out
 
     def _match(self, tokens: bytes, model_id: str) -> int | None:
         """Return the most recent session whose prompt ``tokens`` continues."""

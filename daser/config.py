@@ -77,6 +77,9 @@ SESSION_PREFETCH_ENV = "DASER_SESSION_PREFETCH"
 #: Research switch: number of upcoming sessions the next-session prefetch
 #: reads ahead (default 1), soonest first, within the readahead budget.
 SESSION_PREFETCH_DEPTH_ENV = "DASER_SESSION_PREFETCH_DEPTH"
+#: Research switch: chance in [0, 1] that each next-session prediction is
+#: kept rather than replaced by a random wrong session (default 1.0).
+SESSION_PREDICT_ACCURACY_ENV = "DASER_SESSION_PREDICT_ACCURACY"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).
 READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
