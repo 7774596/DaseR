@@ -16,6 +16,7 @@ from daser.config import (
     GATHER_MIN_RUNS_ENV,
     L1_SPLIT_BYPASS_ENV,
     LOAD_READAHEAD_ENV,
+    LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STRIPE_PIPELINE_ENV,
@@ -1746,6 +1747,7 @@ class IPCServer:
                     readahead_window=int(
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
+                    readahead_stream=os.environ.get(LOAD_READAHEAD_STREAM_ENV) == "1",
                     gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
                     l1_split_bypass=os.environ.get(L1_SPLIT_BYPASS_ENV) == "1",
                 )

@@ -3,7 +3,7 @@
 # Standard
 import asyncio
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from typing import Any
 
@@ -141,6 +141,21 @@ class _Readahead:
     started: float
 
 
+@dataclass
+class _LoadPlan:
+    """Accumulate one grouped load's span resolution across its batches.
+
+    ``copies`` holds the destination-copy tasks submitted so far; the load
+    drains them before returning, also on error or cancellation.
+    """
+
+    total: int = 0
+    misses: list[dict[str, int]] = field(default_factory=list)
+    bypass: list[dict[str, int]] = field(default_factory=list)
+    pending: list[asyncio.Task[None]] = field(default_factory=list)
+    copies: list[asyncio.Task[None]] = field(default_factory=list)
+
+
 def _stripe_extents(nbytes: int, stripe_bytes: int) -> list[tuple[int, int]]:
     """Split one aligned read into submission-sized ``(offset, size)`` parts.
 
@@ -270,6 +285,85 @@ def _resolve_from_hits(
     if cursor < end:
         uncovered.append((target_offset + cursor - file_offset, cursor, end - cursor))
     return chunks, uncovered
+
+
+def _stream_batches(
+    spans: list[dict[str, int]],
+    pieces: list[tuple[list[tuple[int, int]], asyncio.Future[None]]],
+) -> list[tuple[list[asyncio.Future[None]], list[dict[str, int]]]]:
+    """Split load spans into batches gated by the readahead pieces they need.
+
+    Args:
+        spans: Coalesced load spans with ``target_offset``, ``file_offset``,
+            ``nbytes`` and ``accounted_nbytes``.
+        pieces: In-flight readahead pieces in read order, each its physical
+            ranges and the future completed once they are retained.
+
+    Returns:
+        ``(futures, spans)`` batches ordered by the last piece each waits
+        for, so batches become ready roughly in read order. The batch that
+        needs no in-flight piece comes first with no futures. Every input
+        byte appears in exactly one batch; a span cut at piece boundaries
+        splits its capacity charge over the fragments.
+
+    Async/thread-safety:
+        Pure CPU planning; safe on the server event loop.
+    """
+    intervals = sorted(
+        (start, start + size, index)
+        for index, (ranges, _future) in enumerate(pieces)
+        for start, size in ranges
+    )
+    starts = [start for start, _end, _index in intervals]
+    longest = max((end - start for start, end, _index in intervals), default=0)
+    batches: dict[tuple[int, ...], list[dict[str, int]]] = {}
+    for span in spans:
+        file_offset = span["file_offset"]
+        end = file_offset + span["nbytes"]
+        covering = [
+            (max(start, file_offset), min(stop, end), index)
+            for start, stop, index in intervals[
+                bisect.bisect_left(starts, file_offset - longest) : bisect.bisect_left(
+                    starts, end
+                )
+            ]
+            if stop > file_offset
+        ]
+        cuts = sorted(
+            {file_offset, end}
+            | {cut for start, stop, _ in covering for cut in (start, stop)}
+        )
+        # [key, start, end] runs of bytes waiting on the same piece set.
+        runs: list[list[Any]] = []
+        for left, right in zip(cuts, cuts[1:], strict=False):
+            key = tuple(
+                sorted(
+                    {
+                        index
+                        for start, stop, index in covering
+                        if start < right and left < stop
+                    }
+                )
+            )
+            if runs and runs[-1][0] == key:
+                runs[-1][2] = right
+            else:
+                runs.append([key, left, right])
+        parts = [
+            {
+                "target_offset": span["target_offset"] + left - file_offset,
+                "file_offset": left,
+                "nbytes": right - left,
+                "accounted_nbytes": span["accounted_nbytes"],
+            }
+            for _key, left, right in runs
+        ]
+        if len(parts) > 1:
+            _assign_accounting_charges(parts, span["accounted_nbytes"], span["nbytes"])
+        for (key, _left, _right), part in zip(runs, parts, strict=True):
+            batches.setdefault(key, []).append(part)
+    ordered = sorted(batches.items(), key=lambda item: max(item[0], default=-1))
+    return [([pieces[index][1] for index in key], parts) for key, parts in ordered]
 
 
 def _clip_parts(
@@ -697,6 +791,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             them. The SSD queue depth then no longer depends on how many
             worker staging buffers are in flight. 0 disables readahead.
         readahead_window: Read groups in flight per readahead.
+        readahead_stream: Research switch. A grouped load overlapping
+            in-flight readahead copies each piece's bytes to the destination
+            as soon as that piece is retained, instead of waiting for every
+            overlapping piece before the first copy.
         gather_min_runs: Research switch. When positive, an L1-to-CUDA copy
             with at least this many discontiguous runs is issued as one
             zero-copy gather kernel instead of one ``cudaMemcpyAsync`` per run,
@@ -730,6 +828,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         stripe_pipeline: bool = False,
         readahead_piece_bytes: int = 0,
         readahead_window: int = 4,
+        readahead_stream: bool = False,
         gather_min_runs: int = 0,
         l1_split_bypass: bool = False,
     ) -> None:
@@ -772,6 +871,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stripe_pipeline = bool(stripe_pipeline)
         self._readahead_piece = 0 if skip_l2 else readahead_piece_bytes
         self._readahead_window = readahead_window
+        self._readahead_stream = bool(readahead_stream)
         self._gather_min_runs = gather_min_runs
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
@@ -838,6 +938,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
             "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
+            "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s",
             path,
             l1_bytes,
@@ -853,6 +954,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._stripe_pipeline,
             self._readahead_piece,
             self._readahead_window,
+            self._readahead_stream,
             self._gather_min_runs,
             self._bypass_policy is not None,
         )
@@ -941,122 +1043,48 @@ class TieredIOUringTransferLayer(TransferLayer):
         # Coalesce the corresponding request spans so one adjacent
         # allocation is resolved in a single metadata walk.
         spans = _coalesce_load_spans(spans, self._l1_bytes)
-        total = 0
-        merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
-        misses: list[dict[str, int]] = []
-        bypass: list[dict[str, int]] = []
-        pending: list[asyncio.Task[None]] = []
-        copy_future: asyncio.Task[None] | None = None
+        plan = _LoadPlan()
         mark = time.perf_counter()
-        if self._readaheads:
-            await self._wait_for_readaheads(spans)
-        mark = self._add_phase_us("load_readahead_wait_us", mark)
-        async with self._lock:
-            self._raise_l2_error_locked()
-            readahead_hits = self._readahead_hits_locked()
-            for span in spans:
-                target_offset = int(span.get("target_offset", 0))
-                file_offset = int(span["file_offset"])
-                nbytes = int(span["nbytes"])
-                accounted_nbytes = self._accounted_nbytes(span, nbytes)
-                self._check_range(file_offset, nbytes)
-                total += nbytes
-                leased, uncovered = _resolve_from_hits(
-                    readahead_hits, target_offset, file_offset, nbytes
-                )
-                if leased:
-                    self._stats.l1_hits += len(leased)
-                    self._stats.readahead_served_bytes += sum(
-                        chunk[3] for chunk in leased
-                    )
-                    merged_l1.extend(leased)
-                l1_hits = []
-                span_misses = []
-                for sub_target, sub_offset, sub_nbytes in uncovered:
-                    sub_hits, sub_misses = self._l1.resolve_subranges(
-                        target_offset=sub_target,
-                        file_offset=sub_offset,
-                        nbytes=sub_nbytes,
-                    )
-                    l1_hits.extend(sub_hits)
-                    span_misses.extend(sub_misses)
-                if self._l2 is None and span_misses:
-                    self._stats.l1_misses += 1
-                    raise KeyError(
-                        "skip_l2 cache miss for range "
-                        f"[{file_offset}, {file_offset + nbytes})"
-                    )
-                if span_misses:
-                    _assign_accounting_charges(
-                        span_misses,
-                        accounted_nbytes,
-                        nbytes,
-                    )
-                if l1_hits:
-                    self._l1.record_hits(l1_hits)
-                    self._stats.l1_hits += 1 if self._l2 is None else len(l1_hits)
-                    merged_l1.extend(
-                        (
-                            hit.target_offset,
-                            hit.data,
-                            hit.source_offset,
-                            hit.nbytes,
-                        )
-                        for hit in l1_hits
-                    )
-                for miss in span_misses:
-                    self._stats.l1_misses += 1
-                    pending.extend(
-                        self._find_pending_l2_locked(
-                            int(miss["file_offset"]),
-                            int(miss["nbytes"]),
-                        )
-                    )
-                    entry = {
-                        "target_offset": int(miss["target_offset"]),
-                        "file_offset": int(miss["file_offset"]),
-                        "nbytes": int(miss["nbytes"]),
-                        "accounted_nbytes": int(miss["accounted_nbytes"]),
-                    }
-                    if self._bypass_policy is None:
-                        misses.append(entry)
-                        continue
-                    for fragment in _split_at_units(entry, self._bypass_class):
-                        if self._bypass_policy.admits(fragment["file_offset"]):
-                            misses.append(fragment)
-                        else:
-                            bypass.append(fragment)
-            if merged_l1:
-                copy_future = self._copy_grouped_to_dst(dst, merged_l1)
-            if self._readaheads:
-                # The copy above borrows every leased slice it reads, so the
-                # served ranges can leave their readahead lease right away.
-                self._consume_readaheads_locked(_normalize_ranges(spans))
-        mark = self._add_phase_us("load_resolve_us", mark)
-
         try:
-            if pending:
-                await asyncio.gather(*pending)
+            if self._readahead_stream and self._readaheads:
+                # Copy each readahead piece's bytes as soon as it is retained,
+                # so host-to-device copies overlap the remaining SSD reads.
+                for futures, batch in _stream_batches(
+                    spans, self._pending_readahead_pieces(spans)
+                ):
+                    if futures:
+                        await asyncio.gather(*futures)
+                    mark = self._add_phase_us("load_readahead_wait_us", mark)
+                    await self._resolve_load_batch(dst, batch, plan)
+                    mark = self._add_phase_us("load_resolve_us", mark)
+            else:
+                if self._readaheads:
+                    await self._wait_for_readaheads(spans)
+                mark = self._add_phase_us("load_readahead_wait_us", mark)
+                await self._resolve_load_batch(dst, spans, plan)
+                mark = self._add_phase_us("load_resolve_us", mark)
+            if plan.pending:
+                await asyncio.gather(*plan.pending)
             mark = self._add_phase_us("load_pending_write_us", mark)
-            if bypass:
+            if plan.bypass:
                 # Both paths write disjoint destination ranges; collect every
                 # outcome so neither is still copying when an error surfaces.
                 results = await asyncio.gather(
-                    self._load_l2_misses_grouped(dst, misses),
-                    self._load_l2_bypass(dst, bypass),
+                    self._load_l2_misses_grouped(dst, plan.misses),
+                    self._load_l2_bypass(dst, plan.bypass),
                     return_exceptions=True,
                 )
                 for result in results:
                     if isinstance(result, BaseException):
                         raise result
-            elif misses:
-                await self._load_l2_misses_grouped(dst, misses)
+            elif plan.misses:
+                await self._load_l2_misses_grouped(dst, plan.misses)
             mark = self._add_phase_us("load_l2_us", mark)
         finally:
-            if copy_future is not None:
-                await _drain_destination_copies([copy_future])
+            if plan.copies:
+                await _drain_destination_copies(plan.copies)
         self._add_phase_us("load_copy_drain_us", mark)
-        return total
+        return plan.total
 
     async def store_bytes(
         self,
@@ -3475,15 +3503,115 @@ class TieredIOUringTransferLayer(TransferLayer):
             read_bytes / elapsed / 1e9 if elapsed > 0 else 0.0,
         )
 
-    async def _wait_for_readaheads(self, spans: list[dict[str, Any]]) -> None:
-        """Wait for in-flight readahead groups overlapping the load spans."""
+    async def _resolve_load_batch(
+        self, dst: Any, spans: list[dict[str, int]], plan: _LoadPlan
+    ) -> None:
+        """Resolve load spans against readahead leases and L1, under the lock.
+
+        Retained and L1-resident bytes are submitted as one destination copy
+        appended to ``plan.copies``; L1 misses, bypassed fragments and the
+        pending L2 writes they must wait for are appended to ``plan``.
+        """
+        merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        async with self._lock:
+            self._raise_l2_error_locked()
+            readahead_hits = self._readahead_hits_locked()
+            for span in spans:
+                target_offset = int(span.get("target_offset", 0))
+                file_offset = int(span["file_offset"])
+                nbytes = int(span["nbytes"])
+                accounted_nbytes = self._accounted_nbytes(span, nbytes)
+                self._check_range(file_offset, nbytes)
+                plan.total += nbytes
+                leased, uncovered = _resolve_from_hits(
+                    readahead_hits, target_offset, file_offset, nbytes
+                )
+                if leased:
+                    self._stats.l1_hits += len(leased)
+                    self._stats.readahead_served_bytes += sum(
+                        chunk[3] for chunk in leased
+                    )
+                    merged_l1.extend(leased)
+                l1_hits = []
+                span_misses = []
+                for sub_target, sub_offset, sub_nbytes in uncovered:
+                    sub_hits, sub_misses = self._l1.resolve_subranges(
+                        target_offset=sub_target,
+                        file_offset=sub_offset,
+                        nbytes=sub_nbytes,
+                    )
+                    l1_hits.extend(sub_hits)
+                    span_misses.extend(sub_misses)
+                if self._l2 is None and span_misses:
+                    self._stats.l1_misses += 1
+                    raise KeyError(
+                        "skip_l2 cache miss for range "
+                        f"[{file_offset}, {file_offset + nbytes})"
+                    )
+                if span_misses:
+                    _assign_accounting_charges(
+                        span_misses,
+                        accounted_nbytes,
+                        nbytes,
+                    )
+                if l1_hits:
+                    self._l1.record_hits(l1_hits)
+                    self._stats.l1_hits += 1 if self._l2 is None else len(l1_hits)
+                    merged_l1.extend(
+                        (
+                            hit.target_offset,
+                            hit.data,
+                            hit.source_offset,
+                            hit.nbytes,
+                        )
+                        for hit in l1_hits
+                    )
+                for miss in span_misses:
+                    self._stats.l1_misses += 1
+                    plan.pending.extend(
+                        self._find_pending_l2_locked(
+                            int(miss["file_offset"]),
+                            int(miss["nbytes"]),
+                        )
+                    )
+                    entry = {
+                        "target_offset": int(miss["target_offset"]),
+                        "file_offset": int(miss["file_offset"]),
+                        "nbytes": int(miss["nbytes"]),
+                        "accounted_nbytes": int(miss["accounted_nbytes"]),
+                    }
+                    if self._bypass_policy is None:
+                        plan.misses.append(entry)
+                        continue
+                    for fragment in _split_at_units(entry, self._bypass_class):
+                        if self._bypass_policy.admits(fragment["file_offset"]):
+                            plan.misses.append(fragment)
+                        else:
+                            plan.bypass.append(fragment)
+            if merged_l1:
+                copy_future = self._copy_grouped_to_dst(dst, merged_l1)
+                if copy_future is not None:
+                    plan.copies.append(copy_future)
+            if self._readaheads:
+                # The copy above borrows every leased slice it reads, so the
+                # served ranges can leave their readahead lease right away.
+                self._consume_readaheads_locked(_normalize_ranges(spans))
+
+    def _pending_readahead_pieces(
+        self, spans: list[dict[str, Any]]
+    ) -> list[tuple[list[tuple[int, int]], asyncio.Future[None]]]:
+        """Return in-flight readahead pieces overlapping the load spans."""
         ranges = _normalize_ranges(spans)
-        waiters = [
-            future
+        return [
+            (piece_ranges, future)
             for readahead in list(self._readaheads.values())
             for piece_ranges, future in readahead.pieces
             if not future.done() and _ranges_overlap(piece_ranges, ranges)
         ]
+
+    async def _wait_for_readaheads(self, spans: list[dict[str, Any]]) -> None:
+        """Wait for in-flight readahead groups overlapping the load spans."""
+        waiters = [future for _ranges, future in self._pending_readahead_pieces(spans)]
         if waiters:
             await asyncio.gather(*waiters)
 

@@ -2531,6 +2531,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "stripe_pipeline": False,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
+            "readahead_stream": False,
             "gather_min_runs": 0,
             "l1_split_bypass": False,
         }
@@ -2589,6 +2590,7 @@ async def test_bip_setting_is_forwarded(
             "stripe_pipeline": False,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
+            "readahead_stream": False,
             "gather_min_runs": 0,
             "l1_split_bypass": False,
         }

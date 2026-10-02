@@ -1652,15 +1652,17 @@ async def _cold_readahead_layer(
     )
 
 
+@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_iouring_readahead_serves_load_and_releases_lease(
-    tmp_path, device: str
+    tmp_path, device: str, stream: bool
 ) -> None:
     """A load after readahead copies the retained bytes and reads L2 once.
 
     Consuming the readahead releases its lease, so a later store to the same
     range does not wait on it. The CUDA destination exercises the borrowed
-    source path, which must not close slices the lease just released.
+    source path, which must not close slices the lease just released. With
+    ``readahead_stream`` the loads copy piece by piece as reads land.
     """
     cupy = pytest.importorskip("cupy") if device == "cuda" else None
     if cupy is not None and cupy.cuda.runtime.getDeviceCount() == 0:
@@ -1675,6 +1677,7 @@ def test_iouring_readahead_serves_load_and_releases_lease(
             payload,
             readahead_piece_bytes=ALIGNMENT * 2,
             readahead_window=1,
+            readahead_stream=stream,
         )
         try:
             span = {"file_offset": 0, "nbytes": nbytes}
@@ -1709,8 +1712,9 @@ def test_iouring_readahead_serves_load_and_releases_lease(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("stream", [False, True])
 def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
-    tmp_path,
+    tmp_path, stream: bool
 ) -> None:
     """Uncovered bytes use the normal path; a store drops a stale readahead."""
     blocks = 8
@@ -1722,6 +1726,7 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
             str(tmp_path / "daser.store"),
             payload,
             readahead_piece_bytes=nbytes,
+            readahead_stream=stream,
         )
         try:
             half = nbytes // 2
@@ -1751,6 +1756,64 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
                 check, [{"target_offset": 0, "file_offset": half, "nbytes": ALIGNMENT}]
             )
             assert bytes(check) == bytes(_block(b"z"))
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_iouring_readahead_stream_loads_scattered_spans_across_pieces(
+    tmp_path, device: str
+) -> None:
+    """A streamed load over in-flight pieces returns exact bytes and stats.
+
+    Load spans straddle piece boundaries, arrive out of file order, and one
+    range is outside the readahead, so the load mixes retained bytes copied
+    piece by piece with a fallback L2 read; every byte is read from L2 once.
+    """
+    cupy = pytest.importorskip("cupy") if device == "cuda" else None
+    if cupy is not None and cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+    blocks = 12
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT * 3,
+            readahead_window=1,
+            readahead_stream=True,
+        )
+        try:
+            ahead = ALIGNMENT * 9
+            assert await layer.start_readahead([{"file_offset": 0, "nbytes": ahead}])
+            dst = (
+                bytearray(nbytes)
+                if cupy is None
+                else cupy.zeros(nbytes, dtype=cupy.uint8)
+            )
+            # Destination order differs from file order; spans cut pieces.
+            cuts = [(7, 12), (0, 2), (2, 7)]
+            load = [
+                {
+                    "target_offset": ALIGNMENT * lo,
+                    "file_offset": ALIGNMENT * lo,
+                    "nbytes": ALIGNMENT * (hi - lo),
+                }
+                for lo, hi in cuts
+            ]
+            assert await layer.load_bytes_grouped(dst, load) == nbytes
+            loaded = bytes(dst) if cupy is None else cupy.asnumpy(dst).tobytes()
+            assert loaded == payload
+            await layer.drain()
+            assert layer.stats.readahead_read_bytes == ahead
+            assert layer.stats.readahead_served_bytes == ahead
+            # Three readahead pieces plus one read for the uncovered tail.
+            assert layer.stats.l2_reads == 4
         finally:
             await layer.drain()
             layer.close()

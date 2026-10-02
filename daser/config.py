@@ -41,6 +41,9 @@ STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
 LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
+#: Research switch: ``1`` makes a load copy each readahead piece as soon as it
+#: is retained, overlapping host-to-device copies with the remaining reads.
+LOAD_READAHEAD_STREAM_ENV = "DASER_LOAD_READAHEAD_STREAM"
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
