@@ -21,6 +21,7 @@ from daser.config import (
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
+    READAHEAD_SRPT_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STRIPE_PIPELINE_ENV,
 )
@@ -1720,6 +1721,7 @@ class IPCServer:
             ("read", stats.readahead_read_bytes),
             ("served", stats.readahead_served_bytes),
             ("dropped", stats.readahead_dropped_bytes),
+            ("contended", stats.readahead_contended_bytes),
         ):
             delta = current - self._prev_readahead_bytes.get(outcome, 0)
             if delta > 0:
@@ -1868,6 +1870,7 @@ class IPCServer:
                     batch_dst_copies=os.environ.get(BATCH_DST_COPY_ENV) == "1",
                     next_use_replacement=os.environ.get(L1_NEXT_USE_ENV) == "1",
                     skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
+                    readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

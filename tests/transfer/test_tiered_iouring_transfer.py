@@ -2345,3 +2345,63 @@ def test_iouring_next_use_keeps_cyclic_sessions(tmp_path, next_use: bool) -> Non
         assert read_blocks <= total * 2 // 3
     else:
         assert read_blocks == total
+
+
+@pytest.mark.parametrize("srpt", [False, True])
+def test_iouring_readahead_srpt_serves_the_short_request_first(
+    tmp_path, srpt: bool
+) -> None:
+    """A short readahead overtakes long ones that asked for the SSD first.
+
+    Three long readaheads and then a short one return exact bytes. Without
+    the shared window each reads on its own and their reads overlap
+    (contended bytes). With it one read is in flight at a time and the short
+    request's read is granted next, ahead of the long readaheads already
+    waiting, so it is at most the third read instead of the fourth.
+    """
+    long_blocks, longs = 8, 3
+    long = ALIGNMENT * long_blocks
+    blocks = long_blocks * longs + 1
+    payload = b"".join(bytes(_block(bytes([i % 256]))) for i in range(blocks))
+    short_offset = long * longs
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            readahead_window=1,
+            readahead_srpt=srpt,
+        )
+        try:
+            for index in range(longs):
+                assert await layer.start_readahead(
+                    [{"file_offset": index * long, "nbytes": long}]
+                )
+            assert await layer.start_readahead(
+                [{"file_offset": short_offset, "nbytes": ALIGNMENT}]
+            )
+            short = bytearray(ALIGNMENT)
+            load = [
+                {"target_offset": 0, "file_offset": short_offset, "nbytes": ALIGNMENT}
+            ]
+            assert await layer.load_bytes_grouped(short, load) == ALIGNMENT
+            assert bytes(short) == payload[short_offset:]
+            if srpt:
+                assert layer.stats.readahead_read_bytes <= ALIGNMENT * 3
+            for index in range(longs):
+                dst = bytearray(long)
+                load = [
+                    {"target_offset": 0, "file_offset": index * long, "nbytes": long}
+                ]
+                assert await layer.load_bytes_grouped(dst, load) == long
+                assert bytes(dst) == payload[index * long : (index + 1) * long]
+            await layer.drain()
+            assert layer.stats.readahead_read_bytes == len(payload)
+            contended = layer.stats.readahead_contended_bytes
+            assert contended == 0 if srpt else contended > 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

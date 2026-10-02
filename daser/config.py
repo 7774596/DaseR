@@ -64,6 +64,9 @@ L1_NEXT_USE_ENV = "DASER_L1_NEXT_USE"
 #: Research switch: ``1`` makes L1 replacement skip allocations an L2 writer
 #: or lease still owns instead of dropping their residency.
 L1_SKIP_PINNED_ENV = "DASER_L1_SKIP_PINNED"
+#: Research switch: ``1`` makes readaheads share one window of reads in
+#: flight, granted to the readahead with the fewest bytes left.
+READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.

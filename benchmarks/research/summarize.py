@@ -295,6 +295,15 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             if evicted["all"] > 0
             else ""
         )
+        read, contended = (
+            _delta(before, after, f'daser_readahead_bytes_total{{outcome="{kind}"}}')
+            for kind in ("read", "contended")
+        )
+        h2d += (
+            f" ra[read_GB={read / 1e9:.1f} contended={contended / read:.2f}]"
+            if read > 0
+            else ""
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "

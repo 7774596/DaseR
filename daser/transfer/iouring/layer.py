@@ -5,6 +5,7 @@ import asyncio
 import bisect
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import heapq
 import time
 from typing import Any
 
@@ -173,6 +174,43 @@ class _LoadPlan:
     bypass: list[dict[str, int]] = field(default_factory=list)
     pending: list[asyncio.Task[None]] = field(default_factory=list)
     copies: list[asyncio.Task[None]] = field(default_factory=list)
+
+
+class _PriorityGate:
+    """Grant a fixed number of slots, lowest priority value first.
+
+    Ties go to the earlier waiter. A waiter cancelled after its grant passes
+    the slot on, so no slot leaks. Event-loop confined.
+    """
+
+    def __init__(self, slots: int) -> None:
+        self._free = slots
+        self._seq = 0
+        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
+
+    async def acquire(self, priority: int) -> None:
+        """Wait for a slot; smaller ``priority`` values are served first."""
+        if self._free > 0 and not self._waiters:
+            self._free -= 1
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        heapq.heappush(self._waiters, (priority, self._seq, future))
+        try:
+            await future
+        except asyncio.CancelledError:
+            if future.done() and not future.cancelled():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        """Return a slot, handing it to the best live waiter if any."""
+        while self._waiters:
+            future = heapq.heappop(self._waiters)[2]
+            if not future.done():
+                future.set_result(None)
+                return
+        self._free += 1
 
 
 def _stripe_extents(nbytes: int, stripe_bytes: int) -> list[tuple[int, int]]:
@@ -833,6 +871,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             wall time, so cold prefills do not stretch them.
         skip_pinned_eviction: Research switch. L1 replacement passes over
             allocations an L2 writer or lease still owns (see ``L1Cache``).
+        readahead_srpt: Research switch. Concurrent readaheads share one
+            window of ``readahead_window`` reads in flight instead of one
+            window each, and a free slot goes to the group whose readahead
+            has the fewest bytes left from that group on, so the shortest
+            request finishes its SSD reads first.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -863,6 +906,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         batch_dst_copies: bool = False,
         next_use_replacement: bool = False,
         skip_pinned_eviction: bool = False,
+        readahead_srpt: bool = False,
     ) -> None:
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
@@ -912,6 +956,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
         self._readahead_seq = 0
+        # Shared shortest-remaining-first window, or None for one each.
+        self._readahead_gate = (
+            _PriorityGate(readahead_window) if readahead_srpt else None
+        )
+        # Lease ID -> readahead reads in flight, for the contention count.
+        self._readahead_reading: dict[str, int] = {}
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         # L1-only packed ranges waiting for an admission decision. They stay
@@ -982,7 +1032,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
-            "next_use_replacement=%s skip_pinned_eviction=%s",
+            "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -1003,6 +1053,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._batch_dst_copies,
             next_use_replacement,
             skip_pinned_eviction,
+            readahead_srpt,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -3536,20 +3587,28 @@ class TieredIOUringTransferLayer(TransferLayer):
         window = asyncio.Semaphore(self._readahead_window)
         read_bytes = 0
         failed = 0
+        # Bytes left from each group on: the gate priority of that group.
+        sizes = [sum(int(miss["nbytes"]) for miss in group) for group, _ in groups]
+        remaining = [sum(sizes[index:]) for index in range(len(sizes))]
 
         async def read(
-            group: list[dict[str, Any]], publish: bool, future: asyncio.Future[None]
+            index: int,
+            group: list[dict[str, Any]],
+            publish: bool,
+            future: asyncio.Future[None],
         ) -> None:
             nonlocal read_bytes, failed
             try:
                 async with window:
-                    if lease_id in self._request_leases:
-                        await self._load_l2_miss_batch(
-                            None, group, lease_id=lease_id, publish=publish
+                    if self._readahead_gate is not None:
+                        await self._readahead_gate.acquire(remaining[index])
+                    try:
+                        read_bytes += await self._read_readahead_group(
+                            lease_id, group, publish
                         )
-                        group_bytes = sum(int(miss["nbytes"]) for miss in group)
-                        read_bytes += group_bytes
-                        self._stats.readahead_read_bytes += group_bytes
+                    finally:
+                        if self._readahead_gate is not None:
+                            self._readahead_gate.release()
             except Exception as exc:  # noqa: BLE001
                 # A dropped lease or a stale range only costs the readahead:
                 # the waiting load re-resolves through the normal path.
@@ -3561,9 +3620,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         await asyncio.gather(
             *(
-                read(group, publish, future)
-                for (group, publish), (_ranges, future) in zip(
-                    groups, readahead.pieces, strict=True
+                read(index, group, publish, future)
+                for index, ((group, publish), (_ranges, future)) in enumerate(
+                    zip(groups, readahead.pieces, strict=True)
                 )
             )
         )
@@ -3578,6 +3637,35 @@ class TieredIOUringTransferLayer(TransferLayer):
             elapsed * 1000,
             read_bytes / elapsed / 1e9 if elapsed > 0 else 0.0,
         )
+
+    async def _read_readahead_group(
+        self, lease_id: str, group: list[dict[str, Any]], publish: bool
+    ) -> int:
+        """Read one readahead group into its lease and count contention.
+
+        Returns the bytes read, 0 when the lease is already gone. Bytes count
+        as contended when another readahead has a read in flight at the start
+        or the end of this one.
+        """
+        if lease_id not in self._request_leases:
+            return 0
+        reading = self._readahead_reading
+        reading[lease_id] = reading.get(lease_id, 0) + 1
+        contended = len(reading) > 1
+        try:
+            await self._load_l2_miss_batch(
+                None, group, lease_id=lease_id, publish=publish
+            )
+            contended = contended or len(reading) > 1
+        finally:
+            reading[lease_id] -= 1
+            if not reading[lease_id]:
+                del reading[lease_id]
+        group_bytes = sum(int(miss["nbytes"]) for miss in group)
+        self._stats.readahead_read_bytes += group_bytes
+        if contended:
+            self._stats.readahead_contended_bytes += group_bytes
+        return group_bytes
 
     async def _resolve_load_batch(
         self, dst: Any, spans: list[dict[str, int]], plan: _LoadPlan

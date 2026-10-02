@@ -27,6 +27,8 @@ class TransferStats:
         readahead_served_bytes: load bytes served from readahead leases.
         readahead_dropped_bytes: readahead bytes released before any load
             used them (overlapping store or budget reclaim).
+        readahead_contended_bytes: of the read bytes, those read while
+            another readahead also had a read in flight.
         l1_bypass_bytes: L2 load bytes read through transient windows that
             never entered L1 (split-residency bypass).
         load_readahead_wait_us: grouped-load time spent waiting for in-flight
@@ -59,6 +61,7 @@ class TransferStats:
     readahead_read_bytes: int = 0
     readahead_served_bytes: int = 0
     readahead_dropped_bytes: int = 0
+    readahead_contended_bytes: int = 0
     l1_bypass_bytes: int = 0
     load_readahead_wait_us: int = 0
     load_resolve_us: int = 0
