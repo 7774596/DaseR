@@ -3953,16 +3953,18 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Drop speculative readaheads a request readahead needs room from.
 
         Speculative readaheads overlapping the request are its prediction
-        and stay. Others are dropped newest first (the furthest prediction)
-        until the request's uncovered bytes fit the budget.
+        coming true: they stop being speculative, so neither this nor
+        ``drop_speculative_except`` drops them. Others are dropped newest
+        first (the furthest prediction) until the request's uncovered bytes
+        fit the budget.
         """
         wanted = _normalize_ranges(accounted)
-        covered = [
-            rng
-            for item in self._readaheads.values()
-            if not item.speculative or _sorted_ranges_overlap(item.ranges, wanted)
-            for rng in item.ranges
-        ]
+        for item in self._readaheads.values():
+            if item.speculative and _sorted_ranges_overlap(item.ranges, wanted):
+                # The prediction came true: the lease now serves this request
+                # and later prediction rounds (which exclude it) keep it.
+                item.speculative = False
+        covered = [rng for item in self._readaheads.values() for rng in item.ranges]
         need = sum(size for _start, size in _subtract_ranges(wanted, covered))
         for lease_id in reversed(
             [

@@ -1978,6 +1978,43 @@ def test_iouring_drop_speculative_except_keeps_expected_predictions(
     asyncio.run(scenario())
 
 
+def test_iouring_request_readahead_confirms_overlapping_speculation(
+    tmp_path,
+) -> None:
+    """A request readahead overlapping speculation makes it non-speculative.
+
+    The next prediction round excludes the session being served, so a
+    confirmed lease must survive ``drop_speculative_except`` until its load
+    consumes it.
+    """
+    blocks = 8
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            guess = [{"file_offset": 0, "nbytes": ALIGNMENT * 4}]
+            assert await layer.start_readahead(guess, speculative=True) is True
+            await layer.wait_readahead_idle()
+            real = [
+                {"file_offset": ALIGNMENT * (2 + i), "nbytes": ALIGNMENT}
+                for i in range(4)
+            ]
+            assert await layer.start_readahead(real) is True
+            await layer.wait_readahead_idle()
+            assert await layer.drop_speculative_except([]) == 0
+            assert layer.stats.readahead_dropped_bytes == 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_readahead_keeps_live_readahead_and_trims_new_one(tmp_path) -> None:
     """A later readahead never evicts a live one; it uses the budget left.
 
