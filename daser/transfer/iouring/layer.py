@@ -3223,11 +3223,13 @@ class TieredIOUringTransferLayer(TransferLayer):
                         self._cache_epoch,
                         pending_writes,
                     )
+                cause = "l2_write"
                 wait_for: asyncio.Future[None] | None = next(
                     (task for task in self._pending_l2.values() if not task.done()),
                     None,
                 )
                 if wait_for is None:
+                    cause = "promotion"
                     wait_for = next(
                         (
                             future
@@ -3239,9 +3241,20 @@ class TieredIOUringTransferLayer(TransferLayer):
                         None,
                     )
                 if wait_for is None:
+                    cause = "pool"
                     wait_for = asyncio.get_event_loop().create_future()
                     self._l1.register_pool_waiter(wait_for)
-            await wait_for
+            started = time.perf_counter()
+            try:
+                await wait_for
+            finally:
+                field_name = f"promotion_wait_{cause}_us"
+                setattr(
+                    self._stats,
+                    field_name,
+                    getattr(self._stats, field_name)
+                    + int((time.perf_counter() - started) * 1e6),
+                )
 
     def _record_cache_mutation_locked(self, file_offset: int, nbytes: int) -> None:
         """Record a newly published store for concurrent promotion checks."""

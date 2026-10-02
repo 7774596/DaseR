@@ -2451,3 +2451,63 @@ def test_iouring_l2_write_yields_to_readahead_reads(
             layer.close()
 
     asyncio.run(scenario())
+
+
+def test_iouring_promotion_wait_is_attributed_to_held_pool(tmp_path) -> None:
+    """A promotion blocked by a readahead lease waits on a pool release.
+
+    A readahead retains one of two L1 blocks. A two-block load cannot fit
+    until that readahead is consumed, so it waits and the wait is counted
+    under pool releases; both loads still return exact bytes.
+    """
+    path = str(tmp_path / "daser.store")
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(3))
+
+    async def scenario() -> None:
+        writer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * 3, l2_bytes=ALIGNMENT * 3
+        )
+        try:
+            await writer.store_bytes(payload, 0, len(payload))
+            await writer.drain()
+        finally:
+            writer.close()
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 3,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            assert await layer.start_readahead(
+                [{"file_offset": 0, "nbytes": ALIGNMENT}]
+            )
+            await layer.drain()
+            pair = bytearray(ALIGNMENT * 2)
+            blocked = asyncio.create_task(
+                layer.load_bytes_grouped(
+                    pair,
+                    [
+                        {
+                            "target_offset": 0,
+                            "file_offset": ALIGNMENT,
+                            "nbytes": ALIGNMENT * 2,
+                        }
+                    ],
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not blocked.done()
+            first = bytearray(ALIGNMENT)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT}]
+            assert await layer.load_bytes_grouped(first, load) == ALIGNMENT
+            assert await asyncio.wait_for(blocked, timeout=10) == ALIGNMENT * 2
+            assert bytes(first) == payload[:ALIGNMENT]
+            assert bytes(pair) == payload[ALIGNMENT:]
+            assert layer.stats.promotion_wait_pool_us > 0
+            assert layer.stats.promotion_wait_l2_write_us == 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

@@ -397,6 +397,7 @@ class IPCServer:
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
         self._prev_readahead_bytes: dict[str, int] = {}
+        self._prev_promotion_wait_us: dict[str, int] = {}
         self._prev_l1_bypass_bytes = 0
         self._prev_load_phase_us: dict[str, int] = {}
         self._prev_dst_copy: dict[str, int] = {}
@@ -1718,6 +1719,18 @@ class IPCServer:
                 "Finish-admission held-range outcomes.",
             ).inc(held_evicts, labels={"outcome": "l1_evicted"})
         self._prev_held_evict_persists = stats.held_evict_persists
+        for cause, current in (
+            ("l2_write", stats.promotion_wait_l2_write_us),
+            ("promotion", stats.promotion_wait_promotion_us),
+            ("pool", stats.promotion_wait_pool_us),
+        ):
+            delta = current - self._prev_promotion_wait_us.get(cause, 0)
+            if delta > 0:
+                self._metrics.counter(
+                    "daser_promotion_wait_seconds_total",
+                    "Time L2 promotions waited for L1 space, by what they waited on.",
+                ).inc(delta / 1e6, labels={"cause": cause})
+            self._prev_promotion_wait_us[cause] = current
         for outcome, current in (
             ("read", stats.readahead_read_bytes),
             ("served", stats.readahead_served_bytes),

@@ -31,6 +31,10 @@ class TransferStats:
             another readahead also had a read in flight.
         l2_write_contended_bytes: L2 write bytes submitted while a
             readahead was still reading.
+        promotion_wait_l2_write_us: time L2 promotions waited for L1 space
+            on a pending L2 write that holds pool memory.
+        promotion_wait_promotion_us: same, on another in-flight promotion.
+        promotion_wait_pool_us: same, on a pool release.
         l1_bypass_bytes: L2 load bytes read through transient windows that
             never entered L1 (split-residency bypass).
         load_readahead_wait_us: grouped-load time spent waiting for in-flight
@@ -65,6 +69,9 @@ class TransferStats:
     readahead_dropped_bytes: int = 0
     readahead_contended_bytes: int = 0
     l2_write_contended_bytes: int = 0
+    promotion_wait_l2_write_us: int = 0
+    promotion_wait_promotion_us: int = 0
+    promotion_wait_pool_us: int = 0
     l1_bypass_bytes: int = 0
     load_readahead_wait_us: int = 0
     load_resolve_us: int = 0

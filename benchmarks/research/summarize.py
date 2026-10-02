@@ -308,6 +308,17 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             if read > 0
             else ""
         )
+        waits = {
+            cause: _delta(
+                before, after, f'daser_promotion_wait_seconds_total{{cause="{cause}"}}'
+            )
+            for cause in ("l2_write", "promotion", "pool")
+        }
+        h2d += (
+            " promo_wait[" + " ".join(f"{k}={v:.1f}s" for k, v in waits.items()) + "]"
+            if any(waits.values())
+            else ""
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "
