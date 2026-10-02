@@ -831,6 +831,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             (``NextUseReplacementPolicy``) instead of BIP/LRU. Intervals are
             counted in registered readaheads (one per hitting lookup), not
             wall time, so cold prefills do not stretch them.
+        skip_pinned_eviction: Research switch. L1 replacement passes over
+            allocations an L2 writer or lease still owns (see ``L1Cache``).
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -860,6 +862,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         l1_split_bypass: bool = False,
         batch_dst_copies: bool = False,
         next_use_replacement: bool = False,
+        skip_pinned_eviction: bool = False,
     ) -> None:
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
@@ -965,6 +968,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
             replacement_policy=policy,
+            skip_pinned_eviction=skip_pinned_eviction,
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
@@ -978,7 +982,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
-            "next_use_replacement=%s",
+            "next_use_replacement=%s skip_pinned_eviction=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -998,6 +1002,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._bypass_policy is not None,
             self._batch_dst_copies,
             next_use_replacement,
+            skip_pinned_eviction,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:

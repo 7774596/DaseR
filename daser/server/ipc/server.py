@@ -16,6 +16,7 @@ from daser.config import (
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
     L1_NEXT_USE_ENV,
+    L1_SKIP_PINNED_ENV,
     L1_SPLIT_BYPASS_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_STREAM_ENV,
@@ -1866,6 +1867,7 @@ class IPCServer:
                     l1_split_bypass=os.environ.get(L1_SPLIT_BYPASS_ENV) == "1",
                     batch_dst_copies=os.environ.get(BATCH_DST_COPY_ENV) == "1",
                     next_use_replacement=os.environ.get(L1_NEXT_USE_ENV) == "1",
+                    skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

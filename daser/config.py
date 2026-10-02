@@ -61,6 +61,9 @@ BATCH_DST_COPY_ENV = "DASER_BATCH_DST_COPY"
 #: Research switch: ``1`` replaces the L1 policy with predicted-next-use
 #: eviction from per-L2-region reuse intervals.
 L1_NEXT_USE_ENV = "DASER_L1_NEXT_USE"
+#: Research switch: ``1`` makes L1 replacement skip allocations an L2 writer
+#: or lease still owns instead of dropping their residency.
+L1_SKIP_PINNED_ENV = "DASER_L1_SKIP_PINNED"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.
