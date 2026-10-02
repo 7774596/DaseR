@@ -90,7 +90,7 @@ def main() -> None:
                     stream.append((t0 + r["t"] - base, sid, r["hash_ids"]))
                 sid += 1
         stream.sort(key=lambda x: x[0])
-        for depth in (1, 2):
+        for depth in (1, 2, 3, 4):
             pred = SessionPredictor()
             seen: dict[int, bool] = {}
             last_pred: set[int] = set()
