@@ -47,7 +47,7 @@ class SessionPredictor:
         self._seq = 0
         self._gap = 0.0
         self._current: int | None = None
-        self._predicted: int | None = None
+        self._predicted: set[int] = set()
         self.requests = 0
         self.predicted_returns = 0
 
@@ -77,32 +77,37 @@ class SessionPredictor:
                 if self._gap <= 0.0
                 else self._gap + _GAP_EWMA_WEIGHT * (gap - self._gap)
             )
-            if session == self._predicted:
+            if session in self._predicted:
                 self.predicted_returns += 1
         self._sessions[session] = (tokens, model_id, self._seq)
         self._sessions.move_to_end(session)
         while len(self._sessions) > self._max_sessions:
             self._sessions.popitem(last=False)
         self._current = session
-        self._predicted = None
+        self._predicted = set()
         return True
 
-    def predict(self) -> tuple[bytes, str] | None:
-        """Return the prompt and model of the session expected next.
+    def predict(self, depth: int = 1) -> list[tuple[bytes, str]]:
+        """Return the prompts and models of the sessions expected next.
+
+        Args:
+            depth: Number of upcoming sessions to predict.
 
         Returns:
-            The least recently used live session other than the current
-            one, or None when there is none or no return gap is known yet.
+            Up to ``depth`` live sessions other than the current one, least
+            recently used (soonest expected) first; empty when no return gap
+            is known yet.
         """
         if self._gap <= 0.0:
-            return None
+            return []
         horizon = self._stale_factor * self._gap
-        for session, (tokens, model_id, seq) in self._sessions.items():
-            if session == self._current or self._seq - seq > horizon:
-                continue
-            self._predicted = session
-            return tokens, model_id
-        return None
+        predicted = [
+            (session, tokens, model_id)
+            for session, (tokens, model_id, seq) in self._sessions.items()
+            if session != self._current and self._seq - seq <= horizon
+        ][:depth]
+        self._predicted = {session for session, _tokens, _model in predicted}
+        return [(tokens, model_id) for _session, tokens, model_id in predicted]
 
     def _match(self, tokens: bytes, model_id: str) -> int | None:
         """Return the most recent session whose prompt ``tokens`` continues."""

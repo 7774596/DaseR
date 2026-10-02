@@ -283,6 +283,19 @@ class TransferLayer(ABC):
         """
         return False
 
+    async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
+        """Drop speculative readaheads that no kept prediction overlaps.
+
+        Args:
+            keep: Span lists of the predictions still expected.
+
+        Returns:
+            Number of speculative readaheads dropped; 0 for backends without
+            readahead.
+        """
+        del keep
+        return 0
+
     async def wait_readahead_idle(self) -> None:
         """Wait until no readahead is reading.
 

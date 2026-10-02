@@ -22,7 +22,9 @@ from daser.config import (
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
+    READAHEAD_BUDGET_FRACTION_ENV,
     READAHEAD_SRPT_ENV,
+    SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STRIPE_PIPELINE_ENV,
@@ -404,7 +406,10 @@ class IPCServer:
             if self._readahead_piece and os.environ.get(SESSION_PREFETCH_ENV) == "1"
             else None
         )
-        self._session_prefetch: tuple[bytes, str] | None = None
+        self._session_prefetch_depth = max(
+            1, int(os.environ.get(SESSION_PREFETCH_DEPTH_ENV, "1") or 1)
+        )
+        self._session_prefetch: list[tuple[bytes, str]] = []
         self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
@@ -1901,6 +1906,9 @@ class IPCServer:
                     skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
                     readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
                     l2_write_yield=os.environ.get(L2_WRITE_YIELD_ENV) == "1",
+                    readahead_budget_fraction=float(
+                        os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
@@ -1968,62 +1976,78 @@ class IPCServer:
         returned = predictor.predicted_returns > before
         if returned:
             self._session_prefetch_counter().inc(labels={"outcome": "returned"})
-        self._session_prefetch = predictor.predict()
+        self._session_prefetch = predictor.predict(self._session_prefetch_depth)
         logger.info(
-            "[IPC] session request=%d tokens=%d predicted_return=%s next_tokens=%d",
+            "[IPC] session request=%d tokens=%d predicted_return=%s next_tokens=%s",
             predictor.requests,
             len(tokens) // 4,
             returned,
-            0
-            if self._session_prefetch is None
-            else len(self._session_prefetch[0]) // 4,
+            [len(prompt) // 4 for prompt, _model in self._session_prefetch],
         )
 
     def _start_session_prefetch(self) -> None:
-        """Start the pending next-session readahead in the background."""
-        prediction = self._session_prefetch
-        if prediction is None:
+        """Start the pending next-session readaheads in the background."""
+        predictions = self._session_prefetch
+        if not predictions:
             return
         running = self._session_prefetch_task
         if running is not None and not running.done():
             return
-        self._session_prefetch = None
+        self._session_prefetch = []
         self._session_prefetch_task = asyncio.create_task(
-            self._session_prefetch_readahead(*prediction)
+            self._session_prefetch_readahead(predictions)
         )
 
-    async def _session_prefetch_readahead(self, tokens: bytes, model_id: str) -> None:
-        """Read a predicted session's stored prefix ahead into L1.
+    async def _session_prefetch_readahead(
+        self, predictions: list[tuple[bytes, str]]
+    ) -> None:
+        """Read the predicted sessions' stored prefixes ahead into L1.
+
+        Speculative readaheads of sessions no longer predicted are dropped
+        first. Each prediction then reads after the previous one finished,
+        so the soonest session gets the SSD first and later ones take only
+        the budget left.
 
         Args:
-            tokens: The session's last seen prompt.
-            model_id: Model the prompt belongs to.
+            predictions: ``(last prompt, model id)`` per predicted session,
+                soonest first.
 
         Async/thread-safety:
             Runs as a background task on the IPC event loop; failures are
             logged and leave the regular load path unchanged.
         """
         counter = self._session_prefetch_counter()
+        transfer = self._ensure_transfer()
         try:
-            # A grouped load spans several transfer calls fed by the current
-            # request's readahead; start only once that has finished reading.
-            await self._ensure_transfer().wait_readahead_idle()
-            chunks = await self._lookup_now(tokens, model_id, defer=False)
-            hits = _external_prefix_hits(
-                chunks or [],
-                num_computed_tokens=0,
-                # The next prompt extends this one, so all of it may hit.
-                queries=len(tokens) // 4 + 1,
-            )
-            spans = self._external_spans(chunks or [], 0, hits) if hits > 0 else []
-            started = bool(spans) and await self._ensure_transfer().start_readahead(
-                spans, speculative=True
-            )
+            planned = [
+                await self._session_prefix_spans(tokens, model_id)
+                for tokens, model_id in predictions
+            ]
+            await transfer.drop_speculative_except([s for s in planned if s])
+            for spans in planned:
+                # A grouped load spans several transfer calls fed by the
+                # current request's readahead; read only once that finished.
+                await transfer.wait_readahead_idle()
+                started = bool(spans) and await transfer.start_readahead(
+                    spans, speculative=True
+                )
+                counter.inc(labels={"outcome": "started" if started else "skipped"})
         except Exception:
             logger.exception("[IPC] session prefetch failed")
             counter.inc(labels={"outcome": "failed"})
-            return
-        counter.inc(labels={"outcome": "started" if started else "skipped"})
+
+    async def _session_prefix_spans(
+        self, tokens: bytes, model_id: str
+    ) -> list[dict[str, int]]:
+        """Return the physical spans of a session's stored prompt prefix."""
+        chunks = await self._lookup_now(tokens, model_id, defer=False)
+        hits = _external_prefix_hits(
+            chunks or [],
+            num_computed_tokens=0,
+            # The next prompt extends this one, so all of it may hit.
+            queries=len(tokens) // 4 + 1,
+        )
+        return self._external_spans(chunks or [], 0, hits) if hits > 0 else []
 
     def _session_prefetch_counter(self) -> Any:
         """Return the counter of next-session prefetch outcomes."""

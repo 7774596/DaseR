@@ -2539,6 +2539,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "skip_pinned_eviction": False,
             "readahead_srpt": False,
             "l2_write_yield": False,
+            "readahead_budget_fraction": 0.5,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2603,6 +2604,7 @@ async def test_bip_setting_is_forwarded(
             "skip_pinned_eviction": False,
             "readahead_srpt": False,
             "l2_write_yield": False,
+            "readahead_budget_fraction": 0.5,
         }
     ]
 

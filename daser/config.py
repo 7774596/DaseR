@@ -74,6 +74,12 @@ L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
 #: the lookup stream and reads its stored prefix ahead after each load, so the
 #: SSD read overlaps the current request's prefill and decode.
 SESSION_PREFETCH_ENV = "DASER_SESSION_PREFETCH"
+#: Research switch: number of upcoming sessions the next-session prefetch
+#: reads ahead (default 1), soonest first, within the readahead budget.
+SESSION_PREFETCH_DEPTH_ENV = "DASER_SESSION_PREFETCH_DEPTH"
+#: Research switch: share of L1 that readahead leases may retain at once
+#: (default 0.5).
+READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.

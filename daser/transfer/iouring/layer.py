@@ -900,6 +900,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             readahead is still reading, at most ``_WRITE_YIELD_MAX_S``, so
             store writeback does not share the SSD with the next request's
             load; the written slice stays pinned in L1 meanwhile.
+        readahead_budget_fraction: Share of L1 that readahead leases may
+            retain at once (default half).
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -932,7 +934,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         skip_pinned_eviction: bool = False,
         readahead_srpt: bool = False,
         l2_write_yield: bool = False,
+        readahead_budget_fraction: float = 0.5,
     ) -> None:
+        if not 0.0 < readahead_budget_fraction < 1.0:
+            raise ValueError("readahead_budget_fraction must be in (0, 1)")
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
         if gather_min_runs < 0:
@@ -972,6 +977,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stripe_pipeline = bool(stripe_pipeline)
         self._readahead_piece = 0 if skip_l2 else readahead_piece_bytes
         self._readahead_window = readahead_window
+        self._readahead_budget = int(l1_bytes * readahead_budget_fraction)
         self._readahead_stream = bool(readahead_stream)
         self._gather_min_runs = gather_min_runs
         self._batch_dst_copies = bool(batch_dst_copies)
@@ -1765,6 +1771,30 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         await self._readahead_idle.wait()
 
+    async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
+        """Drop speculative readaheads that no kept prediction overlaps.
+
+        Args:
+            keep: Span lists of the predictions still expected.
+
+        Returns:
+            Number of speculative readaheads dropped.
+
+        Async/thread-safety:
+            Runs under the transfer lock on the server event loop.
+        """
+        kept = [_normalize_ranges(spans) for spans in keep]
+        async with self._lock:
+            stale = [
+                lease_id
+                for lease_id, item in self._readaheads.items()
+                if item.speculative
+                and not any(_sorted_ranges_overlap(item.ranges, k) for k in kept)
+            ]
+            for lease_id in stale:
+                self._drop_readahead_locked(lease_id, "stale")
+        return len(stale)
+
     async def start_readahead(
         self, spans: list[dict[str, int]], *, speculative: bool = False
     ) -> bool:
@@ -1777,8 +1807,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         path for anything the readahead did not cover.
 
         A request readahead first drops speculative readaheads it does not
-        overlap: they predicted another request, and keeping them would trim
-        this one's budget.
+        overlap, furthest prediction first, until its own bytes fit the
+        budget; speculative readaheads that leave it room stay.
 
         Args:
             spans: Storage spans with ``file_offset``, ``nbytes`` and optional
@@ -1789,8 +1819,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         Returns:
             True when a new readahead was registered. False when readahead is
             disabled, every span is already being read ahead, or not even the
-            first new span fits the readahead budget (half of L1, less the
-            bytes earlier readaheads still retain). A request larger than the
+            first new span fits the readahead budget (``readahead_budget_
+            fraction`` of L1, less the bytes earlier readaheads still retain).
+            A request larger than the
             remaining budget reads ahead its leading spans. Readaheads are
             reclaimed only once older than their lifetime, so a queued
             request's readahead survives later lookups.
@@ -1827,16 +1858,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             ]:
                 self._drop_readahead_locked(lease_id, "expired")
             if not speculative:
-                wanted = _normalize_ranges(accounted)
-                for lease_id in [
-                    lease_id
-                    for lease_id, item in self._readaheads.items()
-                    if item.speculative
-                    and not _sorted_ranges_overlap(item.ranges, wanted)
-                ]:
-                    self._drop_readahead_locked(lease_id, "mispredicted")
+                self._make_room_for_request_locked(accounted)
             covered = [rng for item in self._readaheads.values() for rng in item.ranges]
-            budget = self._l1_bytes // 2 - self._readahead_bytes_locked()
+            budget = self._readahead_budget - self._readahead_bytes_locked()
             # Spans arrive in load order: read ahead the leading spans that
             # are not read ahead already and fit the remaining budget; the
             # tail goes to the normal load path.
@@ -3924,6 +3948,32 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _lookup_epoch_now(self) -> float:
         """Return the next-use policy's logical time (readaheads so far)."""
         return float(self._lookup_epoch)
+
+    def _make_room_for_request_locked(self, accounted: list[dict[str, int]]) -> None:
+        """Drop speculative readaheads a request readahead needs room from.
+
+        Speculative readaheads overlapping the request are its prediction
+        and stay. Others are dropped newest first (the furthest prediction)
+        until the request's uncovered bytes fit the budget.
+        """
+        wanted = _normalize_ranges(accounted)
+        covered = [
+            rng
+            for item in self._readaheads.values()
+            if not item.speculative or _sorted_ranges_overlap(item.ranges, wanted)
+            for rng in item.ranges
+        ]
+        need = sum(size for _start, size in _subtract_ranges(wanted, covered))
+        for lease_id in reversed(
+            [
+                lease_id
+                for lease_id, item in self._readaheads.items()
+                if item.speculative and not _sorted_ranges_overlap(item.ranges, wanted)
+            ]
+        ):
+            if self._readahead_budget - self._readahead_bytes_locked() >= need:
+                return
+            self._drop_readahead_locked(lease_id, "mispredicted")
 
     def _readahead_bytes_locked(self) -> int:
         """Return physical bytes still retained by readahead leases."""

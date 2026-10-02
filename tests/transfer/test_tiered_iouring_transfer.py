@@ -1887,17 +1887,69 @@ def test_iouring_wait_readahead_idle_returns_after_reads(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_iouring_rejects_invalid_readahead_budget_fraction(tmp_path) -> None:
+    """The readahead budget must be a proper share of L1."""
+    for fraction in (0.0, 1.0):
+        with pytest.raises(ValueError):
+            TieredIOUringTransferLayer(
+                path=str(tmp_path / "daser.store"),
+                l1_bytes=ALIGNMENT * 4,
+                l2_bytes=ALIGNMENT * 4,
+                readahead_budget_fraction=fraction,
+            )
+
+
 @pytest.mark.parametrize(
-    ("real_offset", "dropped"), [(4, True), (2, False)], ids=["miss", "hit"]
+    ("budget_fraction", "real_offset", "dropped"),
+    [(0.1875, 4, True), (0.1875, 2, False), (0.5, 4, False)],
+    ids=["short-miss", "short-hit", "room-miss"],
 )
 def test_iouring_request_readahead_drops_mispredicted_speculation(
-    tmp_path, real_offset: int, dropped: bool
+    tmp_path, budget_fraction: float, real_offset: int, dropped: bool
 ) -> None:
-    """A request readahead drops speculative readaheads it does not overlap.
+    """A request readahead drops non-overlapping speculation it has no room for.
 
     A speculative readahead that overlaps the request is its prediction
-    coming true and is kept for the load.
+    coming true and is kept for the load; one that does not is dropped only
+    when the request's bytes do not fit the budget left.
     """
+    blocks = 8
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        # L1 is 32 blocks: a 0.1875 budget holds 6, so 4 speculative blocks
+        # leave no room for 4 more; a 0.5 budget holds both.
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            readahead_budget_fraction=budget_fraction,
+        )
+        try:
+            guess = [{"file_offset": 0, "nbytes": ALIGNMENT * 4}]
+            assert await layer.start_readahead(guess, speculative=True) is True
+            await layer.wait_readahead_idle()
+            # One span per chunk, as the server sends them.
+            real = [
+                {"file_offset": ALIGNMENT * (real_offset + i), "nbytes": ALIGNMENT}
+                for i in range(4)
+            ]
+            assert await layer.start_readahead(real) is True
+            await layer.wait_readahead_idle()
+            assert layer.stats.readahead_dropped_bytes == (
+                ALIGNMENT * 4 if dropped else 0
+            )
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+def test_iouring_drop_speculative_except_keeps_expected_predictions(
+    tmp_path,
+) -> None:
+    """Speculation no kept prediction overlaps is dropped; the rest stays."""
     blocks = 8
     payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
 
@@ -1908,15 +1960,17 @@ def test_iouring_request_readahead_drops_mispredicted_speculation(
             readahead_piece_bytes=ALIGNMENT,
         )
         try:
-            guess = [{"file_offset": 0, "nbytes": ALIGNMENT * 4}]
-            assert await layer.start_readahead(guess, speculative=True) is True
+            stale = [{"file_offset": 0, "nbytes": ALIGNMENT * 2}]
+            kept = [{"file_offset": ALIGNMENT * 4, "nbytes": ALIGNMENT * 2}]
+            assert await layer.start_readahead(stale, speculative=True) is True
+            assert await layer.start_readahead(kept, speculative=True) is True
             await layer.wait_readahead_idle()
-            real = [{"file_offset": ALIGNMENT * real_offset, "nbytes": ALIGNMENT * 4}]
-            assert await layer.start_readahead(real) is True
-            await layer.wait_readahead_idle()
-            assert layer.stats.readahead_dropped_bytes == (
-                ALIGNMENT * 4 if dropped else 0
-            )
+            # The kept prediction now covers more than the old speculation.
+            expected = [{"file_offset": ALIGNMENT * 4, "nbytes": ALIGNMENT * 4}]
+            assert await layer.drop_speculative_except([expected]) == 1
+            assert layer.stats.readahead_dropped_bytes == ALIGNMENT * 2
+            assert await layer.drop_speculative_except([]) == 1
+            assert layer.stats.readahead_dropped_bytes == ALIGNMENT * 4
         finally:
             await layer.drain()
             layer.close()
