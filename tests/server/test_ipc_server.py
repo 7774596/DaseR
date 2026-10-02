@@ -2538,6 +2538,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "next_use_replacement": False,
             "skip_pinned_eviction": False,
             "readahead_srpt": False,
+            "l2_write_yield": False,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2601,6 +2602,7 @@ async def test_bip_setting_is_forwarded(
             "next_use_replacement": False,
             "skip_pinned_eviction": False,
             "readahead_srpt": False,
+            "l2_write_yield": False,
         }
     ]
 

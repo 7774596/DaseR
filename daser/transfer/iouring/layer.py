@@ -52,6 +52,8 @@ _BYPASS_CLASS_BYTES = 256 * 1024 * 1024
 # A readahead not consumed this long after it started lost its load (aborted
 # or trimmed request) and is reclaimed; it outlives a queued request's wait.
 _READAHEAD_LIFETIME_S = 120.0
+# Longest an L2 write waits for readahead reads to drain when yielding.
+_WRITE_YIELD_MAX_S = 2.0
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -876,6 +878,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             window each, and a free slot goes to the group whose readahead
             has the fewest bytes left from that group on, so the shortest
             request finishes its SSD reads first.
+        l2_write_yield: Research switch. An L2 write waits while any
+            readahead is still reading, at most ``_WRITE_YIELD_MAX_S``, so
+            store writeback does not share the SSD with the next request's
+            load; the written slice stays pinned in L1 meanwhile.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -907,6 +913,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         next_use_replacement: bool = False,
         skip_pinned_eviction: bool = False,
         readahead_srpt: bool = False,
+        l2_write_yield: bool = False,
     ) -> None:
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
@@ -962,6 +969,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         # Lease ID -> readahead reads in flight, for the contention count.
         self._readahead_reading: dict[str, int] = {}
+        self._l2_write_yield = bool(l2_write_yield)
+        # Running readaheads, and an event set while there are none.
+        self._readahead_running = 0
+        self._readahead_idle = asyncio.Event()
+        self._readahead_idle.set()
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         # L1-only packed ranges waiting for an admission decision. They stay
@@ -1032,7 +1044,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
-            "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s",
+            "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s "
+            "l2_write_yield=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -1054,6 +1067,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             next_use_replacement,
             skip_pinned_eviction,
             readahead_srpt,
+            self._l2_write_yield,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -2429,10 +2443,21 @@ class TieredIOUringTransferLayer(TransferLayer):
             data: Pinned host slice containing the immutable payload.
 
         Async/thread-safety:
-            Metadata locks are never held across this await.
+            Metadata locks are never held across this await. With
+            ``l2_write_yield`` the write first waits, bounded, for readahead
+            reads to drain.
         """
         if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
+        if self._l2_write_yield and not self._readahead_idle.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._readahead_idle.wait(), timeout=_WRITE_YIELD_MAX_S
+                )
+            except asyncio.TimeoutError:
+                pass
+        if not self._readahead_idle.is_set():
+            self._stats.l2_write_contended_bytes += len(data)
         await loop.run_in_executor(
             self._l2.executor,
             self._write_l2,
@@ -3584,6 +3609,22 @@ class TieredIOUringTransferLayer(TransferLayer):
         Each group carries whether its reads are published to L1 or retained
         by the readahead lease only (split-residency bypass).
         """
+        self._readahead_running += 1
+        self._readahead_idle.clear()
+        try:
+            await self._read_readahead_groups(lease_id, readahead, groups)
+        finally:
+            self._readahead_running -= 1
+            if not self._readahead_running:
+                self._readahead_idle.set()
+
+    async def _read_readahead_groups(
+        self,
+        lease_id: str,
+        readahead: _Readahead,
+        groups: list[tuple[list[dict[str, Any]], bool]],
+    ) -> None:
+        """Read the groups of one readahead and log its throughput."""
         window = asyncio.Semaphore(self._readahead_window)
         read_bytes = 0
         failed = 0

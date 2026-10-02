@@ -299,8 +299,12 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             _delta(before, after, f'daser_readahead_bytes_total{{outcome="{kind}"}}')
             for kind in ("read", "contended")
         )
+        write_contended = _delta(
+            before, after, 'daser_readahead_bytes_total{outcome="write_contended"}'
+        )
         h2d += (
-            f" ra[read_GB={read / 1e9:.1f} contended={contended / read:.2f}]"
+            f" ra[read_GB={read / 1e9:.1f} contended={contended / read:.2f} "
+            f"write_during_GB={write_contended / 1e9:.1f}]"
             if read > 0
             else ""
         )

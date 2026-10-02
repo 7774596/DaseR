@@ -67,6 +67,9 @@ L1_SKIP_PINNED_ENV = "DASER_L1_SKIP_PINNED"
 #: Research switch: ``1`` makes readaheads share one window of reads in
 #: flight, granted to the readahead with the fewest bytes left.
 READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
+#: Research switch: ``1`` holds L2 writes while a readahead is reading (up to
+#: a bounded delay), so writeback does not share the SSD with the next load.
+L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.

@@ -2405,3 +2405,49 @@ def test_iouring_readahead_srpt_serves_the_short_request_first(
             layer.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("write_yield", [False, True])
+def test_iouring_l2_write_yields_to_readahead_reads(
+    tmp_path, write_yield: bool
+) -> None:
+    """A store during readahead contends, unless its write yields.
+
+    The store and the readahead keep exact bytes either way. Without yield
+    the store's L2 write is submitted while the readahead is still reading
+    and counts as contended; with ``l2_write_yield`` it waits until the
+    readahead has read every piece, including the gaps between pieces.
+    """
+    pieces = 16
+    piece = ALIGNMENT * 256
+    payload = b"".join(bytes(_block(bytes([i]), piece)) for i in range(pieces))
+    nbytes = len(payload)
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=piece,
+            readahead_window=1,
+            l2_write_yield=write_yield,
+        )
+        try:
+            assert await layer.start_readahead([{"file_offset": 0, "nbytes": nbytes}])
+            fresh = bytes(_block(b"w"))
+            await layer.store_bytes(fresh, nbytes, ALIGNMENT)
+            await layer.drain()
+            contended = layer.stats.l2_write_contended_bytes
+            assert contended == (0 if write_yield else ALIGNMENT)
+            dst = bytearray(nbytes)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": nbytes}]
+            assert await layer.load_bytes_grouped(dst, load) == nbytes
+            assert bytes(dst) == payload
+            check = bytearray(ALIGNMENT)
+            load = [{"target_offset": 0, "file_offset": nbytes, "nbytes": ALIGNMENT}]
+            await layer.load_bytes_grouped(check, load)
+            assert bytes(check) == fresh
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
