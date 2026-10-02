@@ -466,10 +466,12 @@ def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
             )
             dst = bytearray(ALIGNMENT * 3)
 
+            started = time.perf_counter()
             loaded = await layer.load_bytes_grouped(
                 dst,
                 [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT * 3}],
             )
+            wall_us = (time.perf_counter() - started) * 1_000_000
 
             assert loaded == ALIGNMENT * 3
             assert bytes(dst) == bytes(_block(b"a") + _block(b"b") + _block(b"c"))
@@ -477,6 +479,17 @@ def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
             assert layer.stats.l1_misses == 1
             assert layer.stats.l2_reads == 1
             assert layer.l2_read_ranges == [(ALIGNMENT, ALIGNMENT)]
+            # Phase counters partition the grouped load's wall time.
+            phases = [
+                layer.stats.load_readahead_wait_us,
+                layer.stats.load_resolve_us,
+                layer.stats.load_pending_write_us,
+                layer.stats.load_l2_us,
+                layer.stats.load_copy_drain_us,
+            ]
+            assert min(phases) >= 0
+            assert layer.stats.load_l2_us > 0
+            assert sum(phases) <= wall_us + 1
         finally:
             layer.close()
 

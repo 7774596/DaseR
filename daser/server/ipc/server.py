@@ -51,6 +51,9 @@ _PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
 
 _CUDA_IPC_CACHE_LIMIT = 16
 _PACKED_IO_ALIGNMENT = 4096
+# Grouped-load phases exported as daser_load_phase_seconds_total{phase}; each
+# maps to a TransferStats load_<phase>_us counter.
+_LOAD_PHASES = ("readahead_wait", "resolve", "pending_write", "l2", "copy_drain")
 
 # Research switch: when set to "1", every storage format retries a lookup that
 # overlaps an in-flight store writer (the online-compressed default). Unset
@@ -389,6 +392,7 @@ class IPCServer:
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_l1_bypass_bytes = 0
+        self._prev_load_phase_us: dict[str, int] = {}
         self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
@@ -1296,6 +1300,10 @@ class IPCServer:
                 # requests behind the slowest destination copy.
                 await asyncio.to_thread(synchronize)
                 sync_ms = (time.perf_counter() - sync_start) * 1000
+                self._metrics.counter(
+                    "daser_load_phase_seconds_total",
+                    "Grouped-load wall time by phase.",
+                ).inc(sync_ms / 1000, labels={"phase": "sync"})
             if lease_id is not None:
                 await transfer.release_lease_ranges(lease_id, spans)
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -1628,6 +1636,15 @@ class IPCServer:
                     "Lookup readahead bytes by outcome.",
                 ).inc(delta, labels={"outcome": outcome})
             self._prev_readahead_bytes[outcome] = current
+        for phase in _LOAD_PHASES:
+            current = getattr(stats, f"load_{phase}_us")
+            delta = current - self._prev_load_phase_us.get(phase, 0)
+            if delta > 0:
+                self._metrics.counter(
+                    "daser_load_phase_seconds_total",
+                    "Grouped-load wall time by phase.",
+                ).inc(delta / 1_000_000, labels={"phase": phase})
+            self._prev_load_phase_us[phase] = current
         bypass_delta = stats.l1_bypass_bytes - self._prev_l1_bypass_bytes
         if bypass_delta > 0:
             self._metrics.counter(

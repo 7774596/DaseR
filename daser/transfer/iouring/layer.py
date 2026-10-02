@@ -947,8 +947,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         bypass: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
         copy_future: asyncio.Task[None] | None = None
+        mark = time.perf_counter()
         if self._readaheads:
             await self._wait_for_readaheads(spans)
+        mark = self._add_phase_us("load_readahead_wait_us", mark)
         async with self._lock:
             self._raise_l2_error_locked()
             readahead_hits = self._readahead_hits_locked()
@@ -1030,10 +1032,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                 # The copy above borrows every leased slice it reads, so the
                 # served ranges can leave their readahead lease right away.
                 self._consume_readaheads_locked(_normalize_ranges(spans))
+        mark = self._add_phase_us("load_resolve_us", mark)
 
         try:
             if pending:
                 await asyncio.gather(*pending)
+            mark = self._add_phase_us("load_pending_write_us", mark)
             if bypass:
                 # Both paths write disjoint destination ranges; collect every
                 # outcome so neither is still copying when an error surfaces.
@@ -1047,9 +1051,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                         raise result
             elif misses:
                 await self._load_l2_misses_grouped(dst, misses)
+            mark = self._add_phase_us("load_l2_us", mark)
         finally:
             if copy_future is not None:
                 await _drain_destination_copies([copy_future])
+        self._add_phase_us("load_copy_drain_us", mark)
         return total
 
     async def store_bytes(
@@ -3480,6 +3486,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         ]
         if waiters:
             await asyncio.gather(*waiters)
+
+    def _add_phase_us(self, field: str, mark: float) -> float:
+        """Charge the time since ``mark`` to a load-phase counter.
+
+        Args:
+            field: ``TransferStats`` microsecond counter to increment.
+            mark: ``time.perf_counter()`` value at the start of the phase.
+
+        Returns:
+            The current ``time.perf_counter()`` value, the next phase's mark.
+        """
+        now = time.perf_counter()
+        setattr(
+            self._stats,
+            field,
+            getattr(self._stats, field) + int((now - mark) * 1_000_000),
+        )
+        return now
 
     def _readahead_hits_locked(self) -> tuple[list[int], list[_LeasedSliceRange]]:
         """Return the retained readahead ranges sorted by physical offset."""

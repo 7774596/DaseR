@@ -29,6 +29,15 @@ class TransferStats:
             used them (overlapping store or budget reclaim).
         l1_bypass_bytes: L2 load bytes read through transient windows that
             never entered L1 (split-residency bypass).
+        load_readahead_wait_us: grouped-load time spent waiting for in-flight
+            readaheads that cover the requested spans.
+        load_resolve_us: grouped-load time spent resolving spans against
+            readahead leases and L1 under the metadata lock.
+        load_pending_write_us: grouped-load time spent waiting for L2 writes
+            of the requested ranges to finish.
+        load_l2_us: grouped-load time spent reading L1 misses from L2.
+        load_copy_drain_us: grouped-load time spent draining the L1 hit copy
+            after the L2 phase finished.
     """
 
     l1_hits: int = 0
@@ -44,6 +53,11 @@ class TransferStats:
     readahead_served_bytes: int = 0
     readahead_dropped_bytes: int = 0
     l1_bypass_bytes: int = 0
+    load_readahead_wait_us: int = 0
+    load_resolve_us: int = 0
+    load_pending_write_us: int = 0
+    load_l2_us: int = 0
+    load_copy_drain_us: int = 0
 
 
 @dataclass(frozen=True)

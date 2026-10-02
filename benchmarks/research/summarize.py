@@ -239,7 +239,8 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
     Returns:
         One line per arm that loaded anything: load operation count, mean and
         bucket p90 latency, and effective throughput (bytes over summed
-        latency, so concurrent loads count once each).
+        latency, so concurrent loads count once each), plus the summed
+        grouped-load phase times when the server exported them.
     """
     lines = []
     name = "daser_transfer_duration_seconds"
@@ -252,10 +253,30 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
         seconds = _delta(before, after, f'{name}_sum{{op="load"}}')
         nbytes = _delta(before, after, _LOAD)
         p90 = _bucket_quantile(before, after, name, 0.9, labels='op="load",')
+        phases = " ".join(
+            f"{phase}={value:.1f}s"
+            for phase in (
+                "readahead_wait",
+                "resolve",
+                "pending_write",
+                "l2",
+                "copy_drain",
+                "sync",
+            )
+            if (
+                value := _delta(
+                    before,
+                    after,
+                    f'daser_load_phase_seconds_total{{phase="{phase}"}}',
+                )
+            )
+            > 0
+        )
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "
             f"per_op_GBps={nbytes / seconds / 1e9 if seconds else 0:.2f}"
+            + (f" phases[{phases}]" if phases else "")
         )
     return lines
 
