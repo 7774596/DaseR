@@ -53,6 +53,10 @@ _BYPASS_CLASS_BYTES = 256 * 1024 * 1024
 # A readahead not consumed this long after it started lost its load (aborted
 # or trimmed request) and is reclaimed; it outlives a queued request's wait.
 _READAHEAD_LIFETIME_S = 120.0
+#: A device-stash fill waits this long after the last grouped load ended: one
+#: request loads as back-to-back staging-sized calls, so a shorter gap is
+#: still the same request's load and its host-to-device copies.
+_STASH_LOAD_QUIET_S = 0.25
 # Longest an L2 write waits for readahead reads to drain when yielding.
 _WRITE_YIELD_MAX_S = 2.0
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
@@ -1030,6 +1034,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         # CUDA device of the load destinations, fixed by the first one.
         self._stash_device: int | None = None
+        # Grouped loads in flight and when the last one ended, so a stash
+        # fill neither shares PCIe with nor unpublishes a running load.
+        self._loads_active = 0
+        self._last_load_end = 0.0
         # With the bypass, offset classes are whole aligned units so the
         # class of an L1 entry equals the admission class of its first unit.
         self._bypass_class = (
@@ -1196,6 +1204,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         spans = _coalesce_load_spans(spans, self._l1_bytes)
         plan = _LoadPlan()
         mark = time.perf_counter()
+        self._loads_active += 1
         try:
             if self._readahead_stream and self._readaheads:
                 # Copy each readahead piece's bytes as soon as it is retained,
@@ -1232,8 +1241,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                 await self._load_l2_misses_grouped(dst, plan.misses)
             mark = self._add_phase_us("load_l2_us", mark)
         finally:
-            if plan.copies:
-                await _drain_destination_copies(plan.copies)
+            try:
+                if plan.copies:
+                    await _drain_destination_copies(plan.copies)
+            finally:
+                self._loads_active -= 1
+                self._last_load_end = time.perf_counter()
         self._add_phase_us("load_copy_drain_us", mark)
         return plan.total
 
@@ -1804,13 +1817,20 @@ class TieredIOUringTransferLayer(TransferLayer):
             CUDA load has fixed its device yet.
 
         Async/thread-safety:
-            Runs on the server event loop. It unpublishes the old ranges and
-            waits for in-flight destination copies (which may read the stash)
-            before overwriting it, then waits for its own host-to-device copy.
+            Runs on the server event loop. It first waits until no grouped
+            load ran for ``_STASH_LOAD_QUIET_S`` (the current request's load
+            is over), then unpublishes the old ranges and waits for in-flight
+            destination copies (which may read the stash) before overwriting
+            it, then waits for its own host-to-device copy.
         """
         if self._device_stash is None or self._stash_device is None:
             return 0
         stash = self._device_stash
+        while (
+            self._loads_active
+            or time.perf_counter() - self._last_load_end < _STASH_LOAD_QUIET_S
+        ):
+            await asyncio.sleep(_STASH_LOAD_QUIET_S / 5)
         async with self._lock:
             stash.clear()
             draining = list(self._pending_h2d)
