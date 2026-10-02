@@ -24,6 +24,7 @@ from daser.config import (
     LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     READAHEAD_BUDGET_FRACTION_ENV,
+    READAHEAD_SKIP_STASHED_ENV,
     READAHEAD_SRPT_ENV,
     SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
@@ -1914,6 +1915,9 @@ class IPCServer:
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
                     ),
                     device_stash_bytes=self._device_stash_bytes,
+                    readahead_skip_stashed=(
+                        os.environ.get(READAHEAD_SKIP_STASHED_ENV) == "1"
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

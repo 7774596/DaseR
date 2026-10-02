@@ -914,6 +914,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             buffer that ``fill_device_stash`` fills with a predicted load's
             stored bytes ahead of time; loads copy those bytes
             device-to-device instead of host-to-device.
+        readahead_skip_stashed: Research switch. Readaheads skip spans the
+            device stash holds whole, so those bytes take neither SSD reads
+            nor readahead budget.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -948,6 +951,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_write_yield: bool = False,
         readahead_budget_fraction: float = 0.5,
         device_stash_bytes: int = 0,
+        readahead_skip_stashed: bool = False,
     ) -> None:
         if not 0.0 < readahead_budget_fraction < 1.0:
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
@@ -1032,6 +1036,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._device_stash = (
             DeviceStash(device_stash_bytes) if device_stash_bytes else None
         )
+        self._readahead_skip_stashed = bool(readahead_skip_stashed)
         # CUDA device of the load destinations, fixed by the first one.
         self._stash_device: int | None = None
         # Grouped loads in flight and when the last one ended, so a stash
@@ -1991,6 +1996,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             # tail goes to the normal load path.
             kept: list[dict[str, int]] = []
             for span in accounted:
+                if self._stashed_locked(span["file_offset"], span["nbytes"]):
+                    continue
                 if not _subtract_ranges(
                     [(span["file_offset"], span["nbytes"])], covered
                 ):
@@ -4068,6 +4075,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         return now
 
+    def _stashed_locked(self, file_offset: int, nbytes: int) -> bool:
+        """Return whether readahead should skip a range the stash holds."""
+        return (
+            self._readahead_skip_stashed
+            and self._device_stash is not None
+            and self._device_stash.covers(file_offset, nbytes)
+        )
+
     def _stash_hits_locked(self, dst: Any) -> tuple[list[int], list[StashRange]]:
         """Return device-stash ranges usable for ``dst``, sorted by offset.
 
@@ -4137,7 +4152,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                 # is over; what it left is prefix the GPU cache served.
                 self._drop_readahead_locked(lease_id, "spent")
         covered = [rng for item in self._readaheads.values() for rng in item.ranges]
-        need = sum(size for _start, size in _subtract_ranges(wanted, covered))
+        unstashed = _normalize_ranges(
+            [
+                span
+                for span in accounted
+                if not self._stashed_locked(span["file_offset"], span["nbytes"])
+            ]
+        )
+        need = sum(size for _start, size in _subtract_ranges(unstashed, covered))
         for lease_id in reversed(
             [
                 lease_id

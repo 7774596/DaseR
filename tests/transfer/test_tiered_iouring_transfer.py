@@ -2775,3 +2775,59 @@ def test_iouring_device_stash_serves_loads_and_drops_overwritten_bytes(
             layer.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_iouring_readahead_skips_stashed_spans(tmp_path, skip: bool) -> None:
+    """With ``readahead_skip_stashed`` stashed spans take no readahead budget.
+
+    The budget holds two of four blocks and the stash holds the leading two.
+    Skipping them lets the readahead retain the trailing two, which the load
+    then takes from the lease; without the switch the leading two use up the
+    budget and the stash serves them instead. The load returns every byte
+    either way.
+    """
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+    blocks = 4
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+    spans = [
+        {
+            "target_offset": ALIGNMENT * i,
+            "file_offset": ALIGNMENT * i,
+            "nbytes": ALIGNMENT,
+        }
+        for i in range(blocks)
+    ]
+
+    async def scenario() -> None:
+        # L1 is 4 * nbytes = 16 blocks; an eighth of it is two blocks.
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            readahead_budget_fraction=0.125,
+            device_stash_bytes=ALIGNMENT * 2,
+            readahead_skip_stashed=skip,
+        )
+        try:
+            dst = cupy.zeros(nbytes, dtype=cupy.uint8)
+            assert await layer.load_bytes_grouped(dst, spans) == nbytes
+            assert await layer.fill_device_stash(spans) == ALIGNMENT * 2
+            assert await layer.start_readahead(spans) is True
+            await layer.wait_readahead_idle()
+            served = layer.stats.readahead_served_bytes
+            dst = cupy.zeros(nbytes, dtype=cupy.uint8)
+            assert await layer.load_bytes_grouped(dst, spans) == nbytes
+            assert cupy.asnumpy(dst).tobytes() == payload
+            assert layer.stats.device_stash_served_bytes == ALIGNMENT * 2
+            assert layer.stats.readahead_served_bytes - served == (
+                ALIGNMENT * 2 if skip else 0
+            )
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

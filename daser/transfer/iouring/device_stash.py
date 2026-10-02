@@ -107,6 +107,26 @@ class DeviceStash:
         """Return published ranges and their starts, sorted by file offset."""
         return self._starts, self._entries
 
+    def covers(self, file_offset: int, nbytes: int) -> bool:
+        """Return whether published ranges hold all of one physical range.
+
+        Args:
+            file_offset: Physical start of the range.
+            nbytes: Length of the range.
+
+        Returns:
+            True when every byte of the range is stashed.
+        """
+        cursor, end = file_offset, file_offset + nbytes
+        index = max(0, bisect.bisect_right(self._starts, cursor) - 1)
+        for entry in self._entries[index:]:
+            if entry.file_offset > cursor:
+                return False
+            cursor = max(cursor, entry.file_offset + entry.nbytes)
+            if cursor >= end:
+                return True
+        return cursor >= end
+
     def clear(self) -> None:
         """Unpublish every range so no new load reads the stash."""
         self._entries = []
@@ -180,11 +200,14 @@ class DeviceStash:
             return
         end = file_offset + nbytes
         index = max(0, bisect.bisect_right(self._starts, file_offset) - 1)
-        if not any(
-            entry.file_offset < end and file_offset < entry.file_offset + entry.nbytes
-            for entry in self._entries[index:]
-            if entry.file_offset < end
-        ):
+        hit = False
+        for entry in self._entries[index:]:
+            if entry.file_offset >= end:
+                break
+            if file_offset < entry.file_offset + entry.nbytes:
+                hit = True
+                break
+        if not hit:
             return
         self._entries = [
             entry
