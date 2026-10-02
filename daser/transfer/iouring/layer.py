@@ -46,6 +46,9 @@ _BYPASS_WINDOWS_IN_FLIGHT = 16
 # boundaries and each unit is admitted or bypassed as a whole, independent of
 # how request spans happen to coalesce.
 _BYPASS_CLASS_BYTES = 256 * 1024 * 1024
+# A readahead not consumed this long after it started lost its load (aborted
+# or trimmed request) and is reclaimed; it outlives a queued request's wait.
+_READAHEAD_LIFETIME_S = 120.0
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -1642,9 +1645,12 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Returns:
             True when a new readahead was registered. False when readahead is
-            disabled, the same ranges are already being read ahead, or not
-            even the first span fits the readahead budget (half of L1). A
-            request larger than the budget reads ahead its leading spans.
+            disabled, every span is already being read ahead, or not even the
+            first new span fits the readahead budget (half of L1, less the
+            bytes earlier readaheads still retain). A request larger than the
+            remaining budget reads ahead its leading spans. Readaheads are
+            reclaimed only once older than their lifetime, so a queued
+            request's readahead survives later lookups.
 
         Async/thread-safety:
             Registers under the transfer lock and returns without waiting for
@@ -1662,32 +1668,40 @@ class TieredIOUringTransferLayer(TransferLayer):
             for span in spans
             if int(span["nbytes"]) > 0
         ]
-        budget = self._l1_bytes // 2
-        # Spans arrive in load order: read ahead the leading spans that fit
-        # the budget and leave the tail to the normal load path.
-        kept: list[dict[str, int]] = []
-        total = 0
-        for span in accounted:
-            if total + span["nbytes"] > budget:
-                break
-            kept.append(span)
-            total += span["nbytes"]
-        accounted = kept
-        ranges = _normalize_ranges(accounted)
-        requested = sum(size for _start, size in ranges)
-        if not ranges:
+        if not accounted:
             return False
         async with self._lock:
             self._raise_l2_error_locked()
             self._prune_readaheads_locked()
-            if any(item.ranges == ranges for item in self._readaheads.values()):
+            # Readaheads past their lifetime lost their load (an aborted or
+            # trimmed request); live ones may belong to a request that is
+            # loading or still queued, so they keep their budget.
+            now = time.perf_counter()
+            for lease_id in [
+                lease_id
+                for lease_id, item in self._readaheads.items()
+                if now - item.started > _READAHEAD_LIFETIME_S
+            ]:
+                self._drop_readahead_locked(lease_id, "expired")
+            covered = [rng for item in self._readaheads.values() for rng in item.ranges]
+            budget = self._l1_bytes // 2 - self._readahead_bytes_locked()
+            # Spans arrive in load order: read ahead the leading spans that
+            # are not read ahead already and fit the remaining budget; the
+            # tail goes to the normal load path.
+            kept: list[dict[str, int]] = []
+            for span in accounted:
+                if not _subtract_ranges(
+                    [(span["file_offset"], span["nbytes"])], covered
+                ):
+                    continue
+                if span["nbytes"] > budget:
+                    break
+                kept.append(span)
+                budget -= span["nbytes"]
+            accounted = kept
+            ranges = _normalize_ranges(accounted)
+            if not ranges:
                 return False
-            # A new lookup means older readaheads lost their load (an aborted
-            # or trimmed request); reclaim them oldest first to fit this one.
-            while self._readaheads and self._readahead_bytes_locked() + requested > (
-                budget
-            ):
-                self._drop_readahead_locked(next(iter(self._readaheads)))
             self._readahead_seq += 1
             lease_id = f"readahead-{self._readahead_seq}"
             self._replace_request_lease_locked(lease_id, ranges, [])
@@ -3398,7 +3412,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 [(file_offset, nbytes)],
             )
         ]:
-            self._drop_readahead_locked(lease_id)
+            self._drop_readahead_locked(lease_id, "store")
         return [
             lease.released
             for lease in self._request_leases.values()
@@ -3663,16 +3677,24 @@ class TieredIOUringTransferLayer(TransferLayer):
             for _start, size in self._request_leases[lease_id].remaining
         )
 
-    def _drop_readahead_locked(self, lease_id: str) -> None:
+    def _drop_readahead_locked(self, lease_id: str, reason: str) -> None:
         """Forget one readahead and release its retained slices.
 
         In-flight groups of a dropped readahead fail when they try to attach
         to the released lease; their reads are closed by the normal cleanup.
+        ``reason`` labels the drop in the log.
         """
         self._readaheads.pop(lease_id, None)
         lease = self._request_leases.get(lease_id)
         if lease is not None:
-            self._stats.readahead_dropped_bytes += sum(hit.nbytes for hit in lease.hits)
+            dropped = sum(hit.nbytes for hit in lease.hits)
+            self._stats.readahead_dropped_bytes += dropped
+            logger.info(
+                "[TRANSFER:iouring] readahead %s dropped reason=%s bytes=%d",
+                lease_id,
+                reason,
+                dropped,
+            )
         self._release_request_lease_locked(lease_id, force=True)
 
     def _prune_readaheads_locked(self) -> None:

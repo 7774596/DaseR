@@ -1862,6 +1862,68 @@ def test_iouring_readahead_disabled_or_over_budget_is_skipped(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_iouring_readahead_keeps_live_readahead_and_trims_new_one(tmp_path) -> None:
+    """A later readahead never evicts a live one; it uses the budget left.
+
+    This is the queued-request case: the request being loaded keeps its
+    readahead while the next request's lookup reads ahead what still fits,
+    and ranges already being read ahead are not registered twice.
+    """
+    blocks = 8
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        # L1 of 4 * nbytes gives a readahead budget of 2 * nbytes = 16 blocks.
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            first = [{"file_offset": 0, "nbytes": ALIGNMENT * 6}]
+            assert await layer.start_readahead(first) is True
+            # Already read ahead: nothing new to register.
+            assert await layer.start_readahead(first) is False
+            await layer.drain()
+            dst = bytearray(ALIGNMENT * 6)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT * 6}]
+            assert await layer.load_bytes_grouped(dst, load) == ALIGNMENT * 6
+            assert bytes(dst) == payload[: ALIGNMENT * 6]
+            assert layer.stats.readahead_served_bytes == ALIGNMENT * 6
+            assert layer.stats.readahead_dropped_bytes == 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+        small = await _cold_readahead_layer(
+            str(tmp_path / "small.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+        )
+        try:
+            # Budget 16 blocks: a 6-block readahead leaves 10, so of a later
+            # request's 8 + 4 blocks only the leading 8-block span fits.
+            live = [{"file_offset": 0, "nbytes": ALIGNMENT * 6}]
+            assert await small.start_readahead(live) is True
+            later = [
+                {"file_offset": ALIGNMENT * 8, "nbytes": ALIGNMENT * 8},
+                {"file_offset": ALIGNMENT * 16, "nbytes": ALIGNMENT * 4},
+            ]
+            assert await small.start_readahead(later) is True
+            await small.drain()
+            assert small.stats.readahead_dropped_bytes == 0
+            dst = bytearray(ALIGNMENT * 6)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT * 6}]
+            assert await small.load_bytes_grouped(dst, load) == ALIGNMENT * 6
+            assert bytes(dst) == payload[: ALIGNMENT * 6]
+            assert small.stats.readahead_served_bytes == ALIGNMENT * 6
+        finally:
+            await small.drain()
+            small.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_l2_read_stripe_must_be_aligned(tmp_path) -> None:
     """The stripe size keeps every part on a direct-IO boundary."""
     with pytest.raises(ValueError, match="l2_read_stripe_bytes"):
