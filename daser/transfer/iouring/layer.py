@@ -478,6 +478,52 @@ def _clip_parts(
     return clipped
 
 
+def _split_runs_at_slices(
+    files: Any, targets: Any, sizes: Any, starts: Any, ends: Any
+) -> tuple[Any, Any, Any, Any]:
+    """Split runs that cross contiguous slice edges into per-slice runs.
+
+    Readahead pieces become L1 slices at their own boundaries, so a record
+    run can span two adjacent slices of one lease.
+
+    Args:
+        files: ``int64`` physical run starts.
+        targets: ``int64`` destination offsets.
+        sizes: ``int64`` run lengths.
+        starts: Sorted ``int64`` slice starts.
+        ends: ``int64`` slice ends matching ``starts``.
+
+    Returns:
+        ``(files, targets, sizes, index)`` with every run inside slice
+        ``index``.
+
+    Raises:
+        KeyError: If a run starts outside every slice or crosses a gap.
+    """
+    import numpy
+
+    index = numpy.searchsorted(starts, files, side="right") - 1
+    if not len(starts) or (index < 0).any() or (files >= ends[index]).any():
+        raise KeyError("request lease does not cover every load run")
+    if not (files + sizes > ends[index]).any():
+        return files, targets, sizes, index
+    out: list[tuple[int, int, int, int]] = []
+    for file_offset, target, size, slot in zip(
+        files.tolist(), targets.tolist(), sizes.tolist(), index.tolist(), strict=True
+    ):
+        while True:
+            piece = min(size, int(ends[slot]) - file_offset)
+            out.append((file_offset, target, piece, slot))
+            size -= piece
+            if size == 0:
+                break
+            file_offset, target, slot = file_offset + piece, target + piece, slot + 1
+            if slot >= len(starts) or int(starts[slot]) != file_offset:
+                raise KeyError("request lease does not cover every load run")
+    split = numpy.array(out, dtype=numpy.int64).T
+    return split[0], split[1], split[2], split[3]
+
+
 def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     """Return sorted, merged positive physical ranges from transfer spans."""
     ranges = sorted(
@@ -2203,8 +2249,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Layer-wise delivery copies one plane group of every record of a
         request per call, i.e. thousands of small runs. Each run must lie in
-        one L1 slice retained by the lease; runs are mapped to their slices
-        with one sorted search instead of per-span metadata walks.
+        L1 slices retained by the lease; runs are mapped to their slices with
+        one sorted search instead of per-span metadata walks, and a run that
+        crosses into the adjacent retained slice is copied in two pieces.
 
         Args:
             dst: Flat CUDA byte destination (optionally with
@@ -2222,8 +2269,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             Bytes copied, after the copies completed on the device.
 
         Raises:
-            KeyError: If the lease is unknown or a run is not inside one
-                retained slice.
+            KeyError: If the lease is unknown or a run is not inside
+                contiguous retained slices.
             ValueError: If the arrays are empty, unequal or out of bounds.
 
         Async/thread-safety:
@@ -2234,7 +2281,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         import numpy
 
         files = numpy.asarray(file_offsets, dtype=numpy.int64)
-        sizes = numpy.asarray(nbytes, dtype=numpy.int64)
+        sizes = numpy.broadcast_to(
+            numpy.asarray(nbytes, dtype=numpy.int64), files.shape
+        )
+        targets = numpy.asarray(target_offsets, dtype=numpy.int64)
         async with self._lock:
             self._raise_l2_error_locked()
             lease = self._request_leases.get(lease_id)
@@ -2255,13 +2305,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                     ),
                 )
             starts, ends, bases = lease.run_index
-            index = numpy.searchsorted(starts, files, side="right") - 1
-            if (
-                not len(starts)
-                or (index < 0).any()
-                or (files + sizes > ends[numpy.maximum(index, 0)]).any()
-            ):
-                raise KeyError("request lease does not cover every load run")
+            files, targets, sizes, index = _split_runs_at_slices(
+                files, targets, sizes, starts, ends
+            )
             sources = bases[index] + (files - starts[index]).astype(numpy.uint64)
             # Pin the lease before enqueueing: a partial submission still
             # reads its slices, and the finally below releases the pin only
@@ -2270,7 +2316,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             try:
                 event = copy_ops.copy_pointer_runs_to_cuda_dst(
                     dst,
-                    target_offsets,
+                    targets,
                     sources,
                     sizes,
                     self._gather_min_runs,

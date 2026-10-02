@@ -2374,10 +2374,22 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
                     assert result[start : start + size] == bytes(
                         payloads[i][begin : begin + size]
                     )
+            # A run across two adjacent leased records copies both pieces; one
+            # past the leased window fails.
+            dst.fill(0)
+            assert (
+                await layer.load_leased_runs(
+                    dst, np.array([record - 512]), np.array([0]), 1024, "runs"
+                )
+                == 1024
+            )
+            assert cupy.asnumpy(dst[:1024]).tobytes() == bytes(
+                payloads[0][record - 512 :] + payloads[1][:512]
+            )
             with pytest.raises(KeyError):
                 await layer.load_leased_runs(
                     dst,
-                    np.array([record - 512]),
+                    np.array([records * record - 512]),
                     np.array([0]),
                     np.array([1024]),
                     "runs",
