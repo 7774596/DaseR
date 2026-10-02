@@ -1524,6 +1524,7 @@ class IPCServer:
             nbytes=total,
             elapsed_s=elapsed_s,
         )
+        self._start_session_prefetch()
         return {"ok": True, "bytes": total, "transfer_ms": elapsed_s * 1000}
 
     async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1994,6 +1995,9 @@ class IPCServer:
         """
         counter = self._session_prefetch_counter()
         try:
+            # A grouped load spans several transfer calls fed by the current
+            # request's readahead; start only once that has finished reading.
+            await self._ensure_transfer().wait_readahead_idle()
             chunks = await self._lookup_now(tokens, model_id, defer=False)
             hits = _external_prefix_hits(
                 chunks or [],

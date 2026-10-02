@@ -1738,6 +1738,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                 await self.release_lease(lease_id)
             raise
 
+    async def wait_readahead_idle(self) -> None:
+        """Wait until every started readahead has finished reading.
+
+        Async/thread-safety:
+            Runs on the server event loop; a readahead started while waiting
+            extends the wait.
+        """
+        await self._readahead_idle.wait()
+
     async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
         """Start reading a looked-up request's L2 spans into a retained lease.
 

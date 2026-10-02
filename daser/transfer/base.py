@@ -279,6 +279,15 @@ class TransferLayer(ABC):
         """
         return False
 
+    async def wait_readahead_idle(self) -> None:
+        """Wait until no readahead is reading.
+
+        Async/thread-safety:
+            Returns at once for backends without readahead; implementations
+            run on the server event loop.
+        """
+        return None
+
     async def resident_prefix(self, groups: list[list[dict[str, int]]]) -> int:
         """Count leading span groups whose bytes are all host-resident.
 

@@ -1862,6 +1862,31 @@ def test_iouring_readahead_disabled_or_over_budget_is_skipped(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_iouring_wait_readahead_idle_returns_after_reads(tmp_path) -> None:
+    """Waiting for readahead idleness returns once every group was read."""
+    blocks = 4
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=ALIGNMENT,
+            readahead_window=1,
+        )
+        try:
+            await layer.wait_readahead_idle()
+            span = {"file_offset": 0, "nbytes": ALIGNMENT * 2}
+            assert await layer.start_readahead([span]) is True
+            await asyncio.wait_for(layer.wait_readahead_idle(), timeout=10)
+            assert layer.stats.readahead_read_bytes == ALIGNMENT * 2
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_readahead_keeps_live_readahead_and_trims_new_one(tmp_path) -> None:
     """A later readahead never evicts a live one; it uses the budget left.
 
