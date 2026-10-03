@@ -951,6 +951,28 @@ def test_lmcache_evict_start_keeps_l2_adapter(tmp_path: Path) -> None:
     assert cmd[cmd.index("--eviction-trigger-watermark") + 1] == "0.8"
     assert l2_spec["type"] == "fs"
     assert l2_spec["base_path"].endswith("lmcache_mp_disk")
+    assert l2_spec["use_odirect"] is False
+
+
+def test_lmcache_l2_odirect_reaches_fs_adapter(tmp_path: Path) -> None:
+    """``lmcache_l2_odirect`` opens the filesystem L2 adapter with O_DIRECT."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        lmcache_l2_odirect=True,
+    )
+
+    cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
+    l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
+
+    assert l2_spec["use_odirect"] is True
 
 
 def test_summarise_results_reports_hit_rate() -> None:

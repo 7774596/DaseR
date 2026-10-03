@@ -27,6 +27,7 @@ import httpx
 
 from benchmarks.mooncake.benchmark import ROUTES
 from benchmarks.utils.servers import (
+    LMCACHE_HTTP_PORT,
     ServerManager,
     check_runtime_environment,
     stop_from_pid_file,
@@ -57,6 +58,8 @@ ARMS = (
     "daser-compressed-piecewise",
     "daser-raw-layerwise",
     "daser-raw-piecewise",
+    # LMCache MP server (L1 + O_DIRECT fs L2) through its vLLM connector.
+    "lmcache",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_MODES = ("none", "pass", "split")
@@ -342,7 +345,11 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
     manager_type = _SERVER_TYPES.get(arm, MatchedServer)
     return manager_type(
         run_id=f"agent-{arm}",
-        backend="daser" if arm.startswith("daser") else "vllm",
+        backend=(
+            "daser"
+            if arm.startswith("daser")
+            else ("lmcache" if arm == "lmcache" else "vllm")
+        ),
         model=args.model,
         store_dir=args.scratch / arm,
         gpu_id=args.gpu_id,
@@ -381,6 +388,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,
         extra_vllm_gpu_ids=tuple(args.extra_gpu_ids) if arm.startswith("daser") else (),
+        lmcache_l2_odirect=True,
     )
 
 
@@ -561,6 +569,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
         )
         daser_after = await _daser_metrics(arm, manager)
         vllm_after = await _vllm_metrics(manager)
+        if arm == "lmcache":
+            # LMCache L1/L2 occupancy and tier state after the replay.
+            (out_dir / "lmcache_status_after.json").write_text(
+                await _text(f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status")
+            )
         (out_dir / "daser_metrics_before.prom").write_text(daser_before)
         (out_dir / "daser_metrics_after.prom").write_text(daser_after)
         (out_dir / "vllm_metrics_before.prom").write_text(vllm_before)
@@ -573,7 +586,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
             "vllm_command": manager.vllm_command(
                 manager.daser_kv_transfer_config()
                 if arm.startswith("daser")
-                else (manager.offload_config() if arm in _SERVER_TYPES else None)
+                else (
+                    manager.lmcache_kv_transfer_config()
+                    if arm == "lmcache"
+                    else (manager.offload_config() if arm in _SERVER_TYPES else None)
+                )
             ),
             "runtime_config": runtime_config,
             "gateway": args.gateway if gateway is not None else "none",

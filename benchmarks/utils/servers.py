@@ -255,6 +255,7 @@ class ServerManager:
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
         extra_vllm_gpu_ids: tuple[str, ...] = (),
+        lmcache_l2_odirect: bool = False,
     ) -> None:
         """Initialize the service manager.
 
@@ -298,6 +299,8 @@ class ServerManager:
             daser_piecewise_cudagraph: force PIECEWISE graphs without
                 layer-wise loads, as the like-for-like baseline.
             storage_format: DaseR physical KV storage format.
+            lmcache_l2_odirect: open LMCache fs L2 files with ``O_DIRECT`` so
+                its reads bypass the OS page cache, as DaseR's L2 reads do.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
@@ -343,6 +346,7 @@ class ServerManager:
         self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
         self.daser_l1_split_fraction = daser_l1_split_fraction
         self.daser_l1_lru = daser_l1_lru
+        self.lmcache_l2_odirect = lmcache_l2_odirect
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -472,7 +476,13 @@ class ServerManager:
             cmd.extend(
                 [
                     "--l2-adapter",
-                    json.dumps({"type": "fs", "base_path": str(scratch)}),
+                    json.dumps(
+                        {
+                            "type": "fs",
+                            "base_path": str(scratch),
+                            "use_odirect": self.lmcache_l2_odirect,
+                        }
+                    ),
                 ]
             )
         return cmd
