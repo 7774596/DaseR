@@ -548,6 +548,7 @@ async def replay(
     abort_after_failures: int = 0,
     prefix_dependencies: bool = False,
     route: str = "sticky",
+    strict_order: bool = False,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -570,6 +571,10 @@ async def replay(
             happens before the concurrency semaphore and is excluded from
             client queue time and TTFT.
         route: :class:`InstanceRouter` policy when several URLs are given.
+        strict_order: Hold each request until the previous one completes, so
+            the send order is exactly the trace order (implies prefix
+            dependencies). Without it, closed-loop replay sends ready
+            requests in semaphore wake-up order, not trace order.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -601,6 +606,11 @@ async def replay(
         if prefix_dependencies
         else [None] * len(selection.eligible)
     )
+    if strict_order:
+        predecessors = [
+            position - 1 if position else None
+            for position in range(len(selection.eligible))
+        ]
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -719,6 +729,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "stored its shared hash_ids prefix completes (closed-loop replay)."
         ),
     )
+    parser.add_argument(
+        "--strict-order",
+        action="store_true",
+        help=(
+            "Send each request only after the previous trace request "
+            "completes, so the replay follows the trace order exactly."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -783,6 +801,7 @@ async def main_async(args: argparse.Namespace) -> int:
         abort_after_failures=args.abort_after_failures,
         prefix_dependencies=args.prefix_dependencies,
         route=args.route,
+        strict_order=args.strict_order,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
