@@ -603,6 +603,14 @@ class LoadPipeline:
         state = self._layerwise
         if state is None or not 0 <= layer < len(state.ready):
             return
+        stream = torch.cuda.current_stream()
+        before: torch.cuda.Event | None = None
+        if self._time_gpu_stall:
+            # Marked before the host blocks: the forward stream idles from
+            # here until the layer's restore completes, whether it waits on
+            # the restore event or on this thread to enqueue more work.
+            before = torch.cuda.Event(enable_timing=True)
+            before.record(stream)
         ready = state.ready[layer]
         if not ready.is_set():
             wait_start = time.perf_counter()
@@ -610,16 +618,9 @@ class LoadPipeline:
             state.stall_ms += (time.perf_counter() - wait_start) * 1000
         event = state.events[layer]
         if event is not None:
-            stream = torch.cuda.current_stream()
-            if not self._time_gpu_stall:
-                stream.wait_event(event)
-                return
-            # The forward stream idles between these two marks while the
-            # layer's restore is still running.
-            before = torch.cuda.Event(enable_timing=True)
-            after = torch.cuda.Event(enable_timing=True)
-            before.record(stream)
             stream.wait_event(event)
+        if before is not None:
+            after = torch.cuda.Event(enable_timing=True)
             after.record(stream)
             state.gpu_marks.append((before, after))
 
