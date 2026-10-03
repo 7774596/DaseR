@@ -63,9 +63,17 @@ def main() -> None:
         default=["24gib", "64gib", "128gib", "256gib", "512gib", "0"],
         help="Byte capacities; 0 means infinite.",
     )
+    parser.add_argument(
+        "--ratios",
+        nargs="+",
+        type=float,
+        default=[1.0],
+        help="Stored/raw byte ratios (one column each, e.g. 1.0 0.737).",
+    )
     args = parser.parse_args()
     requests = list(load_trace(args.trace, args.max_requests, args.start_request, 0))
     unique = len({block for request in requests for block in request.hash_ids})
+    total_tokens = sum(request.input_length for request in requests)
     block_bytes = MOONCAKE_BLOCK_TOKENS * args.kv_bytes_per_token
     print(
         f"requests={len(requests)} span_s={requests[-1].timestamp_ms / 1000:.0f} "
@@ -73,8 +81,12 @@ def main() -> None:
     )
     for text in args.capacities:
         capacity = parse_size_bytes(text)
-        rate, hits, total = prefix_hit_rate(requests, capacity // block_bytes)
-        print(f"cap={text:>8} hit={rate:.3f} hit_tok={hits} prompt_tok={total}")
+        cells = []
+        for ratio in args.ratios:
+            stored = max(1, int(block_bytes * ratio))
+            rate, hits, _ = prefix_hit_rate(requests, capacity // stored)
+            cells.append(f"r{ratio:g}: hit={rate:.3f} miss_tok={total_tokens - hits}")
+        print(f"cap={text:>8} " + "  ".join(cells))
 
 
 if __name__ == "__main__":
