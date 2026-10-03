@@ -246,6 +246,7 @@ class ServerManager:
         daser_prefetch_lease_budget_bytes: int = 0,
         daser_l2_read_stripe_bytes: int = 0,
         daser_l1_split_fraction: float = 0.0,
+        daser_l1_lru: bool = False,
         daser_l1_accounting: str = "stored",
         daser_coalesce_loads: bool = False,
         daser_layerwise_load: bool = False,
@@ -286,6 +287,8 @@ class ServerManager:
                 the server default of one serial read per extent).
             daser_l1_split_fraction: DaseR ``--l1-split-fraction`` (0 leaves
                 split residency off).
+            daser_l1_lru: pass ``--no-bip-enabled`` so L1 inserts at the MRU
+                end (plain LRU) instead of BIP.
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
             daser_coalesce_loads: let the connector hold back requests whose
                 prefix another request is already loading.
@@ -338,6 +341,7 @@ class ServerManager:
         self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
         self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
         self.daser_l1_split_fraction = daser_l1_split_fraction
+        self.daser_l1_lru = daser_l1_lru
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -640,6 +644,8 @@ class ServerManager:
             cmd.extend(["--l2-read-stripe", str(self.daser_l2_read_stripe_bytes)])
         if self.daser_l1_split_fraction:
             cmd.extend(["--l1-split-fraction", str(self.daser_l1_split_fraction)])
+        if self.daser_l1_lru:
+            cmd.append("--no-bip-enabled")
         if self.daser_l1_accounting != "stored":
             cmd.extend(["--l1-accounting", self.daser_l1_accounting])
         if self.trust_remote_code:

@@ -290,6 +290,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.6,
         help="DaseR --l1-split-fraction for the *-split arms only.",
     )
+    parser.add_argument(
+        "--daser-l1-lru",
+        action="store_true",
+        help="Run DaseR L1 as plain LRU (--no-bip-enabled) instead of BIP.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -363,6 +368,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         daser_l1_split_fraction=(
             args.daser_l1_split_fraction if arm.endswith("-split") else 0.0
         ),
+        daser_l1_lru=args.daser_l1_lru,
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,

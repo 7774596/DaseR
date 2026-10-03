@@ -2022,6 +2022,10 @@ class IPCServer:
             return
         self._gpu_shadow_prompt = (tokens, model_id)
         transfer = self._ensure_transfer()
+        counter = self._metrics.counter(
+            "daser_l1_gpu_shadow_rerank_total",
+            "L1 allocations reordered by the GPU residency shadow.",
+        )
         if previous is not None:
             served = sorted(
                 await self._core.lookup(previous[0], previous[1]),
@@ -2032,16 +2036,25 @@ class IPCServer:
                 for chunk in served
             )
             for spans in resident:
-                await transfer.rerank_l1(spans, victim=True)
+                counter.inc(
+                    await transfer.rerank_l1(spans, victim=True),
+                    labels={"to": "victim"},
+                )
             for spans in evicted:
-                await transfer.rerank_l1(spans, victim=False)
+                counter.inc(
+                    await transfer.rerank_l1(spans, victim=False),
+                    labels={"to": "recent"},
+                )
         missing = shadow.drop(
             chunk.chunk_key
             for chunk in chunks
             if int(chunk.target_token_start) >= num_computed_tokens
         )
         for spans in missing:
-            await transfer.rerank_l1(spans, victim=False)
+            counter.inc(
+                await transfer.rerank_l1(spans, victim=False),
+                labels={"to": "recent"},
+            )
 
     def _observe_session(self, tokens: bytes, model_id: str) -> None:
         """Feed a scheduler lookup to the session predictor.
