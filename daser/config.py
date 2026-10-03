@@ -41,6 +41,10 @@ STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
 LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
+#: Research switch: ``1`` makes readahead read the whole stored prefix from
+#: token 0, including the part vLLM already hits on GPU (the LMCache prefetch
+#: semantics), instead of only the external load window after it.
+READAHEAD_WHOLE_PREFIX_ENV = "DASER_READAHEAD_WHOLE_PREFIX"
 #: Research switch: ``1`` makes a load copy each readahead piece as soon as it
 #: is retained, overlapping host-to-device copies with the remaining reads.
 LOAD_READAHEAD_STREAM_ENV = "DASER_LOAD_READAHEAD_STREAM"
