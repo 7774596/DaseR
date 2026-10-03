@@ -27,7 +27,6 @@ from daser.config import (
     READAHEAD_BUDGET_FRACTION_ENV,
     READAHEAD_SKIP_STASHED_ENV,
     READAHEAD_SRPT_ENV,
-    READAHEAD_WHOLE_PREFIX_ENV,
     SESSION_PREDICT_ACCURACY_ENV,
     SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
@@ -465,8 +464,6 @@ class IPCServer:
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
-        # Research switch: readahead the whole stored prefix (LMCache prefetch).
-        self._readahead_whole_prefix = os.environ.get(READAHEAD_WHOLE_PREFIX_ENV) == "1"
         # Research switch: read the predicted next session's prefix ahead.
         self._session_predictor = (
             SessionPredictor(
@@ -754,10 +751,8 @@ class IPCServer:
             await self._core.record_external_prefix_cache(queries=queries, hits=hits)
             if self._session_predictor is not None and isinstance(tokens, bytes):
                 self._observe_session(tokens, str(msg["model_id"]))
-            if self._readahead_piece and chunks:
-                spans = self._readahead_spans(
-                    chunks, num_computed_tokens, hits, queries
-                )
+            if self._readahead_piece and chunks and hits > 0:
+                spans = self._external_spans(chunks, num_computed_tokens, hits)
                 if spans:
                     await self._ensure_transfer().start_readahead(spans)
         return {"chunks": self._chunk_payloads(chunks)}
@@ -788,11 +783,14 @@ class IPCServer:
             self._lookup_tokens(msg), msg["model_id"], defer=False
         )
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
-        queries = int(msg.get("external_prefix_queries", 0))
         hits = _external_prefix_hits(
-            chunks, num_computed_tokens=num_computed_tokens, queries=queries
+            chunks,
+            num_computed_tokens=num_computed_tokens,
+            queries=int(msg.get("external_prefix_queries", 0)),
         )
-        spans = self._readahead_spans(chunks, num_computed_tokens, hits, queries)
+        spans = (
+            self._external_spans(chunks, num_computed_tokens, hits) if hits > 0 else []
+        )
         started = bool(spans) and await self._ensure_transfer().start_readahead(spans)
         return {"started": started}
 
@@ -2008,29 +2006,6 @@ class IPCServer:
                     payload["compressed_slots"] = online_refs
             payloads.append(payload)
         return payloads
-
-    def _readahead_spans(
-        self,
-        chunks: list[ChunkInfo],
-        num_computed_tokens: int,
-        hits: int,
-        queries: int,
-    ) -> list[dict[str, int]]:
-        """Return the spans a lookup readahead reads.
-
-        By default this is the external load window after the GPU hit. With
-        the whole-prefix switch it is the stored prefix from token 0.
-        """
-        if self._readahead_whole_prefix:
-            start, hits = (
-                0,
-                _external_prefix_hits(
-                    chunks, num_computed_tokens=0, queries=num_computed_tokens + queries
-                ),
-            )
-        else:
-            start = num_computed_tokens
-        return self._external_spans(chunks, start, hits) if hits > 0 else []
 
     def _external_spans(
         self,

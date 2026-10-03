@@ -2890,65 +2890,6 @@ async def test_ipc_readahead_hint_reads_ahead_without_lookup_metrics(
     )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("whole_prefix", [False, True])
-async def test_ipc_readahead_whole_prefix_switch_reads_gpu_hit_blocks(
-    tmp_path, monkeypatch, whole_prefix: bool
-) -> None:
-    """Lookup readahead reads only blocks after the GPU hit by default.
-
-    With the whole-prefix switch it also reads the block vLLM computed.
-    """
-    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
-    if whole_prefix:
-        monkeypatch.setenv("DASER_READAHEAD_WHOLE_PREFIX", "1")
-    else:
-        monkeypatch.delenv("DASER_READAHEAD_WHOLE_PREFIX", raising=False)
-    _ReadaheadRecordingTransfer.readaheads = []
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        _ReadaheadRecordingTransfer,
-    )
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, make_core(), make_runtime_config(tmp_path))
-    await server.start()
-    blocks = 2
-    tokens = list(range(1, blocks * BLOCK_TOKENS + 1))
-    try:
-        key = ROLLING_PREFIX_SEED
-        for block in range(blocks):
-            key = rolling_prefix_key(
-                key, tokens[block * BLOCK_TOKENS : (block + 1) * BLOCK_TOKENS]
-            )
-            await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": key,
-                    "token_count": BLOCK_TOKENS,
-                    "model_id": "m",
-                },
-            )
-            await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
-        await _send_recv(
-            socket_path,
-            {
-                "op": "lookup",
-                "tokens": tokens + [99],
-                "model_id": "m",
-                "external_prefix_queries": BLOCK_TOKENS + 1,
-                "num_computed_tokens": BLOCK_TOKENS,
-            },
-        )
-    finally:
-        await server.stop()
-
-    assert len(_ReadaheadRecordingTransfer.readaheads) == 1
-    spans = _ReadaheadRecordingTransfer.readaheads[0]
-    read_blocks = 2 if whole_prefix else 1
-    assert sum(int(span["nbytes"]) for span in spans) == read_blocks * SLOT_SIZE
-
-
 class _SessionPrefetchTransfer(_ReadaheadRecordingTransfer):
     """Readahead recorder that also serves loads without reading."""
 
