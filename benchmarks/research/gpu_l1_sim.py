@@ -36,6 +36,7 @@ def simulate(
     l1_blocks: int,
     policy: str,
     warmup: int,
+    promote: bool = False,
 ) -> dict[str, float]:
     """Replay ``requests`` and return token shares and background block reads.
 
@@ -46,6 +47,8 @@ def simulate(
         policy: ``inclusive``, ``gpu-aware`` or ``demote`` with LRU
             insertion, or the same with a ``bip-`` prefix for BIP insertion.
         warmup: Requests excluded from the shares.
+        promote: Blocks a load reads from L2 also enter L1 (DaseR loads and
+            readaheads fill L1), with the same insertion policy as stores.
 
     Returns:
         ``loc``, ``l1`` and ``l2`` shares of prompt blocks after warmup, and
@@ -85,13 +88,18 @@ def simulate(
             local += 1
         external = local
         served_l1 = served_l2 = 0
+        from_l2: list[int] = []
         while external < len(blocks) and blocks[external] in l2:
             if blocks[external] in l1:
                 served_l1 += 1
                 l1.move_to_end(blocks[external])
             else:
                 served_l2 += 1
+                from_l2.append(blocks[external])
             external += 1
+        if promote:
+            for block in from_l2:
+                l1_insert(block)
         if measured:
             totals["loc"] += local
             totals["l1"] += served_l1
@@ -136,6 +144,9 @@ def main() -> None:
     parser.add_argument("--l1", nargs="+", default=["64gib"])
     parser.add_argument("--ratio", type=float, default=0.737)
     parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument(
+        "--promote", action="store_true", help="L2 load reads also fill L1."
+    )
     args = parser.parse_args()
     requests = load_trace(args.trace, 0, 0, 0)
     block_bytes = MOONCAKE_BLOCK_TOKENS * args.kv_bytes_per_token
@@ -151,7 +162,9 @@ def main() -> None:
                 "shadow",
                 "bip-shadow",
             ):
-                r = simulate(requests, gpu_blocks, l1_blocks, policy, args.warmup)
+                r = simulate(
+                    requests, gpu_blocks, l1_blocks, policy, args.warmup, args.promote
+                )
                 print(
                     f"l1={l1_size} {fmt} {policy:13s} loc={r['loc']:.3f} "
                     f"l1={r['l1']:.3f} l2={r['l2']:.3f} "
