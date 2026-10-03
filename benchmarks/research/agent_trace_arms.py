@@ -50,10 +50,13 @@ ARMS = (
     # L1 split residency (--daser-l1-split-fraction) on raw / compressed stores.
     "daser-raw-split",
     "daser-compressed-split",
-    # Fully leased packed hits restored layer by layer inside the forward
-    # pass, and its PIECEWISE-graph baseline (needs prefetch for leases).
+    # Fully leased hits restored layer by layer inside the forward pass, and
+    # their PIECEWISE-graph baselines (need prefetch for leases), on packed
+    # and raw stores.
     "daser-compressed-layerwise",
     "daser-compressed-piecewise",
+    "daser-raw-layerwise",
+    "daser-raw-piecewise",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_MODES = ("none", "pass", "split")

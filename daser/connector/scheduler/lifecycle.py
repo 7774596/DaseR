@@ -136,9 +136,10 @@ class RequestLifecycle:
         # paired with the vLLM computed-token count their spans start at.
         self._prefetch_lookup_results: dict[str, tuple[int, PrefetchLookupResult]] = {}
         self._leased_request_ids: set[str] = set()
-        # Research switch: fully leased packed hits load synchronously and are
-        # restored layer by layer inside the forward pass. The worker then
-        # owns the request lease, so these IDs never report finished_recving.
+        # Research switch: fully leased packed or raw hits load synchronously
+        # and are restored layer by layer inside the forward pass. The worker
+        # then owns the request lease, so these IDs never report
+        # finished_recving.
         self._layerwise_load = layerwise_load
         self._layerwise_request_ids: set[str] = set()
         self._finish_admission = False
@@ -891,18 +892,24 @@ class RequestLifecycle:
     def _layerwise_eligible(self, req_id: str, chunks: list[dict[str, Any]]) -> bool:
         """Return whether a hit can be restored layer by layer in-forward.
 
-        Only requests whose every record is packed and leased in L1 qualify:
-        the worker then reads each layer's plane bytes straight from L1.
+        Only requests leased in L1 whose records are either all packed or
+        all raw qualify: the worker then reads each layer's bytes straight
+        from L1. Raw chunks must not need a position shift.
         """
         if not getattr(self, "_layerwise_load", False):
             return False
         if req_id not in getattr(self, "_leased_request_ids", set()):
             return False
-        return bool(chunks) and all(
-            chunk.get("compressed_slots")
-            and all(
-                slot.get("mode") == "compressed" for slot in chunk["compressed_slots"]
+        if not chunks:
+            return False
+        if all(chunk.get("compressed_slots") for chunk in chunks):
+            return all(
+                slot.get("mode") == "compressed"
+                for chunk in chunks
+                for slot in chunk["compressed_slots"]
             )
+        return not any(
+            chunk.get("compressed_slots") or chunk.get("pos_offset", 0)
             for chunk in chunks
         )
 

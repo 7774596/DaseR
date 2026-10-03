@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 # Third Party
 import cupy
@@ -31,7 +31,10 @@ from daser.connector.worker.memory import (
     CudaStagingLease,
     FixedCudaStagingPool,
 )
-from daser.connector.worker.staging import copy_staging_to_kv_cache
+from daser.connector.worker.staging import (
+    CROSS_LAYER_KV_CACHE_KEY,
+    copy_staging_to_kv_cache,
+)
 from daser.logging import init_logger
 from daser.ops.compressed_kv import (
     FusedCompressedKVDecoder,
@@ -161,38 +164,60 @@ def _load_source_descriptor(
 
 def _layerwise_records(
     specs: dict[str, ReqLoadSpec],
-) -> tuple[np.ndarray, list[int], str]:
-    """Flatten one step's layer-wise loads into packed records.
+    slot_size: int,
+) -> tuple[np.ndarray, list[int], str, bool]:
+    """Flatten one step's layer-wise loads into packed or raw records.
 
     Args:
         specs: Synchronously scheduled load specs of this step.
+        slot_size: Raw bytes of one slot, used to address raw records.
 
     Returns:
-        Record file offsets, matching destination blocks, and the single
-        request lease that retains every record in L1.
+        Record file offsets, matching destination blocks, the single request
+        lease that retains every record in L1, and whether the records are
+        packed (otherwise every record is a raw slot-major slot).
 
     Raises:
-        ValueError: If a spec is not fully packed, carries no lease, the step
-            mixes leases, or two records target one block.
+        ValueError: If a spec mixes packed and raw records, carries a raw
+            fallback slot, a position offset, or no lease, the step mixes
+            leases or formats, or two records target one block.
 
     Async/thread-safety:
         Pure planning on the load thread.
     """
     offsets: list[int] = []
     block_ids: list[int] = []
+    formats: set[bool] = set()
     leases = {spec.lease_id for spec in specs.values()}
     if len(leases) != 1 or "" in leases:
         raise ValueError(f"layer-wise load needs one request lease, got {leases}")
     for spec in specs.values():
-        if len(spec.compressed_slots) != len(spec.block_ids) or any(
-            slot.mode != "compressed" for slot in spec.compressed_slots
-        ):
-            raise ValueError("layer-wise load requires packed records only")
-        offsets.extend(slot.file_offset for slot in spec.compressed_slots)
+        packed = bool(spec.compressed_slots)
+        formats.add(packed)
+        if packed:
+            if len(spec.compressed_slots) != len(spec.block_ids) or any(
+                slot.mode != "compressed" for slot in spec.compressed_slots
+            ):
+                raise ValueError("layer-wise load requires packed records only")
+            offsets.extend(slot.file_offset for slot in spec.compressed_slots)
+        else:
+            if spec.pos_offset:
+                raise ValueError("raw layer-wise load requires zero position offset")
+            offsets.extend(
+                spec.file_offset + index * slot_size
+                for index in range(len(spec.block_ids))
+            )
         block_ids.extend(int(block) for block in spec.block_ids)
+    if len(formats) != 1:
+        raise ValueError("layer-wise load cannot mix packed and raw records")
     if not offsets or len(set(block_ids)) != len(block_ids):
         raise ValueError("layer-wise load destinations must be distinct")
-    return np.asarray(offsets, dtype=np.int64), block_ids, leases.pop()
+    return (
+        np.asarray(offsets, dtype=np.int64),
+        block_ids,
+        leases.pop(),
+        formats.pop(),
+    )
 
 
 def _interval_union_ms(spans: list[tuple[float, float]]) -> float:
@@ -359,6 +384,7 @@ class LoadPipeline:
         self._rope_is_neox_style = True
         self._cuda_stream: torch.cuda.Stream | None = None
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
+        self._raw_layerwise_stream: torch.cuda.Stream | None = None
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._layerwise: _LayerwiseLoad | None = None
         # Pinned landing buffer for layer-wise header pages, grown on demand
@@ -513,11 +539,11 @@ class LoadPipeline:
     def start_layerwise(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
         """Begin this step's in-forward layer-wise restore.
 
-        Every record is fully leased in L1 and packed. The load thread reads
-        the header pages once, then streams one layer's plane bytes per
-        ``transfer_load_runs`` call over two staging buffers and decodes each
-        layer as soon as its bytes land, so attention of layer ``i`` waits
-        only for layer ``i``.
+        Every record is fully leased in L1, and either all packed or all raw.
+        The load thread streams one layer's bytes per ``transfer_load_runs``
+        call over two staging buffers (packed records first stage their
+        header pages) and restores each layer as soon as its bytes land, so
+        attention of layer ``i`` waits only for layer ``i``.
 
         Args:
             reqs_to_load: Synchronously scheduled load specs keyed by spec ID;
@@ -1302,21 +1328,21 @@ class LoadPipeline:
     async def _run_layerwise(
         self, state: _LayerwiseLoad, specs: dict[str, ReqLoadSpec]
     ) -> None:
-        """Stream and decode one step's packed records layer by layer.
+        """Stream and restore one step's records layer by layer.
 
-        Header pages land compactly at the tail of buffer 1, are planned on
-        the host and placed at every record's slot offset in both buffers.
-        Layer ``g`` then reads only its plane bytes into buffer ``g % 2``,
-        patches its descriptors in place and decodes through one shared
-        prepared plan.
+        Layer ``g`` reads only its bytes of every record into buffer
+        ``g % 2`` and is restored as soon as they land: packed records decode
+        their layer planes through one shared prepared plan
+        (``_packed_layer_groups``); raw slot-major records copy their layer
+        run straight into the KV cache (``_raw_layer_groups``).
 
         Args:
             state: Shared step state published to ``wait_for_layer``.
             specs: The step's synchronously scheduled load specs.
 
         Async/thread-safety:
-            Runs on the load event loop. GPU work is enqueued on the
-            compressed restore stream and host waits poll CUDA events, so the
+            Runs on the load event loop. GPU work is enqueued on a dedicated
+            restore stream and host waits poll CUDA events, so the
             loop keeps serving asynchronous loads. Staging buffers stay leased
             until the last decode completes; the request transfer lease is
             released here because the scheduler handed it to the worker.
@@ -1325,96 +1351,33 @@ class LoadPipeline:
         tasks: list[asyncio.Task[dict[str, Any]]] = []
         stream: torch.cuda.Stream | None = None
         try:
-            files, block_ids, lease_id = _layerwise_records(specs)
+            files, block_ids, lease_id, packed = _layerwise_records(
+                specs, self._local_slot_size
+            )
             self._ensure_cuda_streams()
-            decoder = self._compressed_decoder
-            stream = self._compressed_cuda_stream
             pool = self._staging_pool
-            if decoder is None or stream is None or pool is None:
-                raise RuntimeError("layer-wise load requires the compressed decoder")
+            if pool is None:
+                raise RuntimeError("layer-wise load requires a staging pool")
             if not self._staging_registered or pool.depth < 2 or len(self._clients) < 2:
                 raise RuntimeError("layer-wise load requires two registered buffers")
             leases = [pool.acquire_index(index, pool.buffer_bytes) for index in (0, 1)]
             buffers = [lease.view for lease in leases]
-            words = [
-                buffer[: buffer.numel() // 4 * 4].view(torch.int32)
-                for buffer in buffers
-            ]
-            rows = [
-                buffer[: buffer.numel() // IO_ALIGNMENT * IO_ALIGNMENT].view(
-                    -1, IO_ALIGNMENT
-                )
-                for buffer in buffers
-            ]
             pid = os.getpid()
             records = len(files)
-            header_bytes = records * IO_ALIGNMENT
-            tail = (pool.buffer_bytes - header_bytes) // IO_ALIGNMENT * IO_ALIGNMENT
-            if tail <= 0:
-                raise ValueError("layer-wise header pages exceed staging")
-            await self._clients[1].transfer_load_runs(
-                1,
-                pid,
-                files,
-                tail + np.arange(records, dtype=np.int64) * IO_ALIGNMENT,
-                np.full(records, IO_ALIGNMENT, dtype=np.int64),
-                lease_id,
-            )
-            host = self._header_host
-            if host is None or host.numel() < header_bytes:
-                host = torch.empty(header_bytes, dtype=torch.uint8, pin_memory=True)
-                self._header_host = host
-            with torch.cuda.stream(stream):
-                landed = buffers[1][tail : tail + header_bytes]
-                host[:header_bytes].copy_(landed, non_blocking=True)
-                pages = landed.clone().view(records, IO_ALIGNMENT)
-                copied = torch.cuda.Event()
-                copied.record(stream)
-            await self._wait_for_cuda_event(copied)
-            headers = host[:header_bytes].numpy().reshape(records, IO_ALIGNMENT)
             layers = len(state.ready)
-            plans = plan_layer_groups(
-                headers, [(2 * layer, 2) for layer in range(layers)]
-            )
-            if plans[0].staging_bytes > tail:
-                raise ValueError("layer-wise staging exceeds the staging buffer")
-            patches = [staged_descriptor_patch(headers, plan) for plan in plans]
-            bounds = np.concatenate(([0], np.cumsum([len(p[0]) for p in patches])))
-            device = buffers[0].device
-            with torch.cuda.stream(stream):
-                slots = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
-                    device
+            if packed:
+                stream, plan_group, restore_group = await self._packed_layer_groups(
+                    state, files, block_ids, lease_id, buffers
                 )
-                for buffer_rows in rows:
-                    buffer_rows.index_copy_(0, slots, pages)
-                patch_index = torch.from_numpy(
-                    np.concatenate([p[0] for p in patches])
-                ).to(device)
-                patch_value = torch.from_numpy(
-                    np.concatenate([p[1] for p in patches])
-                ).to(device)
-                restore = decoder.prepare(
-                    staging=buffers[0],
-                    staging_offsets=plans[0].staging_offsets.tolist(),
-                    block_ids=block_ids,
-                    modes=[1] * records,
-                    buffer_index=0,
-                    stream=stream,
-                    plane_range=(0, 2 * layers),
+            else:
+                stream, plan_group, restore_group = self._raw_layer_groups(
+                    files, block_ids, buffers, layers
                 )
-            if restore is None:
-                raise RuntimeError("layer-wise load prepared no records")
             state.records = records
             state.header_ms = (time.perf_counter() - state.started_at) * 1000
 
             def transfer(group: int) -> asyncio.Task[dict[str, Any]]:
-                plan = plans[group]
-                # Gather copies need 16-byte runs. Records are 4 KiB aligned
-                # and staged congruently modulo 16, so widening to 16 stays
-                # inside the record and inside its staging footprint.
-                skew = plan.source_begin % 16
-                begin = plan.source_begin - skew
-                end = (plan.source_end + 15) // 16 * 16
+                group_files, targets, sizes = plan_group(group)
                 lane = group % 2
                 return asyncio.create_task(
                     timed(
@@ -1422,9 +1385,9 @@ class LoadPipeline:
                         self._clients[lane].transfer_load_runs(
                             lane,
                             pid,
-                            files + begin,
-                            plan.data_offsets - skew,
-                            end - begin,
+                            group_files,
+                            targets,
+                            sizes,
                             lease_id,
                             copy_mode=copy_mode,
                         ),
@@ -1449,19 +1412,15 @@ class LoadPipeline:
                 state.copy_ms += copy_ms
                 state.copy_max_ms = max(state.copy_max_ms, copy_ms)
                 lane = group % 2
-                first, last = int(bounds[group]), int(bounds[group + 1])
                 with torch.cuda.stream(stream):
-                    words[lane].index_put_(
-                        (patch_index[first:last],), patch_value[first:last]
-                    )
-                    restore.submit_planes(2 * group, 2, buffers[lane])
+                    restore_group(group, lane)
                     event = torch.cuda.Event()
                     event.record(stream)
                 state.events[group] = event
                 state.ready[group].set()
                 if group + 2 < layers:
                     # The next group on this lane overwrites the buffer this
-                    # decode reads.
+                    # restore reads.
                     waited = time.perf_counter()
                     await self._wait_for_cuda_event(event)
                     state.decode_wait_ms += (time.perf_counter() - waited) * 1000
@@ -1496,6 +1455,171 @@ class LoadPipeline:
                         lease_id[:8],
                         exc,
                     )
+
+    async def _packed_layer_groups(
+        self,
+        state: _LayerwiseLoad,
+        files: np.ndarray,
+        block_ids: list[int],
+        lease_id: str,
+        buffers: list[torch.Tensor],
+    ) -> tuple[
+        torch.cuda.Stream,
+        Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]],
+        Callable[[int, int], None],
+    ]:
+        """Stage packed record headers and plan their per-layer restores.
+
+        Header pages land compactly at the tail of buffer 1, are planned on
+        the host and placed at every record's slot offset in both buffers.
+
+        Returns:
+            The decode stream, a function giving one layer group's
+            ``(file offsets, staging offsets, lengths)`` runs, and a function
+            that patches that group's descriptors in a lane's buffer and
+            decodes it on the current stream.
+        """
+        decoder = self._compressed_decoder
+        stream = self._compressed_cuda_stream
+        if decoder is None or stream is None:
+            raise RuntimeError("packed layer-wise load requires the compressed decoder")
+        pool = self._staging_pool
+        assert pool is not None
+        words = [
+            buffer[: buffer.numel() // 4 * 4].view(torch.int32) for buffer in buffers
+        ]
+        rows = [
+            buffer[: buffer.numel() // IO_ALIGNMENT * IO_ALIGNMENT].view(
+                -1, IO_ALIGNMENT
+            )
+            for buffer in buffers
+        ]
+        records = len(files)
+        header_bytes = records * IO_ALIGNMENT
+        tail = (pool.buffer_bytes - header_bytes) // IO_ALIGNMENT * IO_ALIGNMENT
+        if tail <= 0:
+            raise ValueError("layer-wise header pages exceed staging")
+        await self._clients[1].transfer_load_runs(
+            1,
+            os.getpid(),
+            files,
+            tail + np.arange(records, dtype=np.int64) * IO_ALIGNMENT,
+            np.full(records, IO_ALIGNMENT, dtype=np.int64),
+            lease_id,
+        )
+        host = self._header_host
+        if host is None or host.numel() < header_bytes:
+            host = torch.empty(header_bytes, dtype=torch.uint8, pin_memory=True)
+            self._header_host = host
+        with torch.cuda.stream(stream):
+            landed = buffers[1][tail : tail + header_bytes]
+            host[:header_bytes].copy_(landed, non_blocking=True)
+            pages = landed.clone().view(records, IO_ALIGNMENT)
+            copied = torch.cuda.Event()
+            copied.record(stream)
+        await self._wait_for_cuda_event(copied)
+        headers = host[:header_bytes].numpy().reshape(records, IO_ALIGNMENT)
+        layers = len(state.ready)
+        plans = plan_layer_groups(headers, [(2 * layer, 2) for layer in range(layers)])
+        if plans[0].staging_bytes > tail:
+            raise ValueError("layer-wise staging exceeds the staging buffer")
+        patches = [staged_descriptor_patch(headers, plan) for plan in plans]
+        bounds = np.concatenate(([0], np.cumsum([len(p[0]) for p in patches])))
+        device = buffers[0].device
+        with torch.cuda.stream(stream):
+            slots = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
+                device
+            )
+            for buffer_rows in rows:
+                buffer_rows.index_copy_(0, slots, pages)
+            patch_index = torch.from_numpy(np.concatenate([p[0] for p in patches])).to(
+                device
+            )
+            patch_value = torch.from_numpy(np.concatenate([p[1] for p in patches])).to(
+                device
+            )
+            restore = decoder.prepare(
+                staging=buffers[0],
+                staging_offsets=plans[0].staging_offsets.tolist(),
+                block_ids=block_ids,
+                modes=[1] * records,
+                buffer_index=0,
+                stream=stream,
+                plane_range=(0, 2 * layers),
+            )
+        if restore is None:
+            raise RuntimeError("layer-wise load prepared no records")
+
+        def plan_group(group: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            plan = plans[group]
+            # Gather copies need 16-byte runs. Records are 4 KiB aligned and
+            # staged congruently modulo 16, so widening to 16 stays inside
+            # the record and inside its staging footprint.
+            skew = plan.source_begin % 16
+            begin = plan.source_begin - skew
+            end = (plan.source_end + 15) // 16 * 16
+            return files + begin, plan.data_offsets - skew, end - begin
+
+        def restore_group(group: int, lane: int) -> None:
+            first, last = int(bounds[group]), int(bounds[group + 1])
+            words[lane].index_put_((patch_index[first:last],), patch_value[first:last])
+            restore.submit_planes(2 * group, 2, buffers[lane])
+
+        return stream, plan_group, restore_group
+
+    def _raw_layer_groups(
+        self,
+        files: np.ndarray,
+        block_ids: list[int],
+        buffers: list[torch.Tensor],
+        layers: int,
+    ) -> tuple[
+        torch.cuda.Stream,
+        Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]],
+        Callable[[int, int], None],
+    ]:
+        """Plan per-layer restores of raw slot-major records.
+
+        A raw slot stores its layers back-to-back, so layer ``g`` of every
+        record is one contiguous ``slot_size / layers`` run at offset
+        ``g * layer_bytes``. Each run lands densely in a lane's buffer and is
+        scattered into the cross-layer KV view's layer ``g`` with one indexed
+        copy; no decoder or header pages are involved.
+
+        Returns:
+            The copy stream, a function giving one layer's
+            ``(file offsets, staging offsets, lengths)`` runs, and a function
+            that copies that layer from a lane's buffer into the KV cache on
+            the current stream.
+
+        Raises:
+            ValueError: If one layer of every record exceeds a staging buffer.
+        """
+        kv_cache = self._kv_caches[CROSS_LAYER_KV_CACHE_KEY]
+        if self._load_key_scale != 1.0 or self._load_value_scale != 1.0:
+            raise ValueError("raw layer-wise load does not apply load scales")
+        records = len(files)
+        layer_bytes = self._local_slot_size // layers
+        if records * layer_bytes > min(buffer.numel() for buffer in buffers):
+            raise ValueError("raw layer-wise layer exceeds the staging buffer")
+        if self._raw_layerwise_stream is None:
+            self._raw_layerwise_stream = torch.cuda.Stream(
+                device=kv_cache.device, priority=cuda_stream_priority("high")
+            )
+        stream = self._raw_layerwise_stream
+        targets = np.arange(records, dtype=np.int64) * layer_bytes
+        sizes = np.full(records, layer_bytes, dtype=np.int64)
+        index = torch.tensor(block_ids, dtype=torch.long, device=kv_cache.device)
+        shape = (records, *kv_cache.shape[2:])
+
+        def plan_group(group: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            return files + group * layer_bytes, targets, sizes
+
+        def restore_group(group: int, lane: int) -> None:
+            src = buffers[lane][: records * layer_bytes].view(kv_cache.dtype)
+            kv_cache[:, group].index_copy_(0, index, src.view(shape))
+
+        return stream, plan_group, restore_group
 
     def _log_layerwise(self, state: _LayerwiseLoad) -> None:
         """Log one finished layer-wise restore."""

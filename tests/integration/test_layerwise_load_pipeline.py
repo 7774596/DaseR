@@ -19,6 +19,7 @@ from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker import load as load_module
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import FixedCudaStagingPool
+from daser.connector.worker.staging import CROSS_LAYER_KV_CACHE_KEY
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -249,6 +250,93 @@ def test_layerwise_failure_invalidates_blocks_and_releases_lease(
         assert pipeline.take_invalid_block_ids() == set(blocks)
         assert pipeline.take_invalid_block_ids() == set()
         pipeline.start_layerwise({})
+        assert _FakeLoadClient.released == ["req"]
+    finally:
+        pipeline.shutdown()
+
+
+def test_raw_layerwise_restore_matches_slot_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw slot-major records restore each layer exactly before its wait."""
+    geometry = _geometry()
+    generator = torch.Generator().manual_seed(0)
+    raw = torch.randint(
+        0, 256, (3 * geometry.slot_size,), dtype=torch.uint8, generator=generator
+    )
+    # Two raw chunks; the second starts at its own file offset.
+    first_offset = IO_ALIGNMENT
+    second_offset = first_offset + 2 * geometry.slot_size + IO_ALIGNMENT
+    store = torch.zeros(second_offset + geometry.slot_size, dtype=torch.uint8)
+    store[first_offset : first_offset + 2 * geometry.slot_size] = raw[
+        : 2 * geometry.slot_size
+    ]
+    store[second_offset:] = raw[2 * geometry.slot_size :]
+    blocks = [2, 0, 1]
+
+    expected = _kv_cache(geometry)
+    slots = raw.cuda().view(expected.dtype).view(3, *expected.shape[1:])
+    expected.index_copy_(0, torch.tensor(blocks, device="cuda"), slots)
+
+    pool = FixedCudaStagingPool(torch.device("cuda"), 4 << 20, 2)
+    _FakeLoadClient.store = store.cuda()
+    _FakeLoadClient.pool = pool
+    _FakeLoadClient.fail_on_call = -1
+    _FakeLoadClient.calls = []
+    _FakeLoadClient.released = []
+    monkeypatch.setattr(load_module, "IPCClientAsync", _FakeLoadClient)
+
+    actual = _kv_cache(geometry)
+    pipeline = LoadPipeline("/unused/daser.sock", client_count=2)
+    pipeline.configure(
+        kv_caches={CROSS_LAYER_KV_CACHE_KEY: actual},
+        layer_names=[f"layer.{index}" for index in range(_LAYERS)],
+        local_slot_size=geometry.slot_size,
+        rank_stride_bytes=geometry.slot_size,
+        tp_rank=0,
+        staging_pool=pool,
+        load_key_scale=1.0,
+        load_value_scale=1.0,
+        rope_delta_scale=1.0,
+        rope_base=10000.0,
+        rope_rotary_dim=0,
+        rope_is_neox_style=True,
+    )
+    pipeline.initialize_transfer()
+    specs = {
+        "req:load:0": ReqLoadSpec(
+            chunk_key="a",
+            start_slot=0,
+            num_slots=2,
+            block_ids=blocks[:2],
+            file_offset=first_offset,
+            token_count=2 * geometry.block_tokens,
+            lease_id="req",
+        ),
+        "req:load:1": ReqLoadSpec(
+            chunk_key="b",
+            start_slot=2,
+            num_slots=1,
+            block_ids=blocks[2:],
+            file_offset=second_offset,
+            token_count=geometry.block_tokens,
+            lease_id="req",
+        ),
+    }
+    bits = actual.view(torch.int16)
+    want = expected.view(torch.int16)
+    try:
+        pipeline.start_layerwise(specs)
+        for layer in range(_LAYERS):
+            pipeline.wait_for_layer(layer)
+            torch.cuda.current_stream().synchronize()
+            # Random bytes include NaN patterns: compare bits, not values.
+            assert torch.equal(bits[:, : layer + 1], want[:, : layer + 1])
+        pipeline.start_layerwise({})
+        assert torch.equal(bits, want)
+        assert pipeline.take_invalid_block_ids() == set()
+        # No header read: one transfer per layer on alternating lanes.
+        assert _FakeLoadClient.calls == [0, 1, 0, 1]
         assert _FakeLoadClient.released == ["req"]
     finally:
         pipeline.shutdown()

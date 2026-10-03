@@ -16,14 +16,22 @@ SLOT_SIZE = 4096
 class _LookupIPC:
     """Synchronous IPC stub returning one leased L1 hit."""
 
-    def __init__(self, modes: list[str]) -> None:
+    def __init__(
+        self, modes: list[str], raw: bool = False, pos_offset: int = 0
+    ) -> None:
         self.modes = modes
+        self.raw = raw
+        self.pos_offset = pos_offset
         self.released: list[str] = []
 
     def lookup_with_prefetch(
         self, lease_id: str, tokens: list[int], model_id: str, **kwargs: Any
     ) -> PrefetchLookupResult:
-        """Return a two-slot chunk whose records use ``self.modes``."""
+        """Return a two-slot chunk whose records use ``self.modes``.
+
+        With ``raw`` the chunk is a raw slot-major chunk without packed
+        record metadata.
+        """
         del lease_id, tokens, model_id, kwargs
         slots = [
             {
@@ -43,8 +51,8 @@ class _LookupIPC:
                     "file_offset": 10 * SLOT_SIZE,
                     "token_count": len(slots) * BLOCK_TOKENS,
                     "target_token_start": 0,
-                    "pos_offset": 0,
-                    "compressed_slots": slots,
+                    "pos_offset": self.pos_offset,
+                    "compressed_slots": [] if self.raw else slots,
                 }
             ],
             spans=[],
@@ -111,6 +119,33 @@ def test_leased_packed_hit_loads_synchronously_and_hands_off_lease() -> None:
     assert not lifecycle.build_connector_meta(
         SimpleNamespace(num_scheduled_tokens={})
     ).layerwise_req_ids
+
+
+def test_leased_raw_hit_loads_synchronously() -> None:
+    """A leased raw slot-major L1 hit also takes the layer-wise path."""
+    ipc = _LookupIPC(["raw", "raw"], raw=True)
+    lifecycle = _lifecycle(ipc, layerwise=True)
+
+    matched, meta = _schedule(lifecycle)
+
+    assert matched == (2 * BLOCK_TOKENS, False)
+    assert meta.layerwise_req_ids == {"req"}
+    spec = meta.reqs_to_load["req"]
+    assert spec.block_ids == [5, 6]
+    assert spec.lease_id == "req"
+    assert spec.compressed_slots == []
+
+
+def test_raw_hit_with_position_shift_keeps_the_async_load_path() -> None:
+    """Raw layer-wise copies cannot apply RoPE shifts, so shifted hits wait."""
+    ipc = _LookupIPC(["raw", "raw"], raw=True, pos_offset=3)
+    lifecycle = _lifecycle(ipc, layerwise=True)
+
+    matched, meta = _schedule(lifecycle)
+
+    assert matched == (2 * BLOCK_TOKENS, True)
+    assert not meta.layerwise_req_ids
+    lifecycle.shutdown()
 
 
 @pytest.mark.parametrize(

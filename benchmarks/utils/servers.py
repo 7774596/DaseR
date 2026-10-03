@@ -292,8 +292,9 @@ class ServerManager:
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
             daser_coalesce_loads: let the connector hold back requests whose
                 prefix another request is already loading.
-            daser_layerwise_load: restore fully leased packed hits layer by
-                layer inside the forward pass (forces PIECEWISE graphs).
+            daser_layerwise_load: restore fully leased packed or raw hits
+                layer by layer inside the forward pass (forces PIECEWISE
+                graphs).
             daser_piecewise_cudagraph: force PIECEWISE graphs without
                 layer-wise loads, as the like-for-like baseline.
             storage_format: DaseR physical KV storage format.
