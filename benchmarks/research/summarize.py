@@ -475,6 +475,58 @@ def paired_rows(arm_dirs: list[Path], first: int, warm_ms: float = 0.0) -> list[
     return lines
 
 
+def overlap_bound_rows(
+    arm_dirs: list[Path], oracle_dir: Path, first: int, warm_ms: float = 0.0
+) -> list[str]:
+    """Bound the TTFT left if each request's extra IO overlapped its work.
+
+    The oracle arm keeps every stored byte in L1, so its TTFT ``o`` per request
+    is the work without SSD waits and ``x = t - o`` is the serial extra wait of
+    an arm with TTFT ``t``. Streaming the reads into the forward pass hides at
+    most ``min(x, o)``, which leaves ``max(o, x)`` per request.
+
+    Args:
+        arm_dirs: Arm directories to bound; the first one selects warm requests.
+        oracle_dir: Arm directory of the all-L1 oracle run of the same trace.
+        first: Number of lowest shared trace indices to compare.
+        warm_ms: When positive, keep only requests whose first-arm TTFT is
+            below this bound, as in :func:`paired_rows`.
+
+    Returns:
+        Formatted lines: one per arm with its summed TTFT, summed extra wait
+        and the summed overlap bound, in seconds.
+    """
+    dirs = [oracle_dir, *arm_dirs]
+    ttft_by_arm = [
+        {
+            int(record["trace_index"]): float(record["ttft_ms"])
+            for record in map(json.loads, (d / "requests.jsonl").open())
+            if record["status"] == "completed"
+        }
+        for d in dirs
+    ]
+    shared = sorted(set.intersection(*(set(t) for t in ttft_by_arm)))[:first]
+    if warm_ms > 0:
+        shared = [i for i in shared if ttft_by_arm[1][i] < warm_ms]
+    oracle = ttft_by_arm[0]
+    lines = [
+        f"overlap bound vs {oracle_dir.parent.parent.name} on {len(shared)} "
+        f"requests (s): oracle={sum(oracle[i] for i in shared) / 1e3:.0f}"
+    ]
+    for arm_dir, ttft in zip(arm_dirs, ttft_by_arm[1:], strict=True):
+        extra = [max(0.0, ttft[i] - oracle[i]) for i in shared]
+        pairs = list(zip(shared, extra, strict=True))
+        bound = [min(ttft[i], max(oracle[i], x)) for i, x in pairs]
+        hidden = [min(x, oracle[i]) for i, x in pairs]
+        lines.append(
+            f"  {arm_dir.parent.parent.name}/{arm_dir.name}: "
+            f"ttft={sum(ttft[i] for i in shared) / 1e3:.0f} "
+            f"extra={sum(extra) / 1e3:.1f} bound={sum(bound) / 1e3:.0f} "
+            f"hidden<={sum(hidden) / 1e3:.1f}"
+        )
+    return lines
+
+
 def order_rows(arm_dirs: list[Path]) -> list[str]:
     """Check that requests were sent in trace order.
 
@@ -528,6 +580,12 @@ def main() -> None:
         default=0.0,
         help="with --first, keep requests whose reference TTFT is below this",
     )
+    parser.add_argument(
+        "--overlap-oracle",
+        type=Path,
+        default=None,
+        help="with --first, all-L1 oracle artifact dir for the overlap bound",
+    )
     args = parser.parse_args()
     arm_dirs = [
         summary.parent
@@ -555,6 +613,15 @@ def main() -> None:
     print("\n".join(order_rows(arm_dirs)))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
+    if args.first > 0 and args.overlap_oracle is not None:
+        oracle_dirs = sorted(args.overlap_oracle.glob("*/summary.json"))
+        print(
+            "\n".join(
+                overlap_bound_rows(
+                    arm_dirs, oracle_dirs[0].parent, args.first, args.warm_ms
+                )
+            )
+        )
     if args.stages is not None:
         print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
 
