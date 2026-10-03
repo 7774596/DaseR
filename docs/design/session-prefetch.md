@@ -65,15 +65,34 @@ often no longer fits the budget and its readahead is skipped.
 ## Measured effect
 
 Research runs used agent-session traces with 256k-token contexts, the working
-set spilling to L1/L2, one request at a time, and paired warm TTFT.
+set spilling to L1/L2, one request at a time, and paired warm TTFT. Ratios are
+session prefetch over the same format without it (lower is better).
 
-| Setting (budget 0.75) | Compressed: depth 2 / no session prefetch | Raw: depth 2 / no session prefetch |
+| Session order (dense 4B, budget 0.75) | Compressed | Raw |
 |---|---|---|
-| Dense 4B | 0.75 | 0.87 |
-| MoE 30B-A3B FP8 | 0.81 | 0.90 |
+| Strict round-robin, depth 2 | 0.75 | 0.87 |
+| Real interleaving, depth 3, no idle gap | 1.00 | 1.03 |
+| Real interleaving, depth 3, 5 s idle gap (first 24 warm requests) | 0.99 | 0.92 |
 
-On the dense model the raw baseline is its strongest configuration (depth 1,
-budget 0.5); raw depth 2 equals raw depth 1 there.
+The MoE 30B-A3B FP8 model gave 0.81 (compressed) and 0.90 (raw) under strict
+round-robin.
+
+**The gain is a replay artifact.** Closed-loop replay with only prefix
+dependencies sends every ready request through one FIFO semaphore. That
+produces strict round-robin whatever the trace order, so the oldest-idle
+predictor is almost always right. The real-interleaving rows replay the trace
+in exact order (`--strict-order`). The session order follows Claude Code agent
+traces, where two sessions often alternate and most of the predicted prefix is
+still in GPU memory. In that order:
+
+- Speculative reads grow 3.5× and are mostly evicted from L1 unread.
+- Without idle time they compete with the current request's own load.
+- With idle time raw bytes gain more than compressed bytes, so there is no
+  co-design benefit.
+
+The mechanism stays off by default.
+
+Notes on the round-robin results:
 
 - **Why depth 2 gains under compression.** The second-session readaheads
   mostly start under compression and are mostly skipped under raw bytes.
@@ -88,8 +107,8 @@ budget 0.5); raw depth 2 equals raw depth 1 there.
 ## Limitations
 
 - **Session order is a heuristic.** Prediction relies on prompt-prefix
-  continuation and round-robin return order. Workloads where sessions return
-  in an order unrelated to idle time get no benefit, but the speculative reads
-  still compete for the budget.
+  continuation and round-robin return order. Under real agent interleaving it
+  predicts 40% / 61% / 72% of session switches at depth 1 / 2 / 3. The
+  speculative reads that miss still compete for the budget.
 - **Stash fills cost PCIe bandwidth.** A stash fill that overlaps the next
   request's load competes with it for PCIe bandwidth.
