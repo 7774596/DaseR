@@ -25,6 +25,7 @@ from daser.server.ipc.server import (
     _CachedCudaArray,
     _coalesce_transfer_spans,
     _OnlinePackedExtentAllocator,
+    _phase_prefetch_spans,
 )
 from daser.server.metadata_store import MetadataStore
 from daser.transfer.base import TransferLayer, TransferStats
@@ -3234,3 +3235,33 @@ async def test_ipc_split_prefill_reads_only_the_back_part(
     else:
         assert resp["started"] is False
         assert _ReadaheadRecordingTransfer.readaheads == []
+
+
+def test_phase_prefetch_spans_cut_records_into_aligned_phases() -> None:
+    """Raw runs split per slot and packed records keep their charge."""
+    record = 4 * 4096
+    raw = _phase_prefetch_spans(
+        [{"file_offset": 8 * 4096, "nbytes": 2 * record}],
+        record_bytes=record,
+        phases=4,
+    )
+    assert [(s["file_offset"] // 4096, s["nbytes"], s["phase"]) for s in raw] == [
+        (8 + 4 * r + k, 4096, k) for r in range(2) for k in range(4)
+    ]
+    assert all("accounted_nbytes" not in span for span in raw)
+    packed = _phase_prefetch_spans(
+        [{"file_offset": 0, "nbytes": 3 * 4096, "accounted_nbytes": record}],
+        record_bytes=record,
+        phases=2,
+    )
+    assert [(s["file_offset"], s["nbytes"], s["phase"]) for s in packed] == [
+        (0, 4096, 0),
+        (4096, 2 * 4096, 1),
+    ]
+    assert sum(s["accounted_nbytes"] for s in packed) == record
+    assert all(s["accounted_nbytes"] >= s["nbytes"] for s in packed)
+    # A record shorter than K pages yields fewer, non-empty phases.
+    tiny = _phase_prefetch_spans(
+        [{"file_offset": 0, "nbytes": 4096}], record_bytes=record, phases=4
+    )
+    assert [(s["nbytes"], s["phase"]) for s in tiny] == [(4096, 3)]

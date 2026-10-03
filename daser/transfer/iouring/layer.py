@@ -153,6 +153,10 @@ class _RequestLease:
     # (starts, ends, host bases) of ``hits`` for vectorized run lookup;
     # rebuilt lazily and cleared whenever ``hits`` changes.
     run_index: tuple[Any, Any, Any] | None = None
+    # A streaming prefetch is still promoting this lease's L2 misses; loads
+    # wait for coverage instead of failing on unattached ranges.
+    filling: bool = False
+    fill_error: BaseException | None = None
 
 
 @dataclass
@@ -476,6 +480,23 @@ def _clip_parts(
         if start < end:
             clipped.append((target_offset + start - source_offset, start, end - start))
     return clipped
+
+
+def _misses_by_phase(misses: list[dict[str, int]]) -> list[list[dict[str, int]]]:
+    """Group prefetch misses by fill phase, lowest phase first.
+
+    Args:
+        misses: L2 miss entries carrying a ``phase`` key.
+
+    Returns:
+        One list per present phase, in phase order, of the misses without
+        their ``phase`` key; empty when there are no misses.
+    """
+    groups: dict[int, list[dict[str, int]]] = {}
+    for miss in misses:
+        entry = dict(miss)
+        groups.setdefault(int(entry.pop("phase", 0)), []).append(entry)
+    return [groups[phase] for phase in sorted(groups)]
 
 
 def _split_runs_at_slices(
@@ -1135,6 +1156,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._lock = asyncio.Lock()
         # Signalled under ``_lock`` whenever a lease is dropped.
         self._lease_released = asyncio.Condition(self._lock)
+        # Signalled under ``_lock`` whenever a streaming fill attaches a phase
+        # to its lease or stops filling.
+        self._lease_progress = asyncio.Condition(self._lock)
+        # Background streaming fills, kept referenced until they finish.
+        self._fill_tasks: set[asyncio.Task[None]] = set()
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
@@ -1698,38 +1724,60 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         spans: list[dict[str, int]],
         lease_id: str | None = None,
+        *,
+        streaming: bool = False,
     ) -> PrefetchResult:
         """Promote L2-missing portions of spans into the pinned L1 tier.
 
         Args:
             spans: Aligned storage spans containing ``file_offset`` and
-                ``nbytes``.
+                ``nbytes``. An optional integer ``phase`` (default 0) orders
+                the L2 reads: every miss of phase k is read before phase k+1,
+                and spans of different phases never merge into one read.
             lease_id: Optional request identifier that blocks overlapping
                 stores and retains promoted slices for the later GPU load.
+            streaming: Return once the lease is admitted and resolved
+                against L1; the L2 misses are then read in the background
+                phase by phase, each phase attached to the lease as it lands.
+                Requires ``lease_id``.
 
         Returns:
-            Requested bytes split between existing L1 data and L2 reads.
+            Requested bytes split between existing L1 data and L2 reads
+            (planned reads when ``streaming``).
 
         Raises:
             NotImplementedError: If the L2 tier is disabled.
+            ValueError: If ``streaming`` is set without ``lease_id``.
 
         Async/thread-safety:
             Metadata is protected by the transfer lock; io_uring reads are
-            awaited through the existing executor-backed read path.
+            awaited through the existing executor-backed read path. A
+            streaming fill runs as a task on the same event loop; a new
+            prefetch for its lease waits until it finished.
         """
         if self._l2 is None:
             raise NotImplementedError("prefetch requires the io_uring L2 tier")
+        if streaming and lease_id is None:
+            raise ValueError("streaming prefetch requires a lease")
 
         accounted_spans = [
             {
                 "file_offset": int(span["file_offset"]),
                 "nbytes": int(span["nbytes"]),
                 "accounted_nbytes": self._accounted_nbytes(span, int(span["nbytes"])),
+                "phase": int(span.get("phase", 0)),
             }
             for span in spans
             if int(span["nbytes"]) > 0
         ]
-        normalized_spans = _normalize_accounted_ranges(accounted_spans, self._l1_bytes)
+        normalized_spans = [
+            {**span, "phase": phase}
+            for phase in sorted({span["phase"] for span in accounted_spans})
+            for span in _normalize_accounted_ranges(
+                [span for span in accounted_spans if span["phase"] == phase],
+                self._l1_bytes,
+            )
+        ]
         requested_ranges = _normalize_ranges(accounted_spans)
         requested_bytes = sum(size for _start, size in requested_ranges)
         if lease_id is not None and requested_bytes > self._l1_bytes:
@@ -1754,6 +1802,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                     # leases whose ranges exceed L1 together could each hold
                     # part of the pool and wait for the other forever. Admit a
                     # lease only once its physical bytes fit beside the others.
+                    # A streaming fill still promoting into this lease would
+                    # attach its reads to the replacement.
+                    await self._lease_progress.wait_for(
+                        lambda: not self._lease_filling_locked(lease_id)
+                    )
                     await self._lease_released.wait_for(
                         lambda: (
                             self._leased_physical_bytes_locked(lease_id)
@@ -1807,6 +1860,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 "file_offset": int(miss["file_offset"]),
                                 "nbytes": int(miss["nbytes"]),
                                 "accounted_nbytes": int(miss["accounted_nbytes"]),
+                                "phase": span["phase"],
                             }
                             in_flight = self._find_pending_promotions_locked(
                                 entry["file_offset"], entry["nbytes"]
@@ -1827,9 +1881,28 @@ class TieredIOUringTransferLayer(TransferLayer):
 
             if pending:
                 await asyncio.gather(*set(pending))
-            if misses:
-                await self._load_l2_misses_grouped(None, misses, lease_id=lease_id)
+            phase_misses = _misses_by_phase(misses)
             l2_bytes = sum(int(miss["nbytes"]) for miss in misses)
+            if streaming and phase_misses:
+                assert lease_id is not None
+                async with self._lock:
+                    lease = self._request_leases.get(lease_id)
+                    if lease is None:
+                        raise RuntimeError(
+                            f"transfer lease was released during prefetch: {lease_id}"
+                        )
+                    lease.filling = True
+                    self._stats.prefetch_requests += 1
+                    self._stats.prefetch_l1_bytes += l1_bytes
+                    self._stats.prefetch_l2_bytes += l2_bytes
+                task = asyncio.create_task(
+                    self._fill_lease_phases(lease_id, lease, phase_misses)
+                )
+                self._fill_tasks.add(task)
+                task.add_done_callback(self._fill_tasks.discard)
+                return PrefetchResult(requested_bytes, l1_bytes, l2_bytes)
+            for group in phase_misses:
+                await self._load_l2_misses_grouped(None, group, lease_id=lease_id)
             async with self._lock:
                 if lease_id is not None:
                     self._require_complete_lease_locked(lease_id)
@@ -2203,10 +2276,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
         copy_future: asyncio.Task[None] | None = None
         async with self._lock:
+            await self._lease_progress.wait_for(
+                lambda: not self._lease_filling_locked(lease_id)
+            )
             self._raise_l2_error_locked()
             lease = self._request_leases.get(lease_id)
             if lease is None:
                 raise KeyError(f"unknown transfer lease: {lease_id}")
+            if lease.fill_error is not None:
+                raise lease.fill_error
             lease.active_loads += 1
             try:
                 for span in spans:
@@ -2286,28 +2364,37 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         targets = numpy.asarray(target_offsets, dtype=numpy.int64)
         async with self._lock:
-            self._raise_l2_error_locked()
-            lease = self._request_leases.get(lease_id)
-            if lease is None:
-                raise KeyError(f"unknown transfer lease: {lease_id}")
-            if lease.run_index is None:
-                hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
-                starts = numpy.array(
-                    [hit.file_offset for hit in hits], dtype=numpy.int64
-                )
-                lease.run_index = (
-                    starts,
-                    starts
-                    + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64),
-                    numpy.array(
-                        [hit.data.ptr_at(hit.source_offset) for hit in hits],
-                        dtype=numpy.uint64,
-                    ),
-                )
-            starts, ends, bases = lease.run_index
-            files, targets, sizes, index = _split_runs_at_slices(
-                files, targets, sizes, starts, ends
-            )
+            while True:
+                self._raise_l2_error_locked()
+                lease = self._request_leases.get(lease_id)
+                if lease is None:
+                    raise KeyError(f"unknown transfer lease: {lease_id}")
+                if lease.fill_error is not None:
+                    raise lease.fill_error
+                if lease.run_index is None:
+                    hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
+                    starts = numpy.array(
+                        [hit.file_offset for hit in hits], dtype=numpy.int64
+                    )
+                    lease.run_index = (
+                        starts,
+                        starts
+                        + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64),
+                        numpy.array(
+                            [hit.data.ptr_at(hit.source_offset) for hit in hits],
+                            dtype=numpy.uint64,
+                        ),
+                    )
+                starts, ends, bases = lease.run_index
+                try:
+                    split = _split_runs_at_slices(files, targets, sizes, starts, ends)
+                    break
+                except KeyError:
+                    if not lease.filling:
+                        raise
+                # A streaming fill attaches the missing runs phase by phase.
+                await self._lease_progress.wait()
+            files, targets, sizes, index = split
             sources = bases[index] + (files - starts[index]).astype(numpy.uint64)
             # Pin the lease before enqueueing: a partial submission still
             # reads its slices, and the finally below releases the pin only
@@ -3195,16 +3282,24 @@ class TieredIOUringTransferLayer(TransferLayer):
     ) -> list[dict[str, int]]:
         """Return a miss batch bounded by L1 capacity and io_uring count."""
         ring_count = self._l2.ring_count if self._l2 is not None else 1
+        # A large read occupies a ring on its own (striped or single), while
+        # small reads share one submission of up to _PACKED_READ_BATCH_COUNT
+        # entries; counting each small read as a full ring would cap scattered
+        # small misses at ``ring_count`` reads in flight.
+        capacity = ring_count * _PACKED_READ_BATCH_COUNT
         batch: list[dict[str, int]] = []
         batch_bytes = 0
+        batch_cost = 0
         for span in misses[start:]:
             nbytes = int(span["nbytes"])
+            cost = 1 if nbytes <= _PACKED_READ_BATCH_BYTES else _PACKED_READ_BATCH_COUNT
             if batch and (
-                batch_bytes + nbytes > self._l1_bytes or len(batch) >= ring_count
+                batch_bytes + nbytes > self._l1_bytes or batch_cost + cost > capacity
             ):
                 break
             batch.append(span)
             batch_bytes += nbytes
+            batch_cost += cost
         return batch
 
     def _next_uring(self) -> NativeIOUring:
@@ -3655,6 +3750,58 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         if uncovered:
             raise RuntimeError(f"prefetch did not retain complete lease: {lease_id}")
+
+    def _lease_filling_locked(self, lease_id: str) -> bool:
+        """Return whether a streaming fill still promotes into a lease."""
+        lease = self._request_leases.get(lease_id)
+        return lease is not None and lease.filling
+
+    async def _fill_lease_phases(
+        self,
+        lease_id: str,
+        lease: _RequestLease,
+        phase_misses: list[list[dict[str, int]]],
+    ) -> None:
+        """Promote a streaming lease's L2 misses one phase at a time.
+
+        Each phase is attached to the lease before the next one is read, so a
+        load waiting for that phase's runs wakes as soon as it lands. A
+        failure is recorded on the lease (waiting loads raise it) and the
+        lease is released.
+
+        Args:
+            lease_id: Request lease receiving the promoted slices.
+            lease: The lease object admitted for this fill.
+            phase_misses: L2 misses grouped by phase, in read order.
+
+        Async/thread-safety:
+            Runs as a task on the owning event loop; metadata updates and the
+            progress notifications happen under the transfer lock.
+        """
+        error: BaseException | None = None
+        try:
+            for group in phase_misses:
+                await self._load_l2_misses_grouped(None, group, lease_id=lease_id)
+                async with self._lock:
+                    self._lease_progress.notify_all()
+            async with self._lock:
+                if self._request_leases.get(lease_id) is lease:
+                    self._require_complete_lease_locked(lease_id)
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+            logger.warning(
+                "[TRANSFER:iouring] streaming fill failed lease=%s: %s",
+                lease_id[:8],
+                exc,
+            )
+        finally:
+            async with self._lock:
+                lease.filling = False
+                if error is not None:
+                    lease.fill_error = error
+                    if self._request_leases.get(lease_id) is lease:
+                        self._release_request_lease_locked(lease_id)
+                self._lease_progress.notify_all()
 
     def _resolve_leased_range_locked(
         self,

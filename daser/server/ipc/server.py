@@ -31,6 +31,7 @@ from daser.config import (
     SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STREAMING_ADMISSION_PHASES_ENV,
     STRIPE_PIPELINE_ENV,
 )
 from daser.connector.helpers import TokenSequence
@@ -292,6 +293,65 @@ def _prefetch_spans_from_chunks(
     return spans
 
 
+def _phase_prefetch_spans(
+    spans: list[dict[str, Any]],
+    *,
+    record_bytes: int,
+    phases: int,
+) -> list[dict[str, int]]:
+    """Split prefetch spans into per-record byte phases for a streaming fill.
+
+    A record stores its layers (layer groups for packed records) in file
+    order, so bytes ``[k/K, (k+1)/K)`` of every record hold roughly the k-th
+    K-th of the layers; tagging them ``phase=k`` lets the fill land layer
+    groups in the order the forward pass consumes them.
+
+    Args:
+        spans: Prefetch spans with ``file_offset``, ``nbytes`` and optional
+            ``accounted_nbytes``. Spans longer than ``record_bytes`` are raw
+            slot runs and are cut into ``record_bytes`` records; shorter
+            spans are one packed record each.
+        record_bytes: Bytes of one raw slot (4 KiB multiple).
+        phases: Number of byte phases K per record.
+
+    Returns:
+        Phase-tagged spans; each record's accounting charge is split across
+        its pieces so every piece is charged at least its bytes.
+    """
+    out: list[dict[str, int]] = []
+    for span in spans:
+        start = int(span["file_offset"])
+        nbytes = int(span["nbytes"])
+        if nbytes <= 0:
+            continue
+        step = record_bytes if nbytes > record_bytes else nbytes
+        for record in range(start, start + nbytes, step):
+            size = min(step, start + nbytes - record)
+            cuts = [
+                size * k // phases // _PACKED_IO_ALIGNMENT * _PACKED_IO_ALIGNMENT
+                for k in range(phases)
+            ]
+            cuts.append(size)
+            charged = "accounted_nbytes" in span and nbytes <= record_bytes
+            extra = int(span["accounted_nbytes"]) - size if charged else 0
+            given = 0
+            for phase in range(phases):
+                lo, hi = cuts[phase], cuts[phase + 1]
+                if hi <= lo:
+                    continue
+                piece: dict[str, int] = {
+                    "file_offset": record + lo,
+                    "nbytes": hi - lo,
+                    "phase": phase,
+                }
+                if charged:
+                    share = extra * hi // size - given
+                    given += share
+                    piece["accounted_nbytes"] = hi - lo + share
+                out.append(piece)
+    return out
+
+
 def _coalesce_transfer_spans(
     spans: list[dict[str, Any]],
     *,
@@ -417,6 +477,9 @@ class IPCServer:
         )
         self._session_prefetch: list[tuple[bytes, str]] = []
         self._device_stash_bytes = int(os.environ.get(DEVICE_STASH_BYTES_ENV) or 0)
+        self._streaming_phases = max(
+            0, int(os.environ.get(STREAMING_ADMISSION_PHASES_ENV) or 0)
+        )
         self._device_stash_sessions = max(
             1, int(os.environ.get(DEVICE_STASH_SESSIONS_ENV, "1") or 1)
         )
@@ -1024,6 +1087,17 @@ class IPCServer:
         spans = list(msg.get("spans", []))
         if lease_id is None:
             result = await transfer.prefetch_bytes_grouped(spans)
+        elif self._streaming_phases:
+            record_bytes = int(self._runtime_config.get("slot_size", 0)) // max(
+                1, int(self._runtime_config.get("tensor_parallel_size", 1))
+            )
+            result = await transfer.prefetch_bytes_grouped(
+                _phase_prefetch_spans(
+                    spans, record_bytes=record_bytes, phases=self._streaming_phases
+                ),
+                lease_id=lease_id,
+                streaming=True,
+            )
         else:
             result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
         self._metrics.counter(

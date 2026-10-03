@@ -98,6 +98,11 @@ DEVICE_STASH_BYTES_ENV = "DASER_DEVICE_STASH_BYTES"
 DEVICE_STASH_SESSIONS_ENV = "DASER_DEVICE_STASH_SESSIONS"
 #: Research switch: readaheads skip spans the device stash holds whole.
 READAHEAD_SKIP_STASHED_ENV = "DASER_READAHEAD_SKIP_STASHED"
+#: Research switch: byte phases K of a streaming lease prefetch (default 0 =
+#: off). The prefetch replies once the lease is admitted and resolved; L2
+#: misses fill in the background phase by phase (bytes [k/K, (k+1)/K) of
+#: every record), and leased run loads wait until their runs are covered.
+STREAMING_ADMISSION_PHASES_ENV = "DASER_STREAMING_ADMISSION_PHASES"
 #: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
 #: L2 misses outside the protected class through transient pinned windows that
 #: never enter L1, so SSD traffic cannot evict the protected segment.

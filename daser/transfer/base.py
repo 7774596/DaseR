@@ -246,13 +246,19 @@ class TransferLayer(ABC):
         self,
         spans: list[dict[str, int]],
         lease_id: str | None = None,
+        *,
+        streaming: bool = False,
     ) -> PrefetchResult:
         """Promote storage spans into an optional host-memory tier.
 
         Args:
-            spans: Storage spans containing ``file_offset`` and ``nbytes``.
+            spans: Storage spans containing ``file_offset`` and ``nbytes``,
+                optionally tagged with a fill ``phase``.
             lease_id: Optional request identifier whose promoted bytes must
                 remain stable until a later load consumes them.
+            streaming: Return once the lease is admitted and resolved and
+                fill its L2 misses in the background in ``phase`` order;
+                requires ``lease_id``.
 
         Returns:
             Byte attribution for the request.

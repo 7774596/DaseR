@@ -2843,3 +2843,64 @@ def test_iouring_readahead_skips_stashed_spans(tmp_path, skip: bool) -> None:
             layer.close()
 
     asyncio.run(scenario())
+
+
+def test_iouring_streaming_prefetch_loads_wait_for_their_phase(tmp_path) -> None:
+    """A streaming prefetch replies before its L2 reads; runs wait for them."""
+    cupy = pytest.importorskip("cupy")
+    np = pytest.importorskip("numpy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("CUDA device required")
+
+    records, record, phases = 3, ALIGNMENT * 4, 2
+    half = record // phases
+    path = str(tmp_path / "daser.store")
+    payloads = [
+        bytearray((np.arange(record) * (i + 5) % 251).astype(np.uint8).tobytes())
+        for i in range(records)
+    ]
+    spans = [
+        {"file_offset": i * record + k * half, "nbytes": half, "phase": k}
+        for i in range(records)
+        for k in range(phases)
+    ]
+
+    async def write() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=records * record, l2_bytes=4 * records * record
+        )
+        try:
+            for i, payload in enumerate(payloads):
+                await layer.store_bytes(payload, i * record, record)
+            await layer.drain()
+        finally:
+            layer.close()
+
+    async def scenario(streaming: bool) -> None:
+        # A fresh layer has an empty L1, so every span is an L2 miss.
+        layer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=records * record, l2_bytes=4 * records * record
+        )
+        try:
+            with pytest.raises(ValueError):
+                await layer.prefetch_bytes_grouped(spans, streaming=True)
+            result = await layer.prefetch_bytes_grouped(
+                spans, lease_id="req", streaming=streaming
+            )
+            assert result.l2_bytes == records * record
+            dst = cupy.zeros(records * record, dtype=cupy.uint8)
+            # Second-phase runs first: they wait for the fill when streaming.
+            for phase in reversed(range(phases)):
+                files = np.arange(records, dtype=np.int64) * record + phase * half
+                assert (
+                    await layer.load_leased_runs(dst, files, files, half, "req")
+                    == records * half
+                )
+            assert cupy.asnumpy(dst).tobytes() == b"".join(bytes(p) for p in payloads)
+            await layer.release_lease("req")
+        finally:
+            layer.close()
+
+    asyncio.run(write())
+    asyncio.run(scenario(streaming=True))
+    asyncio.run(scenario(streaming=False))
