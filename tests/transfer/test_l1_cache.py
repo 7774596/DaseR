@@ -312,39 +312,3 @@ def test_skip_pinned_eviction_keeps_owned_allocations_resident(
         pinned.clear()
     finally:
         cache.close()
-
-
-@pytest.mark.parametrize("policy_type", [LRUReplacementPolicy, BIPReplacementPolicy])
-def test_rerank_makes_a_span_the_next_victim_or_most_recent(
-    policy_type: type[ReplacementPolicy[int]],
-) -> None:
-    """A demoted span is evicted first; a promoted one outlives older ranges."""
-    cache = L1Cache(12288, 4096, lambda _key, _data: False, policy_type())
-    try:
-        keys = [(index * 8192, 4096) for index in range(3)]
-        for key in keys:
-            data = cache.reserve_untracked(4096)
-            assert data is not None
-            cache.put(key, data)
-        for key in keys:
-            # Reads make the order plain LRU for both policies.
-            cache.touch(key)
-        assert cache.rerank(keys[2][0], 100, victim=True) == 1
-        assert cache.rerank(keys[0][0] + 4096, 4096, victim=True) == 0
-        held = cache.reserve_untracked(4096)
-        assert held is not None
-        assert cache.get(keys[2]) is None
-        assert cache.get(keys[0]) is not None
-        held.close()
-        refill = cache.reserve_untracked(4096)
-        assert refill is not None
-        cache.put(keys[2], refill)
-        cache.touch(keys[2])
-        assert cache.rerank(keys[0][0], 4096, victim=False) == 1
-        held = cache.reserve_untracked(4096)
-        assert held is not None
-        assert cache.get(keys[1]) is None
-        assert cache.get(keys[0]) is not None
-        held.close()
-    finally:
-        cache.close()

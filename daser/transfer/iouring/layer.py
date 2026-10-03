@@ -1945,28 +1945,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._stats.device_stash_filled_bytes += published
         return published
 
-    async def rerank_l1(self, spans: list[dict[str, int]], *, victim: bool) -> int:
-        """Reorder L1 replacement for the allocations overlapping ``spans``.
-
-        Args:
-            spans: Storage spans (``file_offset``, ``nbytes``).
-            victim: True makes them the next L1 victims; False makes them
-                most recent.
-
-        Returns:
-            Allocations reordered.
-
-        Async/thread-safety:
-            Runs under the transfer lock on the server event loop.
-        """
-        async with self._lock:
-            return sum(
-                self._l1.rerank(
-                    int(span["file_offset"]), int(span["nbytes"]), victim=victim
-                )
-                for span in spans
-            )
-
     async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
         """Drop speculative readaheads that no kept prediction overlaps.
 

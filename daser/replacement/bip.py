@@ -57,18 +57,6 @@ class BIPReplacementPolicy(ReplacementPolicy[K], Generic[K]):
         if key in self._order:
             self._order.move_to_end(key)
 
-    def demote(self, key: K) -> None:
-        """Move a resident key to the LRU end.
-
-        Args:
-            key: Physical allocation identity a faster tier already holds.
-
-        Returns:
-            None. Unknown keys are ignored; owner serialization is required.
-        """
-        if key in self._order:
-            self._order.move_to_end(key, last=False)
-
     def remove(self, key: K) -> None:
         """Forget a key whose last resident child was removed.
 

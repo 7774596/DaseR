@@ -17,7 +17,6 @@ from daser.config import (
     DEVICE_STASH_SESSIONS_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
-    L1_GPU_SHADOW_TOKENS_ENV,
     L1_NEXT_USE_ENV,
     L1_SKIP_PINNED_ENV,
     L1_SPLIT_BYPASS_ENV,
@@ -49,7 +48,6 @@ from daser.server.admission import (
     FinishAdmission,
 )
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.gpu_shadow import GpuResidencyShadow
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 from daser.server.session_predictor import SessionPredictor
 from daser.transfer import TransferLayer
@@ -414,10 +412,6 @@ class IPCServer:
             if self._readahead_piece and os.environ.get(SESSION_PREFETCH_ENV) == "1"
             else None
         )
-        # Research switch: L1 evicts the chunks the GPU still holds first.
-        gpu_tokens = int(os.environ.get(L1_GPU_SHADOW_TOKENS_ENV) or 0)
-        self._gpu_shadow = GpuResidencyShadow(gpu_tokens) if gpu_tokens > 0 else None
-        self._gpu_shadow_prompt: tuple[bytes, str] | None = None
         self._session_prefetch_depth = max(
             1, int(os.environ.get(SESSION_PREFETCH_DEPTH_ENV, "1") or 1)
         )
@@ -694,10 +688,6 @@ class IPCServer:
             await self._core.record_external_prefix_cache(queries=queries, hits=hits)
             if self._session_predictor is not None and isinstance(tokens, bytes):
                 self._observe_session(tokens, str(msg["model_id"]))
-            if self._gpu_shadow is not None and isinstance(tokens, bytes):
-                await self._update_gpu_shadow(
-                    tokens, str(msg["model_id"]), chunks, num_computed_tokens
-                )
             if self._readahead_piece and chunks and hits > 0:
                 spans = self._external_spans(chunks, num_computed_tokens, hits)
                 if spans:
@@ -1988,73 +1978,6 @@ class IPCServer:
             ),
             rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
         )
-
-    async def _update_gpu_shadow(
-        self,
-        tokens: bytes,
-        model_id: str,
-        chunks: list[ChunkInfo],
-        num_computed_tokens: int,
-    ) -> None:
-        """Replay the GPU prefix cache and reorder L1 to match it.
-
-        A new scheduler prompt means the previous one finished: all of its
-        stored chunks, including the ones it wrote, are now GPU-resident and
-        become the next L1 victims; chunks pushed out of the GPU capacity
-        become most recent in L1. Chunks of the new prompt at or past
-        ``num_computed_tokens`` were not found on the GPU, so the shadow
-        drops them.
-
-        Args:
-            tokens: Packed prompt token IDs of the scheduler lookup.
-            model_id: Model identifier of the lookup.
-            chunks: Chunks the lookup returned.
-            num_computed_tokens: Tokens vLLM found in its local prefix cache.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop; L1 reordering takes the
-            transfer lock.
-        """
-        shadow = self._gpu_shadow
-        assert shadow is not None
-        previous = self._gpu_shadow_prompt
-        if previous == (tokens, model_id):
-            return
-        self._gpu_shadow_prompt = (tokens, model_id)
-        transfer = self._ensure_transfer()
-        counter = self._metrics.counter(
-            "daser_l1_gpu_shadow_rerank_total",
-            "L1 allocations reordered by the GPU residency shadow.",
-        )
-        if previous is not None:
-            served = sorted(
-                await self._core.lookup(previous[0], previous[1]),
-                key=lambda item: int(item.target_token_start),
-            )
-            resident, evicted = shadow.serve(
-                (chunk.chunk_key, int(chunk.token_count), self._chunk_spans(chunk))
-                for chunk in served
-            )
-            for spans in resident:
-                counter.inc(
-                    await transfer.rerank_l1(spans, victim=True),
-                    labels={"to": "victim"},
-                )
-            for spans in evicted:
-                counter.inc(
-                    await transfer.rerank_l1(spans, victim=False),
-                    labels={"to": "recent"},
-                )
-        missing = shadow.drop(
-            chunk.chunk_key
-            for chunk in chunks
-            if int(chunk.target_token_start) >= num_computed_tokens
-        )
-        for spans in missing:
-            counter.inc(
-                await transfer.rerank_l1(spans, victim=False),
-                labels={"to": "recent"},
-            )
 
     def _observe_session(self, tokens: bytes, model_id: str) -> None:
         """Feed a scheduler lookup to the session predictor.

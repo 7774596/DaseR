@@ -41,15 +41,6 @@ class LRUReplacementPolicy(ReplacementPolicy[K], Generic[K]):
         if key in self._order:
             self._order.move_to_end(key)
 
-    def demote(self, key: K) -> None:
-        """Move an existing key to the least-recently-used end.
-
-        Args:
-            key: Cache key whose bytes a faster tier already holds.
-        """
-        if key in self._order:
-            self._order.move_to_end(key, last=False)
-
     def remove(self, key: K) -> None:
         """Remove a key from replacement tracking.
 
