@@ -130,6 +130,11 @@ def _p(values: list[float], pct: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(pct / 100 * (len(ordered) - 1))))]
 
 
+def _send_key(record: dict) -> tuple[float, int]:
+    """Sort key: send offset, trace index for ties."""
+    return float(record["send_offset_s"]), int(record["trace_index"])
+
+
 def arm_row(arm_dir: Path) -> dict[str, str]:
     """Build one table row for an arm artifact directory.
 
@@ -470,6 +475,39 @@ def paired_rows(arm_dirs: list[Path], first: int, warm_ms: float = 0.0) -> list[
     return lines
 
 
+def order_rows(arm_dirs: list[Path]) -> list[str]:
+    """Check that requests were sent in trace order.
+
+    Sorts sent requests by ``send_offset_s`` and counts positions whose
+    ``trace_index`` differs from the trace-order position. Replays that do
+    not use strict order are expected to deviate (closed-loop prefix
+    dependencies alone send ready requests in wake-up order), so any
+    deviation means the trace interleaving was not what was replayed.
+
+    Args:
+        arm_dirs: Arm directories.
+
+    Returns:
+        One line per arm with the mismatch count, tagged ``ANOMALY`` when
+        the send order differs from the trace order.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        records = [
+            record
+            for record in map(json.loads, (arm_dir / "requests.jsonl").open())
+            if record.get("send_offset_s") is not None
+        ]
+        sent = [int(r["trace_index"]) for r in sorted(records, key=_send_key)]
+        mismatches = sum(a != b for a, b in zip(sent, sorted(sent), strict=True))
+        tag = " ANOMALY: send order differs from trace order" if mismatches else ""
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: "
+            f"out_of_order={mismatches}/{len(sent)}{tag}"
+        )
+    return lines
+
+
 def main() -> None:
     """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``.
 
@@ -513,6 +551,8 @@ def main() -> None:
     if walls:
         print("per-request load wall (DEBUG load timing)")
         print("\n".join(walls))
+    print("send order vs trace order")
+    print("\n".join(order_rows(arm_dirs)))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
     if args.stages is not None:
