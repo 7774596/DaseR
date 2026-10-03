@@ -34,6 +34,10 @@ ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
 #: New packed records live only in L1 and reach L2 when L1 evicts them, so the
 #: packed arena spans L1 + L2 while L2 holds only records that left L1.
 EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
+#: Research control for compressed-online storage: ``1`` makes the worker
+#: store every packed record through the raw fallback, so the packed layout
+#: and exclusive tiers can be measured without compression.
+PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"

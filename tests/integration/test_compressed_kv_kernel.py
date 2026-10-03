@@ -427,6 +427,72 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_online_packer_force_raw_stores_every_record_raw_byte_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The force-raw switch stores compressible blocks raw and restores them."""
+    monkeypatch.setenv("DASER_PACKED_FORCE_RAW", "1")
+    geometry = _geometry()
+    raw_slots = [_slot(geometry, 31), _slot(geometry, 32)]
+    source = (
+        torch.from_numpy(np.frombuffer(b"".join(raw_slots), dtype=np.uint16).copy())
+        .to("cuda")
+        .view(torch.bfloat16)
+        .reshape(
+            geometry.num_slots,
+            geometry.num_layers,
+            2,
+            geometry.block_tokens,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+        )
+    )
+    source = _kv_cache(geometry.num_slots, geometry, source)
+    codebooks = default_online_codebooks(geometry)
+    packer = FusedOnlineKVPacker(
+        kv_cache=source,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        max_slots_per_buffer=geometry.num_slots,
+    )
+    staging = torch.empty(
+        geometry.num_slots * geometry.slot_size, dtype=torch.uint8, device="cuda"
+    )
+    stream = torch.cuda.Stream()
+    packed = packer.pack_into(
+        staging=staging,
+        block_ids=[0, 1],
+        logical_slots=[0, 1],
+        slot_stride=geometry.slot_size,
+        stream=stream,
+    )
+    stream.synchronize()
+
+    assert [slot.mode for slot in packed] == [SlotMode.RAW, SlotMode.RAW]
+    assert [slot.stored_length for slot in packed] == [geometry.slot_size] * 2
+    destination = _kv_cache(4, geometry)
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=destination,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        ring_depth=1,
+        max_slots_per_buffer=geometry.num_slots,
+    )
+    decoder.decode(
+        staging=staging,
+        staging_offsets=[slot.source_offset for slot in packed],
+        block_ids=[1, 3],
+        modes=[int(slot.mode) for slot in packed],
+        buffer_index=0,
+        stream=stream,
+    )
+    stream.synchronize()
+    for block, expected in zip([1, 3], raw_slots, strict=True):
+        assert destination[block].view(torch.uint8).cpu().numpy().tobytes() == expected
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     ("tile_scalars", "num_layers", "head_dim"),
     [(256, 2, 127), (1024, 2, 127), (256, 18, 129)],

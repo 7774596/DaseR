@@ -3,6 +3,7 @@
 """Fused strict-lossless decode from GPU staging into cross-layer KV cache."""
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,7 @@ from daser.compression.format import (
     digest_bytes,
     online_fixed_envelope_geometry,
 )
+from daser.config import PACKED_FORCE_RAW_ENV
 from daser.logging import init_logger
 from daser.ops.kv_layout import physical_kv_view
 
@@ -302,6 +304,8 @@ class FusedOnlineKVPacker:
             raise ValueError("online codebooks do not match KV geometry")
         self._codebook_hash = digest_bytes(codebooks)
         self._kv_bits = _kv_bits(kv_cache)
+        # Research switch: store every record raw inside the packed layout.
+        self._force_raw = os.environ.get(PACKED_FORCE_RAW_ENV) == "1"
         lookup: NDArray[np.uint8] = np.full(
             (self._num_planes, 256), CODEBOOK_ENTRIES, dtype=np.uint8
         )
@@ -581,6 +585,9 @@ class FusedOnlineKVPacker:
                     self._fixed_escape_bytes,
                     scratch_plane_record_bytes,
                 )
+                if self._force_raw:
+                    # Research control: every record takes the raw fallback.
+                    device_overflow.fill_(1)
                 # Keep variable-length layout planning on the same CUDA
                 # stream as the writer.  This lets compaction start
                 # immediately after the single-read kernel instead of waiting
