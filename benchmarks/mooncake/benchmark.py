@@ -550,6 +550,7 @@ async def replay(
     route: str = "sticky",
     strict_order: bool = False,
     dependency_gap_s: float = 0.0,
+    ordered_admission: bool = False,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -579,6 +580,10 @@ async def replay(
         dependency_gap_s: Idle seconds between a dependency's completion
             and the dependent request (tool execution / think time). The
             gap is excluded from client queue time and TTFT.
+        ordered_admission: Admit requests to the concurrency limit in trace
+            order: each one waits until the previous trace request was
+            admitted (and for its own prefix dependency), so the send order is
+            the trace order while up to ``max_inflight`` requests overlap.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -594,6 +599,8 @@ async def replay(
         raise ValueError("max_inflight must be positive")
     if abort_after_failures < 0:
         raise ValueError("abort_after_failures must be non-negative")
+    if strict_order and ordered_admission:
+        raise ValueError("strict_order and ordered_admission are exclusive")
     scheduled_offset_seconds(0, time_scale)
     router = InstanceRouter(
         [server_url] if isinstance(server_url, str) else server_url, route
@@ -605,6 +612,7 @@ async def replay(
 
     outer_sem = asyncio.Semaphore(max_inflight)
     done_events = [asyncio.Event() for _ in selection.eligible]
+    admitted_events = [asyncio.Event() for _ in selection.eligible]
     predecessors: list[int | None] = (
         prefix_predecessors(selection.eligible)
         if prefix_dependencies
@@ -644,6 +652,12 @@ async def replay(
                         ),
                         done=done_events[position],
                         dependency_gap_s=dependency_gap_s,
+                        admit_after=(
+                            admitted_events[position - 1]
+                            if ordered_admission and position
+                            else None
+                        ),
+                        admitted=admitted_events[position],
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -743,6 +757,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ordered-admission",
+        action="store_true",
+        help=(
+            "Admit requests to --max-inflight in trace order, so the send "
+            "order is the trace order while requests still overlap."
+        ),
+    )
+    parser.add_argument(
         "--dependency-gap-s",
         type=float,
         default=0.0,
@@ -817,6 +839,7 @@ async def main_async(args: argparse.Namespace) -> int:
         route=args.route,
         strict_order=args.strict_order,
         dependency_gap_s=args.dependency_gap_s,
+        ordered_admission=args.ordered_admission,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -970,10 +993,14 @@ async def _run_request(
     wait_for: asyncio.Event | None,
     done: asyncio.Event,
     dependency_gap_s: float = 0.0,
+    admit_after: asyncio.Event | None = None,
+    admitted: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
             dependency_gap_s=dependency_gap_s,
+            admit_after=admit_after,
+            admitted=admitted,
             request=request,
             prompt_builder=prompt_builder,
             client=client,
@@ -990,6 +1017,8 @@ async def _run_request(
     finally:
         # Failed or cancelled predecessors must not strand their successors.
         done.set()
+        if admitted is not None:
+            admitted.set()
 
 
 async def _run_request_after_dependency(
@@ -1007,6 +1036,8 @@ async def _run_request_after_dependency(
     writer: _ResultWriter,
     wait_for: asyncio.Event | None,
     dependency_gap_s: float = 0.0,
+    admit_after: asyncio.Event | None = None,
+    admitted: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
     await asyncio.sleep(max(0.0, started_at + scheduled_offset - time.perf_counter()))
@@ -1016,8 +1047,12 @@ async def _run_request_after_dependency(
         # Idle time after the dependency (tool execution / think time).
         await asyncio.sleep(dependency_gap_s)
     queued_at = time.perf_counter()
+    if admit_after is not None:
+        await admit_after.wait()
     async with outer_sem:
         admitted_at = time.perf_counter()
+        if admitted is not None:
+            admitted.set()
         prompt = prompt_builder.build(request)
         sent_at = admitted_at
         instance, work = router.acquire(request)

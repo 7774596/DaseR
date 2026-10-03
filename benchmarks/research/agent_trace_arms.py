@@ -258,6 +258,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Closed-loop replay in exact trace order (one request after another).",
     )
     parser.add_argument(
+        "--ordered-admission",
+        action="store_true",
+        help="Admit requests in trace order while up to --max-inflight overlap.",
+    )
+    parser.add_argument(
         "--dependency-gap-s",
         type=float,
         default=0.0,
@@ -540,6 +545,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 str(args.abort_after_failures),
                 *(["--prefix-dependencies"] if args.prefix_dependencies else []),
                 *(["--strict-order"] if args.strict_order else []),
+                *(["--ordered-admission"] if args.ordered_admission else []),
                 "--dependency-gap-s",
                 str(args.dependency_gap_s),
                 *(

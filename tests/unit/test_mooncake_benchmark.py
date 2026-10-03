@@ -366,6 +366,76 @@ def test_strict_order_replays_in_trace_order(
     assert sent == [0, 1, 2, 3]
 
 
+def test_ordered_admission_overlaps_requests_in_trace_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordered admission sends in trace order and still overlaps sessions."""
+    sent: list[int] = []
+    inflight = 0
+    peak = 0
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        nonlocal inflight, peak
+        sample = args[2]
+        kwargs["on_send"]()
+        sent.append(sample.sample_id)
+        inflight += 1
+        peak = max(peak, inflight)
+        # Later requests finish first, so completion order is not send order.
+        await asyncio.sleep(0.05 - 0.01 * sample.sample_id)
+        inflight -= 1
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    # Two interleaved sessions: A, B, A's second turn, B's second turn.
+    requests = [
+        TraceRequest(0, 0, 10, 1, (1,)),
+        TraceRequest(1, 1, 10, 1, (5,)),
+        TraceRequest(2, 2, 10, 1, (1, 2)),
+        TraceRequest(3, 3, 10, 1, (5, 6)),
+    ]
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=2,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=0,
+            prefix_dependencies=True,
+            ordered_admission=True,
+        )
+    )
+
+    # B's first turn finishes before A's, but B's second turn still waits for
+    # A's second turn to be admitted first.
+    assert sent == [0, 1, 2, 3]
+    assert peak == 2
+
+
+def test_strict_order_excludes_ordered_admission(tmp_path: Path) -> None:
+    """The two ordering modes cannot be combined."""
+    with pytest.raises(ValueError, match="exclusive"):
+        asyncio.run(
+            replay(
+                selection=select_requests([], max_model_len=100),
+                prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+                server_url="http://unused",
+                served_model_name="m",
+                output_path=tmp_path / "requests.jsonl",
+                max_inflight=2,
+                timeout_seconds=1.0,
+                time_scale=1e6,
+                seed=0,
+                strict_order=True,
+                ordered_admission=True,
+            )
+        )
+
+
 def test_dependency_gap_idles_before_the_dependent_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
