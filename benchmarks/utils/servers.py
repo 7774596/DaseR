@@ -256,6 +256,8 @@ class ServerManager:
         async_scheduling: bool = False,
         extra_vllm_gpu_ids: tuple[str, ...] = (),
         lmcache_l2_odirect: bool = False,
+        lmcache_eviction_watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
+        lmcache_l2_native_workers: int = 0,
     ) -> None:
         """Initialize the service manager.
 
@@ -301,6 +303,13 @@ class ServerManager:
             storage_format: DaseR physical KV storage format.
             lmcache_l2_odirect: open LMCache fs L2 files with ``O_DIRECT`` so
                 its reads bypass the OS page cache, as DaseR's L2 reads do.
+            lmcache_eviction_watermark: LMCache L1 usage fraction that
+                triggers eviction. LMCache reserves L1 for a whole L2
+                prefetch at once and falls back to recompute when the
+                reservation fails, so long contexts need a lower watermark.
+            lmcache_l2_native_workers: when positive, use LMCache's C++
+                ``fs_native`` L2 adapter with this many IO threads instead of
+                the Python ``fs`` adapter.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
@@ -347,6 +356,8 @@ class ServerManager:
         self.daser_l1_split_fraction = daser_l1_split_fraction
         self.daser_l1_lru = daser_l1_lru
         self.lmcache_l2_odirect = lmcache_l2_odirect
+        self.lmcache_eviction_watermark = lmcache_eviction_watermark
+        self.lmcache_l2_native_workers = lmcache_l2_native_workers
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -466,7 +477,7 @@ class ServerManager:
             "--eviction-policy",
             "LRU",
             "--eviction-trigger-watermark",
-            str(LMCACHE_EVICTION_TRIGGER_WATERMARK),
+            str(self.lmcache_eviction_watermark),
             "--http-port",
             str(LMCACHE_HTTP_PORT),
         ]
@@ -478,9 +489,16 @@ class ServerManager:
                     "--l2-adapter",
                     json.dumps(
                         {
-                            "type": "fs",
                             "base_path": str(scratch),
                             "use_odirect": self.lmcache_l2_odirect,
+                            **(
+                                {
+                                    "type": "fs_native",
+                                    "num_workers": self.lmcache_l2_native_workers,
+                                }
+                                if self.lmcache_l2_native_workers
+                                else {"type": "fs"}
+                            ),
                         }
                     ),
                 ]

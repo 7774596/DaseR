@@ -306,6 +306,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run DaseR L1 as plain LRU (--no-bip-enabled) instead of BIP.",
     )
+    parser.add_argument(
+        "--lmcache-eviction-watermark",
+        type=float,
+        default=None,
+        help="LMCache L1 eviction trigger watermark (lmcache arm only).",
+    )
+    parser.add_argument(
+        "--lmcache-l2-native-workers",
+        type=int,
+        default=0,
+        help="Use LMCache's C++ fs_native L2 adapter with N IO threads (0 = fs).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -389,6 +401,12 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         daser_port=args.daser_port,
         extra_vllm_gpu_ids=tuple(args.extra_gpu_ids) if arm.startswith("daser") else (),
         lmcache_l2_odirect=True,
+        lmcache_l2_native_workers=args.lmcache_l2_native_workers,
+        **(
+            {"lmcache_eviction_watermark": args.lmcache_eviction_watermark}
+            if args.lmcache_eviction_watermark is not None
+            else {}
+        ),
     )
 
 

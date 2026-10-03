@@ -975,6 +975,50 @@ def test_lmcache_l2_odirect_reaches_fs_adapter(tmp_path: Path) -> None:
     assert l2_spec["use_odirect"] is True
 
 
+def test_lmcache_eviction_watermark_reaches_server_command(tmp_path: Path) -> None:
+    """``lmcache_eviction_watermark`` overrides the LMCache eviction trigger."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        lmcache_eviction_watermark=0.45,
+    )
+
+    cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
+
+    assert cmd[cmd.index("--eviction-trigger-watermark") + 1] == "0.45"
+
+
+def test_lmcache_native_workers_select_fs_native_adapter(tmp_path: Path) -> None:
+    """Positive ``lmcache_l2_native_workers`` selects the C++ fs adapter."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        lmcache_l2_odirect=True,
+        lmcache_l2_native_workers=16,
+    )
+
+    cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
+    l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
+
+    assert l2_spec["type"] == "fs_native"
+    assert l2_spec["num_workers"] == 16
+    assert l2_spec["use_odirect"] is True
+
+
 def test_summarise_results_reports_hit_rate() -> None:
     """Loadgen summary includes aggregate latency and cache-hit rate."""
     summary = summarise_results(
