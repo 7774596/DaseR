@@ -50,3 +50,21 @@ def test_export_drops_requests_over_max_ctx(tmp_path: Path) -> None:
     rows = export(str(path), 1, 1.0, 2048, 0, seed=0, step_ms=1)
 
     assert [row["input_length"] for row in rows] == [1024]
+
+
+def test_round_robin_interleaves_live_sessions_and_refills(tmp_path: Path) -> None:
+    """``round_robin`` alternates live sessions and hands freed slots on."""
+    path = tmp_path / "traces.jsonl"
+    long = _session([(0.0, 1024, 1), (1.0, 1536, 1), (2.0, 2048, 1)])
+    short = _session([(0.0, 1024, 1)])
+    path.write_text("\n".join(json.dumps(s) for s in (long, short, long)) + "\n")
+
+    rows = export(str(path), 3, 1.0, 262144, 0, seed=0, step_ms=1, round_robin=2)
+
+    order = [row["session_id"] for row in rows]
+    assert len(order) == 7
+    assert order[0] != order[1]
+    assert len(set(order)) == 3
+    for sid in set(order):
+        lengths = [r["input_length"] for r in rows if r["session_id"] == sid]
+        assert lengths == sorted(lengths)
