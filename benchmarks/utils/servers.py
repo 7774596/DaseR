@@ -258,6 +258,7 @@ class ServerManager:
         lmcache_l2_odirect: bool = False,
         lmcache_eviction_watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
         lmcache_l2_native_workers: int = 0,
+        lmcache_l2_bounded: bool = False,
     ) -> None:
         """Initialize the service manager.
 
@@ -310,6 +311,9 @@ class ServerManager:
             lmcache_l2_native_workers: when positive, use LMCache's C++
                 ``fs_native`` L2 adapter with this many IO threads instead of
                 the Python ``fs`` adapter.
+            lmcache_l2_bounded: cap the ``fs_native`` L2 at ``l2_size_bytes``
+                with LRU eviction so LMCache gets the same SSD capacity as a
+                DaseR arm; without it LMCache's fs L2 grows without bound.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
@@ -328,6 +332,8 @@ class ServerManager:
             raise ValueError("daser_l2_read_stripe_bytes must be non-negative")
         if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
             raise ValueError("online_pack_batch_slots must be positive")
+        if lmcache_l2_bounded and lmcache_l2_native_workers <= 0:
+            raise ValueError("lmcache_l2_bounded requires the fs_native L2 adapter")
         if extra_vllm_gpu_ids and backend != "daser":
             raise ValueError("extra vLLM instances require the daser backend")
         self.run_id = run_id
@@ -358,6 +364,7 @@ class ServerManager:
         self.lmcache_l2_odirect = lmcache_l2_odirect
         self.lmcache_eviction_watermark = lmcache_eviction_watermark
         self.lmcache_l2_native_workers = lmcache_l2_native_workers
+        self.lmcache_l2_bounded = lmcache_l2_bounded
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -495,6 +502,22 @@ class ServerManager:
                                 {
                                     "type": "fs_native",
                                     "num_workers": self.lmcache_l2_native_workers,
+                                    **(
+                                        {
+                                            "max_capacity_gb": self.l2_size_bytes
+                                            / BYTES_PER_GIB,
+                                            # Evict late and little so the
+                                            # usable L2 matches DaseR's full
+                                            # arena (defaults .8/.2 keep less).
+                                            "eviction": {
+                                                "eviction_policy": "LRU",
+                                                "trigger_watermark": 0.95,
+                                                "eviction_ratio": 0.05,
+                                            },
+                                        }
+                                        if self.lmcache_l2_bounded
+                                        else {}
+                                    ),
                                 }
                                 if self.lmcache_l2_native_workers
                                 else {"type": "fs"}

@@ -975,6 +975,46 @@ def test_lmcache_l2_odirect_reaches_fs_adapter(tmp_path: Path) -> None:
     assert l2_spec["use_odirect"] is True
 
 
+def test_lmcache_bounded_l2_caps_fs_native_at_l2_size(tmp_path: Path) -> None:
+    """``lmcache_l2_bounded`` caps fs_native L2 at ``l2_size_bytes`` with LRU."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=160 * 1024**3,
+        lmcache_l2_native_workers=16,
+        lmcache_l2_bounded=True,
+    )
+
+    cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
+    l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
+
+    assert l2_spec["max_capacity_gb"] == 160
+    assert l2_spec["eviction"]["eviction_policy"] == "LRU"
+
+
+def test_lmcache_bounded_l2_requires_fs_native(tmp_path: Path) -> None:
+    """Bounding LMCache L2 without the fs_native adapter is rejected."""
+    with pytest.raises(ValueError, match="fs_native"):
+        ServerManager(
+            run_id="run1",
+            backend="lmcache",
+            model="/models/qwen",
+            store_dir=tmp_path,
+            gpu_id="2",
+            gpu_util=0.85,
+            max_num_seqs=32,
+            l1_size_bytes=1024**3,
+            l2_size_bytes=2 * 1024**3,
+            lmcache_l2_bounded=True,
+        )
+
+
 def test_lmcache_eviction_watermark_reaches_server_command(tmp_path: Path) -> None:
     """``lmcache_eviction_watermark`` overrides the LMCache eviction trigger."""
     manager = ServerManager(
