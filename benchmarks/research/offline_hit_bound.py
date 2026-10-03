@@ -6,12 +6,16 @@ Simulates one inclusive LRU cache over Mooncake 512-token hash blocks with a
 byte capacity, and reports the fraction of prompt tokens served as a reusable
 prefix. Because LRU is a stack algorithm, the hit rate at capacity ``C`` is an
 upper bound for any GPU + L1 + L2 hierarchy whose total capacity is ``C``.
+``--policy belady`` instead evicts the block whose next use is farthest
+(deepest prefix position first among ties): a clairvoyant bound for what any
+replacement policy could reach at the same capacity.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import heapq
 from pathlib import Path
 
 from benchmarks.mooncake.benchmark import MOONCAKE_BLOCK_TOKENS, load_trace
@@ -50,6 +54,53 @@ def prefix_hit_rate(requests: list, capacity_blocks: int) -> tuple[float, int, i
     return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
 
 
+def belady_prefix_hit_rate(
+    requests: list, capacity_blocks: int
+) -> tuple[float, int, int]:
+    """Replay requests through a clairvoyant farthest-next-use cache.
+
+    Args:
+        requests: ``TraceRequest`` rows in arrival order.
+        capacity_blocks: Cache capacity in 512-token blocks (``<=0`` = infinite).
+
+    Returns:
+        ``(hit_rate, hit_tokens, prompt_tokens)`` with the same leading-prefix
+        hit rule as :func:`prefix_hit_rate`. Ties in next use evict the block
+        deepest in its prompt, so shared prefixes outlive their tails.
+    """
+    never = len(requests)
+    uses: dict[int, list[int]] = {}
+    for index, request in enumerate(requests):
+        for block in request.hash_ids:
+            uses.setdefault(block, []).append(index)
+    cursor = {block: 0 for block in uses}
+    resident: dict[int, int] = {}
+    heap: list[tuple[int, int, int]] = []
+    hit_tokens = 0
+    prompt_tokens = 0
+    for index, request in enumerate(requests):
+        prompt_tokens += request.input_length
+        leading = 0
+        for block in request.hash_ids:
+            if block not in resident:
+                break
+            leading += 1
+        hit_tokens += min(leading * MOONCAKE_BLOCK_TOKENS, request.input_length)
+        for position, block in enumerate(request.hash_ids):
+            times = uses[block]
+            while cursor[block] < len(times) and times[cursor[block]] <= index:
+                cursor[block] += 1
+            nxt = times[cursor[block]] if cursor[block] < len(times) else never
+            resident[block] = nxt
+            heapq.heappush(heap, (-nxt, -position, block))
+        if capacity_blocks > 0:
+            while len(resident) > capacity_blocks:
+                neg_next, _, block = heapq.heappop(heap)
+                if resident.get(block) == -neg_next:
+                    del resident[block]
+    return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
+
+
 def main() -> None:
     """CLI entry point: print one line per capacity."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -70,7 +121,9 @@ def main() -> None:
         default=[1.0],
         help="Stored/raw byte ratios (one column each, e.g. 1.0 0.737).",
     )
+    parser.add_argument("--policy", choices=("lru", "belady"), default="lru")
     args = parser.parse_args()
+    simulate = prefix_hit_rate if args.policy == "lru" else belady_prefix_hit_rate
     requests = list(load_trace(args.trace, args.max_requests, args.start_request, 0))
     unique = len({block for request in requests for block in request.hash_ids})
     total_tokens = sum(request.input_length for request in requests)
@@ -84,7 +137,7 @@ def main() -> None:
         cells = []
         for ratio in args.ratios:
             stored = max(1, int(block_bytes * ratio))
-            rate, hits, _ = prefix_hit_rate(requests, capacity // stored)
+            rate, hits, _ = simulate(requests, capacity // stored)
             cells.append(f"r{ratio:g}: hit={rate:.3f} miss_tok={total_tokens - hits}")
         print(f"cap={text:>8} " + "  ".join(cells))
 
