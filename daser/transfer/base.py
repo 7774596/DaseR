@@ -315,6 +315,24 @@ class TransferLayer(ABC):
         del spans
         return 0
 
+    async def rerank_l1(self, spans: list[dict[str, int]], *, victim: bool) -> int:
+        """Reorder memory-tier replacement for stored spans.
+
+        Args:
+            spans: Storage spans (``file_offset``, ``nbytes``).
+            victim: True when the GPU now holds these bytes, so they become
+                the next memory-tier victims; False when the GPU dropped
+                them, so they become most recent.
+
+        Returns:
+            Allocations reordered; 0 for backends without a memory tier.
+
+        Async/thread-safety:
+            Implementations run on the server event loop.
+        """
+        del spans, victim
+        return 0
+
     async def wait_readahead_idle(self) -> None:
         """Wait until no readahead is reading.
 

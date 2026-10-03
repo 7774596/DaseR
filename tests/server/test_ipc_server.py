@@ -3174,3 +3174,84 @@ async def test_ipc_split_prefill_reads_only_the_back_part(
     else:
         assert resp["started"] is False
         assert _ReadaheadRecordingTransfer.readaheads == []
+
+
+@pytest.mark.asyncio
+async def test_gpu_shadow_reorders_l1_from_the_lookup_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished prompt's chunks become L1 victims until the GPU drops them."""
+    monkeypatch.setenv("DASER_L1_GPU_SHADOW_TOKENS", str(2 * BLOCK_TOKENS))
+    prompts = {b"A" * 8: 0, b"B" * 8: 4}
+
+    class FakeCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
+        async def lookup(self, tokens: bytes, _model_id: str) -> list[ChunkInfo]:
+            slot = prompts[tokens]
+            return [
+                ChunkInfo(
+                    chunk_key=f"chunk-{slot}",
+                    start_slot=slot,
+                    num_slots=2,
+                    token_count=2 * BLOCK_TOKENS,
+                    pos_offset=0,
+                    model_id="m",
+                    file_offset=slot * SLOT_SIZE,
+                    target_token_start=0,
+                )
+            ]
+
+        async def record_external_prefix_cache(
+            self, *, queries: int, hits: int
+        ) -> None:
+            pass
+
+    reranked: list[tuple[int, bool]] = []
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return nbytes
+
+        def close(self) -> None:
+            pass
+
+        async def rerank_l1(self, spans: list[dict[str, int]], *, victim: bool) -> int:
+            reranked.extend(
+                (span["file_offset"] // SLOT_SIZE, victim) for span in spans
+            )
+            return len(spans)
+
+    server = IPCServer("unused.sock", FakeCore(), dict(RUNTIME_CONFIG))  # type: ignore[arg-type]
+    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
+
+    async def lookup(prompt: bytes, computed: int) -> None:
+        await server._op_lookup(  # noqa: SLF001
+            {
+                "token_bytes": prompt,
+                "model_id": "m",
+                "external_prefix_queries": 2 * BLOCK_TOKENS,
+                "num_computed_tokens": computed,
+            }
+        )
+
+    await lookup(b"A" * 8, 0)
+    assert reranked == []
+    # A finished and fills the GPU: its chunk is the next L1 victim.
+    await lookup(b"B" * 8, 0)
+    assert reranked == [(0, True)]
+    reranked.clear()
+    # B finished and pushed A out of the GPU: A is most recent in L1 again.
+    await lookup(b"A" * 8, 0)
+    assert reranked == [(4, True), (0, False)]

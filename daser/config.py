@@ -64,6 +64,10 @@ L1_NEXT_USE_ENV = "DASER_L1_NEXT_USE"
 #: Research switch: ``1`` makes L1 replacement skip allocations an L2 writer
 #: or lease still owns instead of dropping their residency.
 L1_SKIP_PINNED_ENV = "DASER_L1_SKIP_PINNED"
+#: Research switch: GPU KV capacity in tokens. When set, the server models
+#: the GPU prefix cache from the lookup stream and makes L1 evict the stored
+#: chunks the GPU still holds first.
+L1_GPU_SHADOW_TOKENS_ENV = "DASER_L1_GPU_SHADOW_TOKENS"
 #: Research switch: ``1`` makes readaheads share one window of reads in
 #: flight, granted to the readahead with the fewest bytes left.
 READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"

@@ -172,6 +172,35 @@ class L1Cache:
             index += 1
         return False
 
+    def rerank(self, file_offset: int, nbytes: int, *, victim: bool) -> int:
+        """Reorder the allocations overlapping a span for replacement.
+
+        Args:
+            file_offset: Start of the L2 byte range.
+            nbytes: Number of bytes in the range.
+            victim: True makes them the next victims (a faster tier holds
+                the bytes); False makes them most recent (it dropped them).
+
+        Returns:
+            Number of allocations reordered.
+        """
+        if nbytes <= 0:
+            return 0
+        end = file_offset + nbytes
+        allocations: dict[int, None] = {}
+        index = max(0, bisect.bisect_right(self._starts, file_offset) - 1)
+        while index < len(self._starts) and self._starts[index] < end:
+            key = self._by_start.get(self._starts[index])
+            if key is not None and key[0] + key[1] > file_offset:
+                allocations[self._entries[key].allocation_id] = None
+            index += 1
+        for allocation in allocations:
+            if victim:
+                self._policy.demote(allocation)
+            else:
+                self._policy.access(allocation)
+        return len(allocations)
+
     def resolve_subranges(
         self,
         target_offset: int,

@@ -38,6 +38,16 @@ class ReplacementPolicy(ABC, Generic[K]):
         del file_offset, nbytes
         self.insert(key)
 
+    def demote(self, key: K) -> None:
+        """Make an existing key the next victim.
+
+        Policies without a recency order ignore it.
+
+        Args:
+            key: Cache key whose bytes a faster tier already holds.
+        """
+        del key
+
     @abstractmethod
     def access(self, key: K) -> None:
         """Mark an existing key as recently used.
