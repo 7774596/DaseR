@@ -59,6 +59,9 @@ LAYERWISE_COPY_ENV = "DASER_LAYERWISE_COPY"
 #: More slots let later layers' transfers run while earlier layers restore;
 #: a request gets as many as its per-layer bytes fit.
 LAYERWISE_SLOTS_ENV = "DASER_LAYERWISE_SLOTS"
+#: Research switch: ``1`` times how long the forward stream waits for each
+#: layer's restore and logs the sum per layer-wise load as ``gpu_stall_ms``.
+LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
 #: Research switch: ``1`` submits each request-level L1-to-GPU copy as one
 #: ``cudaMemcpyBatchAsync`` over all its runs instead of one copy per run.
 BATCH_DST_COPY_ENV = "DASER_BATCH_DST_COPY"

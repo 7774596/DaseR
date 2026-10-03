@@ -21,6 +21,7 @@ from daser.compression.format import IO_ALIGNMENT
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import (
     LAYERWISE_COPY_ENV,
+    LAYERWISE_GPU_STALL_ENV,
     LAYERWISE_SLOTS_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
@@ -263,6 +264,11 @@ class _LayerwiseLoad:
     busy_ms: float = 0.0
     decode_wait_ms: float = 0.0
     slots: int = 0
+    # Forward-stream timing events around each layer's restore wait
+    # (``DASER_LAYERWISE_GPU_STALL``).
+    gpu_marks: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=list
+    )
     started_at: float = field(default_factory=time.perf_counter)
 
 
@@ -388,6 +394,7 @@ class LoadPipeline:
         self._cuda_stream: torch.cuda.Stream | None = None
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
         self._raw_layerwise_stream: torch.cuda.Stream | None = None
+        self._time_gpu_stall = os.environ.get(LAYERWISE_GPU_STALL_ENV) == "1"
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._layerwise: _LayerwiseLoad | None = None
         # Pinned landing buffer for layer-wise header pages, grown on demand
@@ -603,7 +610,18 @@ class LoadPipeline:
             state.stall_ms += (time.perf_counter() - wait_start) * 1000
         event = state.events[layer]
         if event is not None:
-            torch.cuda.current_stream().wait_event(event)
+            stream = torch.cuda.current_stream()
+            if not self._time_gpu_stall:
+                stream.wait_event(event)
+                return
+            # The forward stream idles between these two marks while the
+            # layer's restore is still running.
+            before = torch.cuda.Event(enable_timing=True)
+            after = torch.cuda.Event(enable_timing=True)
+            before.record(stream)
+            stream.wait_event(event)
+            after.record(stream)
+            state.gpu_marks.append((before, after))
 
     def mark_failed(
         self,
@@ -1649,11 +1667,22 @@ class LoadPipeline:
         return stream, plan_group, restore_group
 
     def _log_layerwise(self, state: _LayerwiseLoad) -> None:
-        """Log one finished layer-wise restore."""
+        """Log one finished layer-wise restore.
+
+        ``gpu_stall_ms`` sums the forward stream's idle time at the layer
+        waits (``-1`` unless ``DASER_LAYERWISE_GPU_STALL=1``); it waits for
+        the last mark, which the step that logs has already passed.
+        """
+        gpu_stall_ms = -1.0
+        if state.gpu_marks:
+            state.gpu_marks[-1][1].synchronize()
+            gpu_stall_ms = sum(
+                before.elapsed_time(after) for before, after in state.gpu_marks
+            )
         logger.info(
             "[CONNECTOR] layerwise load req=%s wall_ms=%.3f records=%d bytes=%d "
             "header_ms=%.3f stall_ms=%.3f copy_ms=%.3f copy_max_ms=%.3f busy_ms=%.3f "
-            "decode_wait_ms=%.3f slots=%d failed=%d",
+            "decode_wait_ms=%.3f slots=%d gpu_stall_ms=%.3f failed=%d",
             ",".join(sorted(state.req_ids)),
             state.load_ms,
             state.records,
@@ -1665,6 +1694,7 @@ class LoadPipeline:
             state.busy_ms,
             state.decode_wait_ms,
             state.slots,
+            gpu_stall_ms,
             int(state.failed),
         )
 

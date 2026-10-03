@@ -15,7 +15,7 @@ from daser.compression import (
     encode_slot,
 )
 from daser.compression.format import IO_ALIGNMENT
-from daser.config import LAYERWISE_SLOTS_ENV
+from daser.config import LAYERWISE_GPU_STALL_ENV, LAYERWISE_SLOTS_ENV
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker import load as load_module
 from daser.connector.worker.load import LoadPipeline
@@ -245,6 +245,28 @@ def test_layerwise_restore_matches_record_major(
         if slots == "1":
             assert _FakeLoadClient.calls == [1, *lanes]
         assert _FakeLoadClient.released == ["req"]
+    finally:
+        pipeline.shutdown()
+
+
+@pytest.mark.parametrize("timed", [False, True])
+def test_layerwise_log_reports_gpu_stall_only_when_timed(
+    monkeypatch: pytest.MonkeyPatch, timed: bool
+) -> None:
+    """``gpu_stall_ms`` is a nonnegative sum when timed and -1 otherwise."""
+    if timed:
+        monkeypatch.setenv(LAYERWISE_GPU_STALL_ENV, "1")
+    lines: list[str] = []
+    monkeypatch.setattr(
+        load_module.logger, "info", lambda msg, *args: lines.append(msg % args)
+    )
+    actual, expected, pipeline, _ = _restore(monkeypatch)
+    try:
+        pipeline.start_layerwise({})
+        assert torch.equal(actual, expected)
+        (line,) = [line for line in lines if "layerwise load" in line]
+        stall = float(line.split("gpu_stall_ms=")[1].split()[0])
+        assert stall >= 0.0 if timed else stall == -1.0
     finally:
         pipeline.shutdown()
 
