@@ -24,6 +24,23 @@ from daser.transfer.iouring.layer import TieredIOUringTransferLayer
 _PAGE = 4096
 
 
+class _StreamView:
+    """CuPy byte view with a private copy stream, like a registered buffer."""
+
+    def __init__(self, array: cupy.ndarray) -> None:
+        self._array = array
+        self._stream = cupy.cuda.Stream(non_blocking=True)
+
+    def __getitem__(self, item: slice) -> cupy.ndarray:
+        """Return a CuPy slice of the view."""
+        return self._array[item]
+
+    @property
+    def copy_stream_ptr(self) -> int:
+        """Return the private H2D copy stream pointer."""
+        return int(self._stream.ptr)
+
+
 async def _timed(
     layer: TieredIOUringTransferLayer, dst: cupy.ndarray, calls: list
 ) -> float:
@@ -86,8 +103,12 @@ async def _run(args: argparse.Namespace) -> None:
             raise SystemExit("layer-major group does not fit the staging buffer")
         total = args.records * record
         for name, calls, moved in (
-            ("record-major", record_major, total),
-            ("layer-major", layer_major, args.records * group_bytes * groups),
+            ()
+            if args.leased_only
+            else (
+                ("record-major", record_major, total),
+                ("layer-major", layer_major, args.records * group_bytes * groups),
+            )
         ):
             await _timed(layer, staging, calls)
             best = min([await _timed(layer, staging, calls) for _ in range(3)])
@@ -116,11 +137,37 @@ async def _run(args: argparse.Namespace) -> None:
             for g in range(groups)
         ]
 
+        # Each lane owns a staging slice and copy stream; up to ``lanes``
+        # layer groups are in flight at once, as the in-forward restore
+        # pipelines them.
+        lane_bytes = args.staging_bytes // args.lanes
+        if args.records * slot > lane_bytes:
+            raise SystemExit("one layer group does not fit a lane")
+        lanes = [
+            _StreamView(staging[i * lane_bytes : (i + 1) * lane_bytes])
+            for i in range(args.lanes)
+        ]
+
         async def leased() -> float:
             cupy.cuda.Device().synchronize()
             start = time.perf_counter()
-            for files, targets, sizes in groups_runs:
-                await layer.load_leased_runs(staging, files, targets, sizes, lease)
+            queues: list[asyncio.Task] = []
+            for g, (files, targets, sizes) in enumerate(groups_runs):
+                if len(queues) >= args.lanes:
+                    await queues.pop(0)
+                queues.append(
+                    asyncio.create_task(
+                        layer.load_leased_runs(
+                            lanes[g % args.lanes],
+                            files,
+                            targets,
+                            sizes,
+                            lease,
+                            copy_mode=args.copy_mode,
+                        )
+                    )
+                )
+            await asyncio.gather(*queues)
             cupy.cuda.Device().synchronize()
             return (time.perf_counter() - start) * 1e3
 
@@ -128,7 +175,8 @@ async def _run(args: argparse.Namespace) -> None:
         best = min([await leased() for _ in range(3)])
         moved = args.records * group_bytes * groups
         print(
-            f"{'leased-runs':12s} calls={groups:4d} spans/call={args.records:5d} "
+            f"{'leased-runs':12s} lanes={args.lanes} mode={args.copy_mode} "
+            f"calls={groups:4d} spans/call={args.records:5d} "
             f"wall={best:8.1f} ms per_call={best / groups:7.2f} ms "
             f"{moved / best / 1e6:6.1f} GB/s"
         )
@@ -149,6 +197,15 @@ def main() -> None:
     parser.add_argument("--group-layers", type=int, default=1)
     parser.add_argument("--staging-bytes", type=int, default=1610612736)
     parser.add_argument("--gather-min-runs", type=int, default=0)
+    parser.add_argument("--lanes", type=int, default=1)
+    parser.add_argument(
+        "--copy-mode", choices=("gather", "memcpy", "batch"), default="gather"
+    )
+    parser.add_argument(
+        "--leased-only",
+        action="store_true",
+        help="Skip the record-major and layer-major span comparison.",
+    )
     asyncio.run(_run(parser.parse_args()))
 
 

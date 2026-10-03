@@ -15,6 +15,7 @@ from daser.compression import (
     encode_slot,
 )
 from daser.compression.format import IO_ALIGNMENT
+from daser.config import LAYERWISE_SLOTS_ENV
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker import load as load_module
 from daser.connector.worker.load import LoadPipeline
@@ -28,7 +29,8 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
 
-_LAYERS = 4
+# More layers than the deepest tested slot ring, so slots get refilled.
+_LAYERS = 8
 _TILE_SCALARS = 1024
 
 
@@ -225,17 +227,23 @@ def _restore(
     return actual, expected, pipeline, blocks
 
 
+@pytest.mark.parametrize("slots", ["1", "2", "64"])
 def test_layerwise_restore_matches_record_major(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, slots: str
 ) -> None:
-    """Every layer is restored exactly before its wait returns."""
+    """Every layer is restored exactly before its wait, at any slot depth."""
+    monkeypatch.setenv(LAYERWISE_SLOTS_ENV, slots)
     actual, expected, pipeline, _ = _restore(monkeypatch)
     pipeline.start_layerwise({})
     try:
         assert torch.equal(actual, expected)
         assert pipeline.take_invalid_block_ids() == set()
         # One header read, then one transfer per layer on alternating lanes.
-        assert _FakeLoadClient.calls == [1, 0, 1, 0, 1]
+        assert _FakeLoadClient.calls[0] == 1
+        lanes = [layer % 2 for layer in range(_LAYERS)]
+        assert sorted(_FakeLoadClient.calls[1:]) == sorted(lanes)
+        if slots == "1":
+            assert _FakeLoadClient.calls == [1, *lanes]
         assert _FakeLoadClient.released == ["req"]
     finally:
         pipeline.shutdown()
@@ -255,10 +263,12 @@ def test_layerwise_failure_invalidates_blocks_and_releases_lease(
         pipeline.shutdown()
 
 
+@pytest.mark.parametrize("slots", ["1", "2"])
 def test_raw_layerwise_restore_matches_slot_copy(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, slots: str
 ) -> None:
     """Raw slot-major records restore each layer exactly before its wait."""
+    monkeypatch.setenv(LAYERWISE_SLOTS_ENV, slots)
     geometry = _geometry()
     generator = torch.Generator().manual_seed(0)
     raw = torch.randint(
@@ -336,7 +346,10 @@ def test_raw_layerwise_restore_matches_slot_copy(
         assert torch.equal(bits, want)
         assert pipeline.take_invalid_block_ids() == set()
         # No header read: one transfer per layer on alternating lanes.
-        assert _FakeLoadClient.calls == [0, 1, 0, 1]
+        lanes = [layer % 2 for layer in range(_LAYERS)]
+        assert sorted(_FakeLoadClient.calls) == sorted(lanes)
+        if slots == "1":
+            assert _FakeLoadClient.calls == lanes
         assert _FakeLoadClient.released == ["req"]
     finally:
         pipeline.shutdown()

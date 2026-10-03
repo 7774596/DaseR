@@ -21,6 +21,7 @@ from daser.compression.format import IO_ALIGNMENT
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import (
     LAYERWISE_COPY_ENV,
+    LAYERWISE_SLOTS_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
 )
@@ -257,9 +258,11 @@ class _LayerwiseLoad:
     copy_ms: float = 0.0
     copy_max_ms: float = 0.0
     # Worker-side time with at least one layer transfer in flight, and time
-    # spent waiting for a lane's decode before reissuing that lane.
+    # spent waiting for a slot's restore before refilling that slot (summed
+    # over slots, so concurrent waits overlap).
     busy_ms: float = 0.0
     decode_wait_ms: float = 0.0
+    slots: int = 0
     started_at: float = field(default_factory=time.perf_counter)
 
 
@@ -1330,8 +1333,12 @@ class LoadPipeline:
     ) -> None:
         """Stream and restore one step's records layer by layer.
 
-        Layer ``g`` reads only its bytes of every record into buffer
-        ``g % 2`` and is restored as soon as they land: packed records decode
+        Each staging buffer is split into up to ``DASER_LAYERWISE_SLOTS``
+        layer slots, as many as one layer's bytes fit (at least one). With
+        ``n`` slots in total, layer ``g`` reads only its bytes of every record
+        into slot ``g % n`` (buffer ``g % 2``) and is restored as soon as they
+        land; the slot is refilled with layer ``g + n`` once that restore
+        completes, so up to ``n`` layers are in flight. Packed records decode
         their layer planes through one shared prepared plan
         (``_packed_layer_groups``); raw slot-major records copy their layer
         run straight into the KV cache (``_raw_layer_groups``).
@@ -1365,66 +1372,85 @@ class LoadPipeline:
             pid = os.getpid()
             records = len(files)
             layers = len(state.ready)
+            per_buffer = max(1, int(os.environ.get(LAYERWISE_SLOTS_ENV, "1")))
+            offsets: list[int] = []
+
+            def carve(need: int) -> list[torch.Tensor]:
+                # Slot k lives in buffer k % 2 at offset offsets[k // 2]; slot
+                # offsets stay 4 KiB aligned for header pages and gathers.
+                if need > pool.buffer_bytes:
+                    raise ValueError("layer-wise layer exceeds the staging buffer")
+                count = min(per_buffer, pool.buffer_bytes // max(need, 1))
+                while count > 1 and (
+                    pool.buffer_bytes // count // IO_ALIGNMENT * IO_ALIGNMENT < need
+                ):
+                    count -= 1
+                stride = pool.buffer_bytes // count // IO_ALIGNMENT * IO_ALIGNMENT
+                offsets[:] = [index * stride for index in range(count)]
+                return [
+                    buffers[slot % 2][offsets[slot // 2] :][:need]
+                    for slot in range(2 * count)
+                ]
+
             if packed:
                 stream, plan_group, restore_group = await self._packed_layer_groups(
-                    state, files, block_ids, lease_id, buffers
+                    state, files, block_ids, lease_id, buffers, carve
                 )
             else:
                 stream, plan_group, restore_group = self._raw_layer_groups(
-                    files, block_ids, buffers, layers
+                    files, block_ids, layers, carve
                 )
+            slots = 2 * len(offsets)
             state.records = records
+            state.slots = slots
             state.header_ms = (time.perf_counter() - state.started_at) * 1000
 
-            def transfer(group: int) -> asyncio.Task[dict[str, Any]]:
+            async def transfer(group: int) -> dict[str, Any]:
                 group_files, targets, sizes = plan_group(group)
-                lane = group % 2
-                return asyncio.create_task(
-                    timed(
-                        group,
-                        self._clients[lane].transfer_load_runs(
-                            lane,
-                            pid,
-                            group_files,
-                            targets,
-                            sizes,
-                            lease_id,
-                            copy_mode=copy_mode,
-                        ),
-                    )
-                )
-
-            spans: list[tuple[float, float]] = []
-
-            async def timed(group: int, call: Any) -> dict[str, Any]:
+                slot = group % slots
+                lane = slot % 2
                 begin = time.perf_counter()
                 try:
-                    return await call
+                    return await self._clients[lane].transfer_load_runs(
+                        lane,
+                        pid,
+                        group_files,
+                        targets + offsets[slot // 2],
+                        sizes,
+                        lease_id,
+                        copy_mode=copy_mode,
+                    )
                 finally:
                     spans.append((begin, time.perf_counter()))
 
+            async def refill(group: int, event: torch.cuda.Event) -> dict[str, Any]:
+                # Layer ``group`` overwrites the slot the restore behind
+                # ``event`` reads.
+                waited = time.perf_counter()
+                await self._wait_for_cuda_event(event)
+                state.decode_wait_ms += (time.perf_counter() - waited) * 1000
+                return await transfer(group)
+
+            spans: list[tuple[float, float]] = []
             copy_mode = os.environ.get(LAYERWISE_COPY_ENV, "gather")
-            tasks = [transfer(group) for group in range(min(2, layers))]
+            tasks = [
+                asyncio.create_task(transfer(group))
+                for group in range(min(slots, layers))
+            ]
             for group in range(layers):
                 response = await tasks[group]
                 state.nbytes += int(response.get("bytes", 0))
                 copy_ms = float(response.get("transfer_ms", 0.0))
                 state.copy_ms += copy_ms
                 state.copy_max_ms = max(state.copy_max_ms, copy_ms)
-                lane = group % 2
                 with torch.cuda.stream(stream):
-                    restore_group(group, lane)
+                    restore_group(group, group % slots)
                     event = torch.cuda.Event()
                     event.record(stream)
                 state.events[group] = event
                 state.ready[group].set()
-                if group + 2 < layers:
-                    # The next group on this lane overwrites the buffer this
-                    # restore reads.
-                    waited = time.perf_counter()
-                    await self._wait_for_cuda_event(event)
-                    state.decode_wait_ms += (time.perf_counter() - waited) * 1000
-                    tasks.append(transfer(group + 2))
+                if group + slots < layers:
+                    tasks.append(asyncio.create_task(refill(group + slots, event)))
             state.load_ms = (time.perf_counter() - state.started_at) * 1000
             state.busy_ms = _interval_union_ms(spans)
             final = state.events[layers - 1]
@@ -1463,6 +1489,7 @@ class LoadPipeline:
         block_ids: list[int],
         lease_id: str,
         buffers: list[torch.Tensor],
+        carve: Callable[[int], list[torch.Tensor]],
     ) -> tuple[
         torch.cuda.Stream,
         Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]],
@@ -1471,13 +1498,17 @@ class LoadPipeline:
         """Stage packed record headers and plan their per-layer restores.
 
         Header pages land compactly at the tail of buffer 1, are planned on
-        the host and placed at every record's slot offset in both buffers.
+        the host and placed at every record's offset in every layer slot.
+
+        Args:
+            carve: Splits the staging buffers into layer slots of the given
+                bytes and returns the slot views.
 
         Returns:
             The decode stream, a function giving one layer group's
-            ``(file offsets, staging offsets, lengths)`` runs, and a function
-            that patches that group's descriptors in a lane's buffer and
-            decodes it on the current stream.
+            ``(file offsets, slot offsets, lengths)`` runs, and a function
+            that patches that group's descriptors in a slot and decodes it on
+            the current stream.
         """
         decoder = self._compressed_decoder
         stream = self._compressed_cuda_stream
@@ -1485,15 +1516,6 @@ class LoadPipeline:
             raise RuntimeError("packed layer-wise load requires the compressed decoder")
         pool = self._staging_pool
         assert pool is not None
-        words = [
-            buffer[: buffer.numel() // 4 * 4].view(torch.int32) for buffer in buffers
-        ]
-        rows = [
-            buffer[: buffer.numel() // IO_ALIGNMENT * IO_ALIGNMENT].view(
-                -1, IO_ALIGNMENT
-            )
-            for buffer in buffers
-        ]
         records = len(files)
         header_bytes = records * IO_ALIGNMENT
         tail = (pool.buffer_bytes - header_bytes) // IO_ALIGNMENT * IO_ALIGNMENT
@@ -1521,17 +1543,19 @@ class LoadPipeline:
         headers = host[:header_bytes].numpy().reshape(records, IO_ALIGNMENT)
         layers = len(state.ready)
         plans = plan_layer_groups(headers, [(2 * layer, 2) for layer in range(layers)])
-        if plans[0].staging_bytes > tail:
-            raise ValueError("layer-wise staging exceeds the staging buffer")
+        views = carve(plans[0].staging_bytes)
+        words = [view.view(torch.int32) for view in views]
         patches = [staged_descriptor_patch(headers, plan) for plan in plans]
         bounds = np.concatenate(([0], np.cumsum([len(p[0]) for p in patches])))
         device = buffers[0].device
         with torch.cuda.stream(stream):
-            slots = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
+            pages_at = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
                 device
             )
-            for buffer_rows in rows:
-                buffer_rows.index_copy_(0, slots, pages)
+            # The header landing area may overlap a slot of buffer 1; ``pages``
+            # is a clone and these copies precede every slot transfer.
+            for view in views:
+                view.view(-1, IO_ALIGNMENT).index_copy_(0, pages_at, pages)
             patch_index = torch.from_numpy(np.concatenate([p[0] for p in patches])).to(
                 device
             )
@@ -1539,7 +1563,7 @@ class LoadPipeline:
                 device
             )
             restore = decoder.prepare(
-                staging=buffers[0],
+                staging=views[0],
                 staging_offsets=plans[0].staging_offsets.tolist(),
                 block_ids=block_ids,
                 modes=[1] * records,
@@ -1560,10 +1584,10 @@ class LoadPipeline:
             end = (plan.source_end + 15) // 16 * 16
             return files + begin, plan.data_offsets - skew, end - begin
 
-        def restore_group(group: int, lane: int) -> None:
+        def restore_group(group: int, slot: int) -> None:
             first, last = int(bounds[group]), int(bounds[group + 1])
-            words[lane].index_put_((patch_index[first:last],), patch_value[first:last])
-            restore.submit_planes(2 * group, 2, buffers[lane])
+            words[slot].index_put_((patch_index[first:last],), patch_value[first:last])
+            restore.submit_planes(2 * group, 2, views[slot])
 
         return stream, plan_group, restore_group
 
@@ -1571,8 +1595,8 @@ class LoadPipeline:
         self,
         files: np.ndarray,
         block_ids: list[int],
-        buffers: list[torch.Tensor],
         layers: int,
+        carve: Callable[[int], list[torch.Tensor]],
     ) -> tuple[
         torch.cuda.Stream,
         Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]],
@@ -1582,15 +1606,19 @@ class LoadPipeline:
 
         A raw slot stores its layers back-to-back, so layer ``g`` of every
         record is one contiguous ``slot_size / layers`` run at offset
-        ``g * layer_bytes``. Each run lands densely in a lane's buffer and is
+        ``g * layer_bytes``. Each run lands densely in a layer slot and is
         scattered into the cross-layer KV view's layer ``g`` with one indexed
         copy; no decoder or header pages are involved.
 
+        Args:
+            carve: Splits the staging buffers into layer slots of the given
+                bytes and returns the slot views.
+
         Returns:
             The copy stream, a function giving one layer's
-            ``(file offsets, staging offsets, lengths)`` runs, and a function
-            that copies that layer from a lane's buffer into the KV cache on
-            the current stream.
+            ``(file offsets, slot offsets, lengths)`` runs, and a function
+            that copies that layer from a slot into the KV cache on the
+            current stream.
 
         Raises:
             ValueError: If one layer of every record exceeds a staging buffer.
@@ -1600,8 +1628,7 @@ class LoadPipeline:
             raise ValueError("raw layer-wise load does not apply load scales")
         records = len(files)
         layer_bytes = self._local_slot_size // layers
-        if records * layer_bytes > min(buffer.numel() for buffer in buffers):
-            raise ValueError("raw layer-wise layer exceeds the staging buffer")
+        views = carve(records * layer_bytes)
         if self._raw_layerwise_stream is None:
             self._raw_layerwise_stream = torch.cuda.Stream(
                 device=kv_cache.device, priority=cuda_stream_priority("high")
@@ -1615,8 +1642,8 @@ class LoadPipeline:
         def plan_group(group: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             return files + group * layer_bytes, targets, sizes
 
-        def restore_group(group: int, lane: int) -> None:
-            src = buffers[lane][: records * layer_bytes].view(kv_cache.dtype)
+        def restore_group(group: int, slot: int) -> None:
+            src = views[slot].view(kv_cache.dtype)
             kv_cache[:, group].index_copy_(0, index, src.view(shape))
 
         return stream, plan_group, restore_group
@@ -1626,7 +1653,7 @@ class LoadPipeline:
         logger.info(
             "[CONNECTOR] layerwise load req=%s wall_ms=%.3f records=%d bytes=%d "
             "header_ms=%.3f stall_ms=%.3f copy_ms=%.3f copy_max_ms=%.3f busy_ms=%.3f "
-            "decode_wait_ms=%.3f failed=%d",
+            "decode_wait_ms=%.3f slots=%d failed=%d",
             ",".join(sorted(state.req_ids)),
             state.load_ms,
             state.records,
@@ -1637,6 +1664,7 @@ class LoadPipeline:
             state.copy_max_ms,
             state.busy_ms,
             state.decode_wait_ms,
+            state.slots,
             int(state.failed),
         )
 
