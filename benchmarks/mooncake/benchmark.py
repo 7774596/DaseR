@@ -549,6 +549,7 @@ async def replay(
     prefix_dependencies: bool = False,
     route: str = "sticky",
     strict_order: bool = False,
+    dependency_gap_s: float = 0.0,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -575,6 +576,9 @@ async def replay(
             the send order is exactly the trace order (implies prefix
             dependencies). Without it, closed-loop replay sends ready
             requests in semaphore wake-up order, not trace order.
+        dependency_gap_s: Idle seconds between a dependency's completion
+            and the dependent request (tool execution / think time). The
+            gap is excluded from client queue time and TTFT.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -639,6 +643,7 @@ async def replay(
                             else done_events[predecessors[position]]
                         ),
                         done=done_events[position],
+                        dependency_gap_s=dependency_gap_s,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -737,6 +742,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "completes, so the replay follows the trace order exactly."
         ),
     )
+    parser.add_argument(
+        "--dependency-gap-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Idle seconds between a dependency's completion and the next "
+            "request (models tool execution / think time; not in TTFT)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -802,6 +816,7 @@ async def main_async(args: argparse.Namespace) -> int:
         prefix_dependencies=args.prefix_dependencies,
         route=args.route,
         strict_order=args.strict_order,
+        dependency_gap_s=args.dependency_gap_s,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -954,9 +969,11 @@ async def _run_request(
     writer: _ResultWriter,
     wait_for: asyncio.Event | None,
     done: asyncio.Event,
+    dependency_gap_s: float = 0.0,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
+            dependency_gap_s=dependency_gap_s,
             request=request,
             prompt_builder=prompt_builder,
             client=client,
@@ -989,12 +1006,15 @@ async def _run_request_after_dependency(
     seed: int,
     writer: _ResultWriter,
     wait_for: asyncio.Event | None,
+    dependency_gap_s: float = 0.0,
 ) -> dict[str, Any]:
     scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
     await asyncio.sleep(max(0.0, started_at + scheduled_offset - time.perf_counter()))
     dependency_at = time.perf_counter()
     if wait_for is not None:
         await wait_for.wait()
+        # Idle time after the dependency (tool execution / think time).
+        await asyncio.sleep(dependency_gap_s)
     queued_at = time.perf_counter()
     async with outer_sem:
         admitted_at = time.perf_counter()

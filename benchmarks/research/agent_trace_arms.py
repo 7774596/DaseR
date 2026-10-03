@@ -255,6 +255,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Closed-loop replay in exact trace order (one request after another).",
     )
     parser.add_argument(
+        "--dependency-gap-s",
+        type=float,
+        default=0.0,
+        help="Idle seconds after each dependency completes (tool / think time).",
+    )
+    parser.add_argument(
         "--corpus-tokens",
         type=Path,
         default=None,
@@ -525,6 +531,8 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 str(args.abort_after_failures),
                 *(["--prefix-dependencies"] if args.prefix_dependencies else []),
                 *(["--strict-order"] if args.strict_order else []),
+                "--dependency-gap-s",
+                str(args.dependency_gap_s),
                 *(
                     ["--corpus-tokens", str(args.corpus_tokens)]
                     if args.corpus_tokens is not None

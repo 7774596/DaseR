@@ -24,8 +24,8 @@ from daser.server.session_predictor import SessionPredictor
 
 def _real_switch_sequence(
     path: str, sessions: int, concurrency: float, min_ctx: int, seed: int
-) -> list[int]:
-    """Return the merged cc-traces session sequence, repeats collapsed."""
+) -> list[tuple[int, float]]:
+    """Return the merged cc-traces (session, start seconds), repeats collapsed."""
     chains = []
     with open(path) as f:
         for line in f:
@@ -43,10 +43,10 @@ def _real_switch_sequence(
         t0 += rng.expovariate(rate)
         stream += [(t0 + r["t"] - reqs[0]["t"], sid) for r in reqs]
     stream.sort()
-    seq: list[int] = []
-    for _t, sid in stream:
-        if not seq or seq[-1] != sid:
-            seq.append(sid)
+    seq: list[tuple[int, float]] = []
+    for t, sid in stream:
+        if not seq or seq[-1][0] != sid:
+            seq.append((sid, t))
     return seq
 
 
@@ -81,6 +81,11 @@ def main() -> None:
     ap.add_argument("--min-ctx", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--step-ms", type=int, default=1000)
+    ap.add_argument(
+        "--real-timestamps",
+        action="store_true",
+        help="Write the cc-traces start time of each turn instead of index * step.",
+    )
     args = ap.parse_args()
     with open(args.trace) as f:
         rows = [json.loads(line) for line in f]
@@ -91,12 +96,13 @@ def main() -> None:
     seq = _real_switch_sequence(
         args.cc_traces, args.sessions, args.concurrency, args.min_ctx, args.seed
     )
-    last_seen = {cc: index for index, cc in enumerate(seq)}
+    last_seen = {cc: index for index, (cc, _t) in enumerate(seq)}
     mapping: dict[int, int] = {}
     free = list(trace_sessions)
     used: Counter[int] = Counter()
     order: list[int] = []
-    for index, cc in enumerate(seq):
+    starts: list[float] = []
+    for index, (cc, start) in enumerate(seq):
         if cc not in mapping:
             if not free:
                 continue
@@ -106,6 +112,7 @@ def main() -> None:
             continue
         if not order or order[-1] != sid:
             order.append(sid)
+            starts.append(start)
             used[sid] += 1
         if used[sid] == len(by_session[sid]):
             mapping[cc] = -1
@@ -120,14 +127,26 @@ def main() -> None:
     tail = len(rows) - len(order)
     for sid in trace_sessions:
         order += [sid] * (len(by_session[sid]) - used[sid])
+    # Tail turns follow back to back: no gap after the last real start.
+    starts += [starts[-1]] * (len(order) - len(starts))
     emitted: Counter[int] = Counter()
     with open(args.output, "w") as f:
         for index, sid in enumerate(order):
             row = dict(by_session[sid][emitted[sid]])
             emitted[sid] += 1
-            row["timestamp"] = index * args.step_ms
+            row["timestamp"] = (
+                round((starts[index] - starts[0]) * 1000.0)
+                if args.real_timestamps
+                else index * args.step_ms
+            )
             f.write(json.dumps(row) + "\n")
     print("order", " ".join(map(str, order)), f"tail={tail}")
+    gaps = sorted(b - a for a, b in zip(starts, starts[1:], strict=False))
+    print(
+        "switch gap s p10/p50/p90/sum "
+        f"{gaps[len(gaps) // 10]:.1f}/{gaps[len(gaps) // 2]:.1f}/"
+        f"{gaps[len(gaps) * 9 // 10]:.1f}/{sum(gaps):.0f}"
+    )
     for depth in (1, 2, 3):
         print(f"depth={depth} switch_accuracy={_replay_accuracy(order, depth):.3f}")
 

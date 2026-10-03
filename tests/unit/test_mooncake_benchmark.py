@@ -366,6 +366,40 @@ def test_strict_order_replays_in_trace_order(
     assert sent == [0, 1, 2, 3]
 
 
+def test_dependency_gap_idles_before_the_dependent_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap counts as dependency wait, not as client queue time."""
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        sample = args[2]
+        kwargs["on_send"]()
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [TraceRequest(0, 0, 10, 1, (1,)), TraceRequest(1, 1, 10, 1, (1, 2))]
+    results, _, _ = asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=0,
+            strict_order=True,
+            dependency_gap_s=0.1,
+        )
+    )
+
+    by_index = {record["trace_index"]: record for record in results}
+    assert by_index[0]["dependency_wait_ms"] == pytest.approx(0, abs=5)
+    assert by_index[1]["dependency_wait_ms"] >= 100
+    assert by_index[1]["client_queue_ms"] < 50
+
+
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
     """Blocks carry corpus text; equal hashes match and distinct hashes differ."""
     corpus = list(range(5000, 5000 + 3 * MOONCAKE_BLOCK_TOKENS))
