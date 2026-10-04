@@ -93,6 +93,9 @@ READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
 #: Research switch: ``1`` holds L2 writes while a readahead is reading (up to
 #: a bounded delay), so writeback does not share the SSD with the next load.
 L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
+#: Research switch: ``1`` runs L2 writes on their own executor in 16 MiB
+#: pieces that pause (bounded) while any L2 read is in native IO.
+L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
 #: Research switch: fraction in (0, 1) of L1 that held (not yet written)
 #: ranges may fill before the oldest are written to L2 while no readahead is
 #: reading, so later evictions under a readahead free clean memory instead of

@@ -20,6 +20,13 @@ from typing import Any
 # First Party
 from daser.transfer.iouring.native import NativeIOUring
 
+#: Write-gate granularity: a gated write is issued in pieces of this size and
+#: re-checks for in-flight reads between pieces.
+_GATE_CHUNK_BYTES = 16 << 20
+#: Longest a gated write piece waits for reads to drain before it proceeds,
+#: so a continuous read stream cannot starve writes that hold L1 memory.
+_GATE_MAX_WAIT_S = 0.05
+
 
 class L2IoEngine:
     """Round-robin io_uring positioned reads/writes against the L2 store file.
@@ -28,14 +35,21 @@ class L2IoEngine:
         path: pre-allocated or creatable L2 store file.
         l2_bytes: SSD-tier capacity; the file is truncated to this size.
         io_workers: number of native io_uring rings and executor threads.
+        write_gate: Research switch. Writes run on their own executor and are
+            issued in ``_GATE_CHUNK_BYTES`` pieces; before each piece a write
+            waits, at most ``_GATE_MAX_WAIT_S``, while any read job is in
+            native IO, because concurrent O_DIRECT writes cut the read
+            bandwidth of the shared devices by half or more.
 
     Async/thread-safety:
         Ring selection is serialized by an internal lock. Blocking syscalls are
-        meant to be offloaded onto ``executor`` by the caller, which awaits the
-        completion on its event loop.
+        meant to be offloaded onto ``executor`` (``write_executor`` for writes)
+        by the caller, which awaits the completion on its event loop.
     """
 
-    def __init__(self, path: str, l2_bytes: int, io_workers: int) -> None:
+    def __init__(
+        self, path: str, l2_bytes: int, io_workers: int, write_gate: bool = False
+    ) -> None:
         if l2_bytes <= 0:
             raise ValueError("l2_bytes must be positive")
         if io_workers <= 0:
@@ -58,8 +72,20 @@ class L2IoEngine:
         # "write_io"; guarded by ``_timing_lock`` (executor threads add).
         self._timing_lock = threading.Lock()
         self._timing_us = dict.fromkeys(
-            ("read_queue", "read_io", "write_queue", "write_io"), 0
+            ("read_queue", "read_io", "write_queue", "write_io", "write_gate"), 0
         )
+        self._write_gate = bool(write_gate)
+        self._write_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=io_workers, thread_name_prefix="daser-iouring-w"
+            )
+            if self._write_gate
+            else self._executor
+        )
+        # Read jobs currently in native IO; gated writes wait on the condition
+        # until it reaches zero.
+        self._reads_cond = threading.Condition()
+        self._reads_active = 0
 
     @property
     def ring_count(self) -> int:
@@ -68,17 +94,23 @@ class L2IoEngine:
 
     @property
     def executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the executor used to offload blocking io_uring waits."""
+        """Return the executor used to offload blocking io_uring reads."""
         return self._executor
+
+    @property
+    def write_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the executor for blocking writes (``executor`` ungated)."""
+        return self._write_executor
 
     @property
     def timing_us(self) -> dict[str, int]:
         """Return cumulative executor queue and native IO microseconds.
 
         Returns:
-            A copy keyed ``read_queue``, ``read_io``, ``write_queue`` and
-            ``write_io``. Queue time runs from submission to an executor
-            thread starting the job; IO time is the native call itself.
+            A copy keyed ``read_queue``, ``read_io``, ``write_queue``,
+            ``write_io`` and ``write_gate``. Queue time runs from submission
+            to an executor thread starting the job; IO time is the native call
+            itself, including ``write_gate`` time writes waited for reads.
 
         Async/thread-safety:
             Safe from any thread; executor threads update under a lock.
@@ -100,9 +132,18 @@ class L2IoEngine:
 
         def run(*args: Any) -> Any:
             start = time.perf_counter()
+            reading = kind == "read"
+            if reading:
+                with self._reads_cond:
+                    self._reads_active += 1
             try:
                 return fn(*args)
             finally:
+                if reading:
+                    with self._reads_cond:
+                        self._reads_active -= 1
+                        if not self._reads_active:
+                            self._reads_cond.notify_all()
                 end = time.perf_counter()
                 with self._timing_lock:
                     self._timing_us[f"{kind}_queue"] += int(
@@ -142,8 +183,24 @@ class L2IoEngine:
 
         Returns:
             Number of bytes written.
+
+        Async/thread-safety:
+            With ``write_gate`` the write is split into pieces that each wait,
+            bounded, while a read job is in native IO; the ring is not held
+            while waiting.
         """
-        return uring.write(self._fd, file_offset, data)
+        if not self._write_gate:
+            return uring.write(self._fd, file_offset, data)
+        view = memoryview(data).cast("B")
+        written = 0
+        while written < len(view):
+            waited = self._wait_reads_drained()
+            if waited:
+                with self._timing_lock:
+                    self._timing_us["write_gate"] += waited
+            piece = view[written : written + _GATE_CHUNK_BYTES]
+            written += uring.write(self._fd, file_offset + written, piece)
+        return written
 
     def submit_read_batch(
         self, reads: list[tuple[int, memoryview]]
@@ -194,8 +251,25 @@ class L2IoEngine:
         return submitted, completions
 
     def close(self) -> None:
-        """Shut down the executor, close rings, and close the file descriptor."""
+        """Shut down the executors, close rings, and close the file descriptor."""
         self._executor.shutdown(wait=True)
+        if self._write_executor is not self._executor:
+            self._write_executor.shutdown(wait=True)
         for uring in self._urings:
             uring.close()
         os.close(self._fd)
+
+    def _wait_reads_drained(self) -> int:
+        """Block until no read job is in native IO, bounded by the gate cap.
+
+        Returns:
+            Microseconds waited.
+        """
+        with self._reads_cond:
+            if not self._reads_active:
+                return 0
+            start = time.perf_counter()
+            self._reads_cond.wait_for(
+                lambda: not self._reads_active, timeout=_GATE_MAX_WAIT_S
+            )
+            return int((time.perf_counter() - start) * 1_000_000)

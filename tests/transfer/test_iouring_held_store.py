@@ -166,7 +166,13 @@ def test_l2_timing_counts_read_and_write_jobs(tmp_path: Path) -> None:
         # The first page left the one-page L1, so this load reads L2.
         assert await layer.load_bytes(dst, 0, PAGE) == PAGE
         timing = layer.l2_timing_us
-        assert set(timing) == {"read_queue", "read_io", "write_queue", "write_io"}
+        assert set(timing) == {
+            "read_queue",
+            "read_io",
+            "write_queue",
+            "write_io",
+            "write_gate",
+        }
         assert timing["write_io"] > 0
         assert timing["read_io"] > 0
         layer.close()

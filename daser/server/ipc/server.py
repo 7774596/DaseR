@@ -21,6 +21,7 @@ from daser.config import (
     L1_NEXT_USE_ENV,
     L1_SKIP_PINNED_ENV,
     L1_SPLIT_BYPASS_ENV,
+    L2_WRITE_GATE_ENV,
     L2_WRITE_YIELD_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_STREAM_ENV,
@@ -2007,6 +2008,7 @@ class IPCServer:
                     skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
                     readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
                     l2_write_yield=os.environ.get(L2_WRITE_YIELD_ENV) == "1",
+                    l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
                     held_preclean_fraction=float(
                         os.environ.get(HELD_PRECLEAN_FRACTION_ENV) or 0.0
                     ),

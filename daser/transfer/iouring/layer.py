@@ -977,6 +977,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             readahead is still reading, at most ``_WRITE_YIELD_MAX_S``, so
             store writeback does not share the SSD with the next request's
             load; the written slice stays pinned in L1 meanwhile.
+        l2_write_gate: Research switch. L2 writes run on their own executor
+            and pause between 16 MiB pieces while any L2 read is in native IO
+            (bounded per piece), covering writes already issued when a read
+            starts; see ``L2IoEngine``.
         held_preclean_fraction: Research switch (0 disables). Once held
             ranges exceed this fraction of L1, the oldest are written to L2
             while no readahead is reading (one batch at a time) and stay
@@ -1023,6 +1027,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         skip_pinned_eviction: bool = False,
         readahead_srpt: bool = False,
         l2_write_yield: bool = False,
+        l2_write_gate: bool = False,
         held_preclean_fraction: float = 0.0,
         readahead_budget_fraction: float = 0.5,
         device_stash_bytes: int = 0,
@@ -1063,7 +1068,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         self._l2: L2IoEngine | None = None
         if not skip_l2:
-            self._l2 = L2IoEngine(path, l2_bytes, io_workers)
+            self._l2 = L2IoEngine(path, l2_bytes, io_workers, write_gate=l2_write_gate)
         self.bip_enabled = bool(bip_enabled)
         self.l1_accounting = l1_accounting
         self._l1_bytes = l1_bytes
@@ -1186,7 +1191,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
             "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s "
-            "l2_write_yield=%s held_preclean_limit=%d",
+            "l2_write_yield=%s l2_write_gate=%s held_preclean_limit=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -1209,6 +1214,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             skip_pinned_eviction,
             readahead_srpt,
             self._l2_write_yield,
+            l2_write_gate,
             self._held_preclean_limit,
         )
 
@@ -2869,7 +2875,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not self._readahead_idle.is_set():
             self._stats.l2_write_contended_bytes += len(data)
         await loop.run_in_executor(
-            self._l2.executor,
+            self._l2.write_executor,
             self._l2.timed("write", self._write_l2),
             file_offset,
             data,
