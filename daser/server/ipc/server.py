@@ -29,6 +29,7 @@ from daser.config import (
     READAHEAD_BUDGET_FRACTION_ENV,
     READAHEAD_SKIP_STASHED_ENV,
     READAHEAD_SRPT_ENV,
+    READAHEAD_TAIL_BYPASS_ENV,
     SESSION_PREDICT_ACCURACY_ENV,
     SESSION_PREFETCH_DEPTH_ENV,
     SESSION_PREFETCH_ENV,
@@ -2009,6 +2010,9 @@ class IPCServer:
                     readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
                     l2_write_yield=os.environ.get(L2_WRITE_YIELD_ENV) == "1",
                     l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
+                    readahead_tail_bypass=(
+                        os.environ.get(READAHEAD_TAIL_BYPASS_ENV) == "1"
+                    ),
                     held_preclean_fraction=float(
                         os.environ.get(HELD_PRECLEAN_FRACTION_ENV) or 0.0
                     ),

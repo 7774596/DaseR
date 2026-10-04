@@ -1763,6 +1763,43 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
     asyncio.run(scenario())
 
 
+def test_iouring_readahead_tail_bypass_reads_uncovered_spans_around_l1(
+    tmp_path,
+) -> None:
+    """With tail bypass, spans no readahead covers skip L1 and the wait."""
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    half = nbytes // 2
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=nbytes,
+            readahead_tail_bypass=True,
+        )
+        try:
+            assert await layer.start_readahead([{"file_offset": 0, "nbytes": half}])
+            dst = bytearray(nbytes)
+            load = [
+                {"target_offset": 0, "file_offset": 0, "nbytes": half},
+                {"target_offset": half, "file_offset": half, "nbytes": half},
+            ]
+            assert await layer.load_bytes_grouped(dst, load) == nbytes
+            assert bytes(dst) == payload
+            assert layer.stats.readahead_served_bytes == half
+            # Only the readahead half is promoted; the uncovered half was read
+            # around L1, so it is not resident.
+            assert layer.stats.l1_bypass_bytes == half
+            assert layer.l1_bytes_used == half
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_iouring_readahead_stream_loads_scattered_spans_across_pieces(
     tmp_path, device: str

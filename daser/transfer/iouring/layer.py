@@ -61,6 +61,8 @@ _STASH_LOAD_QUIET_S = 0.25
 _WRITE_YIELD_MAX_S = 2.0
 # Held bytes one preclean batch writes before the next idle check.
 _PRECLEAN_BATCH_BYTES = 1 << 30
+#: A promotion reservation still waiting after this long logs the tier state.
+_STUCK_WAIT_LOG_S = 30.0
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -981,6 +983,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             and pause between 16 MiB pieces while any L2 read is in native IO
             (bounded per piece), covering writes already issued when a read
             starts; see ``L2IoEngine``.
+        readahead_tail_bypass: Research switch. A grouped load reads the
+            spans no readahead covers (the tail past the readahead budget)
+            through transient windows straight to the destination while it
+            waits for the covering readaheads, instead of promoting them
+            through L1 after the wait.
         held_preclean_fraction: Research switch (0 disables). Once held
             ranges exceed this fraction of L1, the oldest are written to L2
             while no readahead is reading (one batch at a time) and stay
@@ -1028,6 +1035,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         readahead_srpt: bool = False,
         l2_write_yield: bool = False,
         l2_write_gate: bool = False,
+        readahead_tail_bypass: bool = False,
         held_preclean_fraction: float = 0.0,
         readahead_budget_fraction: float = 0.5,
         device_stash_bytes: int = 0,
@@ -1095,6 +1103,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         # Lease ID -> readahead reads in flight, for the contention count.
         self._readahead_reading: dict[str, int] = {}
         self._l2_write_yield = bool(l2_write_yield)
+        self._readahead_tail_bypass = bool(readahead_tail_bypass) and not skip_l2
         # Running readaheads, and an event set while there are none.
         self._readahead_running = 0
         self._readahead_idle = asyncio.Event()
@@ -1191,7 +1200,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
             "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s "
-            "l2_write_yield=%s l2_write_gate=%s held_preclean_limit=%d",
+            "l2_write_yield=%s l2_write_gate=%s readahead_tail_bypass=%s "
+            "held_preclean_limit=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -1215,6 +1225,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             readahead_srpt,
             self._l2_write_yield,
             l2_write_gate,
+            self._readahead_tail_bypass,
             self._held_preclean_limit,
         )
 
@@ -1303,6 +1314,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         # allocation is resolved in a single metadata walk.
         spans = _coalesce_load_spans(spans, self._l1_bytes)
         plan = _LoadPlan()
+        tail_task: asyncio.Task[int] | None = None
         mark = time.perf_counter()
         self._loads_active += 1
         try:
@@ -1318,10 +1330,18 @@ class TieredIOUringTransferLayer(TransferLayer):
                     await self._resolve_load_batch(dst, batch, plan)
                     mark = self._add_phase_us("load_resolve_us", mark)
             else:
+                waited = spans
+                if self._readahead_tail_bypass and self._readaheads:
+                    waited, tail = self._split_readahead_tail(spans)
+                    if tail:
+                        # Uncovered spans start reading now, beside the wait.
+                        tail_task = asyncio.create_task(
+                            self._load_tail_bypass(dst, tail)
+                        )
                 if self._readaheads:
-                    await self._wait_for_readaheads(spans)
+                    await self._wait_for_readaheads(waited)
                 mark = self._add_phase_us("load_readahead_wait_us", mark)
-                await self._resolve_load_batch(dst, spans, plan)
+                await self._resolve_load_batch(dst, waited, plan)
                 mark = self._add_phase_us("load_resolve_us", mark)
             if plan.pending:
                 await asyncio.gather(*plan.pending)
@@ -1339,9 +1359,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                         raise result
             elif plan.misses:
                 await self._load_l2_misses_grouped(dst, plan.misses)
+            if tail_task is not None:
+                plan.total += await tail_task
             mark = self._add_phase_us("load_l2_us", mark)
         finally:
             try:
+                # The tail reads into ``dst`` too; never return while it runs.
+                if tail_task is not None and not tail_task.done():
+                    await asyncio.gather(tail_task, return_exceptions=True)
                 if plan.copies:
                     await _drain_destination_copies(plan.copies)
             finally:
@@ -3673,6 +3698,23 @@ class TieredIOUringTransferLayer(TransferLayer):
                     self._l1.register_pool_waiter(wait_for)
             started = time.perf_counter()
             try:
+                done, _ = await asyncio.wait({wait_for}, timeout=_STUCK_WAIT_LOG_S)
+                if not done:
+                    # Diagnostic for promotion stalls that never wake.
+                    logger.warning(
+                        "[TRANSFER:iouring] promotion of %d bytes waiting %.0f s "
+                        "on %s: l1_used=%d/%d held=%d readahead_retained=%d "
+                        "pending_l2=%d pending_promotions=%d",
+                        nbytes,
+                        _STUCK_WAIT_LOG_S,
+                        cause,
+                        self._l1.bytes_used,
+                        self._l1_bytes,
+                        self._held_bytes,
+                        self._readahead_bytes_locked(),
+                        sum(not task.done() for task in self._pending_l2.values()),
+                        len(self._pending_l1_promotions),
+                    )
                 await wait_for
             finally:
                 field_name = f"promotion_wait_{cause}_us"
@@ -4328,6 +4370,69 @@ class TieredIOUringTransferLayer(TransferLayer):
             for piece_ranges, future in readahead.pieces
             if not future.done() and _ranges_overlap(piece_ranges, ranges)
         ]
+
+    def _split_readahead_tail(
+        self, spans: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split load spans into readahead-covered bytes and the uncovered tail.
+
+        Args:
+            spans: Coalesced load spans with destination offsets.
+
+        Returns:
+            ``(covered, tail)`` span fragments: bytes inside any readahead
+            range keep the normal wait-then-resolve path; bytes no readahead
+            covers can be read at once.
+        """
+        ranges = sorted(
+            rng for item in self._readaheads.values() for rng in item.ranges
+        )
+        covered: list[dict[str, Any]] = []
+        tail: list[dict[str, Any]] = []
+        for span in spans:
+            start = int(span["file_offset"])
+            nbytes = int(span["nbytes"])
+            outside = _subtract_ranges([(start, nbytes)], ranges)
+            inside = _subtract_ranges([(start, nbytes)], outside)
+            # Coalesced spans can straddle a readahead edge, so split by bytes;
+            # each fragment carries its share of the L1 accounting charge.
+            accounted = int(span.get("accounted_nbytes", nbytes))
+            for fragments, out in ((inside, covered), (outside, tail)):
+                for frag_start, frag_size in fragments:
+                    out.append(
+                        {
+                            "target_offset": int(span.get("target_offset", 0))
+                            + frag_start
+                            - start,
+                            "file_offset": frag_start,
+                            "nbytes": frag_size,
+                            "accounted_nbytes": accounted * frag_size // nbytes,
+                        }
+                    )
+        return covered, tail
+
+    async def _load_tail_bypass(self, dst: Any, tail: list[dict[str, Any]]) -> int:
+        """Load spans no readahead covers, reading L2 misses around L1.
+
+        L1-resident bytes are copied as usual; misses go through transient
+        windows straight to ``dst`` so they neither wait for the readaheads
+        nor compete with readahead leases for L1 residency.
+
+        Returns:
+            Bytes loaded.
+        """
+        plan = _LoadPlan()
+        try:
+            await self._resolve_load_batch(dst, tail, plan)
+            if plan.pending:
+                await asyncio.gather(*plan.pending)
+            misses = plan.misses + plan.bypass
+            if misses:
+                await self._load_l2_bypass(dst, misses)
+        finally:
+            if plan.copies:
+                await _drain_destination_copies(plan.copies)
+        return plan.total
 
     async def _wait_for_readaheads(self, spans: list[dict[str, Any]]) -> None:
         """Wait for in-flight readahead groups overlapping the load spans."""
