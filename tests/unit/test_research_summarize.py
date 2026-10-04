@@ -4,7 +4,11 @@
 import json
 from pathlib import Path
 
-from benchmarks.research.summarize import order_rows, overlap_bound_rows
+from benchmarks.research.summarize import (
+    live_clock_rows,
+    order_rows,
+    overlap_bound_rows,
+)
 
 
 def _arm(root: Path, name: str, send_offsets: list[float]) -> Path:
@@ -53,3 +57,23 @@ def test_overlap_bound_hides_at_most_the_oracle_work(tmp_path: Path) -> None:
     assert "extra=3.5 " in row
     assert "bound=5 " in row  # 1000 + 3000 + 900
     assert "hidden<=1.5" in row
+
+
+def test_live_clock_check_flags_poll_counting(tmp_path: Path) -> None:
+    """One tick per request passes; a clock counting polls is flagged."""
+    arms = []
+    for name, ticks in (("ok", 21), ("polls", 80), ("off", None)):
+        arm_dir = _arm(tmp_path, name, [float(i) for i in range(20)])
+        if ticks is not None:
+            (arm_dir / "daser_metrics_before.prom").write_text(
+                "daser_arena_live_tick 1.0\n"
+            )
+            (arm_dir / "daser_metrics_after.prom").write_text(
+                f"daser_arena_live_tick {ticks}.0\n"
+            )
+        arms.append(arm_dir)
+
+    good, bad = live_clock_rows(arms)
+
+    assert "live_ticks=20 requests=20" in good and "ANOMALY" not in good
+    assert "live_ticks=79" in bad and "ANOMALY" in bad

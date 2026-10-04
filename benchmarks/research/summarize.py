@@ -560,6 +560,41 @@ def order_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def live_clock_rows(arm_dirs: list[Path]) -> list[str]:
+    """Check that the live-victim arena clock counted one tick per request.
+
+    ``daser_arena_live_tick`` advances once per distinct prompt. Its increase
+    over the replay should match the number of sent requests; a clock that
+    counts scheduler polls instead ages live sessions into the idle class.
+
+    Args:
+        arm_dirs: Arm directories; arms without the gauge are skipped.
+
+    Returns:
+        One line per arm with the gauge, tagged ``ANOMALY`` when the tick
+        increase is more than 10% away from the sent request count.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        after = _counters(arm_dir / "daser_metrics_after.prom")
+        if "daser_arena_live_tick" not in after:
+            continue
+        before = _counters(arm_dir / "daser_metrics_before.prom")
+        ticks = _delta(before, after, "daser_arena_live_tick")
+        sent = sum(
+            1
+            for record in map(json.loads, (arm_dir / "requests.jsonl").open())
+            if record.get("send_offset_s") is not None
+        )
+        off = abs(ticks - sent) > 0.1 * max(sent, 1)
+        tag = " ANOMALY: live clock does not count one tick per request" if off else ""
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: "
+            f"live_ticks={ticks:.0f} requests={sent}{tag}"
+        )
+    return lines
+
+
 def main() -> None:
     """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``.
 
@@ -611,6 +646,10 @@ def main() -> None:
         print("\n".join(walls))
     print("send order vs trace order")
     print("\n".join(order_rows(arm_dirs)))
+    clocks = live_clock_rows(arm_dirs)
+    if clocks:
+        print("live-victim arena clock")
+        print("\n".join(clocks))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
     if args.first > 0 and args.overlap_oracle is not None:
