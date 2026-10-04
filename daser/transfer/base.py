@@ -50,6 +50,13 @@ class TransferStats:
         load_l2_us: grouped-load time spent reading L1 misses from L2.
         load_copy_drain_us: grouped-load time spent draining the L1 hit copy
             after the L2 phase finished.
+        load_ra_window_us: readahead group time spent waiting for a slot of
+            the per-readahead read window.
+        load_l2_reserve_us: L2 miss-batch time (readahead and load) spent
+            reserving L1 promotions and waiting for overlapping writes before
+            the last read is submitted.
+        load_l2_io_us: L2 miss-batch time from the last submission until
+            every read completed and was published.
         dst_copies: pinned-to-CUDA destination copy submissions.
         dst_copy_runs: contiguous runs those submissions issued.
         dst_copy_bytes: bytes those submissions copied.
@@ -85,6 +92,9 @@ class TransferStats:
     load_pending_write_us: int = 0
     load_l2_us: int = 0
     load_copy_drain_us: int = 0
+    load_ra_window_us: int = 0
+    load_l2_reserve_us: int = 0
+    load_l2_io_us: int = 0
     dst_copies: int = 0
     dst_copy_runs: int = 0
     dst_copy_bytes: int = 0

@@ -69,7 +69,16 @@ _CUDA_IPC_CACHE_LIMIT = 16
 _PACKED_IO_ALIGNMENT = 4096
 # Grouped-load phases exported as daser_load_phase_seconds_total{phase}; each
 # maps to a TransferStats load_<phase>_us counter.
-_LOAD_PHASES = ("readahead_wait", "resolve", "pending_write", "l2", "copy_drain")
+_LOAD_PHASES = (
+    "readahead_wait",
+    "resolve",
+    "pending_write",
+    "l2",
+    "copy_drain",
+    "ra_window",
+    "l2_reserve",
+    "l2_io",
+)
 
 # Research switch: when set to "1", every storage format retries a lookup that
 # overlaps an in-flight store writer (the online-compressed default). Unset

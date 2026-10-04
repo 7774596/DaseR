@@ -3066,6 +3066,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 for part in parts
             ]
 
+        mark = time.perf_counter()
         try:
             for span in misses:
                 nbytes = int(span["nbytes"])
@@ -3132,6 +3133,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 future_to_read[future] = (span, pinned, promotion_id, epoch)
 
             submit_queued()
+            mark = self._add_phase_us("load_l2_reserve_us", mark)
             pending: set[asyncio.Future[int]] = set(future_to_read) | set(stripe_parts)
             while pending:
                 done, pending = await asyncio.wait(
@@ -3305,6 +3307,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             self._close_unowned_slice_locked(pinned)
                             self._l1.notify_pool_waiters()
                         self._finish_l1_promotion_locked(promotion_id)
+            self._add_phase_us("load_l2_io_us", mark)
         finally:
             # CQ callbacks can report success before the submitting thread has
             # drained its other reads. Wait for actual executor completion on
@@ -4105,6 +4108,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         window = asyncio.Semaphore(self._readahead_window)
         read_bytes = 0
         failed = 0
+        # Physical L2 reads (one per coalesced miss) across all groups.
+        reads = sum(len(group) for group, _ in groups)
         # Bytes left from each group on: the gate priority of that group.
         sizes = [sum(int(miss["nbytes"]) for miss in group) for group, _ in groups]
         remaining = [sum(sizes[index:]) for index in range(len(sizes))]
@@ -4116,8 +4121,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             future: asyncio.Future[None],
         ) -> None:
             nonlocal read_bytes, failed
+            mark = time.perf_counter()
             try:
                 async with window:
+                    self._add_phase_us("load_ra_window_us", mark)
                     if self._readahead_gate is not None:
                         await self._readahead_gate.acquire(remaining[index])
                     try:
@@ -4146,10 +4153,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         elapsed = time.perf_counter() - readahead.started
         logger.info(
-            "[TRANSFER:iouring] readahead %s groups=%d failed=%d read=%d "
+            "[TRANSFER:iouring] readahead %s groups=%d reads=%d failed=%d read=%d "
             "elapsed_ms=%.1f gbps=%.2f",
             lease_id,
             len(groups),
+            reads,
             failed,
             read_bytes,
             elapsed * 1000,
