@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import pytest
@@ -468,6 +469,69 @@ def test_dependency_gap_idles_before_the_dependent_request(
     assert by_index[0]["dependency_wait_ms"] == pytest.approx(0, abs=5)
     assert by_index[1]["dependency_wait_ms"] >= 100
     assert by_index[1]["client_queue_ms"] < 50
+
+
+def test_recorded_gap_paces_dependents_instead_of_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dependent row with gap_ms starts that gap after its producer ends.
+
+    Its own timestamp is ignored, so slow service does not swallow the gap;
+    a row without a producer still waits for its timestamp.
+    """
+    sent_at: dict[int, float] = {}
+    done_at: dict[int, float] = {}
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        sample = args[2]
+        kwargs["on_send"]()
+        sent_at[sample.sample_id] = time.perf_counter()
+        await asyncio.sleep(0.15 if sample.sample_id == 0 else 0.0)
+        done_at[sample.sample_id] = time.perf_counter()
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 10, 1, (1,)),
+        # Timestamp 10 ms (before the producer ends), gap 50 ms.
+        TraceRequest(1, 10, 10, 1, (1, 2), gap_ms=50),
+        # No producer: paced by its 100 ms timestamp alone.
+        TraceRequest(2, 100, 10, 1, (7,), gap_ms=0),
+    ]
+    started = time.perf_counter()
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=8,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            prefix_dependencies=True,
+        )
+    )
+
+    assert sent_at[1] - done_at[0] >= 0.05
+    assert sent_at[1] - done_at[0] < 0.1
+    assert sent_at[2] - started >= 0.1
+    assert sent_at[2] < done_at[0]
+
+
+def test_load_trace_reads_optional_gap(tmp_path: Path) -> None:
+    """gap_ms is optional and must be non-negative."""
+    path = tmp_path / "trace.jsonl"
+    row = {"timestamp": 0, "input_length": 10, "output_length": 1, "hash_ids": [1]}
+    path.write_text(json.dumps(row) + "\n" + json.dumps({**row, "gap_ms": 7}) + "\n")
+    first, second = load_trace(path)
+    assert first.gap_ms is None
+    assert second.gap_ms == 7
+
+    path.write_text(json.dumps({**row, "gap_ms": -1}) + "\n")
+    with pytest.raises(ValueError, match="gap_ms"):
+        load_trace(path)
 
 
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:

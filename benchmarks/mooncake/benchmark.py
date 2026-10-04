@@ -42,6 +42,11 @@ class TraceRequest:
         hash_ids: Remapped 512-token prefix block hashes.
         session_id: Optional conversation/agent session the request belongs
             to; used only for session-affine routing across instances.
+        gap_ms: Optional recorded idle time (tool execution / think time)
+            between the prefix producer's completion and this request. With
+            prefix dependencies it replaces the arrival timestamp for
+            dependent requests, so replay keeps real gaps however long the
+            server takes.
 
     Thread-safety:
         Immutable and safe to share across replay tasks.
@@ -53,6 +58,7 @@ class TraceRequest:
     output_length: int
     hash_ids: tuple[int, ...]
     session_id: int | None = None
+    gap_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -571,7 +577,9 @@ async def replay(
             :func:`prefix_predecessors` request completes, so closed-loop
             replay (large ``time_scale``) keeps cross-request reuse. The wait
             happens before the concurrency semaphore and is excluded from
-            client queue time and TTFT.
+            client queue time and TTFT. Dependent requests carrying
+            ``gap_ms`` start that (time-scaled) gap after the dependency
+            completes instead of at their timestamp.
         route: :class:`InstanceRouter` policy when several URLs are given.
         strict_order: Hold each request until the previous one completes, so
             the send order is exactly the trace order (implies prefix
@@ -898,6 +906,10 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
     session_id = (
         None if raw_session is None else _integer(raw_session, index, "session_id")
     )
+    raw_gap = payload.get("gap_ms")
+    gap_ms = None if raw_gap is None else _number(raw_gap, index, "gap_ms")
+    if gap_ms is not None and gap_ms < 0:
+        raise ValueError(f"row {index}: gap_ms must be non-negative")
     return TraceRequest(
         index=index,
         timestamp_ms=timestamp,
@@ -905,6 +917,7 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
         output_length=output_length,
         hash_ids=hash_ids,
         session_id=session_id,
+        gap_ms=gap_ms,
     )
 
 
@@ -1039,14 +1052,26 @@ async def _run_request_after_dependency(
     admit_after: asyncio.Event | None = None,
     admitted: asyncio.Event | None = None,
 ) -> dict[str, Any]:
-    scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
-    await asyncio.sleep(max(0.0, started_at + scheduled_offset - time.perf_counter()))
+    # A dependent request with a recorded gap is paced by its producer's
+    # completion, not by its arrival timestamp.
+    gap_paced = wait_for is not None and request.gap_ms is not None
+    if not gap_paced:
+        scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
+        await asyncio.sleep(
+            max(0.0, started_at + scheduled_offset - time.perf_counter())
+        )
     dependency_at = time.perf_counter()
     if wait_for is not None:
         await wait_for.wait()
         # Idle time after the dependency (tool execution / think time).
-        await asyncio.sleep(dependency_gap_s)
+        gap_s = dependency_gap_s
+        if gap_paced:
+            gap_s += scheduled_offset_seconds(request.gap_ms, time_scale)
+        await asyncio.sleep(gap_s)
     queued_at = time.perf_counter()
+    if gap_paced:
+        # The request arrives when its gap ends.
+        scheduled_offset = queued_at - started_at
     if admit_after is not None:
         await admit_after.wait()
     async with outer_sem:

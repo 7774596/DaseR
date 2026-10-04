@@ -68,3 +68,22 @@ def test_round_robin_interleaves_live_sessions_and_refills(tmp_path: Path) -> No
     for sid in set(order):
         lengths = [r["input_length"] for r in rows if r["session_id"] == sid]
         assert lengths == sorted(lengths)
+
+
+def test_real_time_export_caps_gaps_and_keeps_arrivals(tmp_path: Path) -> None:
+    """Real-time rows carry ms arrivals and capped per-chain idle gaps."""
+    path = tmp_path / "traces.jsonl"
+    session = _session([(0.0, 1024, 10), (3.0, 1536, 10), (1000.0, 2048, 10)])
+    for r in session["requests"]:
+        r["api_time"] = 1.0
+    path.write_text(json.dumps(session) + "\n")
+
+    rows = export(
+        str(path), 1, 1.0, 262144, 0, seed=0, step_ms=10, real_time_gap_cap_s=5.0
+    )
+
+    # Gaps: 3 - 0 - 1 = 2 s, then 1000 - 3 - 1 capped to 5 s.
+    assert [row["gap_ms"] for row in rows] == [0, 2000, 5000]
+    stamps = [row["timestamp"] for row in rows]
+    # Compressed timeline: service 1 s + gap between consecutive arrivals.
+    assert [b - a for a, b in zip(stamps, stamps[1:], strict=False)] == [3000, 6000]

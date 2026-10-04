@@ -12,6 +12,11 @@ Sessions start
 at Poisson offsets with about ``--concurrency`` overlapping and keep their real
 request offsets; the merged stream is written in time order with
 ``timestamp = index * --step-ms`` and ``session_id`` for strict-order replay.
+``--real-time-gap-cap-s C`` instead keeps real timing: idle gaps are capped
+at C seconds, timestamps are merged arrivals in milliseconds, and each row's
+``gap_ms`` (idle time after the previous request of the same session and
+model) lets prefix-dependent replay start it that long after its producer
+completes.
 ``--max-output`` caps decode length so replays measure TTFT, not decode.
 ``--round-robin K`` instead models K closed-loop agents sharing one server
 (tool waits longer than the other agents' service): K sessions are live and
@@ -51,8 +56,10 @@ def _block_ids(
 
 
 def _poisson_order(
-    chains: list[list[dict]], concurrency: float, rng: random.Random
-) -> list[tuple[int, int]]:
+    chains: list[list[dict]],
+    concurrency: float,
+    rng: random.Random,
+) -> list[tuple[float, int, int]]:
     """Merge sessions started at Poisson offsets on their real timelines.
 
     Args:
@@ -61,7 +68,7 @@ def _poisson_order(
         rng: seeded RNG for the start offsets.
 
     Returns:
-        ``(session, request index)`` pairs in merged time order.
+        ``(arrival seconds, session, request index)`` in merged time order.
     """
     mean_span = sum(c[-1]["t"] - c[0]["t"] for c in chains) / len(chains)
     rate = concurrency / max(mean_span, 1e-9)
@@ -70,10 +77,69 @@ def _poisson_order(
         t0 += rng.expovariate(rate)
         stream += [(t0 + r["t"] - reqs[0]["t"], sid, i) for i, r in enumerate(reqs)]
     stream.sort()
-    return [(sid, i) for _, sid, i in stream]
+    return stream
 
 
-def _round_robin_order(chains: list[list[dict]], live: int) -> list[tuple[int, int]]:
+def _idle_gap(prev: dict, cur: dict, gap_cap_s: float) -> float:
+    """Return the capped idle seconds between ``prev`` finishing and ``cur``.
+
+    Args:
+        prev: earlier request (``t`` start seconds, ``api_time`` service).
+        cur: later request.
+        gap_cap_s: upper bound on a gap in seconds (user think time can run
+            for hours; tool gaps are seconds).
+
+    Returns:
+        Idle seconds, clamped to ``[0, gap_cap_s]``.
+    """
+    idle = cur["t"] - prev["t"] - prev.get("api_time", 0.0)
+    return min(max(idle, 0.0), gap_cap_s)
+
+
+def _chain_gaps(reqs: list[dict], gap_cap_s: float) -> list[float]:
+    """Return each request's capped gap after the previous one of its model.
+
+    A session's main agent and its subagents use different models and hash
+    namespaces, so a request's prefix producer is the previous request of the
+    same model, not the previous request of the session.
+
+    Args:
+        reqs: one session's requests in time order.
+        gap_cap_s: upper bound on a gap in seconds.
+
+    Returns:
+        Gap seconds per request; the first request of each model gets 0.
+    """
+    last: dict[str, dict] = {}
+    gaps = []
+    for r in reqs:
+        prev = last.get(r["model"])
+        gaps.append(0.0 if prev is None else _idle_gap(prev, r, gap_cap_s))
+        last[r["model"]] = r
+    return gaps
+
+
+def _compress_timeline(reqs: list[dict], gap_cap_s: float) -> list[dict]:
+    """Rewrite request offsets ``t`` with idle gaps capped at ``gap_cap_s``.
+
+    Args:
+        reqs: one session's requests in time order.
+        gap_cap_s: upper bound on a gap in seconds.
+
+    Returns:
+        Copies of the requests with compressed ``t`` (service time kept).
+    """
+    out, t = [], 0.0
+    for prev, r in zip([None, *reqs], reqs, strict=False):
+        if prev is not None:
+            t += prev.get("api_time", 0.0) + _idle_gap(prev, r, gap_cap_s)
+        out.append({**r, "t": t})
+    return out
+
+
+def _round_robin_order(
+    chains: list[list[dict]], live: int
+) -> list[tuple[float, int, int]]:
     """Interleave ``live`` sessions one request per turn, refilling freed slots.
 
     Args:
@@ -81,7 +147,7 @@ def _round_robin_order(chains: list[list[dict]], live: int) -> list[tuple[int, i
         live: number of concurrently live sessions.
 
     Returns:
-        ``(session, request index)`` pairs in replay order.
+        ``(0.0, session, request index)`` in replay order (no arrival times).
     """
     pending = list(range(len(chains)))
     slots = [[pending.pop(0), 0] for _ in range(min(live, len(pending)))]
@@ -89,7 +155,7 @@ def _round_robin_order(chains: list[list[dict]], live: int) -> list[tuple[int, i
     while slots:
         for slot in list(slots):
             sid, i = slot
-            order.append((sid, i))
+            order.append((0.0, sid, i))
             slot[1] += 1
             if slot[1] == len(chains[sid]):
                 if pending:
@@ -111,6 +177,7 @@ def export(
     min_ctx: int = 0,
     min_requests: int = 1,
     round_robin: int = 0,
+    real_time_gap_cap_s: float = 0.0,
 ) -> list[dict]:
     """Build the merged replay rows.
 
@@ -127,10 +194,16 @@ def export(
         min_requests: only sample sessions keeping at least this many requests.
         round_robin: when positive, interleave this many live sessions in
             turn instead of merging Poisson-offset real timelines.
+        real_time_gap_cap_s: when positive, emit real-time rows: idle gaps
+            are capped at this many seconds, ``timestamp`` is the merged
+            arrival in milliseconds (not ``index * step_ms``) and each row
+            carries ``gap_ms``, its capped idle time after the session's
+            previous request, for gap-paced closed-loop replay.
 
     Returns:
         Mooncake rows (``timestamp``, ``input_length``, ``output_length``,
-        ``hash_ids``, ``session_id``) in replay order.
+        ``hash_ids``, ``session_id``, and ``gap_ms`` in real-time mode) in
+        replay order.
     """
     chains = []
     with open(path) as f:
@@ -149,26 +222,31 @@ def export(
     rng = random.Random(seed)
     rng.shuffle(chains)
     chains = chains[:sessions]
+    real_time = real_time_gap_cap_s > 0
+    if real_time:
+        if round_robin > 0:
+            raise ValueError("real-time export merges timelines; drop round_robin")
+        chains = [_compress_timeline(c, real_time_gap_cap_s) for c in chains]
     stream = (
         _round_robin_order(chains, round_robin)
         if round_robin > 0
         else _poisson_order(chains, concurrency, rng)
     )
+    gaps = [_chain_gaps(c, real_time_gap_cap_s) for c in chains] if real_time else []
     table: dict = {}
     rows = []
-    for index, (sid, i) in enumerate(stream):
+    for index, (arrival, sid, i) in enumerate(stream):
         r = chains[sid][i]
-        rows.append(
-            {
-                "timestamp": index * step_ms,
-                "input_length": r["in"],
-                "output_length": max(1, min(r["out"], max_output or r["out"])),
-                "hash_ids": _block_ids(
-                    r["hash_ids"], r["in"], (sid, r["model"]), table
-                ),
-                "session_id": sid,
-            }
-        )
+        row = {
+            "timestamp": round(arrival * 1000) if real_time else index * step_ms,
+            "input_length": r["in"],
+            "output_length": max(1, min(r["out"], max_output or r["out"])),
+            "hash_ids": _block_ids(r["hash_ids"], r["in"], (sid, r["model"]), table),
+            "session_id": sid,
+        }
+        if real_time:
+            row["gap_ms"] = round(gaps[sid][i] * 1000)
+        rows.append(row)
     return rows
 
 
@@ -187,6 +265,12 @@ def main() -> None:
     p.add_argument("--min-ctx", type=int, default=0)
     p.add_argument("--min-requests", type=int, default=1)
     p.add_argument("--round-robin", type=int, default=0)
+    p.add_argument(
+        "--real-time-gap-cap-s",
+        type=float,
+        default=0.0,
+        help="Emit real-time rows (ms timestamps + gap_ms) with gaps capped here.",
+    )
     a = p.parse_args()
     rows = export(
         a.cc_traces,
@@ -200,6 +284,7 @@ def main() -> None:
         a.min_ctx,
         a.min_requests,
         a.round_robin,
+        a.real_time_gap_cap_s,
     )
     with open(a.output, "w") as f:
         for row in rows:
