@@ -134,9 +134,13 @@ class DaserConnectorMeta(KVConnectorMetadata):
         layerwise_req_ids: Base IDs whose loads vLLM scheduled synchronously
             in this step; the worker restores them layer by layer inside the
             forward pass and owns their transfer leases.
+        writeback_req_ids: Finished base IDs whose held blocks the scheduler
+            released this step. The worker queues their stores, if any, and
+            reports every one as finished sending, even on no-forward steps.
     """
 
     reqs_to_load: dict[str, ReqLoadSpec] = field(default_factory=dict)
     reqs_to_store: dict[str, ReqStoreSpec] = field(default_factory=dict)
     cancelled_store_req_ids: set[str] = field(default_factory=set)
     layerwise_req_ids: set[str] = field(default_factory=set)
+    writeback_req_ids: set[str] = field(default_factory=set)

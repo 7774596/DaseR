@@ -422,10 +422,19 @@ class WorkerRuntime:
         )
 
     def wait_for_save(self) -> None:
-        """Queue stores until vLLM reports request completion."""
+        """Queue stores until vLLM reports request completion.
+
+        Write-back releases are skipped here; ``get_finished`` queues them so
+        forward and no-forward steps share one path.
+        """
         if self._meta is None:
             return
-        reqs_to_store = dict(self._meta.reqs_to_store)
+        writeback_ids = self._meta.writeback_req_ids
+        reqs_to_store = {
+            req_id: spec
+            for req_id, spec in self._meta.reqs_to_store.items()
+            if base_req_id(req_id) not in writeback_ids
+        }
         if reqs_to_store:
             self._store_pipeline.queue_finished(reqs_to_store)
 
@@ -439,9 +448,31 @@ class WorkerRuntime:
 
         Returns:
             Finished-saving request IDs and finished async-loading request IDs.
+
+        Async/thread-safety:
+            Called on the worker thread while this step's metadata is bound,
+            including no-forward steps that skip ``wait_for_save``. Write-back
+            releases are queued here because they belong to requests vLLM
+            already finished in an earlier step.
         """
         finished_recving = self._load_pipeline.collect_finished()
+        writeback_ids = set(self._meta.writeback_req_ids) if self._meta else set()
+        unsaved_writebacks: set[str] = set()
+        if writeback_ids:
+            writeback_stores = {
+                req_id: spec
+                for req_id, spec in self._meta.reqs_to_store.items()
+                if base_req_id(req_id) in writeback_ids
+            }
+            if writeback_stores and not self._ensure_transfer_ready():
+                writeback_stores = {}
+            if writeback_stores:
+                self._store_pipeline.queue_finished(writeback_stores)
+            queued = {base_req_id(req_id) for req_id in writeback_stores}
+            unsaved_writebacks = writeback_ids - queued
+            finished_req_ids = set(finished_req_ids) | queued
         finished_sending = self._store_pipeline.collect_finished(finished_req_ids)
+        finished_sending |= unsaved_writebacks
         return finished_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:

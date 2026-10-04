@@ -108,9 +108,21 @@ class RequestLifecycle:
         coalesce_loads: bool = False,
         layerwise_load: bool = False,
         arrival_readahead: bool = False,
+        writeback_low_blocks: int = 0,
     ) -> None:
         self._ipc_sync = ipc_client
         self._arrival_readahead = arrival_readahead
+        # Research switch: write-back stores. A finished request keeps its
+        # vLLM blocks (and so its GPU prefix-cache residency) until free
+        # blocks fall below this watermark; only then is its prompt KV
+        # allocated in DaseR and saved, oldest finish first. A release whose
+        # last prompt block is still shared with a live request writes
+        # nothing: that request's own store covers the same prefix later.
+        self._writeback_low_blocks = max(0, writeback_low_blocks)
+        self._writeback_held: dict[str, tuple[Request, list[int]]] = {}
+        self._writeback_released: set[str] = set()
+        self._writeback_stats = {"held": 0, "saved": 0, "superseded": 0}
+        self._gpu_block_pool: Any = None
         self._block_tokens = block_tokens
         self._slot_size = slot_size
         self._model_id = model_id
@@ -577,6 +589,7 @@ class RequestLifecycle:
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
+        meta.writeback_req_ids = self._release_writeback_holds()
 
         for req_id, chunks in list(self._pending_loads.items()):
             if req_id in getattr(self, "_layerwise_request_ids", set()):
@@ -617,11 +630,15 @@ class RequestLifecycle:
                 if slot_index is not None
                 else int(alloc["token_count"])
             )
-            should_store = (
-                base_req_id in scheduled_ids
-                and scheduled_tokens > 0
-                and computed_tokens >= required_tokens
-                and "block_ids" in alloc
+            # Released write-back holds are finished, so every planned block
+            # is already computed although the request is no longer scheduled.
+            should_store = "block_ids" in alloc and (
+                base_req_id in meta.writeback_req_ids
+                or (
+                    base_req_id in scheduled_ids
+                    and scheduled_tokens > 0
+                    and computed_tokens >= required_tokens
+                )
             )
             if should_store:
                 logical_slot_start = _store_slot_index(req_id)
@@ -674,6 +691,18 @@ class RequestLifecycle:
             IPC during connector initialization or recovery, never worker IO.
         """
         self._refresh_runtime_config()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        """Bind vLLM's GPU block pool for write-back watermark decisions.
+
+        Args:
+            gpu_block_pool: vLLM ``BlockPool``; only ``get_num_free_blocks``
+                and per-block ``ref_cnt`` are read.
+
+        Thread-safety:
+            Called once on the scheduler thread after the cache manager exists.
+        """
+        self._gpu_block_pool = gpu_block_pool
 
     def _drop_preempted_pending_state(
         self,
@@ -1181,6 +1210,73 @@ class RequestLifecycle:
         getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
         had_prefetch = self._cancel_prefetch_future(req_id)
         self._release_transfer_lease(req_id, force=had_prefetch)
+        getattr(self, "_writeback_held", {}).pop(req_id, None)
+        getattr(self, "_writeback_released", set()).discard(req_id)
+
+    def _writeback_enabled(self) -> bool:
+        """Return whether write-back stores are active for this scheduler."""
+        return (
+            getattr(self, "_writeback_low_blocks", 0) > 0
+            and getattr(self, "_gpu_block_pool", None) is not None
+        )
+
+    def _release_writeback_holds(self) -> set[str]:
+        """Release held finished requests until free blocks reach the watermark.
+
+        Oldest finishes go first, which matches vLLM's own LRU order for
+        freed blocks. A release whose last prompt block is still referenced by
+        a live request is superseded and writes nothing; otherwise its pending
+        store is allocated now and published this step.
+
+        Returns:
+            Released base request IDs. The worker reports each one as finished
+            sending, which makes vLLM free the held blocks.
+
+        Async/thread-safety:
+            Runs on the scheduler thread inside ``build_connector_meta`` and
+            performs synchronous control-plane allocation IPC.
+        """
+        if not self._writeback_enabled() or not self._writeback_held:
+            return set()
+        pool = self._gpu_block_pool
+        deficit = self._writeback_low_blocks - int(pool.get_num_free_blocks())
+        released: set[str] = set()
+        while deficit > 0 and self._writeback_held:
+            req_id, (request, block_ids) = next(iter(self._writeback_held.items()))
+            del self._writeback_held[req_id]
+            released.add(req_id)
+            # Only blocks this hold owns alone return to the free queue.
+            deficit -= sum(1 for bid in block_ids if pool.blocks[bid].ref_cnt == 1)
+            pending_store = self._pending_alloc.get(req_id)
+            if pending_store is None:
+                continue
+            store_slots = math.ceil(pending_store.token_count / self._block_tokens)
+            store_blocks = pending_store.block_ids[:store_slots]
+            if (
+                len(store_blocks) < store_slots
+                or int(request.num_computed_tokens) < pending_store.token_count
+            ):
+                # Aborted before its prompt was computed: nothing to save.
+                self._pending_alloc.pop(req_id, None)
+                continue
+            if pool.blocks[store_blocks[-1]].ref_cnt > 1:
+                self._pending_alloc.pop(req_id, None)
+                self._writeback_stats["superseded"] += 1
+                continue
+            self._writeback_released.add(req_id)
+            self._maybe_allocate_pending_store(req_id, pending_store)
+            self._report_finish(request)
+            self._writeback_stats["saved"] += 1
+        stats = self._writeback_stats
+        if released and (stats["saved"] + stats["superseded"]) % 64 < len(released):
+            logger.info(
+                "[CONNECTOR] write-back: held=%d saved=%d superseded=%d waiting=%d",
+                stats["held"],
+                stats["saved"],
+                stats["superseded"],
+                len(self._writeback_held),
+            )
+        return released
 
     def _pending_async_save_ids(self) -> set[str]:
         """Return request IDs whose worker-side saves are still pending.
@@ -1207,6 +1303,10 @@ class RequestLifecycle:
             req_id: vLLM request ID being tracked.
             pending_store: store tracker for the request.
         """
+        if self._writeback_enabled() and req_id not in self._writeback_released:
+            # Write-back allocates only when the held blocks are released, so
+            # DaseR never stores a prefix that is still GPU-resident.
+            return
         requested_tokens = pending_store.token_count
         strategy = self._reuse_strategy()
         if not strategy.ready_to_allocate(pending_store):
@@ -1285,14 +1385,18 @@ class RequestLifecycle:
             block_ids: block IDs being freed.
 
         Returns:
-            (True, None) when DaseR is still storing this request's KV blocks,
-            otherwise (False, None).
+            (True, None) when DaseR is still storing this request's KV blocks
+            or holds them for a write-back store, otherwise (False, None).
         """
-        del block_ids
         self._defer_deadlines().pop(request.request_id, None)
         getattr(self, "_inflight_loads", {}).pop(request.request_id, None)
         getattr(self, "_coalesce_followers", {}).pop(request.request_id, None)
         getattr(self, "_follower_digests", {}).pop(request.request_id, None)
+        if self._writeback_enabled() and request.request_id in self._pending_alloc:
+            # The finish hint carries the chunks written at release time.
+            self._writeback_held[request.request_id] = (request, list(block_ids))
+            self._writeback_stats["held"] += 1
+            return True, None
         self._report_finish(request)
         if request.request_id in self._pending_async_save_ids():
             return True, None

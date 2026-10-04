@@ -20,6 +20,10 @@ class SchedulerConnectorMixin:
         """Forward vLLM's waiting-queue arrival to the request lifecycle."""
         self._request_lifecycle.on_new_request(request)
 
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        """Give the request lifecycle read access to vLLM's GPU block pool."""
+        self._request_lifecycle.bind_gpu_block_pool(gpu_block_pool)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

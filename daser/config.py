@@ -60,6 +60,10 @@ LOAD_READAHEAD_STREAM_ENV = "DASER_LOAD_READAHEAD_STREAM"
 #: when a request enters vLLM's waiting queue, so its SSD read overlaps the
 #: requests ahead of it instead of starting when it is scheduled.
 ARRIVAL_READAHEAD_ENV = "DASER_ARRIVAL_READAHEAD"
+#: Research switch: positive block count makes the scheduler connector hold a
+#: finished request's vLLM blocks and write its prompt KV to DaseR only when
+#: free GPU blocks fall below this count (write-back instead of write-through).
+WRITEBACK_LOW_BLOCKS_ENV = "DASER_WRITEBACK_LOW_BLOCKS"
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
