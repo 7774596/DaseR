@@ -1052,15 +1052,21 @@ async def test_live_victim_keeps_oldest_live_prefix(
 async def test_live_victim_clock_ignores_repeated_polls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Re-polling the same prompt does not age other chunks into idle."""
+    """Polls of one prompt, missing then hitting, advance the clock once."""
     monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "1")
     core = make_core()
     blocks = await _committed_blocks(core, 3)
     keys = [first_rolling_key(tokens) for tokens in blocks]
     await core.lookup(blocks[0], "m")
-    for _ in range(5):
-        await core.lookup(blocks[1], "m")
+    pending = [7 * BLOCK_TOKENS + j for j in range(BLOCK_TOKENS)]
+    await core.alloc_chunk(
+        first_rolling_key(pending), token_count=BLOCK_TOKENS, model_id="m"
+    )
+    assert await core.lookup(pending, "m") == []
+    await core.commit_chunk(first_rolling_key(pending))
+    for _ in range(3):
+        assert len(await core.lookup(pending, "m")) == 1
 
     evicted = await core.evict_oldest_chunk(set())
 
-    assert evicted is not None and evicted.chunk_key == keys[2]
+    assert evicted is not None and evicted.chunk_key == keys[1]

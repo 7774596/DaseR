@@ -273,7 +273,7 @@ class ServerCore:
         # mapped to the lookup tick that last touched them.
         self._live_idle = 0 if self._second_chance else arena_live_victim_idle()
         self._live_tick = 0
-        self._live_prompt: tuple[int, str | None] | None = None
+        self._live_prompt: int | None = None
         self._live_touch: OrderedDict[str, int] = OrderedDict()
         self._record_capacity_metrics()
 
@@ -418,12 +418,17 @@ class ServerCore:
         if self._second_chance:
             self._referenced.update(chunk.chunk_key for chunk in chunks)
         if self._live_idle:
-            # Schedulers poll one request many times; only a new prompt
-            # (length and first matched chunk) advances the request clock.
-            prompt = (count_tokens(tokens), chunks[0].chunk_key if chunks else None)
+            # Schedulers poll one request many times, and a poll that misses
+            # can precede one that hits, so only a new prompt advances the
+            # request clock.
+            prompt = hash(tokens if isinstance(tokens, bytes) else tuple(tokens))
             if prompt != self._live_prompt:
                 self._live_prompt = prompt
                 self._live_tick += 1
+                self._metrics.gauge(
+                    "daser_arena_live_tick",
+                    "Prompts counted by the live-victim arena clock.",
+                ).set(self._live_tick)
             for chunk in chunks:
                 if chunk.chunk_key in self._live_touch:
                     self._live_touch[chunk.chunk_key] = self._live_tick
