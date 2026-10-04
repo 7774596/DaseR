@@ -30,6 +30,14 @@ ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
 #: behind the hand, so the ring must outlast the byte arena or its FIFO
 #: allocation eviction removes referenced chunks before the hand sees them.
 ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
+#: Research switch for loop-aware eviction of the packed arena: a positive
+#: integer N makes chunks idle for more than N lookups go first (oldest
+#: allocation first), otherwise the newest chunk outside the current lookup.
+ARENA_LIVE_VICTIM_ENV = "DASER_ARENA_LIVE_VICTIM_IDLE"
+#: Logical ring headroom under live-victim eviction. Kept prefixes stay at the
+#: ring tail while churn happens near the head, so the ring must span several
+#: arenas or FIFO slot reuse sweeps the kept prefixes away.
+ARENA_LIVE_VICTIM_SLOT_FACTOR = 8
 #: Research switch for exclusive L1/L2 tiers under compressed-online storage.
 #: New packed records live only in L1 and reach L2 when L1 evicts them, so the
 #: packed arena spans L1 + L2 while L2 holds only records that left L1.
@@ -183,6 +191,19 @@ class ModelGeometry:
             self.local_slot_size_for_block_tokens(block_tokens, tensor_parallel_size)
             * tensor_parallel_size
         )
+
+
+def arena_live_victim_idle() -> int:
+    """Return the live-victim idle threshold in lookups, 0 when disabled.
+
+    Reads ``DASER_ARENA_LIVE_VICTIM_IDLE``; unset, empty or non-positive values
+    disable loop-aware arena eviction.
+
+    Returns:
+        Idle threshold N (> 0) or 0.
+    """
+    value = os.environ.get(ARENA_LIVE_VICTIM_ENV, "")
+    return max(0, int(value)) if value else 0
 
 
 def _dtype_bytes(dtype: object) -> int:
@@ -385,6 +406,8 @@ class DaserConfig:
         slots = max(physical_slots, logical_bytes // packed_size)
         if os.environ.get(ARENA_SECOND_CHANCE_ENV) == "1":
             slots *= ARENA_SECOND_CHANCE_SLOT_FACTOR
+        elif arena_live_victim_idle():
+            slots *= ARENA_LIVE_VICTIM_SLOT_FACTOR
         return slots
 
     @property

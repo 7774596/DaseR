@@ -1008,3 +1008,41 @@ async def test_second_chance_skips_protected_and_new_generation(
 
     evicted = await core.evict_oldest_chunk({keys[0]})
     assert evicted is not None and evicted.chunk_key == keys[1]
+
+
+@pytest.mark.asyncio
+async def test_live_victim_evicts_idle_chunks_oldest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunks idle beyond the threshold go first, in allocation order."""
+    monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "1")
+    core = make_core()
+    blocks = await _committed_blocks(core, 4)
+    keys = [first_rolling_key(tokens) for tokens in blocks]
+    await core.lookup(blocks[0], "m")
+    await core.lookup(blocks[0], "m")
+
+    first = await core.evict_oldest_chunk(set())
+    second = await core.evict_oldest_chunk({keys[2]})
+
+    assert first is not None and first.chunk_key == keys[1]
+    assert second is not None and second.chunk_key == keys[3]
+    assert await core.lookup(blocks[1], "m") == []
+    assert len(await core.lookup(blocks[0], "m")) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_victim_keeps_oldest_live_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without idle chunks the newest untouched chunk goes; touched ones last."""
+    monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "8")
+    core = make_core()
+    blocks = await _committed_blocks(core, 3)
+    keys = [first_rolling_key(tokens) for tokens in blocks]
+    await core.lookup(blocks[0], "m")
+
+    order = [await core.evict_oldest_chunk(set()) for _ in range(3)]
+
+    assert [meta.chunk_key for meta in order if meta] == [keys[2], keys[1], keys[0]]
+    assert await core.evict_oldest_chunk(set()) is None

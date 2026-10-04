@@ -157,7 +157,7 @@ def test_compressed_config_separates_logical_and_physical_capacity(
 def test_second_chance_widens_only_the_logical_ring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Second chance adds logical headroom but keeps the physical lane."""
+    """Second chance and live victim add logical headroom, not physical lanes."""
     model_path = tmp_path / "model"
     _write_model_config(
         model_path,
@@ -189,6 +189,13 @@ def test_second_chance_widens_only_the_logical_ring(
     assert widened.total_slots == 2 * base_slots
     assert widened.physical_total_slots == base_physical
     assert widened.runtime_config()["rank_stride_bytes"] == raw_slot * 4
+
+    monkeypatch.delenv("DASER_ARENA_SECOND_CHANCE")
+    monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "8")
+    live = build()
+
+    assert live.total_slots == 8 * base_slots
+    assert live.physical_total_slots == base_physical
 
 
 def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:

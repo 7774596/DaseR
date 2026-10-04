@@ -2,13 +2,14 @@
 
 # Standard
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import math
 import os
 from typing import Any, Callable, Optional
 
 # First Party
-from daser.config import ARENA_SECOND_CHANCE_ENV
+from daser.config import ARENA_SECOND_CHANCE_ENV, arena_live_victim_idle
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
 from daser.logging import init_logger
@@ -268,6 +269,11 @@ class ServerCore:
         # since the hand last passed them, and the hand's logical slot.
         self._referenced: set[str] = set()
         self._clock_hand: int | None = None
+        # Live-victim arena eviction: resident chunk keys in allocation order
+        # mapped to the lookup tick that last touched them.
+        self._live_idle = 0 if self._second_chance else arena_live_victim_idle()
+        self._live_tick = 0
+        self._live_touch: OrderedDict[str, int] = OrderedDict()
         self._record_capacity_metrics()
 
     @property
@@ -410,6 +416,11 @@ class ServerCore:
         chunks = [self._chunk_info(match) for match in matches]
         if self._second_chance:
             self._referenced.update(chunk.chunk_key for chunk in chunks)
+        if self._live_idle:
+            self._live_tick += 1
+            for chunk in chunks:
+                if chunk.chunk_key in self._live_touch:
+                    self._live_touch[chunk.chunk_key] = self._live_tick
         self._metrics.counter(
             "daser_cache_lookup_total",
             "Cache lookup requests by result.",
@@ -1027,6 +1038,12 @@ class ServerCore:
         tail instead: a chunk hit by a lookup since its last pass keeps its
         bytes and loses its reference bit, and the first unreferenced chunk is
         removed in place. Its slots become a skip block, so no data moves.
+        With ``DASER_ARENA_LIVE_VICTIM_IDLE=N`` the victim is the oldest
+        chunk no lookup touched in the last N lookups (a dead session), or
+        else the newest chunk the current lookup did not touch, so a loop of
+        sessions larger than the arena keeps a stable part of its prefixes
+        instead of FIFO evicting each one just before its reuse. Chunks the
+        current lookup touched count as protected.
 
         Args:
             protected_keys: Chunk keys that must stay resident, e.g. the
@@ -1041,6 +1058,8 @@ class ServerCore:
         """
         if self._second_chance:
             return await self._evict_second_chance(protected_keys)
+        if self._live_idle:
+            return await self._evict_live_victim(protected_keys)
         store = self._cm.store
         while len(store):
             entry = store.get_slot_entry(self._cm.tail_slot)
@@ -1289,6 +1308,7 @@ class ServerCore:
     def _notify_chunk_removed(self, chunk_key: str) -> None:
         """Tell registered listeners that a chunk left the metadata store."""
         self._referenced.discard(chunk_key)
+        self._live_touch.pop(chunk_key, None)
         for listener in self._removal_listeners:
             listener(chunk_key)
 
@@ -1365,6 +1385,47 @@ class ServerCore:
             return meta
         self._clock_hand = hand
         return None
+
+    async def _evict_live_victim(self, protected_keys: set[str]) -> ChunkMeta | None:
+        """Evict a dead chunk, else the newest chunk outside the current lookup.
+
+        Chunks idle for more than the configured number of lookups go first in
+        allocation order; otherwise the most recently allocated chunk not
+        touched by the current lookup is removed in place. Chunks touched by
+        the current lookup are evicted only when nothing else is left.
+
+        Args:
+            protected_keys: Chunk keys that must stay resident.
+
+        Returns:
+            Metadata of the evicted chunk, or None when every resident chunk
+            is protected.
+        """
+        tick = self._live_tick
+        victim = reason = None
+        for key, touched in self._live_touch.items():
+            if tick - touched > self._live_idle and key not in protected_keys:
+                victim, reason = key, "live_idle"
+                break
+        if victim is None:
+            fallback = None
+            for key in reversed(self._live_touch):
+                if key in protected_keys:
+                    continue
+                if self._live_touch[key] < tick:
+                    victim, reason = key, "live_newest"
+                    break
+                fallback = key
+            if victim is None and fallback is not None:
+                victim, reason = fallback, "live_current"
+        if victim is None:
+            return None
+        meta = self._cm.store.get(victim)
+        if meta is None:
+            self._live_touch.pop(victim, None)
+            return await self._evict_live_victim(protected_keys)
+        await self._remove_chunk(victim, reason=reason)
+        return meta
 
     def _record_clock_probe(self, walked: int) -> None:
         """Publish CLOCK hand state after one second-chance eviction."""
@@ -1481,6 +1542,8 @@ class ServerCore:
         # A new generation of a key starts unreferenced even if a lookup hit
         # an earlier generation that left through a path without a listener.
         self._referenced.discard(chunk_key)
+        if self._live_idle:
+            self._live_touch[chunk_key] = self._live_tick
         return meta
 
     def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:
