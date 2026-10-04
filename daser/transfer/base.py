@@ -20,6 +20,8 @@ class TransferStats:
         l2_write_bytes: bytes written to the SSD tier.
         held_evict_persists: held ranges written to L2 because they left the
             memory tier before an admission decision arrived.
+        held_preclean_bytes: held bytes written to L2 ahead of eviction while
+            no readahead was reading (they stay resident, now clean).
         prefetch_requests: number of host-tier prefetch operations.
         prefetch_l1_bytes: requested bytes already resident in L1.
         prefetch_l2_bytes: requested bytes read from L2.
@@ -63,6 +65,7 @@ class TransferStats:
     l2_writes: int = 0
     l2_write_bytes: int = 0
     held_evict_persists: int = 0
+    held_preclean_bytes: int = 0
     prefetch_requests: int = 0
     prefetch_l1_bytes: int = 0
     prefetch_l2_bytes: int = 0

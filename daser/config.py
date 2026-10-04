@@ -93,6 +93,11 @@ READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
 #: Research switch: ``1`` holds L2 writes while a readahead is reading (up to
 #: a bounded delay), so writeback does not share the SSD with the next load.
 L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
+#: Research switch: fraction in (0, 1) of L1 that held (not yet written)
+#: ranges may fill before the oldest are written to L2 while no readahead is
+#: reading, so later evictions under a readahead free clean memory instead of
+#: writing to the SSD the readahead reads from.
+HELD_PRECLEAN_FRACTION_ENV = "DASER_HELD_PRECLEAN_FRACTION"
 #: Research switch: ``1`` predicts the agent session that returns next from
 #: the lookup stream and reads its stored prefix ahead after each load, so the
 #: SSD read overlaps the current request's prefill and decode.

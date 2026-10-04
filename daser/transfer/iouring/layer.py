@@ -59,6 +59,8 @@ _READAHEAD_LIFETIME_S = 120.0
 _STASH_LOAD_QUIET_S = 0.25
 # Longest an L2 write waits for readahead reads to drain when yielding.
 _WRITE_YIELD_MAX_S = 2.0
+# Held bytes one preclean batch writes before the next idle check.
+_PRECLEAN_BATCH_BYTES = 1 << 30
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -975,6 +977,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             readahead is still reading, at most ``_WRITE_YIELD_MAX_S``, so
             store writeback does not share the SSD with the next request's
             load; the written slice stays pinned in L1 meanwhile.
+        held_preclean_fraction: Research switch (0 disables). Once held
+            ranges exceed this fraction of L1, the oldest are written to L2
+            while no readahead is reading (one batch at a time) and stay
+            resident as clean copies, so evictions during a readahead free
+            memory without an SSD write.
         readahead_budget_fraction: Share of L1 that readahead leases may
             retain at once (default half).
         device_stash_bytes: Research switch (0 disables). Size of a GPU
@@ -1016,6 +1023,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         skip_pinned_eviction: bool = False,
         readahead_srpt: bool = False,
         l2_write_yield: bool = False,
+        held_preclean_fraction: float = 0.0,
         readahead_budget_fraction: float = 0.5,
         device_stash_bytes: int = 0,
         readahead_skip_stashed: bool = False,
@@ -1024,6 +1032,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
         if device_stash_bytes < 0:
             raise ValueError("device_stash_bytes must be >= 0")
+        if not 0.0 <= held_preclean_fraction < 1.0:
+            raise ValueError("held_preclean_fraction must be in [0, 1)")
         if l1_split_bypass and l1_split_fraction <= 0.0:
             raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
         if gather_min_runs < 0:
@@ -1090,6 +1100,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         # pinned; leaving L1 before a decision writes them back to L2.
         self._held: dict[tuple[int, int], PinnedMemorySlice] = {}
         self._held_bytes = 0
+        # Held bytes above which idle time writes the oldest held ranges
+        # (0 disables), and the preclean writes still in flight.
+        self._held_preclean_limit = (
+            0 if skip_l2 else int(l1_bytes * held_preclean_fraction)
+        )
+        self._preclean_writes: set[asyncio.Task[None]] = set()
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
         # L2 byte range of each in-flight promotion, so an overlapping
@@ -1170,7 +1186,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "readahead_stream=%s "
             "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
             "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s "
-            "l2_write_yield=%s",
+            "l2_write_yield=%s held_preclean_limit=%d",
             path,
             l1_bytes,
             l2_bytes,
@@ -1193,6 +1209,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             skip_pinned_eviction,
             readahead_srpt,
             self._l2_write_yield,
+            self._held_preclean_limit,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1707,6 +1724,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
                     data.close()
+                    self._maybe_preclean_held()
                     # Ensure every scheduled write has entered the executor
                     # before callers can close the layer synchronously.
                     await asyncio.sleep(0)
@@ -2565,6 +2583,48 @@ class TieredIOUringTransferLayer(TransferLayer):
         if data is not None:
             self._held_bytes -= key[1]
         return data
+
+    def _maybe_preclean_held(self) -> None:
+        """Write the oldest held ranges to L2 while no readahead is reading.
+
+        Runs only with ``held_preclean_fraction`` set, no readahead running and
+        no earlier preclean batch in flight. Writes oldest-held-first until
+        held bytes fall to the limit or one batch (``_PRECLEAN_BATCH_BYTES``)
+        is submitted; the ranges stay resident in L1 and, once written, leave
+        it later without an SSD write. Each finished batch re-checks.
+
+        Async/thread-safety:
+            Must run on the owning event loop. It does not await, so it is
+            atomic with respect to every locked metadata section.
+        """
+        if (
+            not self._held_preclean_limit
+            or self._held_bytes <= self._held_preclean_limit
+            or self._preclean_writes
+            or not self._readahead_idle.is_set()
+        ):
+            return
+        submitted = 0
+        for key in list(self._held):
+            if (
+                self._held_bytes <= self._held_preclean_limit
+                or submitted >= _PRECLEAN_BATCH_BYTES
+            ):
+                break
+            data = self._pop_held(key)
+            assert data is not None
+            self._persist_locked(key, data)
+            task = self._pending_l2[key]
+            self._preclean_writes.add(task)
+            task.add_done_callback(self._preclean_write_done)
+            submitted += key[1]
+        self._stats.held_preclean_bytes += submitted
+
+    def _preclean_write_done(self, task: asyncio.Task[None]) -> None:
+        """Forget a finished preclean write and start the next batch."""
+        self._preclean_writes.discard(task)
+        if not self._preclean_writes:
+            self._maybe_preclean_held()
 
     def _persist_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Schedule one L2 write for a published L1 range and pin its buffer."""
@@ -4033,6 +4093,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readahead_running -= 1
         if not self._readahead_running:
             self._readahead_idle.set()
+            self._maybe_preclean_held()
 
     async def _read_readahead_groups(
         self,

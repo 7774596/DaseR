@@ -17,6 +17,7 @@ from daser.config import (
     DEVICE_STASH_SESSIONS_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
+    HELD_PRECLEAN_FRACTION_ENV,
     L1_NEXT_USE_ENV,
     L1_SKIP_PINNED_ENV,
     L1_SPLIT_BYPASS_ENV,
@@ -1807,6 +1808,15 @@ class IPCServer:
                 "Finish-admission held-range outcomes.",
             ).inc(held_evicts, labels={"outcome": "l1_evicted"})
         self._prev_held_evict_persists = stats.held_evict_persists
+        precleaned = stats.held_preclean_bytes - getattr(
+            self, "_prev_held_preclean_bytes", 0
+        )
+        if precleaned > 0:
+            self._metrics.counter(
+                "daser_held_preclean_bytes_total",
+                "Held bytes written to L2 ahead of eviction while idle.",
+            ).inc(precleaned)
+        self._prev_held_preclean_bytes = stats.held_preclean_bytes
         for cause, current in (
             ("l2_write", stats.promotion_wait_l2_write_us),
             ("promotion", stats.promotion_wait_promotion_us),
@@ -1977,6 +1987,9 @@ class IPCServer:
                     skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
                     readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
                     l2_write_yield=os.environ.get(L2_WRITE_YIELD_ENV) == "1",
+                    held_preclean_fraction=float(
+                        os.environ.get(HELD_PRECLEAN_FRACTION_ENV) or 0.0
+                    ),
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
                     ),
