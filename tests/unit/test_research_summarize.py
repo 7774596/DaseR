@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from benchmarks.research.summarize import (
+    arm_row,
     live_clock_rows,
     order_rows,
     overlap_bound_rows,
@@ -98,3 +99,27 @@ def test_request_hit_check_reconciles_cached_tokens(tmp_path: Path) -> None:
 
     assert "n=3 request_hit=0.567" in good and "ANOMALY" not in good
     assert "request_hit=0.000" in bad and "ANOMALY" in bad
+
+
+def test_arm_row_reports_load_share_of_ttft(tmp_path: Path) -> None:
+    """io_share divides summed DaseR load latency by summed vLLM TTFT."""
+    arm_dir = _ttft_arm(tmp_path, "io", [100.0, 300.0])
+    summary = {
+        "completed_requests": 2,
+        "failed_requests": 0,
+        "wall_seconds": 10.0,
+        "client_queue_ms": {"p50": 0.0},
+        "arrival_to_completion_ms": {"p50": 0.0},
+    }
+    (arm_dir / "summary.json").write_text(json.dumps(summary))
+    (arm_dir / "daser_metrics_after.prom").write_text(
+        'daser_transfer_duration_seconds_sum{op="load"} 5.0\n'
+    )
+    (arm_dir / "vllm_metrics_after.prom").write_text(
+        'vllm:time_to_first_token_seconds_sum{engine="0"} 20.0\n'
+    )
+
+    row = arm_row(arm_dir)
+
+    assert row["io_share"] == "0.250"
+    assert row["sum_ttft_s"] == "20"

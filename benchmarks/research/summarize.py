@@ -33,6 +33,7 @@ _COLUMNS = (
     "sum_q_s",
     "sum_pf_s",
     "sum_ttft_s",
+    "io_share",
     "l1_hits",
     "load_gib",
     "store_gib",
@@ -189,6 +190,12 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         "sum_q_s": f"{hist('request_queue_time'):.0f}",
         "sum_pf_s": f"{hist('request_prefill_time'):.0f}",
         "sum_ttft_s": f"{hist('time_to_first_token'):.0f}",
+        # Summed external load latency over summed TTFT: the share of TTFT a
+        # free storage tier could remove at most (loads run serially here).
+        "io_share": _rate(
+            _delta(before, after, 'daser_transfer_duration_seconds_sum{op="load"}'),
+            hist("time_to_first_token"),
+        ),
         "l1_hits": f"{_delta(before, after, 'daser_l1_hits_total'):.0f}",
         "load_gib": f"{_delta(before, after, _LOAD) / gib:.1f}",
         "store_gib": f"{_delta(before, after, _STORE) / gib:.1f}",
