@@ -1763,15 +1763,12 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
     asyncio.run(scenario())
 
 
-def test_iouring_unconsumed_readahead_expires_for_waiting_promotion(
-    tmp_path, monkeypatch
-) -> None:
-    """A promotion blocked by an orphaned readahead proceeds once it expires.
+def test_iouring_promotion_reclaims_unconsumed_readahead(tmp_path) -> None:
+    """A promotion blocked by an orphaned readahead reclaims it at once.
 
-    The readahead's request never loads, so nothing else would release its
-    lease; the promotion must reclaim it without a later readahead starting.
+    The readahead's request never loads and no later readahead starts, so
+    nothing else would release its lease before it expires.
     """
-    monkeypatch.setattr(layer_module, "_READAHEAD_LIFETIME_S", 0.3)
     blocks = 8
     nbytes = ALIGNMENT * blocks
     half = nbytes // 2
@@ -1798,9 +1795,10 @@ def test_iouring_unconsumed_readahead_expires_for_waiting_promotion(
             await layer.drain()
             dst = bytearray(half)
             load = [{"target_offset": 0, "file_offset": half, "nbytes": half}]
-            got = await asyncio.wait_for(layer.load_bytes_grouped(dst, load), 10)
+            got = await asyncio.wait_for(layer.load_bytes_grouped(dst, load), 5)
             assert got == half
             assert bytes(dst) == payload[half:]
+            assert layer.stats.readahead_dropped_bytes == orphan
         finally:
             await layer.drain()
             layer.close()
@@ -2706,12 +2704,15 @@ def test_iouring_l2_write_yields_to_readahead_reads(
     asyncio.run(scenario())
 
 
-def test_iouring_promotion_wait_is_attributed_to_held_pool(tmp_path) -> None:
-    """A promotion blocked by a readahead lease waits on a pool release.
+def test_iouring_promotion_reclaims_idle_readahead_of_another_load(
+    tmp_path,
+) -> None:
+    """A promotion blocked by another request's idle readahead reclaims it.
 
     A readahead retains one of two L1 blocks. A two-block load cannot fit
-    until that readahead is consumed, so it waits and the wait is counted
-    under pool releases; both loads still return exact bytes.
+    while it is retained; rather than wait for its consumer (which may be
+    queued behind this load), the load drops it. The later load re-reads
+    the dropped range from L2, and both loads return exact bytes.
     """
     path = str(tmp_path / "daser.store")
     payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(3))
@@ -2749,15 +2750,14 @@ def test_iouring_promotion_wait_is_attributed_to_held_pool(tmp_path) -> None:
                     ],
                 )
             )
-            await asyncio.sleep(0.05)
-            assert not blocked.done()
+            assert await asyncio.wait_for(blocked, timeout=5) == ALIGNMENT * 2
+            assert layer.stats.readahead_dropped_bytes == ALIGNMENT
             first = bytearray(ALIGNMENT)
             load = [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT}]
             assert await layer.load_bytes_grouped(first, load) == ALIGNMENT
-            assert await asyncio.wait_for(blocked, timeout=10) == ALIGNMENT * 2
             assert bytes(first) == payload[:ALIGNMENT]
             assert bytes(pair) == payload[ALIGNMENT:]
-            assert layer.stats.promotion_wait_pool_us > 0
+            assert layer.stats.readahead_served_bytes == 0
             assert layer.stats.promotion_wait_l2_write_us == 0
         finally:
             await layer.drain()
