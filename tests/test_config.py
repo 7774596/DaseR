@@ -194,7 +194,7 @@ def test_second_chance_widens_only_the_logical_ring(
     monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "8")
     live = build()
 
-    assert live.total_slots == 8 * base_slots
+    assert live.total_slots == 16 * base_slots
     assert live.physical_total_slots == base_physical
 
 

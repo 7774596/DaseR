@@ -37,7 +37,7 @@ ARENA_LIVE_VICTIM_ENV = "DASER_ARENA_LIVE_VICTIM_IDLE"
 #: Logical ring headroom under live-victim eviction. Kept prefixes stay at the
 #: ring tail while churn happens near the head, so the ring must span several
 #: arenas or FIFO slot reuse sweeps the kept prefixes away.
-ARENA_LIVE_VICTIM_SLOT_FACTOR = 8
+ARENA_LIVE_VICTIM_SLOT_FACTOR = 16
 #: Research switch for exclusive L1/L2 tiers under compressed-online storage.
 #: New packed records live only in L1 and reach L2 when L1 evicts them, so the
 #: packed arena spans L1 + L2 while L2 holds only records that left L1.
