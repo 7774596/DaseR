@@ -676,6 +676,8 @@ def main() -> None:
         for artifact in args.artifacts
         for summary in sorted(artifact.glob("*/summary.json"))
     ]
+    if not arm_dirs:
+        parser.error("no <arm>/summary.json under the given artifact directories")
     rows = [arm_row(arm_dir) for arm_dir in arm_dirs]
     widths = {c: max([len(c)] + [len(r[c]) for r in rows]) for c in _COLUMNS}
     print("  ".join(c.rjust(widths[c]) for c in _COLUMNS))
