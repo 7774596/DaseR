@@ -3271,3 +3271,40 @@ def test_phase_prefetch_spans_cut_records_into_aligned_phases() -> None:
         [{"file_offset": 0, "nbytes": 4096}], record_bytes=record, phases=4
     )
     assert [(s["nbytes"], s["phase"]) for s in tiny] == [(4096, 3)]
+
+
+@pytest.mark.asyncio
+async def test_ipc_estimate_reuse_counts_pending_writers(tmp_path) -> None:
+    """A block whose writer has not committed still counts as reusable.
+
+    Two committed blocks and one allocated block form a three-block estimate;
+    the fourth block was never stored, so the estimate stops before it.
+    """
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, make_core(), make_runtime_config(tmp_path))
+    await server.start()
+    tokens = list(range(1, 4 * BLOCK_TOKENS + 1))
+    try:
+        key = ROLLING_PREFIX_SEED
+        for block in range(3):
+            key = rolling_prefix_key(
+                key, tokens[block * BLOCK_TOKENS : (block + 1) * BLOCK_TOKENS]
+            )
+            await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": BLOCK_TOKENS,
+                    "model_id": "m",
+                },
+            )
+            if block < 2:
+                await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
+        resp = await _send_recv(
+            socket_path, {"op": "estimate_reuse", "tokens": tokens, "model_id": "m"}
+        )
+    finally:
+        await server.stop()
+
+    assert resp["reusable_tokens"] == 3 * BLOCK_TOKENS

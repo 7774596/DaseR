@@ -121,6 +121,34 @@ class PrefixHashIndex(RetrievalIndex):
             )
         return matches
 
+    async def reusable_tokens(
+        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
+    ) -> int:
+        """Count leading blocks that are committed or still being written.
+
+        Args:
+            tokens: full prompt token IDs.
+            model_id: committed blocks must belong to this model.
+            pending_keys: rolling keys whose store writer has not committed.
+
+        Returns:
+            Tokens in the longest prompt prefix whose every block is either
+            committed for ``model_id`` or held by a pending writer.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        blocks = 0
+        for key in rolling_prefix_keys(tokens, self._block_tokens):
+            meta_entry = self._index.get(key)
+            if meta_entry is not None and meta_entry.model_id == model_id:
+                blocks += 1
+            elif key in pending_keys:
+                blocks += 1
+            else:
+                break
+        return blocks * self._block_tokens
+
     def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return rolling-prefix keys potentially matching this prompt.
 

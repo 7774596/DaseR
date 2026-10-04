@@ -929,6 +929,29 @@ class IPCClientAsync(_IPCClientBase):
             }
         )
 
+    async def estimate_reuse(self, tokens: list[int], model_id: str) -> int:
+        """Estimate how many leading prompt tokens DaseR can supply.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier.
+
+        Returns:
+            Reusable token count, including chunks still being written.
+
+        Async/thread-safety:
+            Serializes with other calls on this client's connection; the
+            server records no lookup metrics for it.
+        """
+        resp = await self.call(
+            {
+                "op": "estimate_reuse",
+                "token_bytes": _pack_lookup_tokens(tokens),
+                "model_id": model_id,
+            }
+        )
+        return int(resp.get("reusable_tokens", 0))
+
     async def register_staging_cuda(
         self,
         direction: str,

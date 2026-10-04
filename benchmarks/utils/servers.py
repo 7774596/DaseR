@@ -259,6 +259,7 @@ class ServerManager:
         lmcache_eviction_watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
         lmcache_l2_native_workers: int = 0,
         lmcache_l2_bounded: bool = False,
+        extra_vllm_args: tuple[str, ...] = (),
     ) -> None:
         """Initialize the service manager.
 
@@ -321,6 +322,9 @@ class ServerManager:
                 this service's DaseR server (DaseR backend only). Instance
                 ``i`` (1-based) listens on ``vllm_port + i``; the DaseR server
                 sees every instance's GPU.
+            extra_vllm_args: Extra ``vllm serve`` arguments appended verbatim
+                (scheduler knobs such as ``--scheduling-policy``), applied to
+                every arm alike.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -373,6 +377,7 @@ class ServerManager:
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
         self.extra_vllm_gpu_ids = tuple(str(gpu) for gpu in extra_vllm_gpu_ids)
+        self.extra_vllm_args = tuple(extra_vllm_args)
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -786,6 +791,7 @@ class ServerManager:
             cmd.append("--trust-remote-code")
         if kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(kv_transfer_config)])
+        cmd.extend(self.extra_vllm_args)
         return cmd
 
     def _start(

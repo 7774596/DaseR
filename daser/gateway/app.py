@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gateway that splits a cached prefix into a computed front and a read back.
+"""Gateway that plans DaseR-aware prefill in front of vLLM.
 
 For a token-ID completion whose prefix DaseR holds, the gateway asks the
 server for a split point ``x`` (``split_prefill``): the server starts reading
@@ -7,6 +7,12 @@ the stored KV of ``[x, hit)`` and the gateway prefills ``[0, x)`` on vLLM with
 DaseR loads disabled. The original request then finds ``[0, x)`` in vLLM's
 prefix cache and loads only the already-read back part, so GPU compute and
 storage reads overlap instead of the GPU idling during the read.
+
+The gateway can also set each completion's vLLM ``priority`` (lower runs
+first; vLLM needs ``--scheduling-policy priority``). ``length`` orders by
+prompt tokens. ``residual`` orders by the tokens left to compute after DaseR's
+reusable prefix, counting chunks still being written, so a long prompt whose
+prefix DaseR holds is not queued as a large job.
 """
 
 from collections.abc import AsyncIterator
@@ -24,6 +30,8 @@ from daser.logging import init_logger
 
 logger = init_logger(__name__)
 
+PRIORITY_MODES = ("none", "length", "residual")
+
 
 @dataclass(frozen=True)
 class GatewayConfig:
@@ -37,6 +45,9 @@ class GatewayConfig:
         load_bytes_per_s: Stored-byte read rate used to size the back part.
         min_compute_tokens: Smallest front part worth a separate prefill.
         timeout_s: Upstream request timeout.
+        priority: vLLM priority policy: ``none`` leaves requests unchanged,
+            ``length`` uses prompt tokens and ``residual`` uses prompt tokens
+            minus DaseR's reusable prefix.
     """
 
     vllm_url: str
@@ -46,6 +57,16 @@ class GatewayConfig:
     load_bytes_per_s: float = 15e9
     min_compute_tokens: int = 4096
     timeout_s: float = 3600.0
+    priority: str = "none"
+
+    def __post_init__(self) -> None:
+        """Validate the priority policy.
+
+        Raises:
+            ValueError: if ``priority`` is not a known policy.
+        """
+        if self.priority not in PRIORITY_MODES:
+            raise ValueError(f"unknown gateway priority {self.priority!r}")
 
 
 def build_gateway_app(
@@ -83,9 +104,11 @@ def build_gateway_app(
         state["model_id"] = str(config.get("model_id", "default"))
         state["block_tokens"] = int(config.get("block_tokens", 0))
         logger.info(
-            "[GATEWAY] ready vllm=%s split=%s compute_tps=%.0f load_bps=%.3g",
+            "[GATEWAY] ready vllm=%s split=%s priority=%s compute_tps=%.0f "
+            "load_bps=%.3g",
             cfg.vllm_url,
             cfg.split,
+            cfg.priority,
             cfg.compute_tokens_per_s,
             cfg.load_bytes_per_s,
         )
@@ -101,9 +124,15 @@ def build_gateway_app(
     async def completions(request: Request) -> Response:
         body = await request.json()
         prompt = body.get("prompt")
-        if cfg.split and isinstance(prompt, list) and prompt:
-            if all(isinstance(token, int) for token in prompt):
-                await _prefill_front(state, cfg, body, prompt)
+        token_prompt = (
+            isinstance(prompt, list)
+            and bool(prompt)
+            and all(isinstance(token, int) for token in prompt)
+        )
+        if token_prompt and cfg.priority != "none":
+            body["priority"] = await _priority(state, cfg, prompt)
+        if token_prompt and cfg.split:
+            await _prefill_front(state, cfg, body, prompt)
         return await _forward(state["http"], "/v1/completions", body)
 
     @app.api_route("/{path:path}", methods=["GET", "POST"])
@@ -121,6 +150,28 @@ def build_gateway_app(
         )
 
     return app
+
+
+async def _priority(
+    state: dict[str, Any], cfg: GatewayConfig, prompt: list[int]
+) -> int:
+    """Return the vLLM priority for a token prompt under ``cfg.priority``."""
+    if cfg.priority == "length":
+        return len(prompt)
+    try:
+        reusable = await state["ipc"].estimate_reuse(prompt, state["model_id"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[GATEWAY] reuse estimate failed: %s", exc)
+        reusable = 0
+    # vLLM computes at least the last prompt token.
+    residual = max(1, len(prompt) - min(reusable, len(prompt)))
+    logger.debug(
+        "[GATEWAY] priority prompt=%d reusable=%d residual=%d",
+        len(prompt),
+        reusable,
+        residual,
+    )
+    return residual
 
 
 async def _prefill_front(

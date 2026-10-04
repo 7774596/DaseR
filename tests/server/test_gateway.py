@@ -38,6 +38,11 @@ class _PlanIPC:
         self.plans.append((list(tokens), external_prefix_queries))
         return {"compute_tokens": self.compute_tokens, "hit_tokens": len(tokens)}
 
+    async def estimate_reuse(self, tokens: list[int], model_id: str) -> int:
+        """Report a fixed reusable prefix of three blocks."""
+        assert model_id == "m"
+        return 3 * BLOCK_TOKENS
+
     async def close(self) -> None:
         """Nothing to close."""
 
@@ -99,3 +104,34 @@ def test_gateway_prefills_front_without_daser_loads(
         assert len(bodies) == 2
     else:
         assert len(bodies) == 1
+
+
+@pytest.mark.parametrize(
+    ("priority", "expected"),
+    [("none", None), ("length", 3 * BLOCK_TOKENS + 1), ("residual", 1)],
+)
+def test_gateway_sets_priority_from_residual_work(
+    priority: str, expected: int | None
+) -> None:
+    """``length`` ranks by prompt tokens, ``residual`` by tokens left to compute.
+
+    Three blocks of the thirteen-token prompt are reusable, so the residual
+    priority is the one uncached token; ``none`` leaves the body unchanged.
+    """
+    bodies: list[dict[str, Any]] = []
+    cfg = GatewayConfig(vllm_url="http://vllm", socket_path="unused", priority=priority)
+    prompt = list(range(3 * BLOCK_TOKENS + 1))
+    with TestClient(
+        build_gateway_app(cfg, transport=_vllm_mock(bodies), ipc=_PlanIPC(0))
+    ) as client:
+        resp = client.post("/v1/completions", json={"model": "m", "prompt": prompt})
+
+    assert resp.status_code == 200
+    (body,) = bodies
+    assert body.get("priority") == expected
+
+
+def test_gateway_rejects_unknown_priority() -> None:
+    """An unknown priority policy fails at configuration time."""
+    with pytest.raises(ValueError, match="priority"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", priority="fifo")

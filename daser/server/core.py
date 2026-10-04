@@ -399,6 +399,30 @@ class ServerCore:
             return None
         return self._record_lookup(tokens, matches)
 
+    async def estimate_reusable_tokens(
+        self, tokens: TokenSequence, model_id: str
+    ) -> int:
+        """Estimate how many leading prompt tokens a lookup will reuse.
+
+        Counts committed chunks and chunks a store writer is still publishing,
+        so a follow-up request arriving before its producer's commit is not
+        mistaken for a miss.  Unlike :meth:`lookup` this records no lookup
+        metrics, touches no replacement state and starts no reads.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+
+        Returns:
+            Contiguous reusable token count from the prompt start.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        return await self._ri.reusable_tokens(
+            tokens, model_id, self._lifecycle.pending_write_keys
+        )
+
     def _record_lookup(
         self, tokens: TokenSequence, matches: list[Any]
     ) -> list[ChunkInfo]:

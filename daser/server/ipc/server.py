@@ -563,6 +563,7 @@ class IPCServer:
             "lookup_prefetch": self._op_lookup_prefetch,
             "readahead_hint": self._op_readahead_hint,
             "split_prefill": self._op_split_prefill,
+            "estimate_reuse": self._op_estimate_reuse,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
             "alloc_chunk": self._op_alloc_chunk,
@@ -852,6 +853,25 @@ class IPCServer:
         back = self._external_spans(chunks, split, hits - split)
         started = bool(back) and await self._ensure_transfer().start_readahead(back)
         return {"compute_tokens": split, "hit_tokens": hits, "started": started}
+
+    async def _op_estimate_reuse(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Estimate a prompt's reusable prefix without serving a lookup.
+
+        Args:
+            msg: ``token_bytes`` (or ``tokens``) and ``model_id``.
+
+        Returns:
+            ``{"reusable_tokens": int}``, counting committed chunks and chunks
+            still being written; no lookup counters, replacement state or
+            reads are touched.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping.
+        """
+        reusable = await self._core.estimate_reusable_tokens(
+            self._lookup_tokens(msg), msg["model_id"]
+        )
+        return {"reusable_tokens": int(reusable)}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""

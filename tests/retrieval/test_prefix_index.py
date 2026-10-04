@@ -181,3 +181,17 @@ def test_continuation_keys_accept_packed_token_bytes() -> None:
         assert idx.continuation_keys(packed, covered, "m") == idx.continuation_keys(
             tokens, covered, "m"
         )
+
+
+def test_reusable_tokens_count_committed_then_pending_blocks() -> None:
+    """Committed and pending blocks extend the estimate; a gap ends it."""
+    idx = PrefixHashIndex(block_tokens=4)
+    tokens = list(range(1, 17))
+    keys = rolling_keys(tokens, block_tokens=4)
+    _run(idx.insert(make_meta(tokens[:4], chunk_key=keys[0])))
+    _run(idx.insert(make_meta(tokens[12:16], chunk_key=keys[3])))
+
+    assert _run(idx.reusable_tokens(tokens, "m", set())) == 4
+    assert _run(idx.reusable_tokens(tokens, "m", {keys[1]})) == 8
+    assert _run(idx.reusable_tokens(tokens, "m", {keys[1], keys[2]})) == 16
+    assert _run(idx.reusable_tokens(tokens, "other", {keys[1]})) == 0

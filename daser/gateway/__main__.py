@@ -5,7 +5,7 @@ import argparse
 
 import uvicorn
 
-from daser.gateway.app import GatewayConfig, build_gateway_app
+from daser.gateway.app import PRIORITY_MODES, GatewayConfig, build_gateway_app
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -30,6 +30,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compute-tokens-per-s", type=float, default=30000.0)
     parser.add_argument("--load-bytes-per-s", type=float, default=15e9)
     parser.add_argument("--min-compute-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--priority",
+        choices=PRIORITY_MODES,
+        default="none",
+        help=(
+            "Set vLLM request priority: 'length' by prompt tokens, 'residual' "
+            "by tokens left after DaseR's reusable prefix. Needs vLLM "
+            "--scheduling-policy priority."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -47,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         compute_tokens_per_s=args.compute_tokens_per_s,
         load_bytes_per_s=args.load_bytes_per_s,
         min_compute_tokens=args.min_compute_tokens,
+        priority=args.priority,
     )
     uvicorn.run(
         build_gateway_app(cfg), host=args.host, port=args.port, log_level="warning"

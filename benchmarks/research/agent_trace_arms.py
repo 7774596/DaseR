@@ -17,6 +17,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -323,6 +324,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Cap LMCache fs_native L2 at --l2-size with LRU eviction.",
     )
+    parser.add_argument(
+        "--vllm-extra-args",
+        default="",
+        help="Extra vllm serve arguments for every arm (shell-split).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -354,6 +360,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gateway-compute-tokens-per-s", type=float, default=30000.0)
     parser.add_argument("--gateway-load-bytes-per-s", type=float, default=15e9)
     parser.add_argument("--gateway-min-compute-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--gateway-priority",
+        choices=("none", "length", "residual"),
+        default="none",
+        help="Gateway vLLM priority policy (needs --scheduling-policy priority).",
+    )
     return parser.parse_args(argv)
 
 
@@ -408,6 +420,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         lmcache_l2_odirect=True,
         lmcache_l2_native_workers=args.lmcache_l2_native_workers,
         lmcache_l2_bounded=args.lmcache_l2_bounded,
+        extra_vllm_args=tuple(shlex.split(args.vllm_extra_args)),
         **(
             {"lmcache_eviction_watermark": args.lmcache_eviction_watermark}
             if args.lmcache_eviction_watermark is not None
@@ -492,6 +505,8 @@ async def _start_gateway(
             "--min-compute-tokens",
             str(args.gateway_min_compute_tokens),
             *(["--split"] if args.gateway == "split" else []),
+            "--priority",
+            args.gateway_priority,
         ],
         cwd=REPO_ROOT,
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},

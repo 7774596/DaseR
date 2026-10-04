@@ -57,6 +57,35 @@ class RetrievalIndex(ABC):
         """
         ...
 
+    async def reusable_tokens(
+        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
+    ) -> int:
+        """Estimate prompt tokens reusable from the start of ``tokens``.
+
+        The default counts tokens covered contiguously by :meth:`lookup` and
+        ignores ``pending_keys``; indexes whose keys name prompt blocks should
+        also count blocks a writer is still publishing.
+
+        Args:
+            tokens: full prompt token IDs.
+            model_id: model identifier used for cache isolation.
+            pending_keys: keys of chunks whose store writer has not committed.
+
+        Returns:
+            Contiguous reusable token count from the prompt start.
+
+        Async/thread-safety:
+            Pure in-memory planning on the server event loop.  Implementations
+            must not perform blocking I/O or mutate index state.
+        """
+        del pending_keys
+        covered = 0
+        for match in await self.lookup(tokens, model_id):
+            if match.target_token_start > covered:
+                break
+            covered = max(covered, match.target_token_start + match.meta.token_count)
+        return covered
+
     def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return keys that this index could match for ``tokens``.
 
