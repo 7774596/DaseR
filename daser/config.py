@@ -31,8 +31,8 @@ ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
 #: allocation eviction removes referenced chunks before the hand sees them.
 ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
 #: Research switch for loop-aware eviction of the packed arena: a positive
-#: integer N makes chunks idle for more than N lookups go first (oldest
-#: allocation first), otherwise the newest chunk outside the current lookup.
+#: integer N makes chunks idle for more than N prompts go first (oldest
+#: allocation first), otherwise the newest chunk outside the current prompt.
 ARENA_LIVE_VICTIM_ENV = "DASER_ARENA_LIVE_VICTIM_IDLE"
 #: Logical ring headroom under live-victim eviction. Kept prefixes stay at the
 #: ring tail while churn happens near the head, so the ring must span several
@@ -194,7 +194,7 @@ class ModelGeometry:
 
 
 def arena_live_victim_idle() -> int:
-    """Return the live-victim idle threshold in lookups, 0 when disabled.
+    """Return the live-victim idle threshold in prompts, 0 when disabled.
 
     Reads ``DASER_ARENA_LIVE_VICTIM_IDLE``; unset, empty or non-positive values
     disable loop-aware arena eviction.

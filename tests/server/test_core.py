@@ -1019,8 +1019,8 @@ async def test_live_victim_evicts_idle_chunks_oldest_first(
     core = make_core()
     blocks = await _committed_blocks(core, 4)
     keys = [first_rolling_key(tokens) for tokens in blocks]
-    await core.lookup(blocks[0], "m")
-    await core.lookup(blocks[0], "m")
+    for index in (0, 3, 0):
+        await core.lookup(blocks[index], "m")
 
     first = await core.evict_oldest_chunk(set())
     second = await core.evict_oldest_chunk({keys[2]})
@@ -1046,3 +1046,21 @@ async def test_live_victim_keeps_oldest_live_prefix(
 
     assert [meta.chunk_key for meta in order if meta] == [keys[2], keys[1], keys[0]]
     assert await core.evict_oldest_chunk(set()) is None
+
+
+@pytest.mark.asyncio
+async def test_live_victim_clock_ignores_repeated_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-polling the same prompt does not age other chunks into idle."""
+    monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "1")
+    core = make_core()
+    blocks = await _committed_blocks(core, 3)
+    keys = [first_rolling_key(tokens) for tokens in blocks]
+    await core.lookup(blocks[0], "m")
+    for _ in range(5):
+        await core.lookup(blocks[1], "m")
+
+    evicted = await core.evict_oldest_chunk(set())
+
+    assert evicted is not None and evicted.chunk_key == keys[2]

@@ -273,6 +273,7 @@ class ServerCore:
         # mapped to the lookup tick that last touched them.
         self._live_idle = 0 if self._second_chance else arena_live_victim_idle()
         self._live_tick = 0
+        self._live_prompt: tuple[int, str | None] | None = None
         self._live_touch: OrderedDict[str, int] = OrderedDict()
         self._record_capacity_metrics()
 
@@ -417,7 +418,12 @@ class ServerCore:
         if self._second_chance:
             self._referenced.update(chunk.chunk_key for chunk in chunks)
         if self._live_idle:
-            self._live_tick += 1
+            # Schedulers poll one request many times; only a new prompt
+            # (length and first matched chunk) advances the request clock.
+            prompt = (count_tokens(tokens), chunks[0].chunk_key if chunks else None)
+            if prompt != self._live_prompt:
+                self._live_prompt = prompt
+                self._live_tick += 1
             for chunk in chunks:
                 if chunk.chunk_key in self._live_touch:
                     self._live_touch[chunk.chunk_key] = self._live_tick
@@ -1039,8 +1045,8 @@ class ServerCore:
         bytes and loses its reference bit, and the first unreferenced chunk is
         removed in place. Its slots become a skip block, so no data moves.
         With ``DASER_ARENA_LIVE_VICTIM_IDLE=N`` the victim is the oldest
-        chunk no lookup touched in the last N lookups (a dead session), or
-        else the newest chunk the current lookup did not touch, so a loop of
+        chunk no lookup touched in the last N prompts (a dead session), or
+        else the newest chunk the current prompt did not touch, so a loop of
         sessions larger than the arena keeps a stable part of its prefixes
         instead of FIFO evicting each one just before its reuse. Chunks the
         current lookup touched count as protected.
@@ -1389,10 +1395,12 @@ class ServerCore:
     async def _evict_live_victim(self, protected_keys: set[str]) -> ChunkMeta | None:
         """Evict a dead chunk, else the newest chunk outside the current lookup.
 
-        Chunks idle for more than the configured number of lookups go first in
+        Chunks idle for more than the configured number of prompts go first in
         allocation order; otherwise the most recently allocated chunk not
-        touched by the current lookup is removed in place. Chunks touched by
-        the current lookup are evicted only when nothing else is left.
+        touched by the current prompt is removed in place. Chunks touched by
+        the current prompt are evicted only when nothing else is left. The
+        clock advances when a lookup's prompt differs from the previous one,
+        so repeated scheduler polls of one request count once.
 
         Args:
             protected_keys: Chunk keys that must stay resident.
