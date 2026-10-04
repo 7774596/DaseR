@@ -63,6 +63,8 @@ _WRITE_YIELD_MAX_S = 2.0
 _PRECLEAN_BATCH_BYTES = 1 << 30
 #: A promotion reservation still waiting after this long logs the tier state.
 _STUCK_WAIT_LOG_S = 30.0
+#: Floor on the pool-wait timeout that retries once a readahead expires.
+_MIN_POOL_RETRY_S = 0.001
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
@@ -2145,16 +2147,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         async with self._lock:
             self._raise_l2_error_locked()
             self._prune_readaheads_locked()
-            # Readaheads past their lifetime lost their load (an aborted or
-            # trimmed request); live ones may belong to a request that is
-            # loading or still queued, so they keep their budget.
-            now = time.perf_counter()
-            for lease_id in [
-                lease_id
-                for lease_id, item in self._readaheads.items()
-                if now - item.started > _READAHEAD_LIFETIME_S
-            ]:
-                self._drop_readahead_locked(lease_id, "expired")
+            self._expire_readaheads_locked()
             if not speculative:
                 self._make_room_for_request_locked(accounted)
             covered = [rng for item in self._readaheads.values() for rng in item.ranges]
@@ -2976,6 +2969,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
+                expiry = self._expire_readaheads_locked()
                 pinned = self._l1.reserve_untracked(int(span["nbytes"]))
                 if pinned is not None:
                     # Own the slice like a lease so cleanup elsewhere keeps it.
@@ -2983,7 +2977,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                     break
                 waiter = loop.create_future()
                 self._l1.register_pool_waiter(waiter)
-            await waiter
+            if expiry is None:
+                await waiter
+            else:
+                # Retry when the oldest readahead expires, as for promotions.
+                await asyncio.wait({waiter}, timeout=max(expiry, _MIN_POOL_RETRY_S))
         read: asyncio.Future[int] | None = None
         copy_future: asyncio.Task[None] | None = None
         try:
@@ -3593,8 +3591,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             those writes to free their pool slices.
         """
         while True:
+            pool_wait = False
             async with self._lock:
                 self._raise_l2_error_locked()
+                expiry = self._expire_readaheads_locked()
                 data = self._l1.reserve(
                     key,
                     nbytes,
@@ -3620,7 +3620,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if wait_for is None:
                     wait_for = asyncio.get_event_loop().create_future()
                     self._l1.register_pool_waiter(wait_for)
-            await wait_for
+                    pool_wait = True
+            if not pool_wait or expiry is None:
+                await wait_for
+            else:
+                # Retry once the oldest unconsumed readahead can be reclaimed.
+                await asyncio.wait({wait_for}, timeout=max(expiry, _MIN_POOL_RETRY_S))
 
     async def _reserve_l1_promotion(
         self,
@@ -3656,6 +3661,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
+                expiry = self._expire_readaheads_locked()
                 data = self._l1.reserve(
                     key,
                     nbytes,
@@ -3698,7 +3704,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                     self._l1.register_pool_waiter(wait_for)
             started = time.perf_counter()
             try:
-                done, _ = await asyncio.wait({wait_for}, timeout=_STUCK_WAIT_LOG_S)
+                limit = _STUCK_WAIT_LOG_S
+                if cause == "pool" and expiry is not None:
+                    # Only an unconsumed readahead may hold the space: wake
+                    # when the oldest expires so the retry reclaims it.
+                    limit = min(limit, max(expiry, _MIN_POOL_RETRY_S))
+                done, _ = await asyncio.wait({wait_for}, timeout=limit)
+                if not done and limit < _STUCK_WAIT_LOG_S:
+                    continue
                 if not done:
                     # Diagnostic for promotion stalls that never wake.
                     logger.warning(
@@ -4553,6 +4566,27 @@ class TieredIOUringTransferLayer(TransferLayer):
             if self._readahead_budget - self._readahead_bytes_locked() >= need:
                 return
             self._drop_readahead_locked(lease_id, "mispredicted")
+
+    def _expire_readaheads_locked(self) -> float | None:
+        """Drop readaheads past their lifetime; return seconds to the next.
+
+        Readaheads past their lifetime lost their load (an aborted or trimmed
+        request); live ones may belong to a request that is loading or still
+        queued, so they keep their budget. Pool waiters use the returned delay
+        to wake and reclaim the next one, since an unconsumed readahead can
+        hold the pool space their promotion needs.
+        """
+        now = time.perf_counter()
+        for lease_id in [
+            lease_id
+            for lease_id, item in self._readaheads.items()
+            if now - item.started > _READAHEAD_LIFETIME_S
+        ]:
+            self._drop_readahead_locked(lease_id, "expired")
+        if not self._readaheads:
+            return None
+        oldest = min(item.started for item in self._readaheads.values())
+        return max(0.0, oldest + _READAHEAD_LIFETIME_S - now)
 
     def _readahead_bytes_locked(self) -> int:
         """Return physical bytes still retained by readahead leases."""

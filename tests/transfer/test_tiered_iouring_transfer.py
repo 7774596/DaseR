@@ -1763,6 +1763,51 @@ def test_iouring_readahead_partial_cover_falls_back_and_store_drops_it(
     asyncio.run(scenario())
 
 
+def test_iouring_unconsumed_readahead_expires_for_waiting_promotion(
+    tmp_path, monkeypatch
+) -> None:
+    """A promotion blocked by an orphaned readahead proceeds once it expires.
+
+    The readahead's request never loads, so nothing else would release its
+    lease; the promotion must reclaim it without a later readahead starting.
+    """
+    monkeypatch.setattr(layer_module, "_READAHEAD_LIFETIME_S", 0.3)
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    half = nbytes // 2
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        layer = await _cold_readahead_layer(
+            str(tmp_path / "daser.store"),
+            payload,
+            readahead_piece_bytes=nbytes,
+        )
+        layer.close()
+        # Reopen with L1 = half the payload: the orphan holds 3/4 of it.
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=half,
+            l2_bytes=nbytes * 4,
+            readahead_piece_bytes=nbytes,
+            readahead_budget_fraction=0.75,
+        )
+        try:
+            orphan = ALIGNMENT * 3
+            assert await layer.start_readahead([{"file_offset": 0, "nbytes": orphan}])
+            await layer.drain()
+            dst = bytearray(half)
+            load = [{"target_offset": 0, "file_offset": half, "nbytes": half}]
+            got = await asyncio.wait_for(layer.load_bytes_grouped(dst, load), 10)
+            assert got == half
+            assert bytes(dst) == payload[half:]
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
 def test_iouring_readahead_tail_bypass_reads_uncovered_spans_around_l1(
     tmp_path,
 ) -> None:
