@@ -207,6 +207,7 @@ class IPCClientSync(_IPCClientBase):
         tokens: list[int],
         model_id: str,
         external_prefix_queries: int,
+        num_computed_tokens: int = 0,
     ) -> bool:
         """Ask the server to read ahead a queued request's external prefix.
 
@@ -214,6 +215,8 @@ class IPCClientSync(_IPCClientBase):
             tokens: Block-aligned prompt token IDs.
             model_id: Model identifier.
             external_prefix_queries: Prompt token count vLLM will query.
+            num_computed_tokens: Leading tokens vLLM's GPU prefix cache
+                already holds; the readahead starts after them.
 
         Returns:
             True when the server started a new readahead.
@@ -228,7 +231,7 @@ class IPCClientSync(_IPCClientBase):
                 "token_bytes": _pack_lookup_tokens(tokens),
                 "model_id": model_id,
                 "external_prefix_queries": int(external_prefix_queries),
-                "num_computed_tokens": 0,
+                "num_computed_tokens": int(num_computed_tokens),
             }
         )
         return bool(resp.get("started", False))

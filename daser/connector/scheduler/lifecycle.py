@@ -174,8 +174,11 @@ class RequestLifecycle:
         With ``arrival_readahead`` the block-aligned prompt is sent as a
         readahead hint, so the server reads the request's external prefix
         while earlier requests run; the scheduling lookup later finds those
-        bytes retained or in flight. The hint is best effort: failures are
-        logged and the request is scheduled normally.
+        bytes retained or in flight. When the GPU block pool is bound, the
+        hint starts after the prompt's GPU prefix-cache hit, so the readahead
+        budget is spent only on blocks vLLM would load externally. The hint
+        is best effort: failures are logged and the request is scheduled
+        normally.
 
         Args:
             request: vLLM Request with prompt_token_ids.
@@ -187,11 +190,14 @@ class RequestLifecycle:
             return
         tokens = list(request.prompt_token_ids)
         aligned = (len(tokens) // self._block_tokens) * self._block_tokens
-        if aligned == 0:
+        local = (self._gpu_cached_tokens(request) // self._block_tokens) * (
+            self._block_tokens
+        )
+        if aligned == 0 or local >= aligned:
             return
         try:
             started = self._ipc_sync.readahead_hint(
-                tokens[:aligned], self._model_id, len(tokens)
+                tokens[:aligned], self._model_id, len(tokens), local
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -201,8 +207,9 @@ class RequestLifecycle:
             )
             return
         logger.debug(
-            "[CONNECTOR] readahead hint req=%s started=%s",
+            "[CONNECTOR] readahead hint req=%s gpu_tokens=%d started=%s",
             request.request_id[:8],
+            local,
             started,
         )
 
@@ -693,11 +700,12 @@ class RequestLifecycle:
         self._refresh_runtime_config()
 
     def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
-        """Bind vLLM's GPU block pool for write-back watermark decisions.
+        """Bind vLLM's GPU block pool for write-back and arrival readahead.
 
         Args:
-            gpu_block_pool: vLLM ``BlockPool``; only ``get_num_free_blocks``
-                and per-block ``ref_cnt`` are read.
+            gpu_block_pool: vLLM ``BlockPool``; only ``get_num_free_blocks``,
+                ``get_cached_block``, ``hash_block_size`` and per-block
+                ``ref_cnt`` are read.
 
         Thread-safety:
             Called once on the scheduler thread after the cache manager exists.
@@ -1219,6 +1227,24 @@ class RequestLifecycle:
             getattr(self, "_writeback_low_blocks", 0) > 0
             and getattr(self, "_gpu_block_pool", None) is not None
         )
+
+    def _gpu_cached_tokens(self, request: "Request") -> int:
+        """Return the prompt prefix length vLLM's GPU prefix cache holds now.
+
+        Walks ``request.block_hashes`` in order and stops at the first hash
+        the bound block pool does not hold for KV cache group 0. Returns 0
+        when no pool is bound. Blocks may still be evicted before the request
+        is scheduled; the scheduling lookup covers whatever is lost.
+        """
+        pool = getattr(self, "_gpu_block_pool", None)
+        if pool is None:
+            return 0
+        cached = 0
+        for block_hash in getattr(request, "block_hashes", ()):
+            if pool.get_cached_block(block_hash, [0]) is None:
+                break
+            cached += 1
+        return cached * int(pool.hash_block_size)
 
     def _release_writeback_holds(self) -> set[str]:
         """Release held finished requests until free blocks reach the watermark.
