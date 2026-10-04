@@ -165,7 +165,7 @@ async def _priority(
         reusable = 0
     # vLLM computes at least the last prompt token.
     residual = max(1, len(prompt) - min(reusable, len(prompt)))
-    logger.debug(
+    logger.info(
         "[GATEWAY] priority prompt=%d reusable=%d residual=%d",
         len(prompt),
         reusable,
