@@ -1826,6 +1826,17 @@ class IPCServer:
                 "Held bytes written to L2 ahead of eviction while idle.",
             ).inc(precleaned)
         self._prev_held_preclean_bytes = stats.held_preclean_bytes
+        timing = getattr(transfer, "l2_timing_us", None) or {}
+        prev_timing = getattr(self, "_prev_l2_timing_us", {})
+        for key, current in timing.items():
+            delta = current - prev_timing.get(key, 0)
+            if delta > 0:
+                kind, phase = key.split("_")
+                self._metrics.counter(
+                    "daser_l2_executor_seconds_total",
+                    "L2 executor queue wait and native IO time.",
+                ).inc(delta / 1_000_000, labels={"kind": kind, "phase": phase})
+        self._prev_l2_timing_us = timing
         for cause, current in (
             ("l2_write", stats.promotion_wait_l2_write_us),
             ("promotion", stats.promotion_wait_promotion_us),

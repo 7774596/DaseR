@@ -154,3 +154,21 @@ def test_preclean_fraction_must_be_below_one(tmp_path: Path) -> None:
     except ValueError:
         return
     raise AssertionError("held_preclean_fraction 1.0 was accepted")
+
+
+def test_l2_timing_counts_read_and_write_jobs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        layer = _layer(tmp_path, 1)
+        await layer.store_bytes_grouped(b"a" * PAGE, [_span(0, hold=False)])
+        await layer.store_bytes_grouped(b"b" * PAGE, [_span(PAGE, hold=False)])
+        await layer.drain()
+        dst = bytearray(PAGE)
+        # The first page left the one-page L1, so this load reads L2.
+        assert await layer.load_bytes(dst, 0, PAGE) == PAGE
+        timing = layer.l2_timing_us
+        assert set(timing) == {"read_queue", "read_io", "write_queue", "write_io"}
+        assert timing["write_io"] > 0
+        assert timing["read_io"] > 0
+        layer.close()
+
+    asyncio.run(scenario())

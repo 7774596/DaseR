@@ -14,6 +14,8 @@ import asyncio
 import concurrent.futures
 import os
 import threading
+import time
+from typing import Any
 
 # First Party
 from daser.transfer.iouring.native import NativeIOUring
@@ -51,6 +53,13 @@ class L2IoEngine:
         )
         self._uring_lock = threading.Lock()
         self._next_uring_index = 0
+        # Microseconds read/write jobs waited for an executor thread and spent
+        # in native IO, keyed "read_queue", "read_io", "write_queue",
+        # "write_io"; guarded by ``_timing_lock`` (executor threads add).
+        self._timing_lock = threading.Lock()
+        self._timing_us = dict.fromkeys(
+            ("read_queue", "read_io", "write_queue", "write_io"), 0
+        )
 
     @property
     def ring_count(self) -> int:
@@ -61,6 +70,47 @@ class L2IoEngine:
     def executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the executor used to offload blocking io_uring waits."""
         return self._executor
+
+    @property
+    def timing_us(self) -> dict[str, int]:
+        """Return cumulative executor queue and native IO microseconds.
+
+        Returns:
+            A copy keyed ``read_queue``, ``read_io``, ``write_queue`` and
+            ``write_io``. Queue time runs from submission to an executor
+            thread starting the job; IO time is the native call itself.
+
+        Async/thread-safety:
+            Safe from any thread; executor threads update under a lock.
+        """
+        with self._timing_lock:
+            return dict(self._timing_us)
+
+    def timed(self, kind: str, fn: Any) -> Any:
+        """Wrap a blocking job so its queue and IO time are counted.
+
+        Args:
+            kind: ``"read"`` or ``"write"``.
+            fn: blocking callable to run on the executor.
+
+        Returns:
+            A callable with the same arguments and result as ``fn``.
+        """
+        submitted = time.perf_counter()
+
+        def run(*args: Any) -> Any:
+            start = time.perf_counter()
+            try:
+                return fn(*args)
+            finally:
+                end = time.perf_counter()
+                with self._timing_lock:
+                    self._timing_us[f"{kind}_queue"] += int(
+                        (start - submitted) * 1_000_000
+                    )
+                    self._timing_us[f"{kind}_io"] += int((end - start) * 1_000_000)
+
+        return run
 
     def next_uring(self) -> NativeIOUring:
         """Return the next native io_uring instance for one L2 operation."""
@@ -126,7 +176,7 @@ class L2IoEngine:
 
         submitted = loop.run_in_executor(
             self._executor,
-            self.next_uring().read_batch_into,
+            self.timed("read", self.next_uring().read_batch_into),
             self._fd,
             reads,
             on_complete,

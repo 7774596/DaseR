@@ -2635,6 +2635,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._pending_l2_buffers[key] = data
 
     @property
+    def l2_timing_us(self) -> dict[str, int]:
+        """Return L2 executor queue and native IO microseconds by kind.
+
+        Returns:
+            ``read_queue``/``read_io``/``write_queue``/``write_io`` totals,
+            empty when L2 is disabled.
+        """
+        return {} if self._l2 is None else self._l2.timing_us
+
+    @property
     def l1_bytes_used(self) -> int:
         """Return resident L1 memory-tier bytes."""
         return self._l1.bytes_used
@@ -2860,7 +2870,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._stats.l2_write_contended_bytes += len(data)
         await loop.run_in_executor(
             self._l2.executor,
-            self._write_l2,
+            self._l2.timed("write", self._write_l2),
             file_offset,
             data,
             self._next_uring(),
@@ -2948,7 +2958,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         try:
             read = loop.run_in_executor(
                 self._l2.executor,
-                self._read_l2_into,
+                self._l2.timed("read", self._read_l2_into),
                 start,
                 pinned,
                 self._next_uring(),
@@ -3024,7 +3034,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 span, pinned, promotion_id, epoch = queued.pop()
                 future = loop.run_in_executor(
                     self._l2.executor,
-                    self._read_l2_into,
+                    self._l2.timed("read", self._read_l2_into),
                     int(span["file_offset"]),
                     pinned,
                     self._next_uring(),
@@ -3125,7 +3135,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 else:
                     future = loop.run_in_executor(
                         self._l2.executor,
-                        self._read_l2_into,
+                        self._l2.timed("read", self._read_l2_into),
                         int(span["file_offset"]),
                         pinned,
                         self._next_uring(),
