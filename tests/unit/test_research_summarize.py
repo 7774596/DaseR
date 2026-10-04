@@ -8,6 +8,7 @@ from benchmarks.research.summarize import (
     live_clock_rows,
     order_rows,
     overlap_bound_rows,
+    request_hit_rows,
 )
 
 
@@ -77,3 +78,23 @@ def test_live_clock_check_flags_poll_counting(tmp_path: Path) -> None:
 
     assert "live_ticks=20 requests=20" in good and "ANOMALY" not in good
     assert "live_ticks=79" in bad and "ANOMALY" in bad
+
+
+def test_request_hit_check_reconciles_cached_tokens(tmp_path: Path) -> None:
+    """Per-request cached tokens matching the counters pass; a gap is flagged."""
+    arms = []
+    for name, cached in (("ok", [0, 80, 90]), ("gap", [0, 0, 0]), ("none", None)):
+        arm_dir = tmp_path / name
+        arm_dir.mkdir()
+        with (arm_dir / "requests.jsonl").open("w") as f:
+            for i in range(3):
+                record = {"trace_index": i, "prompt_tokens": 100}
+                if cached is not None:
+                    record["cached_tokens"] = cached[i]
+                f.write(json.dumps(record) + "\n")
+        arms.append(arm_dir)
+
+    good, bad = request_hit_rows(arms, ["0.567", "0.567", "0.567"])
+
+    assert "n=3 request_hit=0.567" in good and "ANOMALY" not in good
+    assert "request_hit=0.000" in bad and "ANOMALY" in bad

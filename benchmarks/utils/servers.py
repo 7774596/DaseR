@@ -763,7 +763,17 @@ class ServerManager:
             "--async-scheduling" if self.async_scheduling else "--no-async-scheduling",
         ]
         if os.environ.get("DASER_BENCH_SKIP_OPTIONAL_VLLM_FLAGS", "0") != "1":
-            cmd.extend(["--stream-interval", "1", "--attention-backend", "FLASH_ATTN"])
+            # Prompt token details carry per-request cached tokens (GPU plus
+            # connector), so replays can audit hits request by request.
+            cmd.extend(
+                [
+                    "--stream-interval",
+                    "1",
+                    "--attention-backend",
+                    "FLASH_ATTN",
+                    "--enable-prompt-tokens-details",
+                ]
+            )
         if self.gpu_util is not None:
             cmd.extend(["--gpu-memory-utilization", str(self.gpu_util)])
         if self.max_model_len is not None and self.max_model_len > 0:

@@ -48,6 +48,9 @@ class RequestResult:
     error: str | None = None
     cache_hits: int = 0
     cache_chunks_total: int = 0
+    #: Prompt tokens served from any KV cache (GPU prefix or connector), as
+    #: reported by vLLM ``usage.prompt_tokens_details``; None when absent.
+    cached_tokens: int | None = None
     queue_ms: float = 0.0
     response_id: str | None = None
     first_token_observed: bool = False
@@ -688,6 +691,8 @@ async def vllm_completion_stream(
             first_nonempty_text=first_nonempty_text,
         )
     completion_tokens = int(usage.get("completion_tokens", 0))
+    details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = details.get("cached_tokens")
     return RequestResult(
         sample_id=sample.sample_id,
         dataset=sample.dataset,
@@ -696,6 +701,7 @@ async def vllm_completion_stream(
         latency_ms=wall_ms,
         prompt_tokens=int(usage.get("prompt_tokens", 0)),
         completion_tokens=completion_tokens,
+        cached_tokens=None if cached_tokens is None else int(cached_tokens),
         # vLLM ends a request failed by a KV load error with an empty but
         # well-formed stream; without a token there is no TTFT to report.
         error=(

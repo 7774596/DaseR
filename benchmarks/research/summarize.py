@@ -595,6 +595,48 @@ def live_clock_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def request_hit_rows(arm_dirs: list[Path], counter_hits: list[str]) -> list[str]:
+    """Reconcile per-request cached tokens with the vLLM hit counters.
+
+    vLLM reports ``usage.prompt_tokens_details.cached_tokens`` per request
+    when served with ``--enable-prompt-tokens-details``. Their token-weighted
+    sum over the replay should equal the counter-based ``hit`` column; a gap
+    means per-request hit audits (e.g. against an offline cache simulation)
+    would read the wrong requests.
+
+    Args:
+        arm_dirs: Arm directories; arms without ``cached_tokens`` are skipped.
+        counter_hits: Counter-based hit rate per arm, aligned with
+            ``arm_dirs``, as printed in the ``hit`` column.
+
+    Returns:
+        One line per arm with per-request data, tagged ``ANOMALY`` when the
+        two hit rates differ by more than 0.05.
+    """
+    lines = []
+    for arm_dir, counter in zip(arm_dirs, counter_hits, strict=True):
+        records = [
+            record
+            for record in map(json.loads, (arm_dir / "requests.jsonl").open())
+            if record.get("cached_tokens") is not None and not record.get("error")
+        ]
+        if not records:
+            continue
+        cached = sum(record["cached_tokens"] for record in records)
+        prompt = sum(record["prompt_tokens"] for record in records)
+        rate = cached / max(prompt, 1)
+        label = f"{arm_dir.parent.name}/{arm_dir.name}"
+        off = counter not in ("-", "") and abs(rate - float(counter)) > 0.05
+        tag = (
+            " ANOMALY: per-request cached tokens disagree with counters" if off else ""
+        )
+        lines.append(
+            f"  {label}: n={len(records)} request_hit={rate:.3f} "
+            f"counter_hit={counter}{tag}"
+        )
+    return lines
+
+
 def main() -> None:
     """CLI entry point: ``summarize.py <artifact_dir> [<artifact_dir> ...]``.
 
@@ -650,6 +692,10 @@ def main() -> None:
     if clocks:
         print("live-victim arena clock")
         print("\n".join(clocks))
+    request_hits = request_hit_rows(arm_dirs, [row["hit"] for row in rows])
+    if request_hits:
+        print("per-request cached tokens vs hit counters")
+        print("\n".join(request_hits))
     if args.first > 0:
         print("\n".join(paired_rows(arm_dirs, args.first, args.warm_ms)))
     if args.first > 0 and args.overlap_oracle is not None:

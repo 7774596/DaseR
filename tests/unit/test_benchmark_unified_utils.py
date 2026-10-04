@@ -1178,6 +1178,55 @@ async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
     assert len(send_times) == 1
 
 
+async def test_vllm_stream_reports_cached_prompt_tokens() -> None:
+    """Prompt token details populate cached_tokens; absent details leave None."""
+
+    def _client(usage: str) -> object:
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            async def aiter_lines(self) -> object:
+                yield 'data: {"choices":[{"text":"x"}]}'
+                yield f'data: {{"usage":{usage},"choices":[]}}'
+                yield "data: [DONE]"
+
+            async def __aenter__(self) -> "_Response":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        class _Client:
+            def stream(self, *args: object, **kwargs: object) -> _Response:
+                return _Response()
+
+        return _Client()
+
+    sample = BenchmarkSample(
+        sample_id=1, dataset="imdb", context="review", question="q", answers=[]
+    )
+    detailed = (
+        '{"prompt_tokens":8,"completion_tokens":1,'
+        '"prompt_tokens_details":{"cached_tokens":5}}'
+    )
+    plain = '{"prompt_tokens":8,"completion_tokens":1}'
+    results = [
+        await vllm_completion_stream(
+            _client(usage),
+            "http://127.0.0.1:8001",
+            sample,
+            "prompt",
+            {"max_tokens": 1},
+            asyncio.Semaphore(1),
+            10.0,
+        )
+        for usage in (detailed, plain)
+    ]
+
+    assert [r.cached_tokens for r in results] == [5, None]
+
+
 async def test_vllm_stream_timing_accepts_empty_text_token_events() -> None:
     """TTFT uses token IDs when a generated token has empty text."""
 
@@ -3520,6 +3569,7 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
     assert "--no-async-scheduling" in command
     assert command[command.index("--stream-interval") + 1] == "1"
     assert command[command.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert "--enable-prompt-tokens-details" in command
 
 
 def test_vllm_start_can_leave_gpu_memory_utilization_unset(tmp_path: Path) -> None:
