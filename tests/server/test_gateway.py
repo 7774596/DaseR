@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefill gateway: computes the planned front, then forwards the request."""
 
+import asyncio
 from collections.abc import AsyncIterator
 import json
 from typing import Any
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from daser.gateway import GatewayConfig, build_gateway_app
+from daser.gateway import GatewayConfig, SlotDispatcher, build_gateway_app
 
 BLOCK_TOKENS = 4
 
@@ -194,3 +195,83 @@ def test_gateway_rejects_bad_admission() -> None:
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", admit="fifo")
     with pytest.raises(ValueError, match="admit_slots"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", admit_slots=0)
+
+
+def test_dispatcher_releases_smallest_key_first() -> None:
+    """With the only slot taken, later waiters get it in key order."""
+
+    async def scenario() -> list[str]:
+        dispatcher = SlotDispatcher(1)
+        first = await dispatcher.acquire(0.0)
+        order: list[str] = []
+
+        async def waiter(name: str, key: float) -> None:
+            release = await dispatcher.acquire(key)
+            order.append(name)
+            release()
+
+        tasks = [
+            asyncio.create_task(waiter(name, key))
+            for name, key in (("big", 9.0), ("small", 1.0), ("mid", 5.0))
+        ]
+        await asyncio.sleep(0)
+        assert dispatcher.waiting == 3
+        first()
+        first()  # idempotent: a second call must not free an extra slot
+        await asyncio.gather(*tasks)
+        assert dispatcher.waiting == 0
+        return order
+
+    assert asyncio.run(scenario()) == ["small", "mid", "big"]
+
+
+def test_dispatcher_cancelled_waiter_does_not_leak_slot() -> None:
+    """A waiter cancelled after being handed the slot passes it on."""
+
+    async def scenario() -> bool:
+        dispatcher = SlotDispatcher(1)
+        first = await dispatcher.acquire(0.0)
+        doomed = asyncio.create_task(dispatcher.acquire(1.0))
+        survivor = asyncio.create_task(dispatcher.acquire(2.0))
+        await asyncio.sleep(0)
+        first()
+        doomed.cancel()
+        release = await asyncio.wait_for(survivor, timeout=1)
+        release()
+        return doomed.cancelled()
+
+    assert asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("dispatch", ["fifo", "length", "residual"])
+def test_gateway_dispatch_forwards_and_frees_slots(dispatch: str) -> None:
+    """Held completions are forwarded unchanged and free their slot.
+
+    With one dispatch slot the second streamed request is only forwarded if
+    the first released its slot when its stream started.
+    """
+    bodies: list[dict[str, Any]] = []
+    cfg = GatewayConfig(
+        vllm_url="http://vllm",
+        socket_path="unused",
+        dispatch=dispatch,
+        dispatch_slots=1,
+    )
+    prompt = list(range(3 * BLOCK_TOKENS + 1))
+    request = {"model": "m", "prompt": prompt, "stream": True}
+    with TestClient(
+        build_gateway_app(cfg, transport=_streaming_vllm_mock(bodies), ipc=_PlanIPC(0))
+    ) as client:
+        for _ in range(2):
+            resp = client.post("/v1/completions", json=request, timeout=5)
+            assert resp.status_code == 200
+
+    assert bodies == [request, request]
+
+
+def test_gateway_rejects_bad_dispatch() -> None:
+    """Unknown dispatch orders and empty dispatch pools fail at config time."""
+    with pytest.raises(ValueError, match="dispatch"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch="lifo")
+    with pytest.raises(ValueError, match="dispatch_slots"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_slots=0)

@@ -7,6 +7,7 @@ import uvicorn
 
 from daser.gateway.app import (
     ADMIT_MODES,
+    DISPATCH_MODES,
     PRIORITY_MODES,
     GatewayConfig,
     build_gateway_app,
@@ -56,6 +57,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--admit-tokens", type=int, default=8192)
     parser.add_argument("--admit-slots", type=int, default=1)
+    parser.add_argument(
+        "--dispatch",
+        choices=DISPATCH_MODES,
+        default="none",
+        help=(
+            "Hold completions in the gateway and release them to vLLM in "
+            "'fifo', 'length' (prompt tokens) or 'residual' (tokens left after "
+            "DaseR's reusable prefix) order."
+        ),
+    )
+    parser.add_argument("--dispatch-slots", type=int, default=4)
     return parser.parse_args(argv)
 
 
@@ -77,6 +89,8 @@ def main(argv: list[str] | None = None) -> None:
         admit=args.admit,
         admit_tokens=args.admit_tokens,
         admit_slots=args.admit_slots,
+        dispatch=args.dispatch,
+        dispatch_slots=args.dispatch_slots,
     )
     uvicorn.run(
         build_gateway_app(cfg), host=args.host, port=args.port, log_level="warning"

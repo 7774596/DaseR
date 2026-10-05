@@ -19,12 +19,21 @@ completion whose work (prompt tokens under ``length``, residual tokens under
 ``residual``) reaches ``admit_tokens`` waits for one of ``admit_slots`` slots
 and holds it until its first streamed chunk, so at most ``admit_slots`` large
 prefills share vLLM's token budget while small jobs pass straight through.
+
+Dispatch holds completions in the gateway and forwards them to vLLM only while
+fewer than ``dispatch_slots`` are waiting for their first streamed chunk, so
+vLLM's own queue stays short and the gateway picks who runs next. ``residual``
+releases the held request with the fewest tokens left after DaseR's reusable
+prefix first (shortest remaining prefill), ``length`` the shortest prompt, and
+``fifo`` keeps arrival order (the hold-back ablation).
 """
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import heapq
+import itertools
 import time
 from typing import Any
 
@@ -40,6 +49,7 @@ logger = init_logger(__name__)
 
 PRIORITY_MODES = ("none", "length", "residual")
 ADMIT_MODES = ("none", "length", "residual")
+DISPATCH_MODES = ("none", "fifo", "length", "residual")
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,11 @@ class GatewayConfig:
             tokens minus DaseR's reusable prefix.
         admit_tokens: Work at or above which a request is a large job.
         admit_slots: Large jobs allowed in prefill at once.
+        dispatch: Gateway-held release order: ``none`` forwards at once,
+            ``fifo`` by arrival, ``length`` by prompt tokens and ``residual``
+            by prompt tokens minus DaseR's reusable prefix.
+        dispatch_slots: Forwarded completions allowed to await their first
+            streamed chunk at once under ``dispatch``.
     """
 
     vllm_url: str
@@ -75,12 +90,14 @@ class GatewayConfig:
     admit: str = "none"
     admit_tokens: int = 8192
     admit_slots: int = 1
+    dispatch: str = "none"
+    dispatch_slots: int = 4
 
     def __post_init__(self) -> None:
         """Validate the priority and admission policies.
 
         Raises:
-            ValueError: if a policy is unknown or ``admit_slots`` < 1.
+            ValueError: if a policy is unknown or a slot count is < 1.
         """
         if self.priority not in PRIORITY_MODES:
             raise ValueError(f"unknown gateway priority {self.priority!r}")
@@ -88,6 +105,80 @@ class GatewayConfig:
             raise ValueError(f"unknown gateway admit {self.admit!r}")
         if self.admit_slots < 1:
             raise ValueError("gateway admit_slots must be at least 1")
+        if self.dispatch not in DISPATCH_MODES:
+            raise ValueError(f"unknown gateway dispatch {self.dispatch!r}")
+        if self.dispatch_slots < 1:
+            raise ValueError("gateway dispatch_slots must be at least 1")
+
+
+class SlotDispatcher:
+    """Hand out a fixed number of slots, smallest key first.
+
+    Waiters queue by ``(key, arrival)``; a released slot goes to the waiter
+    with the smallest key, so the gateway forwards shortest-work-first while
+    capping how many forwarded requests are in flight.
+
+    Async/thread-safety:
+        Use from one event loop; not thread-safe.
+    """
+
+    def __init__(self, slots: int) -> None:
+        """Create a dispatcher.
+
+        Args:
+            slots: Slots available at once; must be at least 1.
+        """
+        self._free = slots
+        self._waiters: list[tuple[float, int, asyncio.Future[None]]] = []
+        self._order = itertools.count()
+
+    @property
+    def waiting(self) -> int:
+        """Number of callers still queued for a slot (including cancelled)."""
+        return len(self._waiters)
+
+    async def acquire(self, key: float) -> Callable[[], None]:
+        """Wait for a slot and return an idempotent release callback.
+
+        Args:
+            key: Release order; smaller keys get slots first, ties by arrival.
+
+        Returns:
+            Callback that returns the slot; safe to call more than once.
+
+        Raises:
+            asyncio.CancelledError: if cancelled while waiting; a slot already
+                handed to the caller is passed on, not leaked.
+        """
+        if self._free > 0 and not self._waiters:
+            self._free -= 1
+        else:
+            fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            heapq.heappush(self._waiters, (key, next(self._order), fut))
+            try:
+                await fut
+            except asyncio.CancelledError:
+                if fut.done() and not fut.cancelled():
+                    self._release()
+                raise
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._release()
+
+        return release
+
+    def _release(self) -> None:
+        """Give the slot to the smallest live waiter or return it to the pool."""
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._free += 1
 
 
 def build_gateway_app(
@@ -125,15 +216,18 @@ def build_gateway_app(
         state["model_id"] = str(config.get("model_id", "default"))
         state["block_tokens"] = int(config.get("block_tokens", 0))
         state["admit"] = asyncio.Semaphore(cfg.admit_slots)
+        state["dispatch"] = SlotDispatcher(cfg.dispatch_slots)
         logger.info(
             "[GATEWAY] ready vllm=%s split=%s priority=%s admit=%s/%d/%d "
-            "compute_tps=%.0f load_bps=%.3g",
+            "dispatch=%s/%d compute_tps=%.0f load_bps=%.3g",
             cfg.vllm_url,
             cfg.split,
             cfg.priority,
             cfg.admit,
             cfg.admit_tokens,
             cfg.admit_slots,
+            cfg.dispatch,
+            cfg.dispatch_slots,
             cfg.compute_tokens_per_s,
             cfg.load_bytes_per_s,
         )
@@ -155,15 +249,33 @@ def build_gateway_app(
             and all(isinstance(token, int) for token in prompt)
         )
         residual: int | None = None
-        if token_prompt and "residual" in (cfg.priority, cfg.admit):
+        if token_prompt and "residual" in (cfg.priority, cfg.admit, cfg.dispatch):
             residual = await _residual(state, prompt)
         if token_prompt and cfg.priority != "none":
             body["priority"] = len(prompt) if cfg.priority == "length" else residual
-        release: Callable[[], None] | None = None
+        releases: list[Callable[[], None]] = []
+        if token_prompt and cfg.dispatch != "none":
+            key = {
+                "fifo": time.monotonic(),
+                "length": float(len(prompt)),
+                "residual": float(residual or 0),
+            }[cfg.dispatch]
+            releases.append(await state["dispatch"].acquire(key))
         if token_prompt and cfg.admit != "none":
             work = len(prompt) if cfg.admit == "length" else residual
             if work is not None and work >= cfg.admit_tokens:
-                release = await _acquire_large_slot(state["admit"])
+                try:
+                    releases.append(await _acquire_large_slot(state["admit"]))
+                except BaseException:
+                    for fn in releases:
+                        fn()
+                    raise
+
+        def release_all() -> None:
+            for fn in releases:
+                fn()
+
+        release = release_all if releases else None
         try:
             if token_prompt and cfg.split:
                 await _prefill_front(state, cfg, body, prompt)
