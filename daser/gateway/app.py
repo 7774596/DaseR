@@ -50,6 +50,7 @@ logger = init_logger(__name__)
 PRIORITY_MODES = ("none", "length", "residual")
 ADMIT_MODES = ("none", "length", "residual")
 DISPATCH_MODES = ("none", "fifo", "length", "residual")
+_KEEPALIVE_EXPIRY_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,10 @@ def build_gateway_app(
         state["http"] = httpx.AsyncClient(
             base_url=cfg.vllm_url,
             timeout=httpx.Timeout(cfg.timeout_s),
+            # Drop idle connections before vLLM's uvicorn (5 s keep-alive)
+            # closes them, so a held request is never sent on a socket the
+            # server is closing (httpx.ReadError).
+            limits=httpx.Limits(keepalive_expiry=_KEEPALIVE_EXPIRY_S),
             transport=transport,
         )
         state["ipc"] = ipc if ipc is not None else IPCClientAsync(cfg.socket_path)
