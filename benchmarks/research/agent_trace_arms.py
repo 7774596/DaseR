@@ -382,12 +382,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gateway-admit-slots", type=int, default=1)
     parser.add_argument(
         "--gateway-dispatch",
-        choices=("none", "fifo", "length", "residual"),
+        choices=("none", "fifo", "length", "residual", "residual-fresh"),
         default="none",
         help="Gateway-held release order to vLLM (residual = shortest remaining "
         "prefill after DaseR's reusable prefix).",
     )
     parser.add_argument("--gateway-dispatch-slots", type=int, default=4)
+    parser.add_argument("--gateway-dispatch-refresh", type=int, default=8)
     return parser.parse_args(argv)
 
 
@@ -540,6 +541,8 @@ async def _start_gateway(
             args.gateway_dispatch,
             "--dispatch-slots",
             str(args.gateway_dispatch_slots),
+            "--dispatch-refresh",
+            str(args.gateway_dispatch_refresh),
         ],
         cwd=REPO_ROOT,
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},

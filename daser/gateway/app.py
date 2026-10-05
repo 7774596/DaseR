@@ -25,11 +25,13 @@ fewer than ``dispatch_slots`` are waiting for their first streamed chunk, so
 vLLM's own queue stays short and the gateway picks who runs next. ``residual``
 releases the held request with the fewest tokens left after DaseR's reusable
 prefix first (shortest remaining prefill), ``length`` the shortest prompt, and
-``fifo`` keeps arrival order (the hold-back ablation).
+``fifo`` keeps arrival order (the hold-back ablation). ``residual-fresh``
+re-estimates the residual of the ``dispatch_refresh`` best-ranked held requests
+whenever a slot frees, so shared prefixes written while they waited count.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import heapq
@@ -49,7 +51,7 @@ logger = init_logger(__name__)
 
 PRIORITY_MODES = ("none", "length", "residual")
 ADMIT_MODES = ("none", "length", "residual")
-DISPATCH_MODES = ("none", "fifo", "length", "residual")
+DISPATCH_MODES = ("none", "fifo", "length", "residual", "residual-fresh")
 _KEEPALIVE_EXPIRY_S = 2.0
 
 
@@ -75,9 +77,12 @@ class GatewayConfig:
         admit_slots: Large jobs allowed in prefill at once.
         dispatch: Gateway-held release order: ``none`` forwards at once,
             ``fifo`` by arrival, ``length`` by prompt tokens and ``residual``
-            by prompt tokens minus DaseR's reusable prefix.
+            by prompt tokens minus DaseR's reusable prefix; ``residual-fresh``
+            also re-estimates the best-ranked held requests at each release.
         dispatch_slots: Forwarded completions allowed to await their first
             streamed chunk at once under ``dispatch``.
+        dispatch_refresh: Best-ranked held requests re-estimated per release
+            under ``residual-fresh``.
     """
 
     vllm_url: str
@@ -93,6 +98,7 @@ class GatewayConfig:
     admit_slots: int = 1
     dispatch: str = "none"
     dispatch_slots: int = 4
+    dispatch_refresh: int = 8
 
     def __post_init__(self) -> None:
         """Validate the priority and admission policies.
@@ -110,6 +116,8 @@ class GatewayConfig:
             raise ValueError(f"unknown gateway dispatch {self.dispatch!r}")
         if self.dispatch_slots < 1:
             raise ValueError("gateway dispatch_slots must be at least 1")
+        if self.dispatch_refresh < 1:
+            raise ValueError("gateway dispatch_refresh must be at least 1")
 
 
 class SlotDispatcher:
@@ -117,32 +125,48 @@ class SlotDispatcher:
 
     Waiters queue by ``(key, arrival)``; a released slot goes to the waiter
     with the smallest key, so the gateway forwards shortest-work-first while
-    capping how many forwarded requests are in flight.
+    capping how many forwarded requests are in flight. With ``rekey`` set, a
+    release first re-keys the ``refresh`` best-ranked waiters from their
+    payloads, so keys that went stale while waiting are corrected before the
+    slot is granted.
 
     Async/thread-safety:
         Use from one event loop; not thread-safe.
     """
 
-    def __init__(self, slots: int) -> None:
+    def __init__(
+        self,
+        slots: int,
+        rekey: Callable[[Any], Awaitable[float]] | None = None,
+        refresh: int = 8,
+    ) -> None:
         """Create a dispatcher.
 
         Args:
             slots: Slots available at once; must be at least 1.
+            rekey: Optional coroutine mapping a waiter's payload to a fresh
+                key; failures keep the old key.
+            refresh: Best-ranked waiters re-keyed per release under ``rekey``.
         """
         self._free = slots
-        self._waiters: list[tuple[float, int, asyncio.Future[None]]] = []
+        self._waiters: list[tuple[float, int, asyncio.Future[None], Any]] = []
         self._order = itertools.count()
+        self._rekey = rekey
+        self._refresh = refresh
+        self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[None]] = set()
 
     @property
     def waiting(self) -> int:
         """Number of callers still queued for a slot (including cancelled)."""
         return len(self._waiters)
 
-    async def acquire(self, key: float) -> Callable[[], None]:
+    async def acquire(self, key: float, payload: Any = None) -> Callable[[], None]:
         """Wait for a slot and return an idempotent release callback.
 
         Args:
             key: Release order; smaller keys get slots first, ties by arrival.
+            payload: Passed to ``rekey`` when the dispatcher refreshes keys.
 
         Returns:
             Callback that returns the slot; safe to call more than once.
@@ -155,7 +179,7 @@ class SlotDispatcher:
             self._free -= 1
         else:
             fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            heapq.heappush(self._waiters, (key, next(self._order), fut))
+            heapq.heappush(self._waiters, (key, next(self._order), fut, payload))
             try:
                 await fut
             except asyncio.CancelledError:
@@ -173,9 +197,37 @@ class SlotDispatcher:
         return release
 
     def _release(self) -> None:
+        """Grant a freed slot, re-keying the best waiters first if enabled."""
+        if self._rekey is None or len(self._waiters) < 2:
+            self._grant()
+            return
+        # The slot stays reserved (not free) until the refreshed grant runs, so
+        # a newcomer cannot take it while keys are being recomputed.
+        task = asyncio.get_running_loop().create_task(self._grant_refreshed())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _grant_refreshed(self) -> None:
+        """Re-key the best-ranked live waiters, then grant the reserved slot."""
+        assert self._rekey is not None
+        async with self._lock:
+            heads: list[tuple[float, int, asyncio.Future[None], Any]] = []
+            while self._waiters and len(heads) < self._refresh:
+                item = heapq.heappop(self._waiters)
+                if not item[2].done():
+                    heads.append(item)
+            keys = await asyncio.gather(
+                *(self._rekey(item[3]) for item in heads), return_exceptions=True
+            )
+            for (old, order, fut, payload), new in zip(heads, keys, strict=True):
+                key = old if isinstance(new, BaseException) else float(new)
+                heapq.heappush(self._waiters, (key, order, fut, payload))
+            self._grant()
+
+    def _grant(self) -> None:
         """Give the slot to the smallest live waiter or return it to the pool."""
         while self._waiters:
-            _, _, fut = heapq.heappop(self._waiters)
+            fut = heapq.heappop(self._waiters)[2]
             if not fut.done():
                 fut.set_result(None)
                 return
@@ -221,7 +273,16 @@ def build_gateway_app(
         state["model_id"] = str(config.get("model_id", "default"))
         state["block_tokens"] = int(config.get("block_tokens", 0))
         state["admit"] = asyncio.Semaphore(cfg.admit_slots)
-        state["dispatch"] = SlotDispatcher(cfg.dispatch_slots)
+        fresh = cfg.dispatch == "residual-fresh"
+
+        async def rekey(prompt: list[int]) -> float:
+            return float(await _residual(state, prompt))
+
+        state["dispatch"] = SlotDispatcher(
+            cfg.dispatch_slots,
+            rekey=rekey if fresh else None,
+            refresh=cfg.dispatch_refresh,
+        )
         logger.info(
             "[GATEWAY] ready vllm=%s split=%s priority=%s admit=%s/%d/%d "
             "dispatch=%s/%d compute_tps=%.0f load_bps=%.3g",
@@ -254,7 +315,10 @@ def build_gateway_app(
             and all(isinstance(token, int) for token in prompt)
         )
         residual: int | None = None
-        if token_prompt and "residual" in (cfg.priority, cfg.admit, cfg.dispatch):
+        if token_prompt and (
+            "residual" in (cfg.priority, cfg.admit)
+            or cfg.dispatch.startswith("residual")
+        ):
             residual = await _residual(state, prompt)
         if token_prompt and cfg.priority != "none":
             body["priority"] = len(prompt) if cfg.priority == "length" else residual
@@ -264,8 +328,9 @@ def build_gateway_app(
                 "fifo": time.monotonic(),
                 "length": float(len(prompt)),
                 "residual": float(residual or 0),
+                "residual-fresh": float(residual or 0),
             }[cfg.dispatch]
-            releases.append(await state["dispatch"].acquire(key))
+            releases.append(await state["dispatch"].acquire(key, prompt))
         if token_prompt and cfg.admit != "none":
             work = len(prompt) if cfg.admit == "length" else residual
             if work is not None and work >= cfg.admit_tokens:

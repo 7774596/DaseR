@@ -243,7 +243,37 @@ def test_dispatcher_cancelled_waiter_does_not_leak_slot() -> None:
     assert asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("dispatch", ["fifo", "length", "residual"])
+def test_dispatcher_rekeys_best_waiters_before_granting() -> None:
+    """A release re-keys the best-ranked waiters, so a stale key loses."""
+
+    async def scenario() -> list[str]:
+        fresh = {"stale": 9.0, "cheap": 2.0, "big": 7.0}
+
+        async def rekey(name: str) -> float:
+            return fresh[name]
+
+        dispatcher = SlotDispatcher(1, rekey=rekey, refresh=8)
+        first = await dispatcher.acquire(0.0)
+        order: list[str] = []
+
+        async def waiter(name: str, key: float) -> None:
+            release = await dispatcher.acquire(key, name)
+            order.append(name)
+            release()
+
+        tasks = [
+            asyncio.create_task(waiter(name, key))
+            for name, key in (("stale", 1.0), ("cheap", 3.0), ("big", 5.0))
+        ]
+        await asyncio.sleep(0)
+        first()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        return order
+
+    assert asyncio.run(scenario()) == ["cheap", "big", "stale"]
+
+
+@pytest.mark.parametrize("dispatch", ["fifo", "length", "residual", "residual-fresh"])
 def test_gateway_dispatch_forwards_and_frees_slots(dispatch: str) -> None:
     """Held completions are forwarded unchanged and free their slot.
 
@@ -275,3 +305,5 @@ def test_gateway_rejects_bad_dispatch() -> None:
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch="lifo")
     with pytest.raises(ValueError, match="dispatch_slots"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_slots=0)
+    with pytest.raises(ValueError, match="dispatch_refresh"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_refresh=0)
