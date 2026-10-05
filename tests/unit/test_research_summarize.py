@@ -6,6 +6,7 @@ from pathlib import Path
 
 from benchmarks.research.summarize import (
     arm_row,
+    decode_rows,
     live_clock_rows,
     order_rows,
     overlap_bound_rows,
@@ -151,3 +152,29 @@ def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:
 
     assert "ticks=4 busy=3 waiting=3 kv>=60%=2 compute=1" in row
     assert "running<=1=2 pf_tok_s@kvfull=200" in row
+
+
+def test_decode_rows_fit_tpot_against_overlapping_context(tmp_path: Path) -> None:
+    """TPOT = floor + slope x context is recovered from disjoint decodes."""
+    arm_dir = tmp_path / "arm"
+    arm_dir.mkdir()
+    records = []
+    for i, ctx in enumerate((100_000, 200_000, 300_000)):
+        tpot = 5.0 + 10.0 * ctx / 1e5
+        records.append(
+            {
+                "ttft_ms": 100.0,
+                "latency_ms": 100.0 + 20 * tpot,
+                "completion_offset_s": 10.0 * (i + 1),
+                "input_length": ctx,
+                "completion_tokens": 21,
+            }
+        )
+    (arm_dir / "requests.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in records)
+    )
+
+    (row,) = decode_rows([arm_dir])
+
+    assert "tpot_ms=25.0" in row
+    assert "fit n=3 floor_ms=5.0 ms_per_100k_ctx=10.00" in row

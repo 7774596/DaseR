@@ -655,6 +655,66 @@ def vllm_tick_rows(arm_dirs: list[Path], kv_full_pct: float = 60.0) -> list[str]
     return lines
 
 
+def decode_rows(arm_dirs: list[Path], min_tokens: int = 20) -> list[str]:
+    """Attribute client latency to decode and relate TPOT to concurrent context.
+
+    Decode time is client latency minus TTFT. For requests with at least
+    ``min_tokens`` output tokens, TPOT is regressed on the prompt tokens of
+    every request whose decode window overlaps this one (itself included):
+    the slope is the decode cost of resident context (memory-bandwidth bound
+    attention), the intercept the per-step floor (weights, launch).
+
+    Args:
+        arm_dirs: Arm directories with ``requests.jsonl``.
+        min_tokens: Shortest output counted in the TPOT regression.
+
+    Returns:
+        One line per arm: decode seconds and share of client latency, mean
+        TPOT, and the fitted intercept (ms) and slope (ms per 100k tokens).
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        records = [
+            record
+            for record in map(json.loads, (arm_dir / "requests.jsonl").open())
+            if not record.get("error") and record.get("ttft_ms") is not None
+        ]
+        if not records:
+            continue
+        spans = []
+        for record in records:
+            end = float(record["completion_offset_s"])
+            first = (
+                end - (float(record["latency_ms"]) - float(record["ttft_ms"])) / 1000
+            )
+            spans.append((first, end, int(record["input_length"]), record))
+        decode_s = sum(end - first for first, end, _, _ in spans)
+        latency_s = sum(float(r["latency_ms"]) for r in records) / 1000
+        out = sum(int(r["completion_tokens"]) for r in records)
+        points = []
+        for first, end, _, record in spans:
+            tokens = int(record["completion_tokens"])
+            if tokens < min_tokens:
+                continue
+            ctx = sum(c for f, e, c, _ in spans if f < end and e > first)
+            points.append((ctx / 1e5, (end - first) * 1000 / (tokens - 1)))
+        slope = intercept = 0.0
+        if len(points) >= 2:
+            mx = sum(x for x, _ in points) / len(points)
+            my = sum(y for _, y in points) / len(points)
+            var = sum((x - mx) ** 2 for x, _ in points)
+            slope = sum((x - mx) * (y - my) for x, y in points) / max(var, 1e-9)
+            intercept = my - slope * mx
+        tpot = decode_s * 1000 / max(out - len(records), 1)
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: decode_s={decode_s:.0f} "
+            f"share={_rate(decode_s, latency_s)} tpot_ms={tpot:.1f} "
+            f"fit n={len(points)} floor_ms={intercept:.1f} "
+            f"ms_per_100k_ctx={slope:.2f}"
+        )
+    return lines
+
+
 def request_hit_rows(arm_dirs: list[Path], counter_hits: list[str]) -> list[str]:
     """Reconcile per-request cached tokens with the vLLM hit counters.
 
@@ -758,6 +818,10 @@ def main() -> None:
     if ticks:
         print("vLLM scheduler ticks (waiting = queued in vLLM)")
         print("\n".join(ticks))
+    decodes = decode_rows(arm_dirs)
+    if decodes:
+        print("decode attribution (client latency - TTFT; TPOT vs overlapping ctx)")
+        print("\n".join(decodes))
     request_hits = request_hit_rows(arm_dirs, [row["hit"] for row in rows])
     if request_hits:
         print("per-request cached tokens vs hit counters")
