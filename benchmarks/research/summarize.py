@@ -34,6 +34,7 @@ _COLUMNS = (
     "sum_pf_s",
     "sum_ttft_s",
     "csum_ttft_s",
+    "csum_lat_s",
     "io_share",
     "l1_hits",
     "load_gib",
@@ -195,6 +196,9 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         # request (for example a gateway admission wait), which vLLM's
         # time_to_first_token histogram cannot see.
         "csum_ttft_s": f"{sum(ttft) / 1000:.0f}",
+        # Client send-to-completion latency: a scheduler that trades decode
+        # progress for earlier first tokens shows up here, not in TTFT.
+        "csum_lat_s": f"{sum(float(r['latency_ms']) for r in completed) / 1000:.0f}",
         # Summed external load latency over summed TTFT: the share of TTFT a
         # free storage tier could remove at most (loads run serially here).
         "io_share": _rate(
