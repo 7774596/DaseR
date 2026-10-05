@@ -10,6 +10,7 @@ from benchmarks.research.summarize import (
     order_rows,
     overlap_bound_rows,
     request_hit_rows,
+    vllm_tick_rows,
 )
 
 
@@ -40,7 +41,12 @@ def _ttft_arm(root: Path, name: str, ttft_ms: list[float]) -> Path:
     arm_dir.mkdir(parents=True)
     with (arm_dir / "requests.jsonl").open("w") as f:
         for index, ttft in enumerate(ttft_ms):
-            record = {"trace_index": index, "status": "completed", "ttft_ms": ttft}
+            record = {
+                "trace_index": index,
+                "status": "completed",
+                "ttft_ms": ttft,
+                "latency_ms": 2 * ttft,
+            }
             f.write(json.dumps(record) + "\n")
     return arm_dir
 
@@ -123,3 +129,25 @@ def test_arm_row_reports_load_share_of_ttft(tmp_path: Path) -> None:
 
     assert row["io_share"] == "0.250"
     assert row["sum_ttft_s"] == "20"
+    assert row["csum_lat_s"] == "1"  # (200 + 600) ms
+
+
+def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:
+    """Waiting ticks at high KV usage count as capacity-bound, others compute."""
+    arm_dir = tmp_path / "arm"
+    arm_dir.mkdir()
+    line = (
+        "(APIServer pid=1) INFO [loggers.py:315] Engine 000: Avg prompt "
+        "throughput: {pf} tokens/s, Avg generation throughput: 9.0 tokens/s, "
+        "Running: {run} reqs, Waiting: {wait} reqs, GPU KV cache usage: {kv}%, "
+        "Prefix cache hit rate: 0.0%\n"
+    )
+    ticks = [(0, 0, 0, 0.0), (100, 1, 2, 90.0), (300, 1, 1, 70.0), (50, 3, 1, 20.0)]
+    (arm_dir / "vllm_daser.log").write_text(
+        "".join(line.format(pf=pf, run=r, wait=w, kv=kv) for pf, r, w, kv in ticks)
+    )
+
+    (row,) = vllm_tick_rows([arm_dir, tmp_path])
+
+    assert "ticks=4 busy=3 waiting=3 kv>=60%=2 compute=1" in row
+    assert "running<=1=2 pf_tok_s@kvfull=200" in row

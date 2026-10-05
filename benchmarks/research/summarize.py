@@ -44,6 +44,11 @@ _COLUMNS = (
 
 _LOAD = 'daser_transfer_bytes_total{op="load"}'
 _STORE = 'daser_transfer_bytes_total{op="store"}'
+_VLLM_TICK = re.compile(
+    r"prompt throughput: ([0-9.]+).*?generation throughput: ([0-9.]+)"
+    r".*?Running: (\d+) reqs, Waiting: (\d+) reqs(?:, Deferred: (\d+) reqs)?"
+    r".*?usage: ([0-9.]+)%"
+)
 _SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)\s+([-+eE0-9.]+)")
 
 
@@ -611,6 +616,45 @@ def live_clock_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def vllm_tick_rows(arm_dirs: list[Path], kv_full_pct: float = 60.0) -> list[str]:
+    """Classify vLLM periodic stats ticks to attribute queueing.
+
+    Each ``Running: .. Waiting: ..`` stats line is one tick. Ticks with
+    waiting requests are split by why admission stalls: KV usage at or above
+    ``kv_full_pct`` (GPU KV capacity), otherwise compute/budget bound. Idle
+    ticks have nothing running or waiting.
+
+    Args:
+        arm_dirs: Arm directories; arms without a ``vllm_*.log`` are skipped.
+        kv_full_pct: KV usage percentage counted as capacity-bound.
+
+    Returns:
+        One line per arm: tick counts, waiting ticks split into capacity- and
+        compute-bound, waiting ticks with a single running request, and the
+        mean prompt throughput over capacity-bound ticks.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        logs = sorted(arm_dir.glob("vllm_*.log"))
+        if not logs:
+            continue
+        ticks = [
+            m.groups() for m in map(_VLLM_TICK.search, logs[0].open()) if m is not None
+        ]
+        busy = [t for t in ticks if int(t[2]) or int(t[3])]
+        waiting = [t for t in busy if int(t[3])]
+        full = [t for t in waiting if float(t[5]) >= kv_full_pct]
+        single = sum(1 for t in waiting if int(t[2]) <= 1)
+        full_pf = sum(float(t[0]) for t in full) / max(len(full), 1)
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: ticks={len(ticks)} "
+            f"busy={len(busy)} waiting={len(waiting)} kv>={kv_full_pct:.0f}%="
+            f"{len(full)} compute={len(waiting) - len(full)} running<=1={single} "
+            f"pf_tok_s@kvfull={full_pf:.0f}"
+        )
+    return lines
+
+
 def request_hit_rows(arm_dirs: list[Path], counter_hits: list[str]) -> list[str]:
     """Reconcile per-request cached tokens with the vLLM hit counters.
 
@@ -710,6 +754,10 @@ def main() -> None:
     if clocks:
         print("live-victim arena clock")
         print("\n".join(clocks))
+    ticks = vllm_tick_rows(arm_dirs)
+    if ticks:
+        print("vLLM scheduler ticks (waiting = queued in vLLM)")
+        print("\n".join(ticks))
     request_hits = request_hit_rows(arm_dirs, [row["hit"] for row in rows])
     if request_hits:
         print("per-request cached tokens vs hit counters")
