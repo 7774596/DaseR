@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from daser.gateway import GatewayConfig, SlotDispatcher, build_gateway_app
+from daser.gateway.app import prefill_cost
 
 BLOCK_TOKENS = 4
 
@@ -273,7 +274,19 @@ def test_dispatcher_rekeys_best_waiters_before_granting() -> None:
     assert asyncio.run(scenario()) == ["cheap", "big", "stale"]
 
 
-@pytest.mark.parametrize("dispatch", ["fifo", "length", "residual", "residual-fresh"])
+def test_prefill_cost_grows_with_context() -> None:
+    """Equal misses cost more behind a longer reusable prefix."""
+    assert prefill_cost(100, 100, 1e12) == pytest.approx(100.0)
+    short = prefill_cost(1_000, 500, 1_000.0)
+    long = prefill_cost(10_000, 500, 1_000.0)
+    assert short == pytest.approx(500 * (1 + 750 / 1_000))
+    assert long > short
+    assert prefill_cost(4_000, 0, 1_000.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "dispatch", ["fifo", "length", "residual", "residual-fresh", "cost-fresh"]
+)
 def test_gateway_dispatch_forwards_and_frees_slots(dispatch: str) -> None:
     """Held completions are forwarded unchanged and free their slot.
 
@@ -305,5 +318,9 @@ def test_gateway_rejects_bad_dispatch() -> None:
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch="lifo")
     with pytest.raises(ValueError, match="dispatch_slots"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_slots=0)
+    with pytest.raises(ValueError, match="dispatch_attn_tokens"):
+        GatewayConfig(
+            vllm_url="http://vllm", socket_path="unused", dispatch_attn_tokens=0
+        )
     with pytest.raises(ValueError, match="dispatch_refresh"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_refresh=0)

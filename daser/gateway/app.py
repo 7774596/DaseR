@@ -28,6 +28,11 @@ prefix first (shortest remaining prefill), ``length`` the shortest prompt, and
 ``fifo`` keeps arrival order (the hold-back ablation). ``residual-fresh``
 re-estimates the residual of the ``dispatch_refresh`` best-ranked held requests
 whenever a slot frees, so shared prefixes written while they waited count.
+``cost-fresh`` refreshes the same way but ranks by estimated prefill cost: each
+of the ``m`` missing tokens pays a linear part plus attention over the ``h``
+reusable tokens and the earlier misses, ``m * (1 + (h + m / 2) / T)``, where
+``T`` (``dispatch_attn_tokens``) is the context length at which a token's
+attention FLOPs equal its linear-layer FLOPs.
 """
 
 import asyncio
@@ -51,8 +56,32 @@ logger = init_logger(__name__)
 
 PRIORITY_MODES = ("none", "length", "residual")
 ADMIT_MODES = ("none", "length", "residual")
-DISPATCH_MODES = ("none", "fifo", "length", "residual", "residual-fresh")
+DISPATCH_MODES = (
+    "none",
+    "fifo",
+    "length",
+    "residual",
+    "residual-fresh",
+    "cost-fresh",
+)
 _KEEPALIVE_EXPIRY_S = 2.0
+
+
+def prefill_cost(prompt_tokens: int, residual: int, attn_tokens: float) -> float:
+    """Estimate prefill work for ``residual`` missing tokens of a prompt.
+
+    Args:
+        prompt_tokens: Prompt length.
+        residual: Tokens left to compute after the reusable prefix.
+        attn_tokens: Context length at which one token's attention FLOPs equal
+            its linear-layer FLOPs.
+
+    Returns:
+        Cost in linear-token units: each missing token costs 1 plus its
+        attention over the reusable prefix and the misses before it.
+    """
+    reusable = max(prompt_tokens - residual, 0)
+    return residual * (1.0 + (reusable + residual / 2.0) / attn_tokens)
 
 
 @dataclass(frozen=True)
@@ -82,7 +111,9 @@ class GatewayConfig:
         dispatch_slots: Forwarded completions allowed to await their first
             streamed chunk at once under ``dispatch``.
         dispatch_refresh: Best-ranked held requests re-estimated per release
-            under ``residual-fresh``.
+            under ``residual-fresh`` and ``cost-fresh``.
+        dispatch_attn_tokens: Context length at which one token's attention
+            FLOPs equal its linear FLOPs (``cost-fresh`` only).
     """
 
     vllm_url: str
@@ -99,6 +130,7 @@ class GatewayConfig:
     dispatch: str = "none"
     dispatch_slots: int = 4
     dispatch_refresh: int = 8
+    dispatch_attn_tokens: float = 13500.0
 
     def __post_init__(self) -> None:
         """Validate the priority and admission policies.
@@ -118,6 +150,8 @@ class GatewayConfig:
             raise ValueError("gateway dispatch_slots must be at least 1")
         if self.dispatch_refresh < 1:
             raise ValueError("gateway dispatch_refresh must be at least 1")
+        if self.dispatch_attn_tokens <= 0:
+            raise ValueError("gateway dispatch_attn_tokens must be positive")
 
 
 class SlotDispatcher:
@@ -273,10 +307,10 @@ def build_gateway_app(
         state["model_id"] = str(config.get("model_id", "default"))
         state["block_tokens"] = int(config.get("block_tokens", 0))
         state["admit"] = asyncio.Semaphore(cfg.admit_slots)
-        fresh = cfg.dispatch == "residual-fresh"
+        fresh = cfg.dispatch.endswith("-fresh")
 
         async def rekey(prompt: list[int]) -> float:
-            return float(await _residual(state, prompt))
+            return _dispatch_key(cfg, prompt, await _residual(state, prompt))
 
         state["dispatch"] = SlotDispatcher(
             cfg.dispatch_slots,
@@ -317,19 +351,14 @@ def build_gateway_app(
         residual: int | None = None
         if token_prompt and (
             "residual" in (cfg.priority, cfg.admit)
-            or cfg.dispatch.startswith("residual")
+            or cfg.dispatch.endswith(("residual", "-fresh"))
         ):
             residual = await _residual(state, prompt)
         if token_prompt and cfg.priority != "none":
             body["priority"] = len(prompt) if cfg.priority == "length" else residual
         releases: list[Callable[[], None]] = []
         if token_prompt and cfg.dispatch != "none":
-            key = {
-                "fifo": time.monotonic(),
-                "length": float(len(prompt)),
-                "residual": float(residual or 0),
-                "residual-fresh": float(residual or 0),
-            }[cfg.dispatch]
+            key = _dispatch_key(cfg, prompt, residual)
             releases.append(await state["dispatch"].acquire(key, prompt))
         if token_prompt and cfg.admit != "none":
             work = len(prompt) if cfg.admit == "length" else residual
@@ -370,6 +399,17 @@ def build_gateway_app(
         )
 
     return app
+
+
+def _dispatch_key(cfg: GatewayConfig, prompt: list[int], residual: int | None) -> float:
+    """Release-order key for a held completion (smaller is released first)."""
+    if cfg.dispatch == "fifo":
+        return time.monotonic()
+    if cfg.dispatch == "length":
+        return float(len(prompt))
+    if cfg.dispatch == "cost-fresh":
+        return prefill_cost(len(prompt), residual or 0, cfg.dispatch_attn_tokens)
+    return float(residual or 0)
 
 
 async def _acquire_large_slot(slots: asyncio.Semaphore) -> Callable[[], None]:

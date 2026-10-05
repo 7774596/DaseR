@@ -65,11 +65,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Hold completions in the gateway and release them to vLLM in "
             "'fifo', 'length' (prompt tokens) or 'residual' (tokens left after "
             "DaseR's reusable prefix) order; 'residual-fresh' re-estimates the "
-            "best-ranked held requests at each release."
+            "best-ranked held requests at each release; 'cost-fresh' does the "
+            "same but ranks by estimated prefill FLOPs."
         ),
     )
     parser.add_argument("--dispatch-slots", type=int, default=4)
     parser.add_argument("--dispatch-refresh", type=int, default=8)
+    parser.add_argument(
+        "--dispatch-attn-tokens",
+        type=float,
+        default=13500.0,
+        help="Context length where a token's attention FLOPs equal its linear "
+        "FLOPs (cost-fresh); about 2*params / (4*layers*q_heads*head_dim).",
+    )
     return parser.parse_args(argv)
 
 
@@ -94,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
         dispatch=args.dispatch,
         dispatch_slots=args.dispatch_slots,
         dispatch_refresh=args.dispatch_refresh,
+        dispatch_attn_tokens=args.dispatch_attn_tokens,
     )
     uvicorn.run(
         build_gateway_app(cfg), host=args.host, port=args.port, log_level="warning"
