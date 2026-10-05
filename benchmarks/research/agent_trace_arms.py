@@ -247,6 +247,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--max-num-seqs", type=int, default=16)
+    parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="Enable vLLM async scheduling (CPU scheduling overlaps GPU steps) "
+        "for every arm; off by default to match earlier evidence.",
+    )
     parser.add_argument("--max-requests", type=int, default=3000)
     parser.add_argument("--start-request", type=int, default=0)
     parser.add_argument("--max-inflight", type=int, default=16)
@@ -392,6 +398,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         gpu_id=args.gpu_id,
         gpu_util=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
+        async_scheduling=args.async_scheduling,
         l1_size_bytes=args.l1_size,
         l2_size_bytes=args.l2_size,
         block_size=args.block_size,
