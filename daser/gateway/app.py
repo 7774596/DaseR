@@ -13,9 +13,16 @@ first; vLLM needs ``--scheduling-policy priority``). ``length`` orders by
 prompt tokens. ``residual`` orders by the tokens left to compute after DaseR's
 reusable prefix, counting chunks still being written, so a long prompt whose
 prefix DaseR holds is not queued as a large job.
+
+Admission control gates large jobs instead of reordering vLLM's queue: a
+completion whose work (prompt tokens under ``length``, residual tokens under
+``residual``) reaches ``admit_tokens`` waits for one of ``admit_slots`` slots
+and holds it until its first streamed chunk, so at most ``admit_slots`` large
+prefills share vLLM's token budget while small jobs pass straight through.
 """
 
-from collections.abc import AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import time
@@ -24,6 +31,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 import httpx
+from starlette.background import BackgroundTask
 
 from daser.connector.ipc_client import IPCClientAsync
 from daser.logging import init_logger
@@ -31,6 +39,7 @@ from daser.logging import init_logger
 logger = init_logger(__name__)
 
 PRIORITY_MODES = ("none", "length", "residual")
+ADMIT_MODES = ("none", "length", "residual")
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,11 @@ class GatewayConfig:
         priority: vLLM priority policy: ``none`` leaves requests unchanged,
             ``length`` uses prompt tokens and ``residual`` uses prompt tokens
             minus DaseR's reusable prefix.
+        admit: Large-job admission policy: ``none`` admits everything,
+            ``length`` gates by prompt tokens and ``residual`` by prompt
+            tokens minus DaseR's reusable prefix.
+        admit_tokens: Work at or above which a request is a large job.
+        admit_slots: Large jobs allowed in prefill at once.
     """
 
     vllm_url: str
@@ -58,15 +72,22 @@ class GatewayConfig:
     min_compute_tokens: int = 4096
     timeout_s: float = 3600.0
     priority: str = "none"
+    admit: str = "none"
+    admit_tokens: int = 8192
+    admit_slots: int = 1
 
     def __post_init__(self) -> None:
-        """Validate the priority policy.
+        """Validate the priority and admission policies.
 
         Raises:
-            ValueError: if ``priority`` is not a known policy.
+            ValueError: if a policy is unknown or ``admit_slots`` < 1.
         """
         if self.priority not in PRIORITY_MODES:
             raise ValueError(f"unknown gateway priority {self.priority!r}")
+        if self.admit not in ADMIT_MODES:
+            raise ValueError(f"unknown gateway admit {self.admit!r}")
+        if self.admit_slots < 1:
+            raise ValueError("gateway admit_slots must be at least 1")
 
 
 def build_gateway_app(
@@ -103,12 +124,16 @@ def build_gateway_app(
         config = resp.get("runtime_config", {})
         state["model_id"] = str(config.get("model_id", "default"))
         state["block_tokens"] = int(config.get("block_tokens", 0))
+        state["admit"] = asyncio.Semaphore(cfg.admit_slots)
         logger.info(
-            "[GATEWAY] ready vllm=%s split=%s priority=%s compute_tps=%.0f "
-            "load_bps=%.3g",
+            "[GATEWAY] ready vllm=%s split=%s priority=%s admit=%s/%d/%d "
+            "compute_tps=%.0f load_bps=%.3g",
             cfg.vllm_url,
             cfg.split,
             cfg.priority,
+            cfg.admit,
+            cfg.admit_tokens,
+            cfg.admit_slots,
             cfg.compute_tokens_per_s,
             cfg.load_bytes_per_s,
         )
@@ -129,11 +154,24 @@ def build_gateway_app(
             and bool(prompt)
             and all(isinstance(token, int) for token in prompt)
         )
+        residual: int | None = None
+        if token_prompt and "residual" in (cfg.priority, cfg.admit):
+            residual = await _residual(state, prompt)
         if token_prompt and cfg.priority != "none":
-            body["priority"] = await _priority(state, cfg, prompt)
-        if token_prompt and cfg.split:
-            await _prefill_front(state, cfg, body, prompt)
-        return await _forward(state["http"], "/v1/completions", body)
+            body["priority"] = len(prompt) if cfg.priority == "length" else residual
+        release: Callable[[], None] | None = None
+        if token_prompt and cfg.admit != "none":
+            work = len(prompt) if cfg.admit == "length" else residual
+            if work is not None and work >= cfg.admit_tokens:
+                release = await _acquire_large_slot(state["admit"])
+        try:
+            if token_prompt and cfg.split:
+                await _prefill_front(state, cfg, body, prompt)
+            return await _forward(state["http"], "/v1/completions", body, release)
+        except BaseException:
+            if release is not None:
+                release()
+            raise
 
     @app.api_route("/{path:path}", methods=["GET", "POST"])
     async def passthrough(path: str, request: Request) -> Response:
@@ -152,12 +190,22 @@ def build_gateway_app(
     return app
 
 
-async def _priority(
-    state: dict[str, Any], cfg: GatewayConfig, prompt: list[int]
-) -> int:
-    """Return the vLLM priority for a token prompt under ``cfg.priority``."""
-    if cfg.priority == "length":
-        return len(prompt)
+async def _acquire_large_slot(slots: asyncio.Semaphore) -> Callable[[], None]:
+    """Wait for a large-job slot and return an idempotent release callback."""
+    await slots.acquire()
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            slots.release()
+
+    return release
+
+
+async def _residual(state: dict[str, Any], prompt: list[int]) -> int:
+    """Return prompt tokens left to compute after DaseR's reusable prefix."""
     try:
         reusable = await state["ipc"].estimate_reuse(prompt, state["model_id"])
     except Exception as exc:  # noqa: BLE001
@@ -166,7 +214,7 @@ async def _priority(
     # vLLM computes at least the last prompt token.
     residual = max(1, len(prompt) - min(reusable, len(prompt)))
     logger.info(
-        "[GATEWAY] priority prompt=%d reusable=%d residual=%d",
+        "[GATEWAY] residual prompt=%d reusable=%d residual=%d",
         len(prompt),
         reusable,
         residual,
@@ -225,11 +273,22 @@ async def _prefill_front(
 
 
 async def _forward(
-    http: httpx.AsyncClient, path: str, body: dict[str, Any]
+    http: httpx.AsyncClient,
+    path: str,
+    body: dict[str, Any],
+    on_first_chunk: Callable[[], None] | None = None,
 ) -> Response:
-    """Forward a completion to vLLM, streaming the reply when requested."""
+    """Forward a completion to vLLM, streaming the reply when requested.
+
+    ``on_first_chunk`` runs once the first streamed body chunk (or the whole
+    non-streamed reply) arrives, and at the latest when the stream closes.
+    """
     if not body.get("stream"):
-        upstream = await http.post(path, json=body)
+        try:
+            upstream = await http.post(path, json=body)
+        finally:
+            if on_first_chunk is not None:
+                on_first_chunk()
         return Response(
             upstream.content,
             status_code=upstream.status_code,
@@ -240,12 +299,18 @@ async def _forward(
     async def chunks() -> AsyncIterator[bytes]:
         try:
             async for chunk in upstream.aiter_raw():
+                if on_first_chunk is not None:
+                    on_first_chunk()
                 yield chunk
         finally:
+            if on_first_chunk is not None:
+                on_first_chunk()
             await upstream.aclose()
 
     return StreamingResponse(
         chunks(),
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type"),
+        # Runs even when the client disconnects before the body starts.
+        background=None if on_first_chunk is None else BackgroundTask(on_first_chunk),
     )

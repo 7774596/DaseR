@@ -366,6 +366,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="none",
         help="Gateway vLLM priority policy (needs --scheduling-policy priority).",
     )
+    parser.add_argument(
+        "--gateway-admit",
+        choices=("none", "length", "residual"),
+        default="none",
+        help="Gateway large-job admission policy.",
+    )
+    parser.add_argument("--gateway-admit-tokens", type=int, default=8192)
+    parser.add_argument("--gateway-admit-slots", type=int, default=1)
     return parser.parse_args(argv)
 
 
@@ -507,6 +515,12 @@ async def _start_gateway(
             *(["--split"] if args.gateway == "split" else []),
             "--priority",
             args.gateway_priority,
+            "--admit",
+            args.gateway_admit,
+            "--admit-tokens",
+            str(args.gateway_admit_tokens),
+            "--admit-slots",
+            str(args.gateway_admit_slots),
         ],
         cwd=REPO_ROOT,
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},

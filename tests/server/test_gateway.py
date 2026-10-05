@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefill gateway: computes the planned front, then forwards the request."""
 
+from collections.abc import AsyncIterator
 import json
 from typing import Any
 
@@ -135,3 +136,61 @@ def test_gateway_rejects_unknown_priority() -> None:
     """An unknown priority policy fails at configuration time."""
     with pytest.raises(ValueError, match="priority"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", priority="fifo")
+
+
+def _streaming_vllm_mock(bodies: list[dict[str, Any]]) -> httpx.MockTransport:
+    """vLLM stand-in answering completions with a one-chunk SSE stream."""
+
+    async def sse() -> AsyncIterator[bytes]:
+        yield b"data: {}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        # An async stream stays unread until the gateway streams it.
+        return httpx.Response(
+            200, content=sse(), headers={"content-type": "text/event-stream"}
+        )
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize(
+    ("admit", "admit_tokens"),
+    [("length", 3 * BLOCK_TOKENS), ("residual", 1), ("none", 1)],
+)
+def test_gateway_admission_releases_large_job_slot(
+    admit: str, admit_tokens: int
+) -> None:
+    """A gated large job frees its slot once its stream starts.
+
+    Each prompt counts as a large job under ``length`` and ``residual``; with a
+    single slot the second request could only be forwarded if the first one
+    released it, so both bodies reaching vLLM shows the slot is not leaked.
+    """
+    bodies: list[dict[str, Any]] = []
+    cfg = GatewayConfig(
+        vllm_url="http://vllm",
+        socket_path="unused",
+        admit=admit,
+        admit_tokens=admit_tokens,
+        admit_slots=1,
+    )
+    prompt = list(range(3 * BLOCK_TOKENS + 1))
+    request = {"model": "m", "prompt": prompt, "stream": True}
+    with TestClient(
+        build_gateway_app(cfg, transport=_streaming_vllm_mock(bodies), ipc=_PlanIPC(0))
+    ) as client:
+        for _ in range(2):
+            resp = client.post("/v1/completions", json=request, timeout=5)
+            assert resp.status_code == 200
+            assert resp.content == b"data: {}\n\n"
+
+    assert bodies == [request, request]
+
+
+def test_gateway_rejects_bad_admission() -> None:
+    """Unknown admission policies and empty slot pools fail at config time."""
+    with pytest.raises(ValueError, match="admit"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", admit="fifo")
+    with pytest.raises(ValueError, match="admit_slots"):
+        GatewayConfig(vllm_url="http://vllm", socket_path="unused", admit_slots=0)

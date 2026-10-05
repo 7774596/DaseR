@@ -5,7 +5,12 @@ import argparse
 
 import uvicorn
 
-from daser.gateway.app import PRIORITY_MODES, GatewayConfig, build_gateway_app
+from daser.gateway.app import (
+    ADMIT_MODES,
+    PRIORITY_MODES,
+    GatewayConfig,
+    build_gateway_app,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -40,6 +45,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--scheduling-policy priority."
         ),
     )
+    parser.add_argument(
+        "--admit",
+        choices=ADMIT_MODES,
+        default="none",
+        help=(
+            "Gate large jobs: 'length' by prompt tokens, 'residual' by tokens "
+            "left after DaseR's reusable prefix."
+        ),
+    )
+    parser.add_argument("--admit-tokens", type=int, default=8192)
+    parser.add_argument("--admit-slots", type=int, default=1)
     return parser.parse_args(argv)
 
 
@@ -58,6 +74,9 @@ def main(argv: list[str] | None = None) -> None:
         load_bytes_per_s=args.load_bytes_per_s,
         min_compute_tokens=args.min_compute_tokens,
         priority=args.priority,
+        admit=args.admit,
+        admit_tokens=args.admit_tokens,
+        admit_slots=args.admit_slots,
     )
     uvicorn.run(
         build_gateway_app(cfg), host=args.host, port=args.port, log_level="warning"
