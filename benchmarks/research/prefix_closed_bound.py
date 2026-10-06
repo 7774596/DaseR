@@ -11,7 +11,7 @@ tokens). A request hits its leading resident blocks only, like a rolling-prefix
 index. ``fifo`` evicts in insertion order; ``cascade`` also drops the resident
 descendants of each victim (they are unreachable until it returns); ``lru``
 refreshes every block a request touches; ``belady`` evicts the furthest next
-use (clairvoyant, with admission bypass) as the replacement ceiling. The
+use with admission bypass, as a clairvoyant reference. The
 report gives the token hit ratio and the share of resident blocks that are
 unreachable ("orphan"), sampled when the cache is at least 95% full. It
 models one tier, without the GPU cache or host L1, so it only ranks policies.
@@ -109,8 +109,10 @@ def _simulate_belady(
 
     Each request inserts its missing blocks, then the cache evicts the
     blocks whose next use lies furthest ahead (never-reused blocks first,
-    including ones just inserted, which acts as admission bypass). A chained
-    child never recurs before its parent, so this also stays prefix-closed.
+    including ones just inserted, which acts as admission bypass). Blocks
+    sharing a next use go deepest first, since a prefix hit needs every
+    ancestor; a chained child never recurs before its parent, so this stays
+    prefix-closed. It is a clairvoyant reference, not a proven optimum.
     """
     uses: dict[int, list[int]] = {}
     for index, (ids, _) in enumerate(requests):
@@ -121,7 +123,7 @@ def _simulate_belady(
     cursor = dict.fromkeys(uses, 0)
     never = len(requests)
     cache: dict[int, int] = {}
-    heap: list[tuple[int, int]] = []
+    heap: list[tuple[int, int, int]] = []
     hit = total = 0
     for index, (ids, length) in enumerate(requests):
         total += length
@@ -131,16 +133,16 @@ def _simulate_belady(
                 break
             lead += 1
         hit += min(lead * block_tokens, length)
-        for block in ids:
+        for depth, block in enumerate(ids):
             positions = uses[block]
             while cursor[block] < len(positions) and positions[cursor[block]] <= index:
                 cursor[block] += 1
             nxt = positions[cursor[block]] if cursor[block] < len(positions) else never
             if cache.get(block) != nxt:
                 cache[block] = nxt
-                heapq.heappush(heap, (-nxt, block))
+                heapq.heappush(heap, (-nxt, -depth, block))
         while len(cache) > capacity_blocks:
-            neg, block = heapq.heappop(heap)
+            neg, _, block = heapq.heappop(heap)
             if cache.get(block) == -neg:
                 del cache[block]
     return hit / max(total, 1)

@@ -64,6 +64,13 @@ def test_belady_bypasses_never_reused_blocks() -> None:
     assert fifo == 0.0
 
 
+def test_belady_drops_the_deepest_of_tied_blocks() -> None:
+    """Keeping a prefix head beats keeping a tail that cannot hit alone."""
+    requests = [([1, 2, 3], 6), ([4], 2), ([1, 2, 3], 6)]
+    best, _ = simulate(requests, 2, "belady", block_tokens=2)
+    assert best == 4 / 14
+
+
 def test_unknown_mode_raises() -> None:
     """Only the documented modes are accepted."""
     with pytest.raises(ValueError):
