@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline prefix-hit bound of a block cache under FIFO, prefix-closed FIFO or LRU.
+"""Offline prefix-hit bound of a block cache under several replacement policies.
 
 Usage::
 
@@ -10,21 +10,23 @@ The trace is ``hash_ids`` JSONL (one chained block id per ``block_tokens``
 tokens). A request hits its leading resident blocks only, like a rolling-prefix
 index. ``fifo`` evicts in insertion order; ``cascade`` also drops the resident
 descendants of each victim (they are unreachable until it returns); ``lru``
-refreshes every block a request touches. The report gives the token hit ratio
-and the share of resident blocks that are unreachable ("orphan"), sampled when
-the cache is at least 95% full. It models one tier, without the GPU cache or
-host L1, so it only ranks policies.
+refreshes every block a request touches; ``belady`` evicts the furthest next
+use (clairvoyant, with admission bypass) as the replacement ceiling. The
+report gives the token hit ratio and the share of resident blocks that are
+unreachable ("orphan"), sampled when the cache is at least 95% full. It
+models one tier, without the GPU cache or host L1, so it only ranks policies.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import heapq
 import json
 from pathlib import Path
 from typing import Sequence
 
-MODES = ("fifo", "cascade", "lru")
+MODES = ("fifo", "cascade", "lru", "belady")
 
 
 def simulate(
@@ -51,6 +53,8 @@ def simulate(
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
+    if mode == "belady":
+        return _simulate_belady(requests, capacity_blocks, block_tokens), 0.0
     cache: OrderedDict[int, None] = OrderedDict()
     parent: dict[int, int | None] = {}
     children: dict[int | None, set[int]] = {}
@@ -94,6 +98,52 @@ def simulate(
             orphan_samples.append(_orphan_share(cache, parent))
     share = sum(orphan_samples) / len(orphan_samples) if orphan_samples else 0.0
     return hit / max(total, 1), share
+
+
+def _simulate_belady(
+    requests: Sequence[tuple[Sequence[int], int]],
+    capacity_blocks: int,
+    block_tokens: int,
+) -> float:
+    """Return the token hit ratio of clairvoyant replacement with bypass.
+
+    Each request inserts its missing blocks, then the cache evicts the
+    blocks whose next use lies furthest ahead (never-reused blocks first,
+    including ones just inserted, which acts as admission bypass). A chained
+    child never recurs before its parent, so this also stays prefix-closed.
+    """
+    uses: dict[int, list[int]] = {}
+    for index, (ids, _) in enumerate(requests):
+        for block in ids:
+            seen = uses.setdefault(block, [])
+            if not seen or seen[-1] != index:
+                seen.append(index)
+    cursor = dict.fromkeys(uses, 0)
+    never = len(requests)
+    cache: dict[int, int] = {}
+    heap: list[tuple[int, int]] = []
+    hit = total = 0
+    for index, (ids, length) in enumerate(requests):
+        total += length
+        lead = 0
+        for block in ids:
+            if block not in cache:
+                break
+            lead += 1
+        hit += min(lead * block_tokens, length)
+        for block in ids:
+            positions = uses[block]
+            while cursor[block] < len(positions) and positions[cursor[block]] <= index:
+                cursor[block] += 1
+            nxt = positions[cursor[block]] if cursor[block] < len(positions) else never
+            if cache.get(block) != nxt:
+                cache[block] = nxt
+                heapq.heappush(heap, (-nxt, block))
+        while len(cache) > capacity_blocks:
+            neg, block = heapq.heappop(heap)
+            if cache.get(block) == -neg:
+                del cache[block]
+    return hit / max(total, 1)
 
 
 def _orphan_share(

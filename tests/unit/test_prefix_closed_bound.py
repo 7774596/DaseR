@@ -38,7 +38,33 @@ def test_lru_refresh_keeps_reused_prefix() -> None:
     assert lru_hit > fifo_hit
 
 
+def test_belady_bounds_every_online_policy() -> None:
+    """Clairvoyant replacement never hits less than FIFO, cascade or LRU."""
+    requests = [
+        ([1, 2], 4),
+        ([10, 11], 4),
+        ([1, 2, 3], 6),
+        ([20], 2),
+        ([10, 11, 12], 6),
+        ([30, 31], 4),
+        ([1, 2, 3, 4], 8),
+    ]
+    best, _ = simulate(requests, 4, "belady", block_tokens=2)
+    for mode in ("fifo", "cascade", "lru"):
+        hit, _ = simulate(requests, 4, mode, block_tokens=2)
+        assert best >= hit
+
+
+def test_belady_bypasses_never_reused_blocks() -> None:
+    """A one-shot request does not displace a prefix that returns."""
+    requests = [([1, 2], 4), ([50, 51], 4), ([1, 2], 4)]
+    best, _ = simulate(requests, 2, "belady", block_tokens=2)
+    fifo, _ = simulate(requests, 2, "fifo", block_tokens=2)
+    assert best == 4 / 12
+    assert fifo == 0.0
+
+
 def test_unknown_mode_raises() -> None:
     """Only the documented modes are accepted."""
     with pytest.raises(ValueError):
-        simulate([], 1, "belady", block_tokens=1)
+        simulate([], 1, "random", block_tokens=1)
