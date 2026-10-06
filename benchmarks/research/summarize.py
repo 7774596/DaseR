@@ -180,6 +180,11 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
     def hist(name: str) -> float:
         return _histogram_sum(vllm_before, vllm_after, f"vllm:{name}_seconds")
 
+    def daser(cell: str) -> str:
+        # Arms without a DaseR server (native, LMCache) have no DaseR metrics;
+        # print "-" so a missing counter does not read as a measured zero.
+        return cell if after else "-"
+
     return {
         "arm": f"{arm_dir.parent.name}/{arm_dir.name}",
         "ok": str(summary["completed_requests"]),
@@ -211,14 +216,18 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         "csum_lat_s": f"{sum(float(r['latency_ms']) for r in completed) / 1000:.0f}",
         # Summed external load latency over summed TTFT: the share of TTFT a
         # free storage tier could remove at most (loads run serially here).
-        "io_share": _rate(
-            _delta(before, after, 'daser_transfer_duration_seconds_sum{op="load"}'),
-            hist("time_to_first_token"),
+        "io_share": daser(
+            _rate(
+                _delta(before, after, 'daser_transfer_duration_seconds_sum{op="load"}'),
+                hist("time_to_first_token"),
+            )
         ),
-        "l1_hits": f"{_delta(before, after, 'daser_l1_hits_total'):.0f}",
-        "load_gib": f"{_delta(before, after, _LOAD) / gib:.1f}",
-        "store_gib": f"{_delta(before, after, _STORE) / gib:.1f}",
-        "l2w_gib": f"{_delta(before, after, 'daser_l2_write_bytes_total') / gib:.1f}",
+        "l1_hits": daser(f"{_delta(before, after, 'daser_l1_hits_total'):.0f}"),
+        "load_gib": daser(f"{_delta(before, after, _LOAD) / gib:.1f}"),
+        "store_gib": daser(f"{_delta(before, after, _STORE) / gib:.1f}"),
+        "l2w_gib": daser(
+            f"{_delta(before, after, 'daser_l2_write_bytes_total') / gib:.1f}"
+        ),
     }
 
 

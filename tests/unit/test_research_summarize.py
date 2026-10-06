@@ -154,6 +154,31 @@ def test_arm_row_sums_counters_over_vllm_instances(tmp_path: Path) -> None:
     assert row["sum_ttft_s"] == "32"
 
 
+def test_arm_row_marks_daser_columns_absent_without_a_daser_server(
+    tmp_path: Path,
+) -> None:
+    """An arm with an empty DaseR snapshot (LMCache, native) prints "-"."""
+    arm_dir = _ttft_arm(tmp_path, "lmcache", [100.0, 300.0])
+    summary = {
+        "completed_requests": 2,
+        "failed_requests": 0,
+        "wall_seconds": 10.0,
+        "client_queue_ms": {"p50": 0.0},
+        "arrival_to_completion_ms": {"p50": 0.0},
+    }
+    (arm_dir / "summary.json").write_text(json.dumps(summary))
+    (arm_dir / "daser_metrics_after.prom").write_text("")
+    (arm_dir / "vllm_metrics_after.prom").write_text(
+        'vllm:time_to_first_token_seconds_sum{engine="0"} 20.0\n'
+    )
+
+    row = arm_row(arm_dir)
+
+    for column in ("io_share", "l1_hits", "load_gib", "store_gib", "l2w_gib"):
+        assert row[column] == "-"
+    assert row["sum_ttft_s"] == "20"
+
+
 def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:
     """Waiting ticks at high KV usage count as capacity-bound, others compute."""
     arm_dir = tmp_path / "arm"
