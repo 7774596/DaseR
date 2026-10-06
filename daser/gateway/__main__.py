@@ -78,6 +78,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Context length where a token's attention FLOPs equal its linear "
         "FLOPs (cost-fresh); about 2*params / (4*layers*q_heads*head_dim).",
     )
+    parser.add_argument(
+        "--fill-holes",
+        action="store_true",
+        help="Recompute gaps that hide stored DaseR blocks before forwarding.",
+    )
+    parser.add_argument("--fill-min-tail-tokens", type=int, default=4096)
+    parser.add_argument("--fill-max-holes", type=int, default=2)
     return parser.parse_args(argv)
 
 
@@ -103,6 +110,9 @@ def main(argv: list[str] | None = None) -> None:
         dispatch_slots=args.dispatch_slots,
         dispatch_refresh=args.dispatch_refresh,
         dispatch_attn_tokens=args.dispatch_attn_tokens,
+        fill_holes=args.fill_holes,
+        fill_min_tail_tokens=args.fill_min_tail_tokens,
+        fill_max_holes=args.fill_max_holes,
     )
     uvicorn.run(
         build_gateway_app(cfg), host=args.host, port=args.port, log_level="warning"

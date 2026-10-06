@@ -324,3 +324,76 @@ def test_gateway_rejects_bad_dispatch() -> None:
         )
     with pytest.raises(ValueError, match="dispatch_refresh"):
         GatewayConfig(vllm_url="http://vllm", socket_path="unused", dispatch_refresh=0)
+
+
+class _HoleIPC(_PlanIPC):
+    """IPC stub reporting fixed gaps."""
+
+    def __init__(self, holes: list[tuple[int, int]]) -> None:
+        super().__init__(0)
+        self.holes = holes
+        self.probes: list[int] = []
+
+    async def prefill_holes(
+        self, tokens: list[int], model_id: str, min_tail_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Record the probe and return the configured gaps."""
+        assert model_id == "m"
+        self.probes.append(min_tail_tokens)
+        return self.holes
+
+
+@pytest.mark.parametrize(
+    ("fill", "holes", "max_holes", "shadow_ends"),
+    [
+        (True, [(4, 8), (12, 16)], 2, [8, 16]),
+        (True, [(4, 8), (12, 16)], 1, [8]),
+        (True, [(0, 24)], 2, []),
+        (True, [], 2, []),
+        (False, [(4, 8)], 2, []),
+    ],
+)
+def test_gateway_fills_holes_before_forwarding(
+    fill: bool,
+    holes: list[tuple[int, int]],
+    max_holes: int,
+    shadow_ends: list[int],
+) -> None:
+    """Each gap gets a shadow prefill ending at it, with DaseR loads and saves.
+
+    Shadows run earliest gap first and before the unchanged request; a gap
+    reaching the prompt end is skipped, and the switch off sends nothing.
+    """
+    bodies: list[dict[str, Any]] = []
+    ipc = _HoleIPC(holes)
+    cfg = GatewayConfig(
+        vllm_url="http://vllm",
+        socket_path="unused",
+        fill_holes=fill,
+        fill_min_tail_tokens=8,
+        fill_max_holes=max_holes,
+    )
+    prompt = list(range(6 * BLOCK_TOKENS))
+    request = {"model": "m", "prompt": prompt, "max_tokens": 4}
+    with TestClient(
+        build_gateway_app(cfg, transport=_vllm_mock(bodies), ipc=ipc)
+    ) as client:
+        resp = client.post("/v1/completions", json=request)
+
+    assert resp.status_code == 200
+    assert bodies[-1] == request
+    shadows = bodies[:-1]
+    assert [len(body["prompt"]) for body in shadows] == shadow_ends
+    for body in shadows:
+        assert body["prompt"] == prompt[: len(body["prompt"])]
+        assert body["max_tokens"] == 1
+        assert "kv_transfer_params" not in body
+    assert ipc.probes == ([8] if fill else [])
+
+
+def test_gateway_rejects_fill_with_split() -> None:
+    """Hole filling and the bidirectional split are mutually exclusive."""
+    with pytest.raises(ValueError, match="exclusive"):
+        GatewayConfig(
+            vllm_url="http://vllm", socket_path="unused", split=True, fill_holes=True
+        )

@@ -1170,3 +1170,24 @@ async def test_live_victim_clock_ignores_repeated_polls(
     evicted = await core.evict_oldest_chunk(set())
 
     assert evicted is not None and evicted.chunk_key == keys[1]
+
+
+@pytest.mark.asyncio
+async def test_prefill_holes_report_gaps_before_held_blocks() -> None:
+    """Gaps count only when enough held blocks follow; pending blocks hold."""
+    core = make_core()
+    tokens = list(range(7 * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    for index in (0, 3, 4, 5):
+        await core.alloc_chunk(keys[index], token_count=BLOCK_TOKENS, model_id="m")
+        if index != 5:
+            await core.commit_chunk(keys[index])
+
+    # Blocks 1-2 are missing before held 3-5 (5 still pending); 6 is a
+    # trailing miss with nothing behind it.
+    assert core.prefill_holes(tokens, "m", BLOCK_TOKENS) == [
+        (BLOCK_TOKENS, 3 * BLOCK_TOKENS)
+    ]
+    assert core.prefill_holes(tokens, "m", 4 * BLOCK_TOKENS) == []
+    # Committed blocks of another model do not hold; only pending 5 does.
+    assert core.prefill_holes(tokens, "other", 2 * BLOCK_TOKENS) == []

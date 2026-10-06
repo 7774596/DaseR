@@ -952,6 +952,33 @@ class IPCClientAsync(_IPCClientBase):
         )
         return int(resp.get("reusable_tokens", 0))
 
+    async def prefill_holes(
+        self, tokens: list[int], model_id: str, min_tail_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Ask for missing block runs that hide stored blocks behind them.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier.
+            min_tail_tokens: Smallest stored run after a gap worth recovering.
+
+        Returns:
+            ``(start, end)`` token spans of the gaps, in prompt order.
+
+        Async/thread-safety:
+            Serializes with other calls on this client's connection; the
+            server records no lookup metrics for it.
+        """
+        resp = await self.call(
+            {
+                "op": "prefill_holes",
+                "token_bytes": _pack_lookup_tokens(tokens),
+                "model_id": model_id,
+                "min_tail_tokens": min_tail_tokens,
+            }
+        )
+        return [(int(start), int(end)) for start, end in resp.get("holes", [])]
+
     async def register_staging_cuda(
         self,
         direction: str,

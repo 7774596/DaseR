@@ -140,14 +140,34 @@ class PrefixHashIndex(RetrievalIndex):
         """
         blocks = 0
         for key in rolling_prefix_keys(tokens, self._block_tokens):
-            meta_entry = self._index.get(key)
-            if meta_entry is not None and meta_entry.model_id == model_id:
-                blocks += 1
-            elif key in pending_keys:
-                blocks += 1
-            else:
+            if not self._held(key, model_id, pending_keys):
                 break
+            blocks += 1
         return blocks * self._block_tokens
+
+    def resident_blocks(
+        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
+    ) -> list[bool]:
+        """Report, per full prompt block, whether it is committed or pending.
+
+        A rolling key names the whole prefix up to its block, so a held block
+        behind a missing one still holds the exact KV of this prompt.
+
+        Args:
+            tokens: full prompt token IDs.
+            model_id: committed blocks must belong to this model.
+            pending_keys: rolling keys whose store writer has not committed.
+
+        Returns:
+            One flag per full block in prompt order.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        return [
+            self._held(key, model_id, pending_keys)
+            for key in rolling_prefix_keys(tokens, self._block_tokens)
+        ]
 
     def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return rolling-prefix keys potentially matching this prompt.
@@ -208,3 +228,10 @@ class PrefixHashIndex(RetrievalIndex):
             return set()
         window = token_window(tokens, 0, end)
         return {rolling_prefix_keys(window, self._block_tokens)[-1]}
+
+    def _held(self, key: str, model_id: str, pending_keys: set[str]) -> bool:
+        """Return whether ``key`` is committed for ``model_id`` or pending."""
+        meta_entry = self._index.get(key)
+        if meta_entry is not None and meta_entry.model_id == model_id:
+            return True
+        return key in pending_keys

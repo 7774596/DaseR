@@ -33,6 +33,15 @@ of the ``m`` missing tokens pays a linear part plus attention over the ``h``
 reusable tokens and the earlier misses, ``m * (1 + (h + m / 2) / T)``, where
 ``T`` (``dispatch_attn_tokens``) is the context length at which a token's
 attention FLOPs equal its linear-layer FLOPs.
+
+Hole filling recovers stored KV that a prefix lookup cannot reach. A rolling
+key names its whole prefix, so a block DaseR still holds after an evicted one
+is exact KV of this prompt, but vLLM and DaseR both stop matching at the first
+missing block. ``fill_holes`` asks the server for such gaps and, for each one
+followed by at least ``fill_min_tail_tokens`` held tokens, prefills the prompt
+up to the gap's end with DaseR loads and saves on: the shadow loads the held
+prefix, computes only the gap and stores it, so the original request then
+reaches the held blocks behind the gap instead of recomputing them.
 """
 
 import asyncio
@@ -114,6 +123,10 @@ class GatewayConfig:
             under ``residual-fresh`` and ``cost-fresh``.
         dispatch_attn_tokens: Context length at which one token's attention
             FLOPs equal its linear FLOPs (``cost-fresh`` only).
+        fill_holes: Recompute gaps that hide stored blocks before forwarding.
+        fill_min_tail_tokens: Smallest held run after a gap worth a shadow
+            prefill.
+        fill_max_holes: Most gaps filled per request (earliest first).
     """
 
     vllm_url: str
@@ -131,6 +144,9 @@ class GatewayConfig:
     dispatch_slots: int = 4
     dispatch_refresh: int = 8
     dispatch_attn_tokens: float = 13500.0
+    fill_holes: bool = False
+    fill_min_tail_tokens: int = 4096
+    fill_max_holes: int = 2
 
     def __post_init__(self) -> None:
         """Validate the priority and admission policies.
@@ -152,6 +168,10 @@ class GatewayConfig:
             raise ValueError("gateway dispatch_refresh must be at least 1")
         if self.dispatch_attn_tokens <= 0:
             raise ValueError("gateway dispatch_attn_tokens must be positive")
+        if self.fill_max_holes < 1:
+            raise ValueError("gateway fill_max_holes must be at least 1")
+        if self.fill_holes and self.split:
+            raise ValueError("gateway fill_holes and split are exclusive")
 
 
 class SlotDispatcher:
@@ -378,6 +398,8 @@ def build_gateway_app(
         try:
             if token_prompt and cfg.split:
                 await _prefill_front(state, cfg, body, prompt)
+            if token_prompt and cfg.fill_holes:
+                await _fill_holes(state, cfg, body, prompt)
             return await _forward(state["http"], "/v1/completions", body, release)
         except BaseException:
             if release is not None:
@@ -489,6 +511,57 @@ async def _prefill_front(
         int(plan.get("hit_tokens", 0)),
         front,
         plan.get("started"),
+        (planned_at - started_at) * 1000,
+        (time.perf_counter() - planned_at) * 1000,
+    )
+
+
+async def _fill_holes(
+    state: dict[str, Any],
+    cfg: GatewayConfig,
+    body: dict[str, Any],
+    prompt: list[int],
+) -> None:
+    """Recompute gaps that hide stored blocks, so the request reaches them.
+
+    Each shadow prefill ends at a gap's end; it loads the held prefix, which
+    an earlier shadow made contiguous, computes the gap and saves it.
+    """
+    started_at = time.perf_counter()
+    try:
+        holes = await state["ipc"].prefill_holes(
+            prompt, state["model_id"], cfg.fill_min_tail_tokens
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[GATEWAY] hole probe failed: %s", exc)
+        return
+    holes = holes[: cfg.fill_max_holes]
+    if not holes:
+        return
+    planned_at = time.perf_counter()
+    filled = 0
+    for start, end in holes:
+        # vLLM computes at least one prompt token, so end below the prompt.
+        if end >= len(prompt):
+            break
+        shadow = {
+            "model": body.get("model", ""),
+            "prompt": prompt[:end],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        }
+        try:
+            resp = await state["http"].post("/v1/completions", json=shadow)
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[GATEWAY] hole fill [%d, %d) failed: %s", start, end, exc)
+            break
+        filled += end - start
+    logger.info(
+        "[GATEWAY] fill holes=%d hole_tokens=%d prompt=%d plan_ms=%.1f fill_ms=%.1f",
+        len(holes),
+        filled,
+        len(prompt),
         (planned_at - started_at) * 1000,
         (time.perf_counter() - planned_at) * 1000,
     )

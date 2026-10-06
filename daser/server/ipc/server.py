@@ -564,6 +564,7 @@ class IPCServer:
             "readahead_hint": self._op_readahead_hint,
             "split_prefill": self._op_split_prefill,
             "estimate_reuse": self._op_estimate_reuse,
+            "prefill_holes": self._op_prefill_holes,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
             "alloc_chunk": self._op_alloc_chunk,
@@ -872,6 +873,27 @@ class IPCServer:
             self._lookup_tokens(msg), msg["model_id"]
         )
         return {"reusable_tokens": int(reusable)}
+
+    async def _op_prefill_holes(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Report missing block runs that hide stored blocks behind them.
+
+        Args:
+            msg: ``token_bytes`` (or ``tokens``), ``model_id`` and
+                ``min_tail_tokens``.
+
+        Returns:
+            ``{"holes": [[start, end], ...]}`` token spans in prompt order; no
+            lookup counters, replacement state or reads are touched.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping.
+        """
+        holes = self._core.prefill_holes(
+            self._lookup_tokens(msg),
+            msg["model_id"],
+            int(msg.get("min_tail_tokens", 0)),
+        )
+        return {"holes": [[start, end] for start, end in holes]}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""

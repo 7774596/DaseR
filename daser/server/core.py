@@ -438,6 +438,50 @@ class ServerCore:
             tokens, model_id, self._lifecycle.pending_write_keys
         )
 
+    def prefill_holes(
+        self, tokens: TokenSequence, model_id: str, min_tail_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Find missing block runs that hide stored blocks behind them.
+
+        A prefix lookup stops at the first missing block, yet a rolling key
+        names its whole prefix, so a stored block after a gap still holds
+        this prompt's exact KV. Recomputing only the gap makes it reachable.
+        Like :meth:`estimate_reusable_tokens` this counts pending writers as
+        held and records no metrics.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+            min_tail_tokens: Smallest held run after a gap worth recovering.
+
+        Returns:
+            ``(start, end)`` token spans of the gaps to recompute, in prompt
+            order; each is followed by at least ``min_tail_tokens`` held
+            tokens.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        held = self._ri.resident_blocks(
+            tokens, model_id, self._lifecycle.pending_write_keys
+        )
+        block = self._block_tokens
+        holes: list[tuple[int, int]] = []
+        i = 0
+        while i < len(held):
+            if held[i]:
+                i += 1
+                continue
+            start = i
+            while i < len(held) and not held[i]:
+                i += 1
+            tail = i
+            while tail < len(held) and held[tail]:
+                tail += 1
+            if i < len(held) and (tail - i) * block >= min_tail_tokens:
+                holes.append((start * block, i * block))
+        return holes
+
     def _record_lookup(
         self, tokens: TokenSequence, matches: list[Any]
     ) -> list[ChunkInfo]:

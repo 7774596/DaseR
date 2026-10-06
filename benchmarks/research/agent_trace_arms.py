@@ -63,7 +63,7 @@ ARMS = (
     "lmcache",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GATEWAY_MODES = ("none", "pass", "split")
+GATEWAY_MODES = ("none", "pass", "split", "fill")
 
 
 def _pid_running(pid: int) -> bool:
@@ -362,12 +362,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="none",
         help=(
             "Replay DaseR arms through daser.gateway: 'pass' forwards unchanged, "
-            "'split' plans bidirectional prefill."
+            "'split' plans bidirectional prefill, 'fill' recomputes gaps that "
+            "hide stored blocks."
         ),
     )
     parser.add_argument("--gateway-compute-tokens-per-s", type=float, default=30000.0)
     parser.add_argument("--gateway-load-bytes-per-s", type=float, default=15e9)
     parser.add_argument("--gateway-min-compute-tokens", type=int, default=4096)
+    parser.add_argument("--gateway-fill-min-tail-tokens", type=int, default=4096)
     parser.add_argument(
         "--gateway-priority",
         choices=("none", "length", "residual"),
@@ -532,6 +534,9 @@ async def _start_gateway(
             "--min-compute-tokens",
             str(args.gateway_min_compute_tokens),
             *(["--split"] if args.gateway == "split" else []),
+            *(["--fill-holes"] if args.gateway == "fill" else []),
+            "--fill-min-tail-tokens",
+            str(args.gateway_fill_min_tail_tokens),
             "--priority",
             args.gateway_priority,
             "--admit",

@@ -86,6 +86,30 @@ class RetrievalIndex(ABC):
             covered = max(covered, match.target_token_start + match.meta.token_count)
         return covered
 
+    def resident_blocks(
+        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
+    ) -> list[bool]:
+        """Report, per full prompt block, whether its key is held.
+
+        Unlike :meth:`reusable_tokens` this keeps scanning past a missing
+        block, so callers can see stored blocks behind a gap.
+
+        Args:
+            tokens: full prompt token IDs.
+            model_id: committed blocks must belong to this model.
+            pending_keys: keys of chunks whose store writer has not committed.
+
+        Returns:
+            One flag per full block in prompt order, or an empty list when
+            the index has no fixed per-block keys.
+
+        Async/thread-safety:
+            Pure in-memory planning on the server event loop.  Implementations
+            must not perform blocking I/O or mutate index state.
+        """
+        del tokens, model_id, pending_keys
+        return []
+
     def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return keys that this index could match for ``tokens``.
 
