@@ -133,6 +133,27 @@ def test_arm_row_reports_load_share_of_ttft(tmp_path: Path) -> None:
     assert row["csum_lat_s"] == "1"  # (200 + 600) ms
 
 
+def test_arm_row_sums_counters_over_vllm_instances(tmp_path: Path) -> None:
+    """A two-instance snapshot repeats each sample; the row sums both."""
+    arm_dir = _ttft_arm(tmp_path, "multi", [100.0, 300.0])
+    summary = {
+        "completed_requests": 2,
+        "failed_requests": 0,
+        "wall_seconds": 10.0,
+        "client_queue_ms": {"p50": 0.0},
+        "arrival_to_completion_ms": {"p50": 0.0},
+    }
+    (arm_dir / "summary.json").write_text(json.dumps(summary))
+    sample = 'vllm:time_to_first_token_seconds_sum{engine="0"}'
+    (arm_dir / "vllm_metrics_after.prom").write_text(
+        f"# instance a\n{sample} 20.0\n# instance b\n{sample} 12.0\n"
+    )
+
+    row = arm_row(arm_dir)
+
+    assert row["sum_ttft_s"] == "32"
+
+
 def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:
     """Waiting ticks at high KV usage count as capacity-bound, others compute."""
     arm_dir = tmp_path / "arm"

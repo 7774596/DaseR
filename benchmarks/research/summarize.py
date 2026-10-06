@@ -53,14 +53,19 @@ _SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)\s+([-+eE0-9.]+)
 
 
 def _counters(path: Path) -> dict[str, float]:
-    """Parse a Prometheus snapshot keyed by ``name{labels}`` (empty if missing)."""
+    """Parse a Prometheus snapshot keyed by ``name{labels}`` (empty if missing).
+
+    A snapshot of several vLLM instances repeats each sample once per
+    instance; repeated keys are summed so counters cover every instance.
+    """
     if not path.is_file():
         return {}
     samples: dict[str, float] = {}
     for line in path.read_text().splitlines():
         match = _SAMPLE.match(line)
         if match is not None:
-            samples[match.group(1)] = float(match.group(2))
+            key = match.group(1)
+            samples[key] = samples.get(key, 0.0) + float(match.group(2))
     return samples
 
 
