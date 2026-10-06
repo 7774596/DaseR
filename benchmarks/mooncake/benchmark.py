@@ -27,7 +27,7 @@ _BLOCK_ID_DIGITS = 8
 # Marker tokens per corpus block; base >= 1e5 ordinary tokens covers 1e15 IDs.
 _CORPUS_ID_DIGITS = 3
 _WRITER_STOP = object()
-ROUTES = ("sticky", "least-work", "gpu-affinity", "tier-affinity")
+ROUTES = ("sticky", "least-work", "gpu-affinity", "tier-affinity", "hbm-fit")
 
 
 def _prefix_blocks(request: TraceRequest, present: Any) -> int:
@@ -38,6 +38,11 @@ def _prefix_blocks(request: TraceRequest, present: Any) -> int:
             break
         count += 1
     return count
+
+
+def _decode_blocks(request: TraceRequest) -> int:
+    """Return the 512-token blocks a request's decode adds to GPU KV."""
+    return math.ceil(request.output_length / MOONCAKE_BLOCK_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -136,12 +141,21 @@ class InstanceRouter:
     only breaks near-ties in load and blocks never seen are recomputed
     anywhere.
 
+    ``hbm-fit`` routes on GPU KV co-residency rather than work: an instance's
+    resident demand is the union of in-flight prompt blocks (shared prefixes
+    count once, as in vLLM's prefix cache) plus their decode blocks. A session
+    stays on its instance while the request fits there beside the in-flight
+    ones; otherwise it moves to the least-loaded instance it fits on, whose
+    missing prefix the shared external tier serves as a load. When it fits
+    nowhere it stays and queues behind the session's own prefix.
+
     Args:
         server_urls: Instance base URLs.
         route: One of :data:`ROUTES`.
         work_model: Cost model for outstanding work.
-        local_blocks: Shadow GPU prefix-cache capacity per instance, in
-            512-token blocks (affinity routes).
+        local_blocks: Per-instance GPU KV capacity in 512-token blocks: the
+            shadow prefix-cache bound of the affinity routes and the
+            co-residency bound of ``hbm-fit``.
         load_tokens_per_s: External-tier load rate used by
             ``tier-affinity`` to price a non-local reusable block.
 
@@ -174,6 +188,20 @@ class InstanceRouter:
         self._local: list[OrderedDict[int, None]] = [
             OrderedDict() for _ in self.server_urls
         ]
+        # In-flight prompt block refcounts and decode blocks per instance.
+        self._resident: list[dict[int, int]] = [{} for _ in self.server_urls]
+        self._decode_blocks = [0] * len(self.server_urls)
+
+    def resident_blocks(self, instance: int) -> int:
+        """Return the GPU KV blocks in-flight requests hold on ``instance``.
+
+        Args:
+            instance: Instance index.
+
+        Returns:
+            Distinct in-flight prompt blocks plus their decode blocks.
+        """
+        return len(self._resident[instance]) + self._decode_blocks[instance]
 
     def acquire(self, request: TraceRequest) -> tuple[int, float]:
         """Pick an instance for ``request`` and charge its estimated work.
@@ -197,19 +225,57 @@ class InstanceRouter:
             self._touch_local(instance, request.hash_ids)
         else:
             work = self.work_model.seconds(request, cached)
-            instance = self._pick(request)
+            instance = (
+                self._pick_fit(request)
+                if self.route == "hbm-fit"
+                else self._pick(request)
+            )
         self._outstanding[instance] += work
         self._seen.update(request.hash_ids)
+        resident = self._resident[instance]
+        for hash_id in request.hash_ids:
+            resident[hash_id] = resident.get(hash_id, 0) + 1
+        self._decode_blocks[instance] += _decode_blocks(request)
         return instance, work
 
-    def release(self, instance: int, work: float) -> None:
-        """Remove a finished request's work from its instance.
+    def release(self, instance: int, work: float, request: TraceRequest) -> None:
+        """Remove a finished request's work and resident blocks from its instance.
 
         Args:
             instance: Index returned by :meth:`acquire`.
             work: Work returned by :meth:`acquire`.
+            request: The request passed to :meth:`acquire`.
         """
         self._outstanding[instance] = max(0.0, self._outstanding[instance] - work)
+        resident = self._resident[instance]
+        for hash_id in request.hash_ids:
+            count = resident[hash_id] - 1
+            if count:
+                resident[hash_id] = count
+            else:
+                del resident[hash_id]
+        self._decode_blocks[instance] -= _decode_blocks(request)
+
+    def _pick_fit(self, request: TraceRequest) -> int:
+        home = self._sessions.get(request.session_id)
+        fits = [
+            i
+            for i in range(len(self.server_urls))
+            if self.resident_blocks(i) + self._new_blocks(request, i)
+            <= self.local_blocks
+        ]
+        if home is not None and (home in fits or not fits):
+            return home
+        candidates = fits or range(len(self.server_urls))
+        instance = min(candidates, key=self._outstanding.__getitem__)
+        if request.session_id is not None:
+            self._sessions[request.session_id] = instance
+        return instance
+
+    def _new_blocks(self, request: TraceRequest, instance: int) -> int:
+        resident = self._resident[instance]
+        missing = sum(1 for hash_id in request.hash_ids if hash_id not in resident)
+        return missing + _decode_blocks(request)
 
     def _pick(self, request: TraceRequest) -> int:
         if self.route == "sticky" and request.session_id is not None:
@@ -1198,7 +1264,7 @@ async def _run_request_after_dependency(
                 on_send=record_send,
             )
         finally:
-            router.release(instance, work)
+            router.release(instance, work, request)
     record = _result_record(
         request=request,
         result=result,

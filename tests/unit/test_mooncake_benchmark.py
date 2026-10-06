@@ -586,9 +586,10 @@ def test_sticky_route_keeps_a_session_on_its_first_instance() -> None:
 def test_least_work_route_follows_outstanding_work_across_sessions() -> None:
     """A heavy in-flight request pushes the next turn of its session away."""
     router = InstanceRouter(["http://a", "http://b"], route="least-work")
-    first, first_work = router.acquire(_session_request(0, session=1, blocks=64))
+    first_request = _session_request(0, session=1, blocks=64)
+    first, first_work = router.acquire(first_request)
     later, _ = router.acquire(_session_request(1, session=1, blocks=65))
-    router.release(first, first_work)
+    router.release(first, first_work, first_request)
     after, _ = router.acquire(_session_request(2, session=3, blocks=1))
 
     assert (first, later, after) == (0, 1, 0)
@@ -607,8 +608,9 @@ def test_router_charges_less_work_for_a_seen_prefix() -> None:
 def _route_after_busy_holder(route: str) -> int:
     """Route a prefix extension whose holder is busy with a smaller job."""
     router = InstanceRouter(["http://a", "http://b"], route=route)
-    first, first_work = router.acquire(_session_request(0, session=1, blocks=64))
-    router.release(first, first_work)
+    first_request = _session_request(0, session=1, blocks=64)
+    first, first_work = router.acquire(first_request)
+    router.release(first, first_work, first_request)
     router.acquire(_session_request(1, session=2, blocks=8))
     later, _ = router.acquire(_session_request(2, session=1, blocks=65))
     return later
@@ -627,10 +629,12 @@ def test_tier_affinity_balances_when_the_prefix_is_reusable_elsewhere() -> None:
 def test_tier_affinity_breaks_load_ties_by_locality() -> None:
     """With equal outstanding work, the instance holding the prefix is chosen."""
     router = InstanceRouter(["http://a", "http://b"], route="tier-affinity")
-    first, first_work = router.acquire(_session_request(0, session=1, blocks=8))
-    other, other_work = router.acquire(_session_request(1, session=2, blocks=8))
-    router.release(first, first_work)
-    router.release(other, other_work)
+    first_request = _session_request(0, session=1, blocks=8)
+    other_request = _session_request(1, session=2, blocks=8)
+    first, first_work = router.acquire(first_request)
+    other, other_work = router.acquire(other_request)
+    router.release(first, first_work, first_request)
+    router.release(other, other_work, other_request)
     later, _ = router.acquire(_session_request(2, session=2, blocks=9))
 
     assert (first, other, later) == (0, 1, 1)
@@ -644,8 +648,9 @@ def test_affinity_shadow_cache_forgets_evicted_prefixes() -> None:
             ["http://a", "http://b"], route="gpu-affinity", local_blocks=local_blocks
         )
         for index, session, blocks in ((0, 1, 64), (1, 3, 64)):
-            instance, work = router.acquire(_session_request(index, session, blocks))
-            router.release(instance, work)
+            request = _session_request(index, session, blocks)
+            instance, work = router.acquire(request)
+            router.release(instance, work, request)
         router.acquire(_session_request(2, session=4, blocks=1))
         later, _ = router.acquire(_session_request(3, session=1, blocks=65))
         return later
@@ -660,6 +665,60 @@ def test_router_rejects_bad_affinity_settings() -> None:
         InstanceRouter(["http://a"], route="tier-affinity", local_blocks=0)
     with pytest.raises(ValueError):
         InstanceRouter(["http://a"], route="tier-affinity", load_tokens_per_s=0)
+
+
+def _subagent_request(index: int, session: int, base: int, blocks: int) -> TraceRequest:
+    """Build a request of ``session`` whose blocks start at ``base``."""
+    hash_ids = tuple(base * 1000 + block for block in range(blocks))
+    return TraceRequest(
+        index, 0, blocks * MOONCAKE_BLOCK_TOKENS, 8, hash_ids, session_id=session
+    )
+
+
+def test_hbm_fit_counts_a_shared_in_flight_prefix_once() -> None:
+    """A next turn sharing an in-flight prefix fits beside it and stays home."""
+    router = InstanceRouter(["http://a", "http://b"], route="hbm-fit", local_blocks=70)
+    first, _ = router.acquire(_session_request(0, session=1, blocks=64))
+    router.acquire(_session_request(1, session=2, blocks=1))
+    later, _ = router.acquire(_session_request(2, session=1, blocks=65))
+
+    assert (first, later) == (0, 0)
+    assert router.resident_blocks(0) == 65 + 2
+
+
+def test_hbm_fit_moves_a_request_that_does_not_fit_beside_in_flight_ones() -> None:
+    """Disjoint blocks over capacity go to the instance with room and re-pin."""
+    router = InstanceRouter(["http://a", "http://b"], route="hbm-fit", local_blocks=100)
+    first, _ = router.acquire(_session_request(0, session=1, blocks=64))
+    router.acquire(_session_request(1, session=2, blocks=1))
+    moved, _ = router.acquire(_subagent_request(2, session=1, base=5, blocks=50))
+    after, _ = router.acquire(_subagent_request(3, session=1, base=6, blocks=1))
+
+    assert (first, moved, after) == (0, 1, 1)
+
+
+def test_hbm_fit_stays_home_when_the_request_fits_nowhere() -> None:
+    """Without room anywhere the session queues on its own instance."""
+    router = InstanceRouter(["http://a", "http://b"], route="hbm-fit", local_blocks=80)
+    first, _ = router.acquire(_session_request(0, session=1, blocks=64))
+    router.acquire(_session_request(1, session=2, blocks=60))
+    later, _ = router.acquire(_subagent_request(2, session=1, base=5, blocks=50))
+
+    assert (first, later) == (0, 0)
+
+
+def test_router_release_frees_resident_blocks() -> None:
+    """Finished requests drop their blocks; shared ones stay while referenced."""
+    router = InstanceRouter(["http://a"], route="hbm-fit", local_blocks=200)
+    a = _session_request(0, session=1, blocks=64)
+    b = _session_request(1, session=1, blocks=65)
+    _, a_work = router.acquire(a)
+    _, b_work = router.acquire(b)
+    router.release(0, a_work, a)
+
+    assert router.resident_blocks(0) == 65 + 1
+    router.release(0, b_work, b)
+    assert router.resident_blocks(0) == 0
 
 
 def test_replay_routes_between_instances_and_records_them(
