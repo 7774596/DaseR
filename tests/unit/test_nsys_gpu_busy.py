@@ -4,7 +4,13 @@
 from pathlib import Path
 import sqlite3
 
-from benchmarks.research.nsys_gpu_busy import category, merge, overlap_ns, summarize
+from benchmarks.research.nsys_gpu_busy import (
+    category,
+    merge,
+    overlap_ns,
+    phase_gaps,
+    summarize,
+)
 
 
 def test_merge_joins_overlapping_and_touching_intervals() -> None:
@@ -38,3 +44,22 @@ def test_copy_only_report_still_lists_copies(tmp_path: Path) -> None:
     lines = summarize(db)
     assert lines[0] == "copy_only.sqlite: no kernels"
     assert lines[1].startswith("  D2H: n=1 GB=2.0 ")
+
+
+def test_phase_gaps_assigns_each_gap_to_its_dominant_phase() -> None:
+    """Gaps go to first-token, decode or idle by coverage; copies are measured."""
+    busy = [
+        (0, 10_000_000),
+        (15_000_000, 20_000_000),
+        (30_000_000, 31_000_000),
+        (40_000_000, 50_000_000),
+    ]
+    result = phase_gaps(
+        busy,
+        first_token=[(10_000_000, 15_000_000)],
+        decode=[(20_000_000, 29_000_000)],
+        copies=[(11_000_000, 13_000_000)],
+    )
+    assert result["first_token"] == (1, 5_000_000, 2_000_000)
+    assert result["decode"] == (1, 10_000_000, 0)
+    assert result["no_request"] == (1, 9_000_000, 0)
