@@ -27,7 +27,17 @@ _BLOCK_ID_DIGITS = 8
 # Marker tokens per corpus block; base >= 1e5 ordinary tokens covers 1e15 IDs.
 _CORPUS_ID_DIGITS = 3
 _WRITER_STOP = object()
-ROUTES = ("sticky", "least-work")
+ROUTES = ("sticky", "least-work", "gpu-affinity", "tier-affinity")
+
+
+def _prefix_blocks(request: TraceRequest, present: Any) -> int:
+    """Count the leading ``request.hash_ids`` contained in ``present``."""
+    count = 0
+    for hash_id in request.hash_ids:
+        if hash_id not in present:
+            break
+        count += 1
+    return count
 
 
 @dataclass(frozen=True)
@@ -117,10 +127,23 @@ class InstanceRouter:
     of :class:`WorkModel` estimates of admitted, unfinished requests; cached
     prefixes are predicted from ``hash_ids`` already sent to any instance.
 
+    The affinity routes also keep a per-instance shadow LRU of the blocks sent
+    there, bounded by the GPU prefix-cache capacity, and pick the instance
+    minimizing outstanding work plus this request's cost on it.
+    ``gpu-affinity`` (Preble-style) prices a block missing from the instance's
+    GPU cache as recompute. ``tier-affinity`` prices it as a load from the
+    shared external tier when any instance already produced it, so locality
+    only breaks near-ties in load and blocks never seen are recomputed
+    anywhere.
+
     Args:
         server_urls: Instance base URLs.
         route: One of :data:`ROUTES`.
         work_model: Cost model for outstanding work.
+        local_blocks: Shadow GPU prefix-cache capacity per instance, in
+            512-token blocks (affinity routes).
+        load_tokens_per_s: External-tier load rate used by
+            ``tier-affinity`` to price a non-local reusable block.
 
     Thread-safety:
         Single asyncio event loop only; no internal locking.
@@ -131,17 +154,26 @@ class InstanceRouter:
         server_urls: Sequence[str],
         route: str = "sticky",
         work_model: WorkModel | None = None,
+        local_blocks: int = 2048,
+        load_tokens_per_s: float = 360e3,
     ) -> None:
         if not server_urls:
             raise ValueError("at least one server URL is required")
         if route not in ROUTES:
             raise ValueError(f"unknown route: {route}")
+        if local_blocks <= 0 or load_tokens_per_s <= 0:
+            raise ValueError("local_blocks and load_tokens_per_s must be positive")
         self.server_urls = tuple(url.rstrip("/") for url in server_urls)
         self.route = route
         self.work_model = work_model or WorkModel()
+        self.local_blocks = local_blocks
+        self.load_tokens_per_s = load_tokens_per_s
         self._outstanding = [0.0] * len(self.server_urls)
         self._sessions: dict[int, int] = {}
         self._seen: set[int] = set()
+        self._local: list[OrderedDict[int, None]] = [
+            OrderedDict() for _ in self.server_urls
+        ]
 
     def acquire(self, request: TraceRequest) -> tuple[int, float]:
         """Pick an instance for ``request`` and charge its estimated work.
@@ -152,14 +184,20 @@ class InstanceRouter:
         Returns:
             Instance index and the charged work, to pass to :meth:`release`.
         """
-        cached_blocks = 0
-        for hash_id in request.hash_ids:
-            if hash_id not in self._seen:
-                break
-            cached_blocks += 1
-        cached = min(cached_blocks * MOONCAKE_BLOCK_TOKENS, request.input_length - 1)
-        work = self.work_model.seconds(request, max(0, cached))
-        instance = self._pick(request)
+        cached = self._cached_tokens(request, _prefix_blocks(request, self._seen))
+        if self.route in ("gpu-affinity", "tier-affinity"):
+            costs = [
+                self._affinity_cost(request, i, cached)
+                for i in range(len(self.server_urls))
+            ]
+            instance = min(
+                range(len(costs)), key=lambda i: self._outstanding[i] + costs[i]
+            )
+            work = costs[instance]
+            self._touch_local(instance, request.hash_ids)
+        else:
+            work = self.work_model.seconds(request, cached)
+            instance = self._pick(request)
         self._outstanding[instance] += work
         self._seen.update(request.hash_ids)
         return instance, work
@@ -184,6 +222,32 @@ class InstanceRouter:
 
     def _least_loaded(self) -> int:
         return min(range(len(self._outstanding)), key=self._outstanding.__getitem__)
+
+    def _cached_tokens(self, request: TraceRequest, blocks: int) -> int:
+        return max(0, min(blocks * MOONCAKE_BLOCK_TOKENS, request.input_length - 1))
+
+    def _affinity_cost(
+        self, request: TraceRequest, instance: int, cached: int
+    ) -> float:
+        local = self._cached_tokens(
+            request, _prefix_blocks(request, self._local[instance])
+        )
+        if self.route == "gpu-affinity":
+            return self.work_model.seconds(request, local)
+        return (
+            self.work_model.seconds(request, cached)
+            + max(0, cached - local) / self.load_tokens_per_s
+        )
+
+    def _touch_local(self, instance: int, hash_ids: Sequence[int]) -> None:
+        # vLLM frees a request's blocks tail first, so the prefix head is the
+        # most recently used and is evicted last.
+        lru = self._local[instance]
+        for hash_id in reversed(hash_ids):
+            lru[hash_id] = None
+            lru.move_to_end(hash_id)
+        while len(lru) > self.local_blocks:
+            lru.popitem(last=False)
 
 
 @dataclass(frozen=True)
@@ -554,6 +618,8 @@ async def replay(
     abort_after_failures: int = 0,
     prefix_dependencies: bool = False,
     route: str = "sticky",
+    route_local_blocks: int = 2048,
+    route_load_tokens_per_s: float = 360e3,
     strict_order: bool = False,
     dependency_gap_s: float = 0.0,
     ordered_admission: bool = False,
@@ -581,6 +647,10 @@ async def replay(
             ``gap_ms`` start that (time-scaled) gap after the dependency
             completes instead of at their timestamp.
         route: :class:`InstanceRouter` policy when several URLs are given.
+        route_local_blocks: Shadow GPU cache blocks per instance for the
+            affinity routes.
+        route_load_tokens_per_s: External-tier load rate for
+            ``tier-affinity``.
         strict_order: Hold each request until the previous one completes, so
             the send order is exactly the trace order (implies prefix
             dependencies). Without it, closed-loop replay sends ready
@@ -611,7 +681,10 @@ async def replay(
         raise ValueError("strict_order and ordered_admission are exclusive")
     scheduled_offset_seconds(0, time_scale)
     router = InstanceRouter(
-        [server_url] if isinstance(server_url, str) else server_url, route
+        [server_url] if isinstance(server_url, str) else server_url,
+        route,
+        local_blocks=route_local_blocks,
+        load_tokens_per_s=route_load_tokens_per_s,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _ResultWriter(output_path)
@@ -721,6 +794,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=ROUTES,
         default="sticky",
         help="Instance choice per request when several --server-url are given.",
+    )
+    parser.add_argument(
+        "--route-local-blocks",
+        type=int,
+        default=2048,
+        help="Shadow GPU prefix-cache capacity per instance in 512-token blocks "
+        "(affinity routes).",
+    )
+    parser.add_argument(
+        "--route-load-tokens-per-s",
+        type=float,
+        default=360e3,
+        help="External-tier load rate pricing non-local reuse (tier-affinity).",
     )
     parser.add_argument("--served-model-name", default="")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -845,6 +931,8 @@ async def main_async(args: argparse.Namespace) -> int:
         abort_after_failures=args.abort_after_failures,
         prefix_dependencies=args.prefix_dependencies,
         route=args.route,
+        route_local_blocks=args.route_local_blocks,
+        route_load_tokens_per_s=args.route_load_tokens_per_s,
         strict_order=args.strict_order,
         dependency_gap_s=args.dependency_gap_s,
         ordered_admission=args.ordered_admission,

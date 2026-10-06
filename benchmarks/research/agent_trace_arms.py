@@ -227,6 +227,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--route", choices=ROUTES, default="sticky")
+    parser.add_argument("--route-local-blocks", type=int, default=2048)
+    parser.add_argument("--route-load-tokens-per-s", type=float, default=360e3)
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument(
         "--gpu-util",
@@ -611,6 +613,10 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 *server_urls,
                 "--route",
                 args.route,
+                "--route-local-blocks",
+                str(args.route_local_blocks),
+                "--route-load-tokens-per-s",
+                str(args.route_load_tokens_per_s),
                 "--served-model-name",
                 model_name,
                 "--output-dir",

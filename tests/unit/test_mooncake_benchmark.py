@@ -604,6 +604,64 @@ def test_router_charges_less_work_for_a_seen_prefix() -> None:
     assert warm < cold / 10
 
 
+def _route_after_busy_holder(route: str) -> int:
+    """Route a prefix extension whose holder is busy with a smaller job."""
+    router = InstanceRouter(["http://a", "http://b"], route=route)
+    first, first_work = router.acquire(_session_request(0, session=1, blocks=64))
+    router.release(first, first_work)
+    router.acquire(_session_request(1, session=2, blocks=8))
+    later, _ = router.acquire(_session_request(2, session=1, blocks=65))
+    return later
+
+
+def test_gpu_affinity_follows_the_instance_holding_the_prefix() -> None:
+    """Recompute elsewhere costs more than queueing behind the smaller job."""
+    assert _route_after_busy_holder("gpu-affinity") == 0
+
+
+def test_tier_affinity_balances_when_the_prefix_is_reusable_elsewhere() -> None:
+    """A shared-tier hit costs only a load, so the idle instance wins."""
+    assert _route_after_busy_holder("tier-affinity") == 1
+
+
+def test_tier_affinity_breaks_load_ties_by_locality() -> None:
+    """With equal outstanding work, the instance holding the prefix is chosen."""
+    router = InstanceRouter(["http://a", "http://b"], route="tier-affinity")
+    first, first_work = router.acquire(_session_request(0, session=1, blocks=8))
+    other, other_work = router.acquire(_session_request(1, session=2, blocks=8))
+    router.release(first, first_work)
+    router.release(other, other_work)
+    later, _ = router.acquire(_session_request(2, session=2, blocks=9))
+
+    assert (first, other, later) == (0, 1, 1)
+
+
+def test_affinity_shadow_cache_forgets_evicted_prefixes() -> None:
+    """Blocks pushed out of the shadow capacity no longer attract the request."""
+
+    def route_return(local_blocks: int) -> int:
+        router = InstanceRouter(
+            ["http://a", "http://b"], route="gpu-affinity", local_blocks=local_blocks
+        )
+        for index, session, blocks in ((0, 1, 64), (1, 3, 64)):
+            instance, work = router.acquire(_session_request(index, session, blocks))
+            router.release(instance, work)
+        router.acquire(_session_request(2, session=4, blocks=1))
+        later, _ = router.acquire(_session_request(3, session=1, blocks=65))
+        return later
+
+    assert route_return(local_blocks=1024) == 0
+    assert route_return(local_blocks=64) == 1
+
+
+def test_router_rejects_bad_affinity_settings() -> None:
+    """Non-positive shadow capacity or load rate is rejected."""
+    with pytest.raises(ValueError):
+        InstanceRouter(["http://a"], route="tier-affinity", local_blocks=0)
+    with pytest.raises(ValueError):
+        InstanceRouter(["http://a"], route="tier-affinity", load_tokens_per_s=0)
+
+
 def test_replay_routes_between_instances_and_records_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
