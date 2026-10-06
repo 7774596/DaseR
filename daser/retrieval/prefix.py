@@ -167,6 +167,21 @@ class PrefixHashIndex(RetrievalIndex):
         del model_id
         return set(rolling_prefix_keys(tokens, self._block_tokens))
 
+    def chain_keys(self, tokens: TokenSequence) -> list[str]:
+        """Return rolling-prefix keys of every full block in prompt order.
+
+        Args:
+            tokens: full prompt token IDs.
+
+        Returns:
+            One chained key per full block; block ``i`` matches only after
+            blocks ``0..i-1`` matched.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        return rolling_prefix_keys(tokens, self._block_tokens)
+
     def continuation_keys(
         self, tokens: TokenSequence, covered_tokens: int, model_id: str
     ) -> set[str] | None:

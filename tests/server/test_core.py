@@ -966,6 +966,79 @@ async def test_evict_oldest_chunk_second_chance(
     assert len(await core.lookup(survivor, "m")) == 1
 
 
+async def _committed_chain(
+    core: ServerCore, blocks: int
+) -> tuple[list[int], list[str]]:
+    """Commit one prompt's ``blocks`` chained blocks and look it up once."""
+    # Offset keeps these tokens apart from ``_committed_blocks``.
+    tokens = list(range(1000, 1000 + blocks * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    for key in keys:
+        await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+        await core.commit_chunk(key)
+    assert len(await core.lookup(tokens, "m")) == 1
+    return tokens, keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", [False, True])
+async def test_prefix_closed_eviction_removes_unreachable_descendants(
+    closed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evicting a prefix head also frees the blocks only it led to."""
+    if closed:
+        monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
+    else:
+        monkeypatch.delenv("DASER_PREFIX_CLOSED_EVICTION", raising=False)
+    core = make_core()
+    tokens, keys = await _committed_chain(core, 3)
+    other = await _committed_blocks(core, 1)
+
+    evicted = await core.evict_oldest_chunk(set())
+
+    assert evicted is not None and evicted.chunk_key == keys[0]
+    assert await core.lookup(tokens, "m") == []
+    resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
+    assert resident == [not closed, not closed]
+    assert len(await core.lookup(other[0], "m")) == 1
+
+
+@pytest.mark.asyncio
+async def test_prefix_closed_eviction_keeps_pending_and_protected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uncommitted or protected descendants survive, and so does what follows."""
+    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
+    core = make_core()
+    tokens = list(range(4 * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    for key in keys:
+        await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+    for key in (keys[0], keys[1], keys[3]):
+        await core.commit_chunk(key)
+    await core.lookup(tokens, "m")
+
+    await core.evict_oldest_chunk({keys[1]})
+
+    resident = [core.chunk_manager.store.get(key) is not None for key in keys]
+    assert resident == [False, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_prefix_closed_eviction_follows_ring_wrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ring allocation that evicts a head also frees its descendants."""
+    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
+    core = make_core(total_slots=4)
+    _, keys = await _committed_chain(core, 3)
+    fresh = await _committed_blocks(core, 2)
+
+    resident = [core.chunk_manager.store.get(key) is not None for key in keys]
+    assert resident == [False, False, False]
+    assert all([len(await core.lookup(block, "m")) == 1 for block in fresh])
+
+
 @pytest.mark.asyncio
 async def test_second_chance_clears_bit_and_wraps(
     monkeypatch: pytest.MonkeyPatch,

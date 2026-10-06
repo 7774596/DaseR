@@ -9,7 +9,11 @@ import os
 from typing import Any, Callable, Optional
 
 # First Party
-from daser.config import ARENA_SECOND_CHANCE_ENV, arena_live_victim_idle
+from daser.config import (
+    ARENA_SECOND_CHANCE_ENV,
+    PREFIX_CLOSED_EVICTION_ENV,
+    arena_live_victim_idle,
+)
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
 from daser.logging import init_logger
@@ -275,6 +279,12 @@ class ServerCore:
         self._live_tick = 0
         self._live_prompt: int | None = None
         self._live_touch: OrderedDict[str, int] = OrderedDict()
+        # Prefix-closed eviction: key -> keys a lookup reaches only through
+        # it, learned from looked-up prompts. Grows with distinct prompt
+        # blocks (research switch only).
+        self._prefix_closed = os.environ.get(PREFIX_CLOSED_EVICTION_ENV) == "1"
+        self._chain_children: dict[str, set[str]] = {}
+        self._chain_prompt: int | None = None
         self._record_capacity_metrics()
 
     @property
@@ -439,6 +449,8 @@ class ServerCore:
         if matches:
             self._lookup_hits += 1
         chunks = [self._chunk_info(match) for match in matches]
+        if self._prefix_closed:
+            self._learn_chain(tokens)
         if self._second_chance:
             self._referenced.update(chunk.chunk_key for chunk in chunks)
         if self._live_idle:
@@ -1103,7 +1115,7 @@ class ServerCore:
                 return None
             self._cm.evict_oldest()
             if meta is not None:
-                await self._drain_ring_evictions()
+                await self._drain_ring_evictions(frozenset(protected_keys))
                 return meta
         return None
 
@@ -1247,13 +1259,20 @@ class ServerCore:
         )
         return DeleteDocumentResult(chunks_evicted=chunks_evicted)
 
-    async def _drain_ring_evictions(self) -> None:
+    async def _drain_ring_evictions(
+        self, protected: frozenset[str] = frozenset()
+    ) -> None:
         """Remove ring-evicted chunks from retrieval index.
+
+        Args:
+            protected: Chunk keys prefix-closed eviction must keep, e.g. the
+                chunk whose allocation evicted the ring tail.
 
         Async/thread-safety:
             Runs on the server event loop after allocation.
         """
-        for chunk_key in self._cm.drain_evicted_chunk_keys():
+        evicted = self._cm.drain_evicted_chunk_keys()
+        for chunk_key in evicted:
             self._clear_packed_refs(chunk_key)
             await self._ri.remove(chunk_key)
             self._lifecycle.mark_evicted(chunk_key)
@@ -1263,6 +1282,8 @@ class ServerCore:
                 "Chunks evicted from cache metadata.",
             ).inc(labels={"reason": "capacity"})
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
+        if self._prefix_closed and evicted:
+            await self._remove_orphans(evicted, protected)
         self._record_capacity_metrics()
 
     def _record_capacity_metrics(self) -> None:
@@ -1371,6 +1392,46 @@ class ServerCore:
         ).inc(labels={"reason": reason})
         self._record_capacity_metrics()
         logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
+
+    def _learn_chain(self, tokens: TokenSequence) -> None:
+        """Record which keys a lookup of ``tokens`` reaches through which.
+
+        Schedulers poll one prompt many times, so a prompt identical to the
+        last linked one is skipped before hashing its chain.
+        """
+        prompt = hash(tokens if isinstance(tokens, bytes) else tuple(tokens))
+        if prompt == self._chain_prompt:
+            return
+        self._chain_prompt = prompt
+        chain = self._ri.chain_keys(tokens)
+        for parent, child in zip(chain, chain[1:], strict=False):
+            self._chain_children.setdefault(parent, set()).add(child)
+
+    async def _remove_orphans(
+        self, evicted: list[str], protected: frozenset[str]
+    ) -> None:
+        """Remove resident chunks that only evicted chunks led to.
+
+        A lookup stops at the first missing key, so every key reached through
+        an evicted one is dead weight until that key is stored again. Keys
+        still being written (or ``protected``) are kept, and so are their
+        descendants.
+
+        Args:
+            evicted: Keys just removed by capacity eviction.
+            protected: Keys that must stay resident.
+        """
+        keep = protected | self._lifecycle.pending_write_keys
+        stack = list(evicted)
+        seen = set(stack)
+        while stack:
+            for child in tuple(self._chain_children.get(stack.pop(), ())):
+                if child in seen or child in keep:
+                    continue
+                seen.add(child)
+                stack.append(child)
+                if self._cm.store.get(child) is not None:
+                    await self._remove_chunk(child, reason="orphan")
 
     async def _evict_second_chance(self, protected_keys: set[str]) -> ChunkMeta | None:
         """Evict the first unreferenced chunk under the CLOCK hand.
@@ -1570,7 +1631,7 @@ class ServerCore:
             model_id=model_id,
             pos_offset=pos_offset,
         )
-        await self._drain_ring_evictions()
+        await self._drain_ring_evictions(frozenset((chunk_key,)))
         meta = self._cm.store.get(chunk_key)
         if meta is None:
             raise RuntimeError(

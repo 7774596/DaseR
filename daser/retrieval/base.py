@@ -131,6 +131,26 @@ class RetrievalIndex(ABC):
         del tokens, covered_tokens, model_id
         return None
 
+    def chain_keys(self, tokens: TokenSequence) -> list[str]:
+        """Return the keys a lookup of ``tokens`` would match, in match order.
+
+        Each key can only match once every earlier key matched, so key
+        ``i`` is reachable only through key ``i - 1``.
+
+        Args:
+            tokens: full prompt token IDs used by a lookup.
+
+        Returns:
+            Ordered keys, or an empty list when the index has no fixed match
+            order (callers then learn no reachability links).
+
+        Async/thread-safety:
+            Pure in-memory planning on the server event loop.  Implementations
+            must not perform blocking I/O or mutate index state.
+        """
+        del tokens
+        return []
+
     async def insert(self, meta: ChunkMeta) -> None:
         """Add a committed chunk to the retrieval index.
 
