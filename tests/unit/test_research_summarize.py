@@ -174,9 +174,47 @@ def test_arm_row_marks_daser_columns_absent_without_a_daser_server(
 
     row = arm_row(arm_dir)
 
-    for column in ("io_share", "l1_hits", "load_gib", "store_gib", "l2w_gib"):
+    for column in (
+        "io_share",
+        "l1_hits",
+        "load_gib",
+        "store_gib",
+        "l2w_gib",
+        "ssd_r_gib",
+        "ra_wait_s",
+    ):
         assert row[column] == "-"
     assert row["sum_ttft_s"] == "20"
+
+
+def test_arm_row_reports_ssd_reads_and_readahead_wait(tmp_path: Path) -> None:
+    """ssd_r_gib is readahead bytes read from SSD; ra_wait_s is load wait on it."""
+    arm_dir = _ttft_arm(tmp_path, "ssd", [100.0, 300.0])
+    summary = {
+        "completed_requests": 2,
+        "failed_requests": 0,
+        "wall_seconds": 10.0,
+        "client_queue_ms": {"p50": 0.0},
+        "arrival_to_completion_ms": {"p50": 0.0},
+    }
+    (arm_dir / "summary.json").write_text(json.dumps(summary))
+    (arm_dir / "daser_metrics_before.prom").write_text(
+        'daser_readahead_bytes_total{outcome="read"} 1073741824.0\n'
+        'daser_load_phase_seconds_total{phase="readahead_wait"} 1.0\n'
+    )
+    (arm_dir / "daser_metrics_after.prom").write_text(
+        'daser_readahead_bytes_total{outcome="read"} 4294967296.0\n'
+        'daser_readahead_bytes_total{outcome="served"} 9663676416.0\n'
+        'daser_load_phase_seconds_total{phase="readahead_wait"} 3.5\n'
+    )
+    (arm_dir / "vllm_metrics_after.prom").write_text(
+        'vllm:time_to_first_token_seconds_sum{engine="0"} 20.0\n'
+    )
+
+    row = arm_row(arm_dir)
+
+    assert row["ssd_r_gib"] == "3.0"
+    assert row["ra_wait_s"] == "2.5"
 
 
 def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:

@@ -39,11 +39,15 @@ _COLUMNS = (
     "l1_hits",
     "load_gib",
     "store_gib",
+    "ssd_r_gib",
+    "ra_wait_s",
 )
 
 
 _LOAD = 'daser_transfer_bytes_total{op="load"}'
 _STORE = 'daser_transfer_bytes_total{op="store"}'
+_SSD_READ = 'daser_readahead_bytes_total{outcome="read"}'
+_RA_WAIT = 'daser_load_phase_seconds_total{phase="readahead_wait"}'
 _VLLM_TICK = re.compile(
     r"prompt throughput: ([0-9.]+).*?generation throughput: ([0-9.]+)"
     r".*?Running: (\d+) reqs, Waiting: (\d+) reqs(?:, Deferred: (\d+) reqs)?"
@@ -228,6 +232,10 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         "l2w_gib": daser(
             f"{_delta(before, after, 'daser_l2_write_bytes_total') / gib:.1f}"
         ),
+        # Bytes readahead pulled from the SSD tier into L1, and the time loads
+        # spent waiting on those reads: the SSD share of the load path.
+        "ssd_r_gib": daser(f"{_delta(before, after, _SSD_READ) / gib:.1f}"),
+        "ra_wait_s": daser(f"{_delta(before, after, _RA_WAIT):.1f}"),
     }
 
 
