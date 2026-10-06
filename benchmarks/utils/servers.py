@@ -943,7 +943,8 @@ def profile_prefix(env_var: str, log_path: Path) -> list[str]:
 
     The variable holds a shell-style command (for example an ``nsys profile``
     invocation) prepended to the service argv; ``{log}`` expands to the
-    service log path without its suffix, so each instance gets its own report.
+    service log path without its suffix and ``{name}`` to its stem, so each
+    instance gets its own report or profiler session.
 
     Args:
         env_var: ``DASER_BENCH_PROFILE_VLLM`` or ``DASER_BENCH_PROFILE_DASER``.
@@ -958,7 +959,10 @@ def profile_prefix(env_var: str, log_path: Path) -> list[str]:
     template = os.environ.get(env_var, "").strip()
     if not template:
         return []
-    return shlex.split(template.replace("{log}", str(log_path.with_suffix(""))))
+    stem = log_path.with_suffix("")
+    return shlex.split(
+        template.replace("{log}", str(stem)).replace("{name}", stem.name)
+    )
 
 
 def _is_port_open(host: str, port: int) -> bool:

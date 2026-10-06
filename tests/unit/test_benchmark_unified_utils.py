@@ -4081,14 +4081,12 @@ def test_profile_prefix_is_empty_unless_configured(
     monkeypatch.delenv("DASER_BENCH_PROFILE_VLLM", raising=False)
     assert profile_prefix("DASER_BENCH_PROFILE_VLLM", log) == []
     monkeypatch.setenv(
-        "DASER_BENCH_PROFILE_VLLM", "nsys profile -t cuda -o {log} --kill=sigterm"
+        "DASER_BENCH_PROFILE_VLLM", "nsys launch --session-new={name} -o {log}"
     )
     assert profile_prefix("DASER_BENCH_PROFILE_VLLM", log) == [
         "nsys",
-        "profile",
-        "-t",
-        "cuda",
+        "launch",
+        "--session-new=vllm_daser_1",
         "-o",
         str(tmp_path / "vllm_daser_1"),
-        "--kill=sigterm",
     ]
