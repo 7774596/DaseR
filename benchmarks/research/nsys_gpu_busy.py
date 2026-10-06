@@ -80,6 +80,33 @@ def category(name: str) -> str:
     return "other"
 
 
+def _copy_lines(
+    copies: Sequence[tuple[int, int, int, int]], busy: Sequence[tuple[int, int]]
+) -> list[str]:
+    """Return one line per copy direction with bytes, time and kernel overlap.
+
+    Args:
+        copies: ``(start, end, bytes, copyKind)`` memcpy rows.
+        busy: Disjoint sorted kernel intervals (may be empty).
+
+    Returns:
+        Report lines for the H2D and D2H copies present.
+    """
+    lines: list[str] = []
+    for kind, label in _COPY_KINDS.items():
+        rows = [(s, e, b) for s, e, b, k in copies if k == kind]
+        if not rows:
+            continue
+        spans = merge((s, e) for s, e, _ in rows)
+        copy_ns = sum(e - s for s, e in spans)
+        lines.append(
+            f"  {label}: n={len(rows)} GB={sum(b for _, _, b in rows) / 1e9:.1f} "
+            f"time={copy_ns / 1e9:.2f}s overlap_with_kernels="
+            f"{overlap_ns(spans, busy) / max(copy_ns, 1):.3f}"
+        )
+    return lines
+
+
 def summarize(path: Path, top: int = 6) -> list[str]:
     """Return report lines for one nsys sqlite export.
 
@@ -91,11 +118,16 @@ def summarize(path: Path, top: int = 6) -> list[str]:
         Human-readable lines.
     """
     con = sqlite3.connect(path)
-    kernels = con.execute(
-        "SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
-        "JOIN StringIds s ON s.id = COALESCE(k.demangledName, k.shortName)"
-    ).fetchall()
     tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master")}
+    # A process that only copies (e.g. the DaseR server) has no kernel table.
+    kernels = (
+        con.execute(
+            "SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
+            "JOIN StringIds s ON s.id = COALESCE(k.demangledName, k.shortName)"
+        ).fetchall()
+        if "CUPTI_ACTIVITY_KIND_KERNEL" in tables
+        else []
+    )
     copies = (
         con.execute(
             "SELECT start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY"
@@ -104,9 +136,9 @@ def summarize(path: Path, top: int = 6) -> list[str]:
         else []
     )
     con.close()
-    if not kernels:
-        return [f"{path.name}: no kernels"]
     busy = merge((start, end) for start, end, _ in kernels)
+    if not busy:
+        return [f"{path.name}: no kernels"] + _copy_lines(copies, busy)
     window = busy[-1][1] - busy[0][0]
     busy_ns = sum(end - start for start, end in busy)
     gaps = [b[0] - a[1] for a, b in zip(busy, busy[1:], strict=False)]
@@ -135,18 +167,7 @@ def summarize(path: Path, top: int = 6) -> list[str]:
     )
     for name, ns in sorted(by_name.items(), key=lambda kv: -kv[1])[:top]:
         lines.append(f"    {ns / kernel_ns:.3f} {category(name):9s} {name[:110]}")
-    for kind, label in _COPY_KINDS.items():
-        rows = [(s, e, b) for s, e, b, k in copies if k == kind]
-        if not rows:
-            continue
-        spans = merge((s, e) for s, e, _ in rows)
-        copy_ns = sum(e - s for s, e in spans)
-        lines.append(
-            f"  {label}: n={len(rows)} GB={sum(b for _, _, b in rows) / 1e9:.1f} "
-            f"time={copy_ns / 1e9:.2f}s overlap_with_kernels="
-            f"{overlap_ns(spans, busy) / max(copy_ns, 1):.3f}"
-        )
-    return lines
+    return lines + _copy_lines(copies, busy)
 
 
 def main(argv: list[str] | None = None) -> None:
