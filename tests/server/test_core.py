@@ -1004,6 +1004,33 @@ async def test_prefix_closed_eviction_removes_unreachable_descendants(
 
 
 @pytest.mark.asyncio
+async def test_prefix_closed_eviction_bounds_learned_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lookups of never-stored prompts do not grow the edge map forever."""
+    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry, total_slots=8)
+    tokens, keys = await _committed_chain(core, 3)
+    for prompt in range(40):
+        start = 10_000 + prompt * 4 * BLOCK_TOKENS
+        await core.lookup(list(range(start, start + 4 * BLOCK_TOKENS)), "m")
+
+    gauge = [
+        line
+        for line in registry.render_prometheus().splitlines()
+        if line.startswith("daser_prefix_chain_edges ")
+    ]
+    # 40 prompts learn 120 edges; a prune keeps the 2 cached edges plus at
+    # most one generation of fresh ones (2 * 8 slots each).
+    assert gauge and float(gauge[0].split()[1]) <= 2 + 2 * 2 * 8
+    evicted = await core.evict_oldest_chunk(set())
+    assert evicted is not None and evicted.chunk_key == keys[0]
+    resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
+    assert resident == [False, False]
+
+
+@pytest.mark.asyncio
 async def test_prefix_closed_eviction_keeps_pending_and_protected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

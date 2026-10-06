@@ -280,11 +280,16 @@ class ServerCore:
         self._live_prompt: int | None = None
         self._live_touch: OrderedDict[str, int] = OrderedDict()
         # Prefix-closed eviction: key -> keys a lookup reaches only through
-        # it, learned from looked-up prompts. Grows with distinct prompt
-        # blocks (research switch only).
+        # it, learned from looked-up prompts (research switch only). Edges to
+        # children that are neither stored, pending nor learned since the last
+        # prune are dropped periodically, so it stays proportional to the
+        # cache instead of to every prompt ever seen.
         self._prefix_closed = os.environ.get(PREFIX_CLOSED_EVICTION_ENV) == "1"
         self._chain_children: dict[str, set[str]] = {}
         self._chain_prompt: int | None = None
+        self._chain_edges = 0
+        self._chain_fresh: set[str] = set()
+        self._chain_limit = 2 * chunk_manager.total_slots
         self._record_capacity_metrics()
 
     @property
@@ -1405,7 +1410,48 @@ class ServerCore:
         self._chain_prompt = prompt
         chain = self._ri.chain_keys(tokens)
         for parent, child in zip(chain, chain[1:], strict=False):
-            self._chain_children.setdefault(parent, set()).add(child)
+            children = self._chain_children.setdefault(parent, set())
+            if child not in children:
+                children.add(child)
+                self._chain_edges += 1
+            self._chain_fresh.add(child)
+        if self._chain_edges > self._chain_limit:
+            self._prune_chain()
+
+    def _prune_chain(self) -> None:
+        """Drop reachability edges that can no longer guide a cascade.
+
+        An edge matters only while its child is stored, still being written,
+        or about to be (learned since the last prune); any other edge is
+        relearned by the next lookup that reaches it. The next prune waits
+        for as many new edges as are cached (at least two per slot), so the
+        map stays within three times that and pruning is amortised O(1).
+        """
+        pending = self._lifecycle.pending_write_keys
+        store = self._cm.store
+        edges = cached = 0
+        for parent in list(self._chain_children):
+            children = set()
+            for child in self._chain_children[parent]:
+                if child in pending or store.get(child) is not None:
+                    cached += 1
+                elif child not in self._chain_fresh:
+                    continue
+                children.add(child)
+            if children:
+                self._chain_children[parent] = children
+                edges += len(children)
+            else:
+                del self._chain_children[parent]
+        self._chain_edges = edges
+        self._chain_fresh = set()
+        # Size the next generation by the cached edges, not the kept fresh
+        # ones, so fresh-but-never-stored edges cannot ratchet the limit up.
+        self._chain_limit = edges + max(cached, 2 * self._cm.total_slots)
+        self._metrics.gauge(
+            "daser_prefix_chain_edges",
+            "Reachability edges kept for prefix-closed eviction.",
+        ).set(edges)
 
     async def _remove_orphans(
         self, evicted: list[str], protected: frozenset[str]
