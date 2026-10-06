@@ -1613,9 +1613,9 @@ def _online_arena_server(
 
 
 async def _store_online_record(
-    socket_path: str, chunk_key: str, nbytes: int
+    socket_path: str, chunk_key: str, nbytes: int, fill: bytes = b"x"
 ) -> dict[str, Any]:
-    """Allocate one single-slot chunk and store one packed record for it."""
+    """Allocate one single-slot chunk and store one ``fill`` record for it."""
     allocation = await _send_recv(
         socket_path,
         {
@@ -1629,7 +1629,7 @@ async def _store_online_record(
         socket_path,
         {
             "op": "transfer_store",
-            "payload": {"data": b"x" * nbytes},
+            "payload": {"data": fill * nbytes},
             "spans": [
                 {
                     "source_offset": 0,
@@ -1823,6 +1823,79 @@ async def test_exclusive_tiers_write_records_only_when_l1_evicts_them(
         assert _l2_write_bytes(registry) == written * local_slot_size
         assert _metric_value(registry, "daser_held_bytes") == 2 * local_slot_size
     finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_exclusive_store_evicted_before_registration_keeps_its_successor(
+    tmp_path, monkeypatch
+) -> None:
+    """A held store evicted before it registers keeps the record reusing its bytes.
+
+    Store "a" is paused after its write, before its held range is registered.
+    Stores "b" and "c" then evict "z" and "a" from the two-record arena.
+    Whatever survives must load back its own bytes.
+    """
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    registry = MetricsRegistry()
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path,
+        logical_slots=8,
+        arena_slots=2,
+        metrics_registry=registry,
+        l1_slots=2,
+    )
+    entered, gate = asyncio.Event(), asyncio.Event()
+    record_store_ranges = core.record_store_ranges
+
+    async def paused_record(spans: list[dict[str, Any]], **kwargs: Any) -> list[str]:
+        if any(span.get("chunk_key") == "a" for span in spans):
+            entered.set()
+            await gate.wait()
+        return await record_store_ranges(spans, **kwargs)
+
+    monkeypatch.setattr(core, "record_store_ranges", paused_record)
+    await server.start()
+    try:
+        await _store_online_record(socket_path, "z", local_slot_size, b"z")
+        await server.drain_transfer()
+        first = asyncio.create_task(
+            _store_online_record(socket_path, "a", local_slot_size, b"a")
+        )
+        await asyncio.wait_for(entered.wait(), 10)
+        for key in "bc":
+            await _store_online_record(socket_path, key, local_slot_size, key.encode())
+        gate.set()
+        await first
+        await server.drain_transfer()
+        present = [k for k in "zabc" if core.chunk_manager.store.get(k) is not None]
+        assert present
+        for key in present:
+            record = core.chunk_manager.store.get(key)
+            assert record is not None
+            (ref,) = core.packed_slot_refs(record.start_slot, 1)
+            load = await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_load",
+                    "payload": {"return_data": True},
+                    "spans": [
+                        {
+                            "target_offset": 0,
+                            "file_offset": int(ref["file_offset"]),
+                            "nbytes": int(ref["stored_length"]),
+                        }
+                    ],
+                },
+            )
+            assert load["data"] == key.encode() * local_slot_size
+        assert (
+            _metric_value(registry, "daser_packed_deferred_free_bytes_total")
+            == local_slot_size
+        )
+    finally:
+        gate.set()
         await server.drain_transfer()
         await server.stop()
 

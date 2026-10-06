@@ -1445,38 +1445,47 @@ class IPCServer:
                 (time.perf_counter() - started) * 1000,
             )
         finally:
-            if write_hold is not None:
-                self._packed_layout.end_writes(write_hold)
+            # A held range is registered only after record_store_ranges, so
+            # its bytes stay reserved until then: freed earlier, a later
+            # record placed there would share the held range's L1 key.
+            if write_hold is not None and held_spans is None:
+                self._end_packed_writes(write_hold)
             if (
                 isinstance(buffer, _UncachedCudaArray)
                 and "store_staging_buffer_index" not in payload
             ):
                 buffer.close()
-        if accepted_spans:
-            configured_tp_size = int(
-                self._runtime_config.get("tensor_parallel_size", tp_size)
-            )
-            if configured_tp_size != tp_size:
-                raise ValueError(
-                    f"transfer TP size {tp_size} != configured {configured_tp_size}"
+        try:
+            if accepted_spans:
+                configured_tp_size = int(
+                    self._runtime_config.get("tensor_parallel_size", tp_size)
                 )
-            slot_size = int(self._runtime_config.get("slot_size", 0))
-            local_slot_size = int(
-                self._runtime_config.get(
-                    "local_slot_size", slot_size // max(1, tp_size)
+                if configured_tp_size != tp_size:
+                    raise ValueError(
+                        f"transfer TP size {tp_size} != configured {configured_tp_size}"
+                    )
+                slot_size = int(self._runtime_config.get("slot_size", 0))
+                local_slot_size = int(
+                    self._runtime_config.get(
+                        "local_slot_size", slot_size // max(1, tp_size)
+                    )
                 )
-            )
-            rank_stride_bytes = int(self._runtime_config.get("rank_stride_bytes", 0))
-            await self._core.record_store_ranges(
-                accepted_spans,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                local_slot_size=local_slot_size,
-                rank_stride_bytes=rank_stride_bytes,
-            )
-        if held_spans is not None:
-            # After record_store_ranges: an early deny may evict the chunk.
-            await self._record_held_spans(transfer, *held_spans)
+                rank_stride_bytes = int(
+                    self._runtime_config.get("rank_stride_bytes", 0)
+                )
+                await self._core.record_store_ranges(
+                    accepted_spans,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    local_slot_size=local_slot_size,
+                    rank_stride_bytes=rank_stride_bytes,
+                )
+            if held_spans is not None:
+                # After record_store_ranges: an early deny may evict the chunk.
+                await self._record_held_spans(transfer, *held_spans)
+        finally:
+            if write_hold is not None and held_spans is not None:
+                self._end_packed_writes(write_hold)
         self._record_transfer_metrics(
             op="store",
             backend=backend,
@@ -1770,6 +1779,15 @@ class IPCServer:
             elapsed_s * 1000,
             throughput_gbps,
         )
+
+    def _end_packed_writes(self, token: int) -> None:
+        """End one packed write hold and count bytes freed late by it."""
+        freed = self._packed_layout.end_writes(token)
+        if freed:
+            self._metrics.counter(
+                "daser_packed_deferred_free_bytes_total",
+                "Packed bytes freed when a store finished after its chunk left.",
+            ).inc(freed)
 
     async def _record_held_spans(
         self,

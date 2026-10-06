@@ -259,7 +259,7 @@ def test_write_hold_keeps_evicted_bytes_until_the_write_ends() -> None:
         layout.compact([new], manager, local_slot_size=SLOT)
     assert layout.free_bytes() == SLOT - 3 * 4096
 
-    layout.end_writes(hold)
+    assert layout.end_writes(hold) == 3 * 4096
     assert layout.free_bytes() == SLOT
     assert layout.compact([new], manager, local_slot_size=SLOT)[0]["file_offset"] == 0
 
@@ -270,7 +270,7 @@ def test_write_hold_of_a_live_record_frees_nothing() -> None:
     layout = OnlinePackedLayout()
     record = allocate(manager, "live", 4096)
     placed = layout.compact([record], manager, local_slot_size=SLOT)
-    layout.end_writes(layout.begin_writes(placed))
+    assert layout.end_writes(layout.begin_writes(placed)) == 0
     assert layout.free_bytes() == 2 * SLOT - 4096
     retry = layout.compact([record], manager, local_slot_size=SLOT)
     assert retry[0]["file_offset"] == placed[0]["file_offset"]

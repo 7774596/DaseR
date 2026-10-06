@@ -320,11 +320,14 @@ class OnlinePackedLayout:
         self._holds[token] = held
         return token
 
-    def end_writes(self, token: int) -> None:
+    def end_writes(self, token: int) -> int:
         """End a write hold and free bytes whose owner left meanwhile.
 
         Args:
             token: Value returned by ``begin_writes``.
+
+        Returns:
+            Bytes freed here because their owner was removed during the hold.
 
         Raises:
             KeyError: If the token is unknown or already ended.
@@ -333,10 +336,13 @@ class OnlinePackedLayout:
             Call on the server event loop once the transfer layer has the
             write ordered (returned or failed).
         """
+        freed = 0
         for rank_base, placement in self._holds.pop(token):
             placement.writers -= 1
             if placement.retired and placement.writers == 0:
                 self._arenas[rank_base].free(placement.file_offset, placement.nbytes)
+                freed += placement.nbytes
+        return freed
 
     def release(self, chunk_key: str, manager: ChunkManager) -> None:
         """Reclaim the bytes of a chunk that is no longer a current allocation.
