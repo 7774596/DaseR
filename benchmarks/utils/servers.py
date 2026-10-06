@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -642,6 +643,7 @@ class ServerManager:
             gpu_ids=",".join(
                 dict.fromkeys((str(self.gpu_id), *self.extra_vllm_gpu_ids))
             ),
+            profile_env="DASER_BENCH_PROFILE_DASER",
         )
         await self._wait_healthy(self.daser_url, "/health", self.startup_timeout, proc)
 
@@ -723,6 +725,7 @@ class ServerManager:
             log_name,
             extra_env=extra_env,
             gpu_ids=gpu_ids,
+            profile_env="DASER_BENCH_PROFILE_VLLM",
         )
         await self._wait_healthy(
             f"http://127.0.0.1:{port}", "/health", self.startup_timeout, proc
@@ -800,10 +803,13 @@ class ServerManager:
         log_name: str,
         extra_env: dict[str, str] | None = None,
         gpu_ids: str | None = None,
+        profile_env: str | None = None,
     ) -> subprocess.Popen[bytes]:
         visible = str(self.gpu_id) if gpu_ids is None else gpu_ids
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / log_name
+        if profile_env is not None:
+            cmd = profile_prefix(profile_env, log_path) + cmd
         fh = log_path.open("wb")
         env = os.environ.copy()
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -930,6 +936,29 @@ class ServerManager:
         if busy:
             joined = ", ".join(str(port) for port in busy)
             raise RuntimeError(f"benchmark service port(s) already in use: {joined}")
+
+
+def profile_prefix(env_var: str, log_path: Path) -> list[str]:
+    """Return a profiler command prefix configured through ``env_var``.
+
+    The variable holds a shell-style command (for example an ``nsys profile``
+    invocation) prepended to the service argv; ``{log}`` expands to the
+    service log path without its suffix, so each instance gets its own report.
+
+    Args:
+        env_var: ``DASER_BENCH_PROFILE_VLLM`` or ``DASER_BENCH_PROFILE_DASER``.
+        log_path: Service log path.
+
+    Returns:
+        The prefix argv, empty when the variable is unset (default).
+
+    Thread-safety:
+        Reads the process environment only.
+    """
+    template = os.environ.get(env_var, "").strip()
+    if not template:
+        return []
+    return shlex.split(template.replace("{log}", str(log_path.with_suffix(""))))
 
 
 def _is_port_open(host: str, port: int) -> bool:

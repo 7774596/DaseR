@@ -805,6 +805,7 @@ async def test_daser_benchmark_start_does_not_force_debug_logging(
         log_name: str,
         extra_env: dict[str, str] | None = None,
         gpu_ids: str | None = None,
+        profile_env: str | None = None,
     ) -> subprocess.Popen[bytes]:
         observed["log_name"] = log_name
         observed["level"] = (
@@ -4068,3 +4069,26 @@ def test_extra_vllm_instances_require_daser_backend(tmp_path: Path) -> None:
             l2_size_bytes=1,
             extra_vllm_gpu_ids=("3",),
         )
+
+
+def test_profile_prefix_is_empty_unless_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profiling wraps a service only when its variable is set."""
+    from benchmarks.utils.servers import profile_prefix
+
+    log = tmp_path / "vllm_daser_1.log"
+    monkeypatch.delenv("DASER_BENCH_PROFILE_VLLM", raising=False)
+    assert profile_prefix("DASER_BENCH_PROFILE_VLLM", log) == []
+    monkeypatch.setenv(
+        "DASER_BENCH_PROFILE_VLLM", "nsys profile -t cuda -o {log} --kill=sigterm"
+    )
+    assert profile_prefix("DASER_BENCH_PROFILE_VLLM", log) == [
+        "nsys",
+        "profile",
+        "-t",
+        "cuda",
+        "-o",
+        str(tmp_path / "vllm_daser_1"),
+        "--kill=sigterm",
+    ]
