@@ -56,6 +56,22 @@ def parse(lines: Iterable[str]) -> list[tuple[list[str], int]]:
     return stacks
 
 
+def within(
+    stacks: list[tuple[list[str], int]], pattern: str
+) -> list[tuple[list[str], int]]:
+    """Keep the stacks that contain a frame matching ``pattern``.
+
+    Args:
+        stacks: Output of :func:`parse`.
+        pattern: Regex searched in each frame.
+
+    Returns:
+        The matching stacks, unchanged.
+    """
+    regex = re.compile(pattern)
+    return [(f, c) for f, c in stacks if any(regex.search(x) for x in f)]
+
+
 def summarize(
     stacks: list[tuple[list[str], int]], match: str = DEFAULT_MATCH, top: int = 12
 ) -> list[str]:
@@ -98,9 +114,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("profile", type=Path)
     parser.add_argument("--match", default=DEFAULT_MATCH)
     parser.add_argument("--top", type=int, default=12)
+    parser.add_argument(
+        "--within",
+        default=None,
+        help="keep only stacks with a frame matching this regex (e.g. one "
+        "thread's loop); shares are then relative to those stacks",
+    )
     args = parser.parse_args(argv)
-    with args.profile.open() as handle:
-        print("\n".join(summarize(parse(handle), args.match, args.top)))
+    # Native frames can carry non-UTF-8 symbol bytes.
+    with args.profile.open(errors="replace") as handle:
+        stacks = parse(handle)
+    if args.within is not None:
+        stacks = within(stacks, args.within)
+    print("\n".join(summarize(stacks, args.match, args.top)))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the py-spy raw profile summary."""
 
-from benchmarks.research.pyspy_summary import frame_key, parse, summarize
+from benchmarks.research.pyspy_summary import frame_key, parse, summarize, within
 
 
 def test_frame_key_drops_line_number() -> None:
@@ -29,3 +29,11 @@ def test_inclusive_counts_each_frame_once_per_stack() -> None:
     assert "incl 0.750 f server/a.py" in lines
     assert not any(line.startswith("incl") and "x/y.py" in line for line in lines)
     assert "self 0.750 g x/y.py" in lines
+
+
+def test_within_keeps_matching_stacks_only() -> None:
+    """Shares after ``within`` are relative to the kept stacks."""
+    stacks = parse(["p;loop (core.py:1);a (x.py:2) 1", "p;idle (t.py:3) 3"])
+    kept = within(stacks, r"loop \(core")
+    assert kept == [(["p", "loop (core.py:1)", "a (x.py:2)"], 1)]
+    assert "self 1.000 a x.py" in summarize(kept)
