@@ -70,6 +70,9 @@ class TraceRequest:
             prefix dependencies it replaces the arrival timestamp for
             dependent requests, so replay keeps real gaps however long the
             server takes.
+        prewarm_tokens: Optional leading prompt tokens known as soon as the
+            prefix producer completes (a user turn whose previous query
+            chain a thinking-model template re-renders without reasoning).
 
     Thread-safety:
         Immutable and safe to share across replay tasks.
@@ -82,6 +85,7 @@ class TraceRequest:
     hash_ids: tuple[int, ...]
     session_id: int | None = None
     gap_ms: float | None = None
+    prewarm_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -813,6 +817,7 @@ async def replay(
     strict_order: bool = False,
     dependency_gap_s: float = 0.0,
     ordered_admission: bool = False,
+    prewarm: bool = False,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -858,6 +863,12 @@ async def replay(
             order: each one waits until the previous trace request was
             admitted (and for its own prefix dependency), so the send order is
             the trace order while up to ``max_inflight`` requests overlap.
+        prewarm: When a dependent request carries ``prewarm_tokens``, send
+            that prefix (one output token, outside the concurrency limit) as
+            soon as its producer completes, so its prefill runs during the
+            idle gap. The request itself is sent after the prewarm finishes;
+            any wait past the gap counts toward its TTFT. Records carry
+            ``prewarm_ms`` and ``prewarm_error``.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -937,6 +948,7 @@ async def replay(
                             else None
                         ),
                         admitted=admitted_events[position],
+                        prewarm=prewarm,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -1012,6 +1024,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Re-bind a request waiting for GPU KV to another instance this "
         "many seconds past its expected prefill time (off by default).",
+    )
+    parser.add_argument(
+        "--prewarm-stripped",
+        action="store_true",
+        help="Prefill each row's prewarm_tokens prefix as soon as its "
+        "prefix producer completes (off by default).",
     )
     parser.add_argument(
         "--route-saturation-s",
@@ -1149,6 +1167,7 @@ async def main_async(args: argparse.Namespace) -> int:
         strict_order=args.strict_order,
         dependency_gap_s=args.dependency_gap_s,
         ordered_admission=args.ordered_admission,
+        prewarm=args.prewarm_stripped,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1211,6 +1230,12 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
     gap_ms = None if raw_gap is None else _number(raw_gap, index, "gap_ms")
     if gap_ms is not None and gap_ms < 0:
         raise ValueError(f"row {index}: gap_ms must be non-negative")
+    raw_prewarm = payload.get("prewarm_tokens")
+    prewarm_tokens = (
+        None if raw_prewarm is None else _integer(raw_prewarm, index, "prewarm_tokens")
+    )
+    if prewarm_tokens is not None and not 0 < prewarm_tokens <= input_length:
+        raise ValueError(f"row {index}: prewarm_tokens must be in [1, input_length]")
     return TraceRequest(
         index=index,
         timestamp_ms=timestamp,
@@ -1219,6 +1244,7 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
         hash_ids=hash_ids,
         session_id=session_id,
         gap_ms=gap_ms,
+        prewarm_tokens=prewarm_tokens,
     )
 
 
@@ -1316,6 +1342,61 @@ async def _rebind_when_waiting(
     return None
 
 
+async def _prewarm_prefix(
+    *,
+    request: TraceRequest,
+    prompt_builder: PromptBuilder,
+    client: httpx.AsyncClient,
+    router: InstanceRouter,
+    served_model_name: str,
+    timeout_seconds: float,
+    seed: int,
+) -> tuple[float, str | None]:
+    """Prefill ``request``'s known prefix with a one-token completion.
+
+    The prefix request is routed like the request itself (same session), so
+    its KV lands where the request will look for it.
+
+    Returns:
+        ``(elapsed milliseconds, error or None)``.
+    """
+    tokens = request.prewarm_tokens or 0
+    prefix = replace(
+        request,
+        input_length=tokens,
+        output_length=1,
+        hash_ids=request.hash_ids[: math.ceil(tokens / MOONCAKE_BLOCK_TOKENS)],
+    )
+    begin = time.perf_counter()
+    instance, work = router.acquire(prefix)
+    try:
+        result = await vllm_completion_stream(
+            client,
+            router.server_urls[instance],
+            BenchmarkSample(
+                sample_id=request.index,
+                dataset="mooncake-toolagent",
+                context="",
+                question="",
+                answers=[],
+            ),
+            prompt_builder.build(prefix),
+            {
+                "model": served_model_name,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "ignore_eos": True,
+                "seed": seed,
+                "request_id": f"trace-{request.index}-warm",
+            },
+            asyncio.Semaphore(1),
+            timeout_seconds,
+        )
+    finally:
+        router.release(instance, work, prefix)
+    return (time.perf_counter() - begin) * 1000.0, result.error
+
+
 async def _run_request(
     *,
     request: TraceRequest,
@@ -1334,9 +1415,11 @@ async def _run_request(
     dependency_gap_s: float = 0.0,
     admit_after: asyncio.Event | None = None,
     admitted: asyncio.Event | None = None,
+    prewarm: bool = False,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
+            prewarm=prewarm,
             dependency_gap_s=dependency_gap_s,
             admit_after=admit_after,
             admitted=admitted,
@@ -1377,6 +1460,7 @@ async def _run_request_after_dependency(
     dependency_gap_s: float = 0.0,
     admit_after: asyncio.Event | None = None,
     admitted: asyncio.Event | None = None,
+    prewarm: bool = False,
 ) -> dict[str, Any]:
     # A dependent request with a recorded gap is paced by its producer's
     # completion, not by its arrival timestamp.
@@ -1387,13 +1471,35 @@ async def _run_request_after_dependency(
             max(0.0, started_at + scheduled_offset - time.perf_counter())
         )
     dependency_at = time.perf_counter()
+    warm: asyncio.Task[tuple[float, str | None]] | None = None
     if wait_for is not None:
         await wait_for.wait()
+        if prewarm and request.prewarm_tokens:
+            warm = asyncio.create_task(
+                _prewarm_prefix(
+                    request=request,
+                    prompt_builder=prompt_builder,
+                    client=client,
+                    router=router,
+                    served_model_name=served_model_name,
+                    timeout_seconds=timeout_seconds,
+                    seed=seed,
+                )
+            )
         # Idle time after the dependency (tool execution / think time).
         gap_s = dependency_gap_s
         if gap_paced:
             gap_s += scheduled_offset_seconds(request.gap_ms, time_scale)
         await asyncio.sleep(gap_s)
+    prewarm_ms: float | None = None
+    prewarm_error: str | None = None
+    warm_wait_s = 0.0
+    if warm is not None:
+        # The gateway sends the turn once its prefix is resident; a prewarm
+        # outlasting the idle gap delays the request's first token.
+        warm_from = time.perf_counter()
+        prewarm_ms, prewarm_error = await warm
+        warm_wait_s = time.perf_counter() - warm_from
     queued_at = time.perf_counter()
     if gap_paced:
         # The request arrives when its gap ends.
@@ -1469,9 +1575,11 @@ async def _run_request_after_dependency(
             if stream is not None and not stream.done():
                 stream.cancel()
             router.release(instance, work, request)
+        shift_ms = warm_wait_s * 1000.0
         if resent_at is not None:
             # Time spent on the abandoned instance counts toward TTFT.
-            shift_ms = (resent_at - sent_at) * 1000.0
+            shift_ms += (resent_at - sent_at) * 1000.0
+        if shift_ms:
             result = replace(
                 result,
                 ttft_ms=result.ttft_ms + shift_ms,
@@ -1490,6 +1598,9 @@ async def _run_request_after_dependency(
     )
     record["instance"] = instance
     record["session_id"] = request.session_id
+    if warm is not None:
+        record["prewarm_ms"] = prewarm_ms
+        record["prewarm_error"] = prewarm_error
     record["rebinds"] = rebinds
     writer.write(record)
     return record

@@ -87,3 +87,45 @@ def test_real_time_export_caps_gaps_and_keeps_arrivals(tmp_path: Path) -> None:
     stamps = [row["timestamp"] for row in rows]
     # Compressed timeline: service 1 s + gap between consecutive arrivals.
     assert [b - a for a, b in zip(stamps, stamps[1:], strict=False)] == [3000, 6000]
+
+
+def test_reasoning_strip_rewrites_the_previous_chain_at_user_turns(
+    tmp_path: Path,
+) -> None:
+    """A user turn re-IDs the previous chain's blocks and marks a prewarm prefix."""
+    path = tmp_path / "traces.jsonl"
+    session = _session(
+        [
+            (0.0, 1024, 10),  # user query; chain 0 starts at 1024
+            (1.0, 2048, 10),  # tool step
+            (2.0, 3072, 10),  # user turn: tokens 1024+ re-rendered
+            (3.0, 3584, 10),  # tool step of chain 1
+            (4.0, 4096, 10),  # user turn: tokens 3072+ re-rendered
+        ]
+    )
+    for r, think in zip(session["requests"], (0, 0, 60, 0, 60), strict=True):
+        r["think_time"] = think
+    path.write_text(json.dumps(session) + "\n")
+
+    plain = export(str(path), 1, 1.0, 262144, 0, seed=0, step_ms=1)
+    rows = export(
+        str(path), 1, 1.0, 262144, 0, seed=0, step_ms=1, reasoning_strip_think_s=5.0
+    )
+
+    ids = [row["hash_ids"] for row in rows]
+    assert plain[2]["hash_ids"][:4] == plain[1]["hash_ids"]
+    # Blocks before the chain start survive; the chain tail is new.
+    assert ids[2][:2] == ids[1][:2]
+    assert not set(ids[2][2:]) & set(ids[1])
+    # Within the new chain, tool steps reuse the re-rendered prefix.
+    assert ids[3][:6] == ids[2]
+    # The next user turn keeps chain 1's prefix up to its start (3072).
+    assert ids[4][:6] == ids[3][:6]
+    assert ids[4][6] != ids[3][6]
+    assert [row.get("prewarm_tokens") for row in rows] == [
+        None,
+        None,
+        2058,
+        None,
+        3594,
+    ]

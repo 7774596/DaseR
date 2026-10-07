@@ -17,6 +17,10 @@ at C seconds, timestamps are merged arrivals in milliseconds, and each row's
 ``gap_ms`` (idle time after the previous request of the same session and
 model) lets prefix-dependent replay start it that long after its producer
 completes.
+``--reasoning-strip-think-s S`` models a thinking-model template that drops
+past reasoning at user turns (idle longer than S seconds): the previous query
+chain is re-rendered, so its blocks get new IDs, and the user-turn row carries
+``prewarm_tokens``, the prefix known as soon as that chain ends.
 ``--max-output`` caps decode length so replays measure TTFT, not decode.
 ``--round-robin K`` instead models K closed-loop agents sharing one server
 (tool waits longer than the other agents' service): K sessions are live and
@@ -24,6 +28,7 @@ take turns one request each; a finished session's slot goes to the next one.
 """
 
 import argparse
+import bisect
 import json
 import math
 import random
@@ -34,7 +39,11 @@ GROUP = OUT_BLOCK_TOKENS // CC_BLOCK_TOKENS
 
 
 def _block_ids(
-    hash_ids: list[int], tokens: int, scope: tuple[int, str], table: dict
+    hash_ids: list[int],
+    tokens: int,
+    scope: tuple[int, str],
+    table: dict,
+    epochs: list[tuple[int, int]] | None = None,
 ) -> list[int]:
     """Map one request's 64-token chained hashes to global 512-token IDs.
 
@@ -43,16 +52,74 @@ def _block_ids(
         tokens: request input length in tokens.
         scope: ``(session index, model)`` namespace for the local IDs.
         table: shared key -> global ID map, extended in place.
+        epochs: optional reasoning-strip rewrite points ``(token offset,
+            epoch)`` sorted by offset, first offset 0. A block ending past an
+            offset takes that epoch, so blocks rewritten at a user turn get
+            new IDs while older and later requests of the same epoch agree.
 
     Returns:
         One global ID per 512-token block of the request.
     """
     ids = []
+    offsets = [o for o, _ in epochs] if epochs else []
     for start in range(0, math.ceil(tokens / OUT_BLOCK_TOKENS) * GROUP, GROUP):
         group = hash_ids[start : start + GROUP]
         key = (*scope, group[-1], len(group))
+        if epochs:
+            end = start * CC_BLOCK_TOKENS + len(group) * CC_BLOCK_TOKENS
+            key += (epochs[bisect.bisect_left(offsets, end) - 1][1],)
         ids.append(table.setdefault(key, len(table)))
     return ids
+
+
+def _strip_reasoning(
+    reqs: list[dict], think_s: float
+) -> tuple[list[list[tuple[int, int]]], list[int]]:
+    """Model a thinking-model chat template that strips past reasoning.
+
+    Templates such as Qwen3's drop ``reasoning_content`` of every assistant
+    message before the last real user query. When a new user turn arrives
+    (``think_time`` above ``think_s``), the previous query chain is re-rendered
+    without reasoning, so the prompt diverges where that chain started and its
+    whole tail is recomputed, while the old chain KV is never read again.
+
+    Args:
+        reqs: one session's requests in time order.
+        think_s: idle seconds above which a request starts a new user turn.
+
+    Returns:
+        ``(epochs, prewarm)`` per request: the rewrite points to pass to
+        :func:`_block_ids`, and the leading tokens of the request that are
+        known when the previous chain ends (0 when not a user turn). The
+        known prefix is capped at the previous request's input plus output,
+        an upper bound on the stripped chain because reasoning is part of
+        the recorded output.
+    """
+    state: dict[str, dict] = {}
+    epochs_out, prewarm_out = [], []
+    for r in reqs:
+        s = state.get(r["model"])
+        prewarm = 0
+        if s is None:
+            s = state[r["model"]] = {
+                "epochs": [(0, 0)],
+                "next": 1,
+                "start": r["in"],
+                "prev": r,
+            }
+        elif r.get("think_time", 0.0) > think_s:
+            # Re-render diverges at the previous chain's first assistant turn.
+            start = s["start"]
+            kept = [e for e in s["epochs"] if e[0] < start]
+            s["epochs"] = [*kept, (start, s["next"])]
+            s["next"] += 1
+            prev = s["prev"]
+            prewarm = min(r["in"], prev["in"] + prev["out"])
+            s["start"] = r["in"]
+        s["prev"] = r
+        epochs_out.append(list(s["epochs"]))
+        prewarm_out.append(prewarm)
+    return epochs_out, prewarm_out
 
 
 def _poisson_order(
@@ -178,6 +245,7 @@ def export(
     min_requests: int = 1,
     round_robin: int = 0,
     real_time_gap_cap_s: float = 0.0,
+    reasoning_strip_think_s: float = 0.0,
 ) -> list[dict]:
     """Build the merged replay rows.
 
@@ -199,11 +267,16 @@ def export(
             arrival in milliseconds (not ``index * step_ms``) and each row
             carries ``gap_ms``, its capped idle time after the session's
             previous request, for gap-paced closed-loop replay.
+        reasoning_strip_think_s: when positive, model a template that strips
+            past reasoning at user turns (``think_time`` above this many
+            seconds): rewritten blocks get new IDs, and each user-turn row
+            carries ``prewarm_tokens``, its prefix known when the previous
+            chain ends.
 
     Returns:
         Mooncake rows (``timestamp``, ``input_length``, ``output_length``,
-        ``hash_ids``, ``session_id``, and ``gap_ms`` in real-time mode) in
-        replay order.
+        ``hash_ids``, ``session_id``, ``gap_ms`` in real-time mode and
+        ``prewarm_tokens`` on stripped user turns) in replay order.
     """
     chains = []
     with open(path) as f:
@@ -233,6 +306,11 @@ def export(
         else _poisson_order(chains, concurrency, rng)
     )
     gaps = [_chain_gaps(c, real_time_gap_cap_s) for c in chains] if real_time else []
+    strip = (
+        [_strip_reasoning(c, reasoning_strip_think_s) for c in chains]
+        if reasoning_strip_think_s > 0
+        else []
+    )
     table: dict = {}
     rows = []
     for index, (arrival, sid, i) in enumerate(stream):
@@ -241,11 +319,19 @@ def export(
             "timestamp": round(arrival * 1000) if real_time else index * step_ms,
             "input_length": r["in"],
             "output_length": max(1, min(r["out"], max_output or r["out"])),
-            "hash_ids": _block_ids(r["hash_ids"], r["in"], (sid, r["model"]), table),
+            "hash_ids": _block_ids(
+                r["hash_ids"],
+                r["in"],
+                (sid, r["model"]),
+                table,
+                strip[sid][0][i] if strip else None,
+            ),
             "session_id": sid,
         }
         if real_time:
             row["gap_ms"] = round(gaps[sid][i] * 1000)
+        if strip and strip[sid][1][i]:
+            row["prewarm_tokens"] = strip[sid][1][i]
         rows.append(row)
     return rows
 
@@ -271,6 +357,12 @@ def main() -> None:
         default=0.0,
         help="Emit real-time rows (ms timestamps + gap_ms) with gaps capped here.",
     )
+    p.add_argument(
+        "--reasoning-strip-think-s",
+        type=float,
+        default=0.0,
+        help="Strip past reasoning at user turns idle longer than this (seconds).",
+    )
     a = p.parse_args()
     rows = export(
         a.cc_traces,
@@ -285,6 +377,7 @@ def main() -> None:
         a.min_requests,
         a.round_robin,
         a.real_time_gap_cap_s,
+        a.reasoning_strip_think_s,
     )
     with open(a.output, "w") as f:
         for row in rows:

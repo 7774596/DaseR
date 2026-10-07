@@ -534,6 +534,89 @@ def test_load_trace_reads_optional_gap(tmp_path: Path) -> None:
         load_trace(path)
 
 
+def test_load_trace_bounds_prewarm_tokens(tmp_path: Path) -> None:
+    """prewarm_tokens is optional and must lie within the prompt."""
+    path = tmp_path / "trace.jsonl"
+    row = {"timestamp": 0, "input_length": 10, "output_length": 1, "hash_ids": [1]}
+    path.write_text(json.dumps({**row, "prewarm_tokens": 8}) + "\n")
+    assert load_trace(path)[0].prewarm_tokens == 8
+
+    path.write_text(json.dumps({**row, "prewarm_tokens": 11}) + "\n")
+    with pytest.raises(ValueError, match="prewarm_tokens"):
+        load_trace(path)
+
+
+def _prewarm_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prewarm: bool, warm_s: float
+) -> tuple[list[tuple[int, int, str | None, float]], dict[int, dict]]:
+    """Replay a producer and a gap-paced user turn with a known prefix."""
+    sends: list[tuple[int, int, str | None, float]] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        index, prompt, params = args[2].sample_id, args[3], args[4]
+        sends.append(
+            (index, len(prompt), params.get("request_id"), time.perf_counter())
+        )
+        if kwargs.get("on_send"):
+            kwargs["on_send"]()
+        await asyncio.sleep(warm_s if params["max_tokens"] == 1 else 0.0)
+        return RequestResult(index, "d", "", 1.0, 2.0, len(prompt), 1)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 1024, 8, (1, 2), session_id=0),
+        TraceRequest(
+            1, 0, 2048, 8, (1, 3, 4, 5), session_id=0, gap_ms=50, prewarm_tokens=1100
+        ),
+    ]
+    results, _, _ = asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100_000),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://a",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            prefix_dependencies=True,
+            prewarm=prewarm,
+        )
+    )
+    return sends, {record["trace_index"]: record for record in results}
+
+
+def test_prewarm_sends_the_known_prefix_during_the_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prefix goes out when the producer ends; the turn follows its gap."""
+    sends, by_index = _prewarm_replay(tmp_path, monkeypatch, True, warm_s=0.0)
+
+    assert [(i, n, rid) for i, n, rid, _ in sends] == [
+        (0, 1024, None),
+        (1, 1100, "trace-1-warm"),
+        (1, 2048, None),
+    ]
+    assert sends[2][3] - sends[1][3] >= 0.05
+    assert by_index[1]["prewarm_error"] is None
+    assert by_index[1]["ttft_ms"] < 5.0
+    assert "prewarm_ms" not in by_index[0]
+
+
+def test_prewarm_outlasting_the_gap_counts_toward_ttft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn waits for its prewarm, and that extra wait is part of TTFT."""
+    _, by_index = _prewarm_replay(tmp_path, monkeypatch, True, warm_s=0.2)
+    assert by_index[1]["prewarm_ms"] >= 200.0
+    assert 140.0 <= by_index[1]["ttft_ms"] < 200.0
+
+    sends, by_index = _prewarm_replay(tmp_path, monkeypatch, False, warm_s=0.2)
+    assert [i for i, *_ in sends] == [0, 1]
+    assert "prewarm_ms" not in by_index[1]
+
+
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
     """Blocks carry corpus text; equal hashes match and distinct hashes differ."""
     corpus = list(range(5000, 5000 + 3 * MOONCAKE_BLOCK_TOKENS))
