@@ -46,6 +46,24 @@ def _pid_running(pid: int) -> bool:
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def _group_running(pgid: int) -> bool:
+    """Return whether any live, non-zombie process is in group ``pgid``.
+
+    Services lead their own process group, so a wrapper (``nsys profile``)
+    exiting while the server it started still runs is not a service exit.
+    """
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if fields[0] != "Z" and int(fields[2]) == pgid:
+            return True
+    return False
+
+
 def _find_replay_pid(output_dir: Path) -> int | None:
     """Return the PID of the replay client writing to ``output_dir``."""
     needle = str(output_dir.resolve())
@@ -238,7 +256,8 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
         pid_file = args.service_dir / "pids.json"
         if pid_file.is_file():
             for item in json.loads(pid_file.read_text()):
-                if not _pid_running(int(item["pid"])):
+                pid = int(item["pid"])
+                if not _pid_running(pid) and not _group_running(pid):
                     name = " ".join(item.get("cmd", [])[:2]) or item["pid"]
                     return False, f"service {name} exited; {history[0]}"
 
