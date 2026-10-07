@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +39,28 @@ LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
 # The connector targets the vLLM 0.30 KV cache layouts; older releases fail
 # only after model load with an unknown cache layout error.
 MIN_VLLM_VERSION = (0, 30)
+
+
+def _signal_service(pid: int, sig: int) -> bool:
+    """Send ``sig`` to a service's process group, or to the PID alone.
+
+    Args:
+        pid: Service PID; services lead their own process group.
+        sig: Signal number; ``0`` only probes whether anything is alive.
+
+    Returns:
+        True if the group or process existed and was signalled.
+    """
+    try:
+        os.killpg(pid, sig)
+        return True
+    except ProcessLookupError:
+        pass
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def check_runtime_environment() -> None:
@@ -821,11 +844,15 @@ class ServerManager:
         )
         if extra_env:
             env.update(extra_env)
+        # Each service leads its own process group so stop_from_pid_file can
+        # reach every descendant, even after a wrapper (profiler, launcher)
+        # exited and left the real server re-parented.
         proc = subprocess.Popen(
             cmd,
             stdout=fh,
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=True,
         )
         self._procs.append((proc, visible))
         # Record every spawn at once so a later startup failure can still stop
@@ -974,6 +1001,11 @@ def _is_port_open(host: str, port: int) -> bool:
 def stop_from_pid_file(path: str | Path) -> None:
     """Terminate processes listed in a benchmark pid file.
 
+    Each recorded PID leads its own process group (services start in a new
+    session), so the whole group is signalled: descendants left behind by an
+    exited wrapper are stopped too. A PID that is not a group leader is
+    signalled alone.
+
     Args:
         path: PID JSON path.
 
@@ -985,22 +1017,13 @@ def stop_from_pid_file(path: str | Path) -> None:
         return
     payload = json.loads(pid_path.read_text(encoding="utf-8"))
     for item in reversed(payload):
-        pid = int(item["pid"])
-        try:
-            os.kill(pid, 15)
-        except ProcessLookupError:
-            pass
+        _signal_service(int(item["pid"]), signal.SIGTERM)
     deadline = time.monotonic() + 15.0
     for item in reversed(payload):
         pid = int(item["pid"])
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not _signal_service(pid, 0):
                 break
             time.sleep(0.2)
         else:
-            try:
-                os.kill(pid, 9)
-            except ProcessLookupError:
-                pass
+            _signal_service(pid, signal.SIGKILL)

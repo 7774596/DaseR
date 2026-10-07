@@ -4092,6 +4092,31 @@ def test_profile_prefix_is_empty_unless_configured(
     ]
 
 
+def test_stop_from_pid_file_stops_children_of_an_exited_wrapper(
+    tmp_path: Path,
+) -> None:
+    """A service whose wrapper already exited is still stopped by its group."""
+    from benchmarks.utils.servers import stop_from_pid_file
+
+    # The wrapper starts the real server in the background and exits, the way
+    # a profiler does when its collection window ends.
+    wrapper = subprocess.Popen(
+        ["sh", "-c", "sleep 60 & echo $!"],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert wrapper.stdout is not None
+    child = int(wrapper.stdout.readline())
+    wrapper.wait(timeout=5)
+    pid_file = tmp_path / "pids.json"
+    pid_file.write_text(json.dumps([{"pid": wrapper.pid, "cmd": ["sh"]}]))
+
+    stop_from_pid_file(pid_file)
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+
+
 @pytest.mark.asyncio
 async def test_vllm_stream_counts_token_events_per_step() -> None:
     """Each streamed chunk with token IDs is one engine step."""
