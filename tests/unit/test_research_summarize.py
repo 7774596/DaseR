@@ -11,6 +11,7 @@ from benchmarks.research.summarize import (
     order_rows,
     overlap_bound_rows,
     request_hit_rows,
+    slo_rows,
     vllm_tick_rows,
 )
 
@@ -215,6 +216,53 @@ def test_arm_row_reports_ssd_reads_and_readahead_wait(tmp_path: Path) -> None:
 
     assert row["ssd_r_gib"] == "3.0"
     assert row["ra_wait_s"] == "2.5"
+
+
+def test_slo_goodput_needs_both_ttft_and_tpot(tmp_path: Path) -> None:
+    """Goodput counts requests meeting both SLOs; failures count as misses."""
+    arm_dir = tmp_path / "load" / "art" / "arm"
+    arm_dir.mkdir(parents=True)
+    records = [
+        # meets both: TTFT 100, TPOT (1100 - 100) / 10 = 100
+        {
+            "status": "completed",
+            "ttft_ms": 100.0,
+            "latency_ms": 1100.0,
+            "completion_tokens": 11,
+        },
+        # TPOT too slow: (3100 - 100) / 10 = 300
+        {
+            "status": "completed",
+            "ttft_ms": 100.0,
+            "latency_ms": 3100.0,
+            "completion_tokens": 11,
+        },
+        # TTFT too slow
+        {
+            "status": "completed",
+            "ttft_ms": 900.0,
+            "latency_ms": 1000.0,
+            "completion_tokens": 2,
+        },
+        # one token: TTFT alone decides
+        {
+            "status": "completed",
+            "ttft_ms": 50.0,
+            "latency_ms": 50.0,
+            "completion_tokens": 1,
+        },
+        {"status": "failed", "ttft_ms": 0.0, "latency_ms": 0.0},
+    ]
+    with (arm_dir / "requests.jsonl").open("w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    (arm_dir / "summary.json").write_text(json.dumps({"wall_seconds": 4.0}))
+
+    (line,) = slo_rows([arm_dir], ttft_ms=500.0, tpot_ms=150.0)[1:]
+
+    assert "ok=4" in line
+    assert "slo=0.400" in line
+    assert "goodput=0.500/s" in line
 
 
 def test_arm_row_reports_speculative_acceptance_length(tmp_path: Path) -> None:

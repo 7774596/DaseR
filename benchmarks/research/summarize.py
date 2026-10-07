@@ -484,6 +484,48 @@ def stage_rows(arm_dirs: list[Path], stages_path: Path, slo_ms: float) -> list[s
     return lines
 
 
+def slo_rows(arm_dirs: list[Path], ttft_ms: float, tpot_ms: float) -> list[str]:
+    """Report per-request SLO attainment and goodput per arm.
+
+    A request meets the SLO when its TTFT is at most ``ttft_ms`` and its mean
+    time per output token after the first is at most ``tpot_ms``; requests with
+    one output token are judged on TTFT alone.
+
+    Args:
+        arm_dirs: Arm artifact directories.
+        ttft_ms: TTFT SLO in milliseconds.
+        tpot_ms: TPOT SLO in milliseconds.
+
+    Returns:
+        One line per arm: completed requests, TTFT and TPOT p90, SLO attainment
+        over all sent requests (failures miss it), and goodput in SLO-meeting
+        requests per wall-clock second.
+    """
+    lines = [f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms)"]
+    for arm_dir in arm_dirs:
+        records = [json.loads(line) for line in (arm_dir / "requests.jsonl").open()]
+        wall = float(json.loads((arm_dir / "summary.json").read_text())["wall_seconds"])
+        done = [r for r in records if r["status"] == "completed"]
+        ttft = [float(r["ttft_ms"]) for r in done]
+        tpot = [
+            (float(r["latency_ms"]) - float(r["ttft_ms"]))
+            / max(int(r.get("completion_tokens", 1)) - 1, 1)
+            for r in done
+        ]
+        good = sum(
+            first <= ttft_ms
+            and (int(r.get("completion_tokens", 1)) <= 1 or t <= tpot_ms)
+            for r, first, t in zip(done, ttft, tpot, strict=True)
+        )
+        lines.append(
+            f"  {arm_dir.parent.parent.name}/{arm_dir.name}: ok={len(done)} "
+            f"ttft_p90={_p(ttft, 90):.0f} tpot_p90={_p(tpot, 90):.1f} "
+            f"slo={_rate(good, len(records))} "
+            f"goodput={good / wall if wall else 0:.3f}/s"
+        )
+    return lines
+
+
 def paired_rows(arm_dirs: list[Path], first: int, warm_ms: float = 0.0) -> list[str]:
     """Compare per-request TTFT on the first ``first`` shared trace requests.
 
@@ -800,7 +842,13 @@ def main() -> None:
     parser.add_argument(
         "--stages", type=Path, default=None, help="stages.json for per-stage rows"
     )
-    parser.add_argument("--slo-ms", type=float, default=2000.0)
+    parser.add_argument("--slo-ms", type=float, default=2000.0, help="TTFT SLO")
+    parser.add_argument(
+        "--slo-tpot-ms",
+        type=float,
+        default=None,
+        help="TPOT SLO; adds per-arm SLO goodput rows with --slo-ms as TTFT SLO",
+    )
     parser.add_argument(
         "--warm-ms",
         type=float,
@@ -869,6 +917,8 @@ def main() -> None:
         )
     if args.stages is not None:
         print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
+    if args.slo_tpot_ms is not None:
+        print("\n".join(slo_rows(arm_dirs, args.slo_ms, args.slo_tpot_ms)))
 
 
 if __name__ == "__main__":
