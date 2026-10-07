@@ -129,6 +129,7 @@ def export(
     seed: int,
     min_requests: int = 2,
     decode_step_s: float = 0.03,
+    min_session_tokens: int = 0,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     """Build the token stream and merged replay rows.
 
@@ -144,6 +145,8 @@ def export(
         min_requests: only keep sessions with at least this many rows.
         decode_step_s: estimated seconds per generated token, used only to
             space session starts (see :func:`session_span_s`).
+        min_session_tokens: only keep sessions whose longest kept prompt has
+            at least this many tokens (selects long-context sessions).
 
     Returns:
         ``(tokens, rows)``: all session streams back to back (int32) and
@@ -169,7 +172,8 @@ def export(
         stream, rows = session_rows(
             record, encode, header, max_ctx, max_output, gap_cap_s
         )
-        if len(rows) >= min_requests:
+        longest = max((row["input_length"] for row in rows), default=0)
+        if len(rows) >= min_requests and longest >= min_session_tokens:
             chains.append((stream, rows))
     spans = [session_span_s(rows, decode_step_s) for _, rows in chains]
     rate = concurrency / max(sum(spans) / max(len(spans), 1), 1e-9)
@@ -224,6 +228,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--min-requests", type=int, default=2)
     p.add_argument("--decode-step-s", type=float, default=0.03)
+    p.add_argument(
+        "--min-session-tokens",
+        type=int,
+        default=0,
+        help="Keep only sessions whose longest prompt reaches this many tokens.",
+    )
     a = p.parse_args()
     tokens, rows = export(
         a.sessions_file,
@@ -236,6 +246,7 @@ def main() -> None:
         a.seed,
         a.min_requests,
         a.decode_step_s,
+        a.min_session_tokens,
     )
     np.save(a.tokens, tokens)
     with open(a.output, "w") as f:

@@ -114,6 +114,42 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _json_object(text: str) -> dict[str, Any]:
+    """Parse a CLI JSON object argument.
+
+    Args:
+        text: JSON text.
+
+    Returns:
+        The parsed object.
+
+    Raises:
+        argparse.ArgumentTypeError: if ``text`` is not a JSON object.
+    """
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return value
+
+
+def _speculative_args(config: dict[str, Any] | None) -> tuple[str, ...]:
+    """Return ``vllm serve`` arguments enabling ``config`` speculation.
+
+    Args:
+        config: ``--speculative-config`` object, or None for no speculation.
+
+    Returns:
+        ``("--speculative-config", <compact JSON>)`` or an empty tuple. The JSON
+        is passed as one argv item, so it needs no shell quoting.
+    """
+    if config is None:
+        return ()
+    return ("--speculative-config", json.dumps(config, separators=(",", ":")))
+
+
 class MatchedServer(ServerManager):
     """ServerManager with prefix caching on and a fixed GPU KV byte budget."""
 
@@ -347,6 +383,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Extra vllm serve arguments for every arm (shell-split).",
     )
+    parser.add_argument(
+        "--speculative-config",
+        type=_json_object,
+        default=None,
+        help="vllm serve --speculative-config JSON for every arm, so arms "
+        "compare under the same speculative-decoding baseline.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -459,7 +502,8 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         lmcache_l2_odirect=True,
         lmcache_l2_native_workers=args.lmcache_l2_native_workers,
         lmcache_l2_bounded=args.lmcache_l2_bounded,
-        extra_vllm_args=tuple(shlex.split(args.vllm_extra_args)),
+        extra_vllm_args=tuple(shlex.split(args.vllm_extra_args))
+        + _speculative_args(args.speculative_config),
         **(
             {"lmcache_eviction_watermark": args.lmcache_eviction_watermark}
             if args.lmcache_eviction_watermark is not None

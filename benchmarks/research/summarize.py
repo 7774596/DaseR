@@ -41,6 +41,7 @@ _COLUMNS = (
     "store_gib",
     "ssd_r_gib",
     "ra_wait_s",
+    "acc",
 )
 
 
@@ -180,6 +181,10 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         if key.startswith("vllm:num_preemptions_total")
     )
     gib = 2**30
+    steps = sum(int(r.get("token_events", 0)) for r in completed)
+    generated = sum(
+        int(r.get("completion_tokens", 0)) for r in completed if r.get("token_events")
+    )
 
     def hist(name: str) -> float:
         return _histogram_sum(vllm_before, vllm_after, f"vllm:{name}_seconds")
@@ -236,6 +241,9 @@ def arm_row(arm_dir: Path) -> dict[str, str]:
         # spent waiting on those reads: the SSD share of the load path.
         "ssd_r_gib": daser(f"{_delta(before, after, _SSD_READ) / gib:.1f}"),
         "ra_wait_s": daser(f"{_delta(before, after, _RA_WAIT):.1f}"),
+        # Mean tokens per engine step over completed requests: the speculative
+        # acceptance length (1.0 without speculation, "-" for old artifacts).
+        "acc": f"{generated / steps:.2f}" if steps else "-",
     }
 
 

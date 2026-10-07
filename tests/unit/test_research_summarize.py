@@ -217,6 +217,37 @@ def test_arm_row_reports_ssd_reads_and_readahead_wait(tmp_path: Path) -> None:
     assert row["ra_wait_s"] == "2.5"
 
 
+def test_arm_row_reports_speculative_acceptance_length(tmp_path: Path) -> None:
+    """acc is generated tokens per engine step; "-" without step counts."""
+    arm_dir = tmp_path / "spec" / "art" / "arm"
+    arm_dir.mkdir(parents=True)
+    records = [
+        {"completion_tokens": 30, "token_events": 10},
+        {"completion_tokens": 10, "token_events": 10},
+    ]
+    with (arm_dir / "requests.jsonl").open("w") as f:
+        for record in records:
+            record.update(status="completed", ttft_ms=100.0, latency_ms=200.0)
+            f.write(json.dumps(record) + "\n")
+    summary = {
+        "completed_requests": 2,
+        "failed_requests": 0,
+        "wall_seconds": 10.0,
+        "client_queue_ms": {"p50": 0.0},
+        "arrival_to_completion_ms": {"p50": 0.0},
+    }
+    (arm_dir / "summary.json").write_text(json.dumps(summary))
+    (arm_dir / "vllm_metrics_after.prom").write_text("")
+
+    assert arm_row(arm_dir)["acc"] == "2.00"
+
+    old = _ttft_arm(tmp_path, "old", [100.0])
+    (old / "summary.json").write_text(json.dumps(summary))
+    (old / "vllm_metrics_after.prom").write_text("")
+
+    assert arm_row(old)["acc"] == "-"
+
+
 def test_vllm_ticks_split_waiting_by_kv_capacity(tmp_path: Path) -> None:
     """Waiting ticks at high KV usage count as capacity-bound, others compute."""
     arm_dir = tmp_path / "arm"
