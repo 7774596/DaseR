@@ -15,7 +15,10 @@ Rows keep Mooncake fields: ``hash_ids`` name 512-token blocks by
 of one stream, so equal blocks get equal IDs), ``gap_ms`` is the recorded
 idle time before the iteration (capped at ``--gap-cap-s``) and ``timestamp``
 merges sessions started at Poisson offsets with about ``--concurrency``
-overlapping. Unlike hash-only traces the prompts are real code and tool
+overlapping. Recorded gaps are short (the agent waits on its own decode, not
+on tools), so a session's span is estimated as its gaps plus its output at
+``--decode-step-s`` seconds per token; without that, every session would
+start at once. Unlike hash-only traces the prompts are real code and tool
 output, so decode and prompt-lookup speculation see real repetition.
 """
 
@@ -100,6 +103,21 @@ def session_rows(
     return stream, rows
 
 
+def session_span_s(rows: list[dict[str, Any]], decode_step_s: float) -> float:
+    """Estimate how long one session runs when served alone.
+
+    Args:
+        rows: the session's rows (``gap_ms``, ``output_length``).
+        decode_step_s: estimated seconds per generated token.
+
+    Returns:
+        Idle gaps plus decode time in seconds.
+    """
+    return sum(r["gap_ms"] for r in rows) / 1000 + decode_step_s * sum(
+        r["output_length"] for r in rows
+    )
+
+
 def export(
     path: str,
     tokenizer: str,
@@ -110,6 +128,7 @@ def export(
     gap_cap_s: float,
     seed: int,
     min_requests: int = 2,
+    decode_step_s: float = 0.03,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     """Build the token stream and merged replay rows.
 
@@ -123,6 +142,8 @@ def export(
         gap_cap_s: upper bound on a recorded idle gap in seconds.
         seed: RNG seed for sampling and start offsets.
         min_requests: only keep sessions with at least this many rows.
+        decode_step_s: estimated seconds per generated token, used only to
+            space session starts (see :func:`session_span_s`).
 
     Returns:
         ``(tokens, rows)``: all session streams back to back (int32) and
@@ -150,7 +171,7 @@ def export(
         )
         if len(rows) >= min_requests:
             chains.append((stream, rows))
-    spans = [sum(r["gap_ms"] for r in rows) / 1000 for _, rows in chains]
+    spans = [session_span_s(rows, decode_step_s) for _, rows in chains]
     rate = concurrency / max(sum(spans) / max(len(spans), 1), 1e-9)
     tokens: list[int] = []
     merged = []
@@ -202,6 +223,7 @@ def main() -> None:
     p.add_argument("--gap-cap-s", type=float, default=60.0)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--min-requests", type=int, default=2)
+    p.add_argument("--decode-step-s", type=float, default=0.03)
     a = p.parse_args()
     tokens, rows = export(
         a.sessions_file,
@@ -213,6 +235,7 @@ def main() -> None:
         a.gap_cap_s,
         a.seed,
         a.min_requests,
+        a.decode_step_s,
     )
     np.save(a.tokens, tokens)
     with open(a.output, "w") as f:

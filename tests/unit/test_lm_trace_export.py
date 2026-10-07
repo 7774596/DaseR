@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the real-text agent session trace exporter."""
 
-from benchmarks.research.lm_trace_export import session_rows
+from benchmarks.research.lm_trace_export import session_rows, session_span_s
 
 
 def _encode(text: str) -> list[int]:
@@ -38,3 +38,9 @@ def test_session_rows_drop_iterations_past_the_context_limit() -> None:
     }
     _, rows = session_rows(session, _encode, _encode("<|assistant|>\n"), 40, 0, 60.0)
     assert rows == []
+
+
+def test_session_span_counts_gaps_and_decode_time() -> None:
+    """Spacing uses idle gaps plus output tokens at the decode step time."""
+    rows = [{"gap_ms": 0, "output_length": 100}, {"gap_ms": 2000, "output_length": 50}]
+    assert session_span_s(rows, 0.02) == 2.0 + 3.0
