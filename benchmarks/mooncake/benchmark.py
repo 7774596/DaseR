@@ -27,7 +27,15 @@ _BLOCK_ID_DIGITS = 8
 # Marker tokens per corpus block; base >= 1e5 ordinary tokens covers 1e15 IDs.
 _CORPUS_ID_DIGITS = 3
 _WRITER_STOP = object()
-ROUTES = ("sticky", "least-work", "gpu-affinity", "tier-affinity", "hbm-fit")
+ROUTES = (
+    "sticky",
+    "least-work",
+    "gpu-affinity",
+    "tier-affinity",
+    "hbm-fit",
+    "kv-cost",
+    "sticky-saturated",
+)
 
 
 def _prefix_blocks(request: TraceRequest, present: Any) -> int:
@@ -149,6 +157,13 @@ class InstanceRouter:
     missing prefix the shared external tier serves as a load. When it fits
     nowhere it stays and queues behind the session's own prefix.
 
+    ``kv-cost`` (NVIDIA Dynamo KV router) picks the instance minimizing
+    prefill blocks missing from its shadow GPU cache plus its potential
+    active blocks (in-flight resident blocks plus this request's new ones).
+    ``sticky-saturated`` (llm-d sticky-until-saturated) keeps a session on its
+    instance until that instance's outstanding work reaches
+    ``saturation_s``, then moves it to the least-loaded instance.
+
     Args:
         server_urls: Instance base URLs.
         route: One of :data:`ROUTES`.
@@ -158,6 +173,8 @@ class InstanceRouter:
             co-residency bound of ``hbm-fit``.
         load_tokens_per_s: External-tier load rate used by
             ``tier-affinity`` to price a non-local reusable block.
+        saturation_s: Outstanding-work seconds at which
+            ``sticky-saturated`` stops honoring session affinity.
 
     Thread-safety:
         Single asyncio event loop only; no internal locking.
@@ -170,6 +187,7 @@ class InstanceRouter:
         work_model: WorkModel | None = None,
         local_blocks: int = 2048,
         load_tokens_per_s: float = 360e3,
+        saturation_s: float = 10.0,
     ) -> None:
         if not server_urls:
             raise ValueError("at least one server URL is required")
@@ -177,11 +195,14 @@ class InstanceRouter:
             raise ValueError(f"unknown route: {route}")
         if local_blocks <= 0 or load_tokens_per_s <= 0:
             raise ValueError("local_blocks and load_tokens_per_s must be positive")
+        if saturation_s <= 0:
+            raise ValueError("saturation_s must be positive")
         self.server_urls = tuple(url.rstrip("/") for url in server_urls)
         self.route = route
         self.work_model = work_model or WorkModel()
         self.local_blocks = local_blocks
         self.load_tokens_per_s = load_tokens_per_s
+        self.saturation_s = saturation_s
         self._outstanding = [0.0] * len(self.server_urls)
         self._sessions: dict[int, int] = {}
         self._seen: set[int] = set()
@@ -222,6 +243,13 @@ class InstanceRouter:
                 range(len(costs)), key=lambda i: self._outstanding[i] + costs[i]
             )
             work = costs[instance]
+            self._touch_local(instance, request.hash_ids)
+        elif self.route == "kv-cost":
+            work = self.work_model.seconds(request, cached)
+            instance = min(
+                range(len(self.server_urls)),
+                key=lambda i: self._kv_cost(request, i),
+            )
             self._touch_local(instance, request.hash_ids)
         else:
             work = self.work_model.seconds(request, cached)
@@ -277,14 +305,27 @@ class InstanceRouter:
         missing = sum(1 for hash_id in request.hash_ids if hash_id not in resident)
         return missing + _decode_blocks(request)
 
+    def _kv_cost(self, request: TraceRequest, instance: int) -> int:
+        blocks = math.ceil(request.input_length / MOONCAKE_BLOCK_TOKENS)
+        overlap = _prefix_blocks(request, self._local[instance])
+        prefill = max(0, blocks - overlap)
+        return (
+            prefill
+            + self.resident_blocks(instance)
+            + self._new_blocks(request, instance)
+        )
+
     def _pick(self, request: TraceRequest) -> int:
-        if self.route == "sticky" and request.session_id is not None:
-            instance = self._sessions.get(request.session_id)
-            if instance is None:
-                instance = self._least_loaded()
-                self._sessions[request.session_id] = instance
-            return instance
-        return self._least_loaded()
+        if self.route == "least-work" or request.session_id is None:
+            return self._least_loaded()
+        instance = self._sessions.get(request.session_id)
+        if instance is None or (
+            self.route == "sticky-saturated"
+            and self._outstanding[instance] >= self.saturation_s
+        ):
+            instance = self._least_loaded()
+            self._sessions[request.session_id] = instance
+        return instance
 
     def _least_loaded(self) -> int:
         return min(range(len(self._outstanding)), key=self._outstanding.__getitem__)
@@ -686,6 +727,7 @@ async def replay(
     route: str = "sticky",
     route_local_blocks: int = 2048,
     route_load_tokens_per_s: float = 360e3,
+    route_saturation_s: float = 10.0,
     strict_order: bool = False,
     dependency_gap_s: float = 0.0,
     ordered_admission: bool = False,
@@ -717,6 +759,8 @@ async def replay(
             affinity routes.
         route_load_tokens_per_s: External-tier load rate for
             ``tier-affinity``.
+        route_saturation_s: Outstanding-work threshold of
+            ``sticky-saturated``.
         strict_order: Hold each request until the previous one completes, so
             the send order is exactly the trace order (implies prefix
             dependencies). Without it, closed-loop replay sends ready
@@ -751,6 +795,7 @@ async def replay(
         route,
         local_blocks=route_local_blocks,
         load_tokens_per_s=route_load_tokens_per_s,
+        saturation_s=route_saturation_s,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _ResultWriter(output_path)
@@ -873,6 +918,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=360e3,
         help="External-tier load rate pricing non-local reuse (tier-affinity).",
+    )
+    parser.add_argument(
+        "--route-saturation-s",
+        type=float,
+        default=10.0,
+        help="Outstanding work (s) at which sticky-saturated drops affinity.",
     )
     parser.add_argument("--served-model-name", default="")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -999,6 +1050,7 @@ async def main_async(args: argparse.Namespace) -> int:
         route=args.route,
         route_local_blocks=args.route_local_blocks,
         route_load_tokens_per_s=args.route_load_tokens_per_s,
+        route_saturation_s=args.route_saturation_s,
         strict_order=args.strict_order,
         dependency_gap_s=args.dependency_gap_s,
         ordered_admission=args.ordered_admission,

@@ -721,6 +721,32 @@ def test_router_release_frees_resident_blocks() -> None:
     assert router.resident_blocks(0) == 0
 
 
+def test_kv_cost_prefers_the_cached_prefix_and_spreads_new_sessions() -> None:
+    """Dynamo-style cost: missing prefill blocks plus potential active blocks."""
+    router = InstanceRouter(["http://a", "http://b"], route="kv-cost", local_blocks=200)
+    first, _ = router.acquire(_session_request(0, session=1, blocks=64))
+    later, _ = router.acquire(_session_request(1, session=1, blocks=65))
+    other, _ = router.acquire(_session_request(2, session=2, blocks=10))
+
+    assert (first, later, other) == (0, 0, 1)
+
+
+def test_sticky_saturated_drops_affinity_once_home_is_saturated() -> None:
+    """Sessions stay home below the work threshold and move above it."""
+    for saturation_s, expected in ((1e9, 0), (1e-9, 1)):
+        router = InstanceRouter(
+            ["http://a", "http://b"],
+            route="sticky-saturated",
+            saturation_s=saturation_s,
+        )
+        router.acquire(_session_request(0, session=1, blocks=64))
+        later, _ = router.acquire(_session_request(1, session=1, blocks=65))
+
+        assert later == expected
+    with pytest.raises(ValueError):
+        InstanceRouter(["http://a"], route="sticky-saturated", saturation_s=0)
+
+
 def test_replay_routes_between_instances_and_records_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
