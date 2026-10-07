@@ -865,6 +865,7 @@ async def replay(
     ordered_admission: bool = False,
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
+    prewarm_max_waiting: int | None = None,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -922,6 +923,11 @@ async def replay(
             and foreground requests queue between pieces. Chunking stops at
             the end of the idle gap; the request prefills the rest itself.
             Zero sends the whole prefix at once.
+        prewarm_max_waiting: When set, read ``vllm:num_requests_waiting``
+            before each prewarm piece and stop prewarming that turn once more
+            than this many requests wait, so background prefill never queues
+            ahead of foreground turns. ``None`` disables the check. Prewarmed
+            records carry ``prewarm_pieces`` and ``prewarm_yielded``.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -939,6 +945,8 @@ async def replay(
         raise ValueError("abort_after_failures must be non-negative")
     if prewarm_chunk_tokens < 0:
         raise ValueError("prewarm_chunk_tokens must be non-negative")
+    if prewarm_max_waiting is not None and prewarm_max_waiting < 0:
+        raise ValueError("prewarm_max_waiting must be non-negative")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
     scheduled_offset_seconds(0, time_scale)
@@ -1005,6 +1013,7 @@ async def replay(
                         admitted=admitted_events[position],
                         prewarm=prewarm,
                         prewarm_chunk_tokens=prewarm_chunk_tokens,
+                        prewarm_max_waiting=prewarm_max_waiting,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -1093,6 +1102,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Prewarm in growing prefixes of this many more tokens each, "
         "stopping at the end of the idle gap (0 sends the whole prefix).",
+    )
+    parser.add_argument(
+        "--prewarm-max-waiting",
+        type=int,
+        default=None,
+        help="Stop a turn's prewarm once vLLM reports more than this many "
+        "waiting requests (off by default).",
     )
     parser.add_argument(
         "--route-saturation-s",
@@ -1249,6 +1265,7 @@ async def main_async(args: argparse.Namespace) -> int:
         ordered_admission=args.ordered_admission,
         prewarm=args.prewarm_stripped,
         prewarm_chunk_tokens=args.prewarm_chunk_tokens,
+        prewarm_max_waiting=args.prewarm_max_waiting,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1441,7 +1458,8 @@ async def _prewarm_prefix(
     seed: int,
     chunk_tokens: int = 0,
     stop: asyncio.Event | None = None,
-) -> tuple[float, str | None]:
+    max_waiting: int | None = None,
+) -> tuple[float, str | None, int, bool]:
     """Prefill ``request``'s known prefix with one-token completions.
 
     The prefix requests are routed like the request itself (same session), so
@@ -1453,16 +1471,26 @@ async def _prewarm_prefix(
     Args:
         chunk_tokens: Tokens added per piece; zero sends the whole prefix.
         stop: Set when the idle gap ends.
+        max_waiting: When set, no piece starts while the instances report
+            more than this many waiting requests; the prewarm ends there.
 
     Returns:
-        ``(elapsed milliseconds, first error or None)``.
+        ``(elapsed milliseconds, first error or None, pieces sent, whether
+        the waiting-queue check ended the prewarm)``.
     """
     tokens = request.prewarm_tokens or 0
     step = chunk_tokens if chunk_tokens > 0 else tokens
     begin = time.perf_counter()
+    pieces = 0
     for end in range(step, tokens + step, step):
         if end > step and stop is not None and stop.is_set():
             break
+        if (
+            max_waiting is not None
+            and await _waiting_requests(client, router.server_urls) > max_waiting
+        ):
+            return (time.perf_counter() - begin) * 1000.0, None, pieces, True
+        pieces += 1
         error = await _prefill_prefix(
             request=request,
             tokens=min(end, tokens),
@@ -1474,8 +1502,25 @@ async def _prewarm_prefix(
             seed=seed,
         )
         if error is not None:
-            return (time.perf_counter() - begin) * 1000.0, error
-    return (time.perf_counter() - begin) * 1000.0, None
+            return (time.perf_counter() - begin) * 1000.0, error, pieces, False
+    return (time.perf_counter() - begin) * 1000.0, None, pieces, False
+
+
+async def _waiting_requests(
+    client: httpx.AsyncClient, server_urls: Sequence[str]
+) -> float:
+    """Sum ``vllm:num_requests_waiting`` over the instances (unreachable = 0)."""
+    waiting = 0.0
+    for server_url in server_urls:
+        try:
+            response = await client.get(f"{server_url}/metrics")
+            response.raise_for_status()
+        except httpx.HTTPError:
+            continue
+        waiting += extract_prometheus_counters(response.text).get(
+            "vllm:num_requests_waiting", 0.0
+        )
+    return waiting
 
 
 async def _prefill_prefix(
@@ -1549,11 +1594,13 @@ async def _run_request(
     admitted: asyncio.Event | None = None,
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
+    prewarm_max_waiting: int | None = None,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
             prewarm=prewarm,
             prewarm_chunk_tokens=prewarm_chunk_tokens,
+            prewarm_max_waiting=prewarm_max_waiting,
             dependency_gap_s=dependency_gap_s,
             admit_after=admit_after,
             admitted=admitted,
@@ -1596,6 +1643,7 @@ async def _run_request_after_dependency(
     admitted: asyncio.Event | None = None,
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
+    prewarm_max_waiting: int | None = None,
 ) -> dict[str, Any]:
     # A dependent request with a recorded gap is paced by its producer's
     # completion, not by its arrival timestamp.
@@ -1606,7 +1654,7 @@ async def _run_request_after_dependency(
             max(0.0, started_at + scheduled_offset - time.perf_counter())
         )
     dependency_at = time.perf_counter()
-    warm: asyncio.Task[tuple[float, str | None]] | None = None
+    warm: asyncio.Task[tuple[float, str | None, int, bool]] | None = None
     gap_over = asyncio.Event()
     if wait_for is not None:
         await wait_for.wait()
@@ -1622,6 +1670,7 @@ async def _run_request_after_dependency(
                     seed=seed,
                     chunk_tokens=prewarm_chunk_tokens,
                     stop=gap_over,
+                    max_waiting=prewarm_max_waiting,
                 )
             )
         # Idle time after the dependency (tool execution / think time).
@@ -1632,12 +1681,14 @@ async def _run_request_after_dependency(
     gap_over.set()
     prewarm_ms: float | None = None
     prewarm_error: str | None = None
+    prewarm_pieces = 0
+    prewarm_yielded = False
     warm_wait_s = 0.0
     if warm is not None:
         # The gateway sends the turn once its prefix is resident; a prewarm
         # outlasting the idle gap delays the request's first token.
         warm_from = time.perf_counter()
-        prewarm_ms, prewarm_error = await warm
+        prewarm_ms, prewarm_error, prewarm_pieces, prewarm_yielded = await warm
         warm_wait_s = time.perf_counter() - warm_from
     queued_at = time.perf_counter()
     if gap_paced:
@@ -1740,6 +1791,8 @@ async def _run_request_after_dependency(
     if warm is not None:
         record["prewarm_ms"] = prewarm_ms
         record["prewarm_error"] = prewarm_error
+        record["prewarm_pieces"] = prewarm_pieces
+        record["prewarm_yielded"] = prewarm_yielded
     record["rebinds"] = rebinds
     writer.write(record)
     return record

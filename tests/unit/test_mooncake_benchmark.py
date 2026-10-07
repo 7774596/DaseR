@@ -553,6 +553,7 @@ def _prewarm_replay(
     prewarm: bool,
     warm_s: float,
     chunk_tokens: int = 0,
+    max_waiting: int | None = None,
 ) -> tuple[list[tuple[int, int, str | None, float]], dict[int, dict]]:
     """Replay a producer and a gap-paced user turn with a known prefix."""
     sends: list[tuple[int, int, str | None, float]] = []
@@ -588,6 +589,7 @@ def _prewarm_replay(
             prefix_dependencies=True,
             prewarm=prewarm,
             prewarm_chunk_tokens=chunk_tokens,
+            prewarm_max_waiting=max_waiting,
         )
     )
     return sends, {record["trace_index"]: record for record in results}
@@ -649,6 +651,32 @@ def test_chunked_prewarm_stops_at_the_end_of_the_gap(
     )
     assert [(i, n) for i, n, *_ in sends] == [(0, 1024), (1, 400), (1, 800), (1, 2048)]
     assert by_index[1]["ttft_ms"] < 40.0
+
+
+def test_prewarm_yields_once_the_server_queue_exceeds_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A piece starts only while vLLM's waiting queue is within the bound."""
+    queue = iter([0.0, 3.0])
+
+    async def waiting(*args: Any) -> float:
+        return next(queue)
+
+    monkeypatch.setattr(benchmark, "_waiting_requests", waiting)
+    sends, by_index = _prewarm_replay(
+        tmp_path, monkeypatch, True, warm_s=0.0, chunk_tokens=400, max_waiting=2
+    )
+
+    assert [(i, n) for i, n, *_ in sends] == [(0, 1024), (1, 400), (1, 2048)]
+    assert by_index[1]["prewarm_pieces"] == 1
+    assert by_index[1]["prewarm_yielded"] is True
+
+    sends, by_index = _prewarm_replay(
+        tmp_path, monkeypatch, True, warm_s=0.0, chunk_tokens=400
+    )
+    assert len(sends) == 5
+    assert by_index[1]["prewarm_pieces"] == 3
+    assert by_index[1]["prewarm_yielded"] is False
 
 
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
