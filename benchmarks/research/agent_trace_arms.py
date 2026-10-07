@@ -232,6 +232,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-saturation-s", type=float, default=10.0)
     parser.add_argument("--rebind-after-s", type=float, default=None)
     parser.add_argument("--prewarm-stripped", action="store_true")
+    parser.add_argument("--prewarm-chunk-tokens", type=int, default=0)
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument(
         "--gpu-util",
@@ -633,6 +634,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                     else []
                 ),
                 *(["--prewarm-stripped"] if args.prewarm_stripped else []),
+                *(
+                    ["--prewarm-chunk-tokens", str(args.prewarm_chunk_tokens)]
+                    if args.prewarm_chunk_tokens
+                    else []
+                ),
                 "--served-model-name",
                 model_name,
                 "--output-dir",

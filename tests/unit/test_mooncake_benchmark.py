@@ -547,7 +547,11 @@ def test_load_trace_bounds_prewarm_tokens(tmp_path: Path) -> None:
 
 
 def _prewarm_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prewarm: bool, warm_s: float
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prewarm: bool,
+    warm_s: float,
+    chunk_tokens: int = 0,
 ) -> tuple[list[tuple[int, int, str | None, float]], dict[int, dict]]:
     """Replay a producer and a gap-paced user turn with a known prefix."""
     sends: list[tuple[int, int, str | None, float]] = []
@@ -582,6 +586,7 @@ def _prewarm_replay(
             seed=0,
             prefix_dependencies=True,
             prewarm=prewarm,
+            prewarm_chunk_tokens=chunk_tokens,
         )
     )
     return sends, {record["trace_index"]: record for record in results}
@@ -615,6 +620,34 @@ def test_prewarm_outlasting_the_gap_counts_toward_ttft(
     sends, by_index = _prewarm_replay(tmp_path, monkeypatch, False, warm_s=0.2)
     assert [i for i, *_ in sends] == [0, 1]
     assert "prewarm_ms" not in by_index[1]
+
+
+def test_chunked_prewarm_sends_growing_prefixes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chunked prewarm covers the known prefix in growing pieces."""
+    sends, by_index = _prewarm_replay(
+        tmp_path, monkeypatch, True, warm_s=0.0, chunk_tokens=400
+    )
+    assert [(i, n) for i, n, *_ in sends] == [
+        (0, 1024),
+        (1, 400),
+        (1, 800),
+        (1, 1100),
+        (1, 2048),
+    ]
+    assert by_index[1]["prewarm_error"] is None
+
+
+def test_chunked_prewarm_stops_at_the_end_of_the_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No new piece starts after the gap; the turn prefills the rest."""
+    sends, by_index = _prewarm_replay(
+        tmp_path, monkeypatch, True, warm_s=0.035, chunk_tokens=400
+    )
+    assert [(i, n) for i, n, *_ in sends] == [(0, 1024), (1, 400), (1, 800), (1, 2048)]
+    assert by_index[1]["ttft_ms"] < 40.0
 
 
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
