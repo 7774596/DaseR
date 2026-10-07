@@ -4,6 +4,7 @@
 from benchmarks.mooncake.benchmark import TraceRequest
 from benchmarks.research.offline_hit_bound import (
     belady_prefix_hit_rate,
+    dead_hint_prefix_hit_rate,
     prefix_hit_rate,
 )
 
@@ -43,3 +44,26 @@ def test_belady_matches_lru_when_everything_fits() -> None:
     requests = _loop(sessions=2, rounds=3, blocks=2)
 
     assert belady_prefix_hit_rate(requests, 0) == prefix_hit_rate(requests, 0)
+
+
+def test_dead_hint_evicts_blocks_a_session_diverged_from() -> None:
+    """Blocks dropped by a session's new prefix go before live blocks."""
+    # Session 0 touches (1, 2) after session 1, then diverges from it.
+    rows = [(1, (7, 8)), (0, (1, 2)), (0, (3, 4)), (1, (7, 8))]
+    requests = [
+        TraceRequest(
+            index=i,
+            timestamp_ms=i,
+            input_length=len(ids) * 512,
+            output_length=1,
+            hash_ids=ids,
+            session_id=sid,
+        )
+        for i, (sid, ids) in enumerate(rows)
+    ]
+
+    lru, _, _ = prefix_hit_rate(requests, capacity_blocks=4)
+    dead, _, _ = dead_hint_prefix_hit_rate(requests, capacity_blocks=4)
+
+    assert lru == 0.0
+    assert dead == 0.25

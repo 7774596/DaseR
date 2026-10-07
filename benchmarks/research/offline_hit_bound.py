@@ -8,7 +8,9 @@ prefix. Because LRU is a stack algorithm, the hit rate at capacity ``C`` is an
 upper bound for any GPU + L1 + L2 hierarchy whose total capacity is ``C``.
 ``--policy belady`` instead evicts the block whose next use is farthest
 (deepest prefix position first among ties): a clairvoyant bound for what any
-replacement policy could reach at the same capacity.
+replacement policy could reach at the same capacity. ``--policy lru-dead``
+ranks a realizable hint: blocks a session's prefix diverged from are evicted
+first.
 """
 
 from __future__ import annotations
@@ -51,6 +53,50 @@ def prefix_hit_rate(requests: list, capacity_blocks: int) -> tuple[float, int, i
         if capacity_blocks > 0:
             while len(cache) > capacity_blocks:
                 cache.popitem(last=False)
+    return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
+
+
+def dead_hint_prefix_hit_rate(
+    requests: list, capacity_blocks: int
+) -> tuple[float, int, int]:
+    """Replay requests through an LRU that evicts session-dead blocks first.
+
+    When a session's request no longer contains blocks of that session's
+    previous request (the prefix diverged, e.g. a template stripped earlier
+    reasoning), those blocks are moved to the eviction end. This needs no
+    future knowledge: a serving gateway sees the divergence on arrival.
+
+    Args:
+        requests: ``TraceRequest`` rows in arrival order.
+        capacity_blocks: Cache capacity in 512-token blocks (``<=0`` = infinite).
+
+    Returns:
+        ``(hit_rate, hit_tokens, prompt_tokens)`` with the same leading-prefix
+        hit rule as :func:`prefix_hit_rate`.
+    """
+    cache: OrderedDict[int, None] = OrderedDict()
+    previous: dict[object, list[int]] = {}
+    hit_tokens = 0
+    prompt_tokens = 0
+    for request in requests:
+        prompt_tokens += request.input_length
+        leading = 0
+        for block in request.hash_ids:
+            if block not in cache:
+                break
+            leading += 1
+        hit_tokens += min(leading * MOONCAKE_BLOCK_TOKENS, request.input_length)
+        current = set(request.hash_ids)
+        for block in previous.get(request.session_id, []):
+            if block not in current and block in cache:
+                cache.move_to_end(block, last=False)
+        for block in request.hash_ids:
+            cache[block] = None
+            cache.move_to_end(block)
+        if capacity_blocks > 0:
+            while len(cache) > capacity_blocks:
+                cache.popitem(last=False)
+        previous[request.session_id] = request.hash_ids
     return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
 
 
@@ -101,6 +147,17 @@ def belady_prefix_hit_rate(
     return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
 
 
+_POLICIES = {
+    "lru": prefix_hit_rate,
+    "lru-dead": dead_hint_prefix_hit_rate,
+    "belady": belady_prefix_hit_rate,
+}
+_POLICY_HELP = (
+    "lru: plain LRU; lru-dead: LRU that evicts blocks a session's prefix "
+    "diverged from first; belady: clairvoyant farthest next use."
+)
+
+
 def main() -> None:
     """CLI entry point: print one line per capacity."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -121,9 +178,11 @@ def main() -> None:
         default=[1.0],
         help="Stored/raw byte ratios (one column each, e.g. 1.0 0.737).",
     )
-    parser.add_argument("--policy", choices=("lru", "belady"), default="lru")
+    parser.add_argument(
+        "--policy", choices=tuple(_POLICIES), default="lru", help=_POLICY_HELP
+    )
     args = parser.parse_args()
-    simulate = prefix_hit_rate if args.policy == "lru" else belady_prefix_hit_rate
+    simulate = _POLICIES[args.policy]
     requests = list(load_trace(args.trace, args.max_requests, args.start_request, 0))
     unique = len({block for request in requests for block in request.hash_ids})
     total_tokens = sum(request.input_length for request in requests)
