@@ -164,6 +164,13 @@ class InstanceRouter:
     instance until that instance's outstanding work reaches
     ``saturation_s``, then moves it to the least-loaded instance.
 
+    With ``rebind_after_s`` set, a request still waiting for its first token
+    after :meth:`rebind_wait_s` may be re-bound once (:meth:`rebind_target`,
+    :meth:`move`): only when its instance's resident demand exceeds
+    ``local_blocks`` (it waits for GPU KV, not compute) and another instance
+    can hold it. The caller cancels the waiting stream and resends there; the
+    shared external tier serves its prefix.
+
     Args:
         server_urls: Instance base URLs.
         route: One of :data:`ROUTES`.
@@ -175,6 +182,9 @@ class InstanceRouter:
             ``tier-affinity`` to price a non-local reusable block.
         saturation_s: Outstanding-work seconds at which
             ``sticky-saturated`` stops honoring session affinity.
+        rebind_after_s: Slack beyond the expected prefill time before a
+            waiting request may be re-bound; ``None`` disables re-binding.
+        prefill_tokens_per_s: Prefill rate used for the expected wait.
 
     Thread-safety:
         Single asyncio event loop only; no internal locking.
@@ -188,6 +198,8 @@ class InstanceRouter:
         local_blocks: int = 2048,
         load_tokens_per_s: float = 360e3,
         saturation_s: float = 10.0,
+        rebind_after_s: float | None = None,
+        prefill_tokens_per_s: float = 10e3,
     ) -> None:
         if not server_urls:
             raise ValueError("at least one server URL is required")
@@ -197,12 +209,18 @@ class InstanceRouter:
             raise ValueError("local_blocks and load_tokens_per_s must be positive")
         if saturation_s <= 0:
             raise ValueError("saturation_s must be positive")
+        if rebind_after_s is not None and rebind_after_s < 0:
+            raise ValueError("rebind_after_s must be non-negative")
+        if prefill_tokens_per_s <= 0:
+            raise ValueError("prefill_tokens_per_s must be positive")
         self.server_urls = tuple(url.rstrip("/") for url in server_urls)
         self.route = route
         self.work_model = work_model or WorkModel()
         self.local_blocks = local_blocks
         self.load_tokens_per_s = load_tokens_per_s
         self.saturation_s = saturation_s
+        self.rebind_after_s = rebind_after_s
+        self.prefill_tokens_per_s = prefill_tokens_per_s
         self._outstanding = [0.0] * len(self.server_urls)
         self._sessions: dict[int, int] = {}
         self._seen: set[int] = set()
@@ -258,12 +276,8 @@ class InstanceRouter:
                 if self.route == "hbm-fit"
                 else self._pick(request)
             )
-        self._outstanding[instance] += work
         self._seen.update(request.hash_ids)
-        resident = self._resident[instance]
-        for hash_id in request.hash_ids:
-            resident[hash_id] = resident.get(hash_id, 0) + 1
-        self._decode_blocks[instance] += _decode_blocks(request)
+        self._charge(instance, work, request)
         return instance, work
 
     def release(self, instance: int, work: float, request: TraceRequest) -> None:
@@ -283,6 +297,73 @@ class InstanceRouter:
             else:
                 del resident[hash_id]
         self._decode_blocks[instance] -= _decode_blocks(request)
+
+    def rebind_wait_s(self, request: TraceRequest) -> float | None:
+        """Return how long ``request`` may wait for its first token.
+
+        Call before :meth:`acquire`, which marks its blocks as produced.
+
+        Args:
+            request: Request about to be acquired.
+
+        Returns:
+            Expected prefill seconds of its unproduced tokens plus
+            ``rebind_after_s``, or ``None`` when re-binding is disabled.
+        """
+        if self.rebind_after_s is None:
+            return None
+        cached = self._cached_tokens(request, _prefix_blocks(request, self._seen))
+        new = request.input_length - cached
+        return self.rebind_after_s + new / self.prefill_tokens_per_s
+
+    def rebind_target(self, instance: int, request: TraceRequest) -> int | None:
+        """Return an instance to re-bind a waiting request to, if any.
+
+        Args:
+            instance: Instance currently holding ``request``.
+            request: Acquired request still waiting for its first token.
+
+        Returns:
+            The least-loaded other instance that can hold ``request`` beside
+            its in-flight requests when ``instance`` is over its GPU KV
+            capacity; otherwise ``None``.
+        """
+        if self.resident_blocks(instance) <= self.local_blocks:
+            return None
+        fits = [
+            i
+            for i in range(len(self.server_urls))
+            if i != instance
+            and self.resident_blocks(i) + self._new_blocks(request, i)
+            <= self.local_blocks
+        ]
+        if not fits:
+            return None
+        return min(fits, key=self._outstanding.__getitem__)
+
+    def move(
+        self, instance: int, target: int, work: float, request: TraceRequest
+    ) -> None:
+        """Move an acquired request's charge from ``instance`` to ``target``.
+
+        Args:
+            instance: Instance the request was acquired on.
+            target: New instance, e.g. from :meth:`rebind_target`.
+            work: Work returned by :meth:`acquire`.
+            request: The acquired request.
+        """
+        self.release(instance, work, request)
+        self._charge(target, work, request)
+        self._touch_local(target, request.hash_ids)
+        if request.session_id is not None:
+            self._sessions[request.session_id] = target
+
+    def _charge(self, instance: int, work: float, request: TraceRequest) -> None:
+        self._outstanding[instance] += work
+        resident = self._resident[instance]
+        for hash_id in request.hash_ids:
+            resident[hash_id] = resident.get(hash_id, 0) + 1
+        self._decode_blocks[instance] += _decode_blocks(request)
 
     def _pick_fit(self, request: TraceRequest) -> int:
         home = self._sessions.get(request.session_id)
@@ -728,6 +809,7 @@ async def replay(
     route_local_blocks: int = 2048,
     route_load_tokens_per_s: float = 360e3,
     route_saturation_s: float = 10.0,
+    rebind_after_s: float | None = None,
     strict_order: bool = False,
     dependency_gap_s: float = 0.0,
     ordered_admission: bool = False,
@@ -761,6 +843,10 @@ async def replay(
             ``tier-affinity``.
         route_saturation_s: Outstanding-work threshold of
             ``sticky-saturated``.
+        rebind_after_s: Re-bind a request waiting for GPU KV to another
+            instance this many seconds past its expected prefill time (see
+            :class:`InstanceRouter`); ``None`` disables it. Records carry
+            ``rebinds`` and the final ``instance``.
         strict_order: Hold each request until the previous one completes, so
             the send order is exactly the trace order (implies prefix
             dependencies). Without it, closed-loop replay sends ready
@@ -796,6 +882,7 @@ async def replay(
         local_blocks=route_local_blocks,
         load_tokens_per_s=route_load_tokens_per_s,
         saturation_s=route_saturation_s,
+        rebind_after_s=rebind_after_s,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _ResultWriter(output_path)
@@ -918,6 +1005,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=360e3,
         help="External-tier load rate pricing non-local reuse (tier-affinity).",
+    )
+    parser.add_argument(
+        "--rebind-after-s",
+        type=float,
+        default=None,
+        help="Re-bind a request waiting for GPU KV to another instance this "
+        "many seconds past its expected prefill time (off by default).",
     )
     parser.add_argument(
         "--route-saturation-s",
@@ -1051,6 +1145,7 @@ async def main_async(args: argparse.Namespace) -> int:
         route_local_blocks=args.route_local_blocks,
         route_load_tokens_per_s=args.route_load_tokens_per_s,
         route_saturation_s=args.route_saturation_s,
+        rebind_after_s=args.rebind_after_s,
         strict_order=args.strict_order,
         dependency_gap_s=args.dependency_gap_s,
         ordered_admission=args.ordered_admission,
@@ -1196,6 +1291,31 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
     return float(ordered[lower] * (1 - fraction) + ordered[upper] * fraction)
 
 
+async def _rebind_when_waiting(
+    router: InstanceRouter,
+    instance: int,
+    request: TraceRequest,
+    stream: asyncio.Future[RequestResult],
+    first_token: asyncio.Event,
+    wait_s: float,
+    poll_s: float = 0.25,
+) -> int | None:
+    """Return a re-bind target once ``request`` has waited ``wait_s``.
+
+    Returns ``None`` as soon as the stream produces a token or finishes.
+    """
+    deadline = time.perf_counter() + wait_s
+    while not stream.done() and not first_token.is_set():
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            target = router.rebind_target(instance, request)
+            if target is not None:
+                return target
+            remaining = poll_s
+        await asyncio.wait({stream}, timeout=remaining)
+    return None
+
+
 async def _run_request(
     *,
     request: TraceRequest,
@@ -1286,37 +1406,77 @@ async def _run_request_after_dependency(
             admitted.set()
         prompt = prompt_builder.build(request)
         sent_at = admitted_at
+        wait_s = router.rebind_wait_s(request)
         instance, work = router.acquire(request)
+        rebinds = 0
+        resent_at: float | None = None
+        stream: asyncio.Future[RequestResult] | None = None
 
         def record_send() -> None:
-            nonlocal sent_at
-            sent_at = time.perf_counter()
+            nonlocal sent_at, resent_at
+            if rebinds:
+                resent_at = time.perf_counter()
+            else:
+                sent_at = time.perf_counter()
 
         try:
-            result = await vllm_completion_stream(
-                client,
-                router.server_urls[instance],
-                BenchmarkSample(
-                    sample_id=request.index,
-                    dataset="mooncake-toolagent",
-                    context="",
-                    question="",
-                    answers=[],
-                ),
-                prompt,
-                {
+            while True:
+                params: dict[str, Any] = {
                     "model": served_model_name,
                     "max_tokens": request.output_length,
                     "temperature": 0.0,
                     "ignore_eos": True,
                     "seed": seed,
-                },
-                asyncio.Semaphore(1),
-                timeout_seconds,
-                on_send=record_send,
-            )
+                }
+                if rebinds:
+                    # A re-sent request must not share its aborted
+                    # predecessor's ID in the shared DaseR server.
+                    params["request_id"] = f"trace-{request.index}-r{rebinds}"
+                first_token = asyncio.Event()
+                stream = asyncio.ensure_future(
+                    vllm_completion_stream(
+                        client,
+                        router.server_urls[instance],
+                        BenchmarkSample(
+                            sample_id=request.index,
+                            dataset="mooncake-toolagent",
+                            context="",
+                            question="",
+                            answers=[],
+                        ),
+                        prompt,
+                        params,
+                        asyncio.Semaphore(1),
+                        timeout_seconds,
+                        on_send=record_send,
+                        on_first_token=first_token.set,
+                    )
+                )
+                target = None
+                if wait_s is not None and not rebinds:
+                    target = await _rebind_when_waiting(
+                        router, instance, request, stream, first_token, wait_s
+                    )
+                if target is None:
+                    result = await stream
+                    break
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
+                router.move(instance, target, work, request)
+                instance = target
+                rebinds += 1
         finally:
+            if stream is not None and not stream.done():
+                stream.cancel()
             router.release(instance, work, request)
+        if resent_at is not None:
+            # Time spent on the abandoned instance counts toward TTFT.
+            shift_ms = (resent_at - sent_at) * 1000.0
+            result = replace(
+                result,
+                ttft_ms=result.ttft_ms + shift_ms,
+                latency_ms=result.latency_ms + shift_ms,
+            )
     record = _result_record(
         request=request,
         result=result,
@@ -1330,6 +1490,7 @@ async def _run_request_after_dependency(
     )
     record["instance"] = instance
     record["session_id"] = request.session_id
+    record["rebinds"] = rebinds
     writer.write(record)
     return record
 

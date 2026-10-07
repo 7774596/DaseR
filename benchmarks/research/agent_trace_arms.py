@@ -230,6 +230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-local-blocks", type=int, default=2048)
     parser.add_argument("--route-load-tokens-per-s", type=float, default=360e3)
     parser.add_argument("--route-saturation-s", type=float, default=10.0)
+    parser.add_argument("--rebind-after-s", type=float, default=None)
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument(
         "--gpu-util",
@@ -625,6 +626,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 str(args.route_load_tokens_per_s),
                 "--route-saturation-s",
                 str(args.route_saturation_s),
+                *(
+                    ["--rebind-after-s", str(args.rebind_after_s)]
+                    if args.rebind_after_s is not None
+                    else []
+                ),
                 "--served-model-name",
                 model_name,
                 "--output-dir",

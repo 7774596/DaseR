@@ -577,6 +577,7 @@ async def vllm_completion_stream(
     sem: asyncio.Semaphore,
     timeout: float,
     on_send: Callable[[], None] | None = None,
+    on_first_token: Callable[[], None] | None = None,
 ) -> RequestResult:
     """Send one streaming completion request and measure its latency.
 
@@ -589,6 +590,8 @@ async def vllm_completion_stream(
         sem: Client-side concurrency limit.
         timeout: Per-request timeout in seconds.
         on_send: Optional callback invoked immediately before the HTTP stream.
+        on_first_token: Optional callback invoked when the first token event
+            arrives.
 
     Returns:
         Request result containing latency, usage, text, and any error.
@@ -651,13 +654,13 @@ async def vllm_completion_stream(
                         fragment = str(choice.get("text", ""))
                         token_ids = choice.get("token_ids")
                         has_token = isinstance(token_ids, list) and bool(token_ids)
-                        if fragment and first_token_at is None:
+                        if first_token_at is None and (fragment or has_token):
                             first_token_at = time.perf_counter()
+                            if on_first_token is not None:
+                                on_first_token()
                         if fragment:
                             first_nonempty_text = True
                             text_parts.append(fragment)
-                        elif has_token and first_token_at is None:
-                            first_token_at = time.perf_counter()
     except Exception as exc:
         return RequestResult(
             sample_id=sample.sample_id,

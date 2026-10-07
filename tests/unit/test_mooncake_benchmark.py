@@ -747,6 +747,114 @@ def test_sticky_saturated_drops_affinity_once_home_is_saturated() -> None:
         InstanceRouter(["http://a"], route="sticky-saturated", saturation_s=0)
 
 
+def _overcommitted_router(**kwargs: Any) -> InstanceRouter:
+    """Instance 0 holds two disjoint session-1 requests past its capacity."""
+    router = InstanceRouter(
+        ["http://a", "http://b"], route="sticky", local_blocks=100, **kwargs
+    )
+    router.acquire(_session_request(0, session=1, blocks=64))
+    router.acquire(_session_request(1, session=2, blocks=1))
+    return router
+
+
+def test_rebind_target_needs_an_overcommitted_home_and_room_elsewhere() -> None:
+    """Only a request waiting for GPU KV moves, and only where it fits."""
+    router = _overcommitted_router()
+    waiting = _subagent_request(2, session=1, base=5, blocks=50)
+    assert router.rebind_target(0, waiting) is None
+    router.acquire(waiting)
+
+    assert router.rebind_target(0, waiting) == 1
+    router.acquire(_subagent_request(3, session=2, base=7, blocks=60))
+    assert router.rebind_target(0, waiting) is None
+
+
+def test_router_move_transfers_the_charge_and_session() -> None:
+    """A moved request's blocks leave its old instance and pin the session."""
+    router = _overcommitted_router()
+    waiting = _subagent_request(2, session=1, base=5, blocks=50)
+    _, work = router.acquire(waiting)
+    router.move(0, 1, work, waiting)
+
+    assert router.resident_blocks(0) == 64 + 1
+    assert router.resident_blocks(1) == 1 + 1 + 50 + 1
+    later, _ = router.acquire(_subagent_request(3, session=1, base=6, blocks=1))
+    assert later == 1
+
+
+def test_rebind_wait_counts_only_unproduced_prefill() -> None:
+    """The wait budget is the slack plus prefill of tokens never produced."""
+    router = _overcommitted_router(rebind_after_s=1.0, prefill_tokens_per_s=512.0)
+    assert (
+        InstanceRouter(["http://a"]).rebind_wait_s(
+            _session_request(0, session=1, blocks=2)
+        )
+        is None
+    )
+    # 65 blocks of which 64 were already produced: one block left to prefill.
+    assert router.rebind_wait_s(
+        _session_request(2, session=1, blocks=65)
+    ) == pytest.approx(1.0 + 1.0)
+    with pytest.raises(ValueError):
+        InstanceRouter(["http://a"], rebind_after_s=-1.0)
+
+
+def test_replay_rebinds_a_request_waiting_on_an_overcommitted_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The waiting stream is cancelled and resent; TTFT keeps the lost time."""
+    sends: list[tuple[int, str, str | None]] = []
+    resent = asyncio.Event()
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        index = args[2].sample_id
+        sends.append((index, args[1], args[4].get("request_id")))
+        kwargs["on_send"]()
+        if index == 2 and args[1] == "http://a":
+            await asyncio.sleep(60)
+        if index == 2:
+            resent.set()
+        kwargs["on_first_token"]()
+        if index == 0:
+            # Hold instance 0's blocks until the waiting request moves.
+            await asyncio.wait_for(resent.wait(), timeout=10)
+        await asyncio.sleep(0.01)
+        return RequestResult(index, "d", "", 1.0, 5.0, 1, 3)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        _session_request(0, session=1, blocks=64),
+        _session_request(1, session=2, blocks=1),
+        _subagent_request(2, session=1, base=5, blocks=50),
+    ]
+    selection = select_requests(requests, max_model_len=100_000)
+    results, _, _ = asyncio.run(
+        replay(
+            selection=selection,
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url=["http://a", "http://b"],
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=4,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=0,
+            route="sticky",
+            route_local_blocks=100,
+            rebind_after_s=0.0,
+        )
+    )
+
+    by_index = {record["trace_index"]: record for record in results}
+    assert (by_index[2]["instance"], by_index[2]["rebinds"]) == (1, 1)
+    assert (by_index[0]["rebinds"], by_index[1]["rebinds"]) == (0, 0)
+    assert [send for send in sends if send[0] == 2] == [
+        (2, "http://a", None),
+        (2, "http://b", "trace-2-r1"),
+    ]
+    assert by_index[2]["ttft_ms"] > 200.0
+
+
 def test_replay_routes_between_instances_and_records_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
