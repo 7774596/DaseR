@@ -291,6 +291,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Real-text .npy token corpus passed to the replay (see longdoc_trace).",
     )
     parser.add_argument(
+        "--session-tokens",
+        type=Path,
+        default=None,
+        help="Real session token stream passed to the replay (see lm_trace_export).",
+    )
+    parser.add_argument(
         "--daser-prefetch-max-requests",
         type=int,
         default=0,
@@ -665,6 +671,11 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 *(
                     ["--corpus-tokens", str(args.corpus_tokens)]
                     if args.corpus_tokens is not None
+                    else []
+                ),
+                *(
+                    ["--session-tokens", str(args.session_tokens)]
+                    if args.session_tokens is not None
                     else []
                 ),
             ],

@@ -17,6 +17,7 @@ from benchmarks.mooncake.benchmark import (
     CorpusPromptBuilder,
     InstanceRouter,
     PromptBuilder,
+    SessionTextPromptBuilder,
     TraceRequest,
     load_trace,
     prefix_predecessors,
@@ -1009,3 +1010,37 @@ def test_replay_routes_between_instances_and_records_them(
     assert by_index[0]["tpot_ms"] == pytest.approx(2.0)
     summary = summarise(selection, results, 1.0, 1.0)
     assert summary["requests_per_instance"] == {"0": 2, "1": 2}
+
+
+def test_session_text_prompts_are_stream_prefixes(tmp_path: Path) -> None:
+    """Rows read input_length real tokens from their session's offset."""
+    path = tmp_path / "trace.jsonl"
+    rows = [
+        {
+            "timestamp": 0,
+            "input_length": 3,
+            "output_length": 1,
+            "hash_ids": [0],
+            "token_offset": 4,
+        },
+        {
+            "timestamp": 1,
+            "input_length": 5,
+            "output_length": 1,
+            "hash_ids": [0],
+            "token_offset": 4,
+        },
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    requests = load_trace(path)
+    builder = SessionTextPromptBuilder(list(range(100, 110)))
+    assert builder.build(requests[0]) == [104, 105, 106]
+    assert builder.build(requests[1]) == [104, 105, 106, 107, 108]
+
+    with pytest.raises(ValueError, match="past the token stream"):
+        builder.build(TraceRequest(2, 0, 7, 1, (0,), token_offset=4))
+    with pytest.raises(ValueError, match="token_offset"):
+        builder.build(TraceRequest(3, 0, 2, 1, (0,)))
+    path.write_text(json.dumps({**rows[0], "token_offset": -1}) + "\n")
+    with pytest.raises(ValueError, match="token_offset"):
+        load_trace(path)

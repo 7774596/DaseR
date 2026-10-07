@@ -57,6 +57,10 @@ class RequestResult:
     first_nonempty_text: bool = False
     sent_at_s: float | None = None
     first_token_at_s: float | None = None
+    #: Stream chunks that carried token IDs. With ``--stream-interval 1`` this
+    #: is the request's engine steps, so completion_tokens / token_events is
+    #: its mean speculative acceptance length (tokens per step).
+    token_events: int = 0
 
 
 @dataclass
@@ -624,6 +628,7 @@ async def vllm_completion_stream(
     first_token_at: float | None = None
     first_nonempty_text = False
     queue_ms = 0.0
+    token_events = 0
     try:
         async with sem:
             t0 = time.perf_counter()
@@ -654,6 +659,7 @@ async def vllm_completion_stream(
                         fragment = str(choice.get("text", ""))
                         token_ids = choice.get("token_ids")
                         has_token = isinstance(token_ids, list) and bool(token_ids)
+                        token_events += has_token
                         if first_token_at is None and (fragment or has_token):
                             first_token_at = time.perf_counter()
                             if on_first_token is not None:
@@ -718,6 +724,7 @@ async def vllm_completion_stream(
         first_nonempty_text=first_nonempty_text,
         sent_at_s=t0,
         first_token_at_s=first_token_at,
+        token_events=token_events,
     )
 
 

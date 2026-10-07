@@ -73,6 +73,9 @@ class TraceRequest:
         prewarm_tokens: Optional leading prompt tokens known as soon as the
             prefix producer completes (a user turn whose previous query
             chain a thinking-model template re-renders without reasoning).
+        token_offset: Optional start of the request's session in a real
+            token stream (see :class:`SessionTextPromptBuilder`); the prompt
+            is the stream's next ``input_length`` tokens.
 
     Thread-safety:
         Immutable and safe to share across replay tasks.
@@ -86,6 +89,7 @@ class TraceRequest:
     session_id: int | None = None
     gap_ms: float | None = None
     prewarm_tokens: int | None = None
+    token_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -574,6 +578,48 @@ class CorpusPromptBuilder(PromptBuilder):
         return tuple(self._id_tokens(hash_id, _CORPUS_ID_DIGITS)) + tuple(
             int(token) for token in text
         )
+
+
+class SessionTextPromptBuilder(PromptBuilder):
+    """Build prompts as prefixes of real per-session token streams.
+
+    Agent sessions grow by appending messages, so every request of a session
+    is a prefix of the session's full rendered conversation. Rows carry
+    ``token_offset``, the session's start in one concatenated stream; the
+    prompt is the stream's ``input_length`` tokens from there. Unlike
+    :class:`CorpusPromptBuilder`, outputs then see the real context (code,
+    tool results), so prompt-lookup speculation sees real repetition.
+
+    Args:
+        tokens: 1-D sequence of real token IDs (for example a memory-mapped
+            ``numpy`` array) holding every session back to back.
+
+    Thread-safety:
+        Same as :class:`PromptBuilder`.
+    """
+
+    def __init__(self, tokens: Sequence[int]) -> None:
+        self._stream = tokens
+
+    def build(self, request: TraceRequest) -> list[int]:
+        """Return the request's real prompt tokens.
+
+        Args:
+            request: Validated request carrying ``token_offset``.
+
+        Returns:
+            ``input_length`` token IDs starting at ``token_offset``.
+
+        Raises:
+            ValueError: When the row has no offset or runs past the stream.
+        """
+        start = request.token_offset
+        if start is None:
+            raise ValueError(f"row {request.index}: session text needs token_offset")
+        end = start + request.input_length
+        if end > len(self._stream):
+            raise ValueError(f"row {request.index}: prompt runs past the token stream")
+        return [int(token) for token in self._stream[start:end]]
 
 
 def load_trace(
@@ -1081,6 +1127,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--session-tokens",
+        type=Path,
+        default=None,
+        help=(
+            "Optional .npy stream of real session tokens; each row's prompt "
+            "is the input_length tokens at its token_offset."
+        ),
+    )
+    parser.add_argument(
         "--prefix-dependencies",
         action="store_true",
         help=(
@@ -1147,7 +1202,15 @@ async def main_async(args: argparse.Namespace) -> int:
         args.tokenizer,
         trust_remote_code=args.trust_remote_code,
     )
-    if args.corpus_tokens is None:
+    if args.corpus_tokens is not None and args.session_tokens is not None:
+        raise ValueError("--corpus-tokens and --session-tokens are exclusive")
+    if args.session_tokens is not None:
+        import numpy as np
+
+        prompt_builder: PromptBuilder = SessionTextPromptBuilder(
+            np.load(args.session_tokens, mmap_mode="r")
+        )
+    elif args.corpus_tokens is None:
         prompt_builder = PromptBuilder(
             vocab_size=len(tokenizer),
             special_token_ids=tokenizer.all_special_ids,
@@ -1254,6 +1317,12 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
     )
     if prewarm_tokens is not None and not 0 < prewarm_tokens <= input_length:
         raise ValueError(f"row {index}: prewarm_tokens must be in [1, input_length]")
+    raw_offset = payload.get("token_offset")
+    token_offset = (
+        None if raw_offset is None else _integer(raw_offset, index, "token_offset")
+    )
+    if token_offset is not None and token_offset < 0:
+        raise ValueError(f"row {index}: token_offset must be non-negative")
     return TraceRequest(
         index=index,
         timestamp_ms=timestamp,
@@ -1263,6 +1332,7 @@ def _parse_request(index: int, payload: Any) -> TraceRequest:
         session_id=session_id,
         gap_ms=gap_ms,
         prewarm_tokens=prewarm_tokens,
+        token_offset=token_offset,
     )
 
 

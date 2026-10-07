@@ -4090,3 +4090,44 @@ def test_profile_prefix_is_empty_unless_configured(
         "-o",
         str(tmp_path / "vllm_daser_1"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_vllm_stream_counts_token_events_per_step() -> None:
+    """Each streamed chunk with token IDs is one engine step."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self) -> object:
+            yield 'data: {"choices":[{"text":"a","token_ids":[1]}]}'
+            yield 'data: {"choices":[{"text":"bcd","token_ids":[2,3,4]}]}'
+            yield 'data: {"choices":[{"text":"","token_ids":[]}]}'
+            yield (
+                'data: {"usage":{"prompt_tokens":3,"completion_tokens":4},"choices":[]}'
+            )
+            yield "data: [DONE]"
+
+        async def __aenter__(self) -> "_Response":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class _Client:
+        def stream(self, *args: object, **kwargs: object) -> _Response:
+            return _Response()
+
+    result = await vllm_completion_stream(
+        _Client(),
+        "http://127.0.0.1:8001",
+        BenchmarkSample(sample_id=1, dataset="t", context="", question="", answers=[]),
+        "prompt",
+        {"max_tokens": 4},
+        asyncio.Semaphore(1),
+        10.0,
+    )
+
+    assert result.completion_tokens == 4
+    assert result.token_events == 2
