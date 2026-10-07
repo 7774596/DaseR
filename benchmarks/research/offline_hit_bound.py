@@ -10,13 +10,15 @@ upper bound for any GPU + L1 + L2 hierarchy whose total capacity is ``C``.
 (deepest prefix position first among ties): a clairvoyant bound for what any
 replacement policy could reach at the same capacity. ``--policy lru-dead``
 ranks a realizable hint: blocks a session's prefix diverged from are evicted
-first.
+first. ``--restart-at`` empties the cache before the given requests to price
+a cold cache-service restart.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from collections.abc import Callable
 import heapq
 from pathlib import Path
 
@@ -147,6 +149,37 @@ def belady_prefix_hit_rate(
     return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
 
 
+def restarted_hit_rate(
+    simulate: Callable[[list, int], tuple[float, int, int]],
+    requests: list,
+    capacity_blocks: int,
+    restart_at: list[int],
+) -> tuple[float, int, int]:
+    """Replay ``requests`` with the cache emptied before each restart index.
+
+    Models a cache service that loses its contents (cold restart) before
+    request ``restart_at[i]``: each segment is replayed on an empty cache.
+
+    Args:
+        simulate: One of the policy functions in this module.
+        requests: ``TraceRequest`` rows in arrival order.
+        capacity_blocks: Cache capacity in 512-token blocks (``<=0`` = infinite).
+        restart_at: Request indices before which the cache is emptied.
+
+    Returns:
+        ``(hit_rate, hit_tokens, prompt_tokens)`` summed over the segments.
+    """
+    bounds = [0, *sorted(i for i in restart_at if 0 < i < len(requests))]
+    bounds.append(len(requests))
+    hit_tokens = 0
+    prompt_tokens = 0
+    for start, end in zip(bounds, bounds[1:], strict=False):
+        _, hits, tokens = simulate(requests[start:end], capacity_blocks)
+        hit_tokens += hits
+        prompt_tokens += tokens
+    return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
+
+
 _POLICIES = {
     "lru": prefix_hit_rate,
     "lru-dead": dead_hint_prefix_hit_rate,
@@ -181,8 +214,20 @@ def main() -> None:
     parser.add_argument(
         "--policy", choices=tuple(_POLICIES), default="lru", help=_POLICY_HELP
     )
+    parser.add_argument(
+        "--restart-at",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Request indices (within the window) before which the cache is "
+        "emptied, modelling a cold cache-service restart.",
+    )
     args = parser.parse_args()
-    simulate = _POLICIES[args.policy]
+    policy = _POLICIES[args.policy]
+
+    def simulate(rows: list, capacity_blocks: int) -> tuple[float, int, int]:
+        return restarted_hit_rate(policy, rows, capacity_blocks, args.restart_at)
+
     requests = list(load_trace(args.trace, args.max_requests, args.start_request, 0))
     unique = len({block for request in requests for block in request.hash_ids})
     total_tokens = sum(request.input_length for request in requests)

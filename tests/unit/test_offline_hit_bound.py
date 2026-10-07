@@ -6,6 +6,7 @@ from benchmarks.research.offline_hit_bound import (
     belady_prefix_hit_rate,
     dead_hint_prefix_hit_rate,
     prefix_hit_rate,
+    restarted_hit_rate,
 )
 
 
@@ -67,3 +68,17 @@ def test_dead_hint_evicts_blocks_a_session_diverged_from() -> None:
 
     assert lru == 0.0
     assert dead == 0.25
+
+
+def test_restart_empties_the_cache_before_the_given_request() -> None:
+    """A restart turns the next resend of every prompt into a cold miss."""
+    requests = _loop(sessions=2, rounds=3, blocks=2)
+
+    warm = prefix_hit_rate(requests, 0)
+    cold = restarted_hit_rate(prefix_hit_rate, requests, 0, [4])
+    unrestarted = restarted_hit_rate(prefix_hit_rate, requests, 0, [])
+
+    assert unrestarted == warm
+    # Rounds 1 and 3 miss (2 of 6 requests hit instead of 4 of 6).
+    assert warm[0] == 4 / 6
+    assert cold[0] == 2 / 6
