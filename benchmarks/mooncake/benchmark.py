@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 import queue
 import random
+import signal
 import statistics
 import threading
 import time
@@ -946,7 +947,9 @@ async def replay(
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
-        wall duration, and whether the replay was aborted early.
+        wall duration, and whether the replay was aborted early (failure
+        budget spent, or SIGTERM received: in-flight requests are cancelled
+        and the finished ones returned).
 
     Async/thread-safety:
         Uses one asyncio event loop for scheduling and a dedicated writer
@@ -1053,20 +1056,33 @@ async def replay(
             failures = 0
             aborted = False
             pending: set[asyncio.Task[dict[str, Any]]] = set(tasks)
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    record = task.result()
-                    results.append(record)
-                    failures += record.get("error") is not None
-                if abort_after_failures and failures >= abort_after_failures:
+            # SIGTERM (watchdog or a truncated run) stops the replay like a
+            # spent failure budget, so the caller still writes its summary.
+            stop = asyncio.Event()
+            stop_wait = asyncio.create_task(stop.wait())
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signal.SIGTERM, stop.set)
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending | {stop_wait}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    pending.discard(stop_wait)
+                    for task in done - {stop_wait}:
+                        record = task.result()
+                        results.append(record)
+                        failures += record.get("error") is not None
+                    spent = abort_after_failures and failures >= abort_after_failures
+                    if not (spent or stop.is_set()):
+                        continue
                     aborted = bool(pending)
                     for task in pending:
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
                     break
+            finally:
+                loop.remove_signal_handler(signal.SIGTERM)
+                stop_wait.cancel()
             if population is not None:
                 population.cancel()
                 await asyncio.gather(population, return_exceptions=True)

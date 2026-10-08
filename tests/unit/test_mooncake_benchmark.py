@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
+import signal
 import time
 from typing import Any
 
@@ -261,6 +263,45 @@ def test_replay_aborts_after_failure_threshold(
     # Requests finishing in the same wakeup may overshoot the budget slightly.
     assert 3 <= len(results) < len(requests)
     assert summarise(selection, results, 1.0, 1.0, aborted=aborted)["aborted"]
+
+
+def test_replay_stops_on_sigterm_and_returns_finished_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM cancels in-flight requests and returns the finished ones."""
+    finished = 0
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        nonlocal finished
+        if finished == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(60)
+        finished += 1
+        return RequestResult(0, "m", "x", 1.0, 2.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [TraceRequest(i, 0, 10, 1, (i,)) for i in range(10)]
+    selection = select_requests(requests, max_model_len=100)
+
+    results, _, aborted = asyncio.run(
+        replay(
+            selection=selection,
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=1,
+            timeout_seconds=120.0,
+            time_scale=1.0,
+            seed=0,
+        )
+    )
+
+    assert aborted
+    assert len(results) == 2
+    assert all(r["error"] is None for r in results)
+    # The handler is removed again: SIGTERM keeps its default action.
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
 
 
 def test_prefix_predecessor_is_the_producer_of_the_deepest_shared_block() -> None:
