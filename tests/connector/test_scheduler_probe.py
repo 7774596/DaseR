@@ -110,3 +110,19 @@ def test_probe_weights_load_wait_from_allocation(
     line = probe_log.lines[-1]
     assert "load_prealloc n=1 s=2.0 blk_s=0" in line
     assert "load_wait n=1 s=1.0 blk_s=10" in line
+
+
+def test_probe_separates_repeat_lookups(probe_log: _Capture) -> None:
+    """Re-asks after a counted lookup are tallied and their deferrals tagged."""
+    probe = SchedulerProbe(interval_s=1e-9)
+    probe.on_lookup("r", 0.010, (256, True))  # first count
+    probe.on_lookup("r", 0.020, (None, True), "pending_writer")  # re-ask, deferred
+    probe.on_lookup("r", 0.030, (256, True))  # re-ask, counted again
+    probe.on_lookup("s", 0.005, (None, True), "pending_writer")  # first-time deferral
+    probe.on_request_finished("r", 4, delayed=False)
+    probe.on_lookup("r", 0.001, (0, False))  # a finished request starts fresh
+
+    line = probe_log.lines[-1]
+    assert "repeat_n=2 repeat_s=0.05" in line
+    assert "pending_writer_repeat[n=1" in line
+    assert "pending_writer[n=0" in line and "open=1" in line

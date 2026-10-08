@@ -10,7 +10,12 @@ seconds; the probe then logs cumulative totals at that interval. It measures:
 - defer: time a request spends between a ``None`` lookup result (vLLM keeps
   it waiting and asks again next step) and the next lookup that returns a
   count, split by the reason the connector deferred it (pending writer,
-  prefetch, coalesce follower, ...).
+  prefetch, coalesce follower, ...). Deferrals of a request whose lookup
+  already returned a count (vLLM re-asks while its allocation fails) are
+  kept under ``<reason>_repeat``, since that wall time also lies inside the
+  request's ``load_prealloc`` interval.
+- repeat: lookups of requests that already got a count, with their wall
+  time (the IPC cost of re-asking while capacity is short).
 - load prealloc: time from an async external hit until vLLM allocates the
   request's blocks (the hit is re-looked-up each step while capacity is
   short; no blocks are held yet).
@@ -92,6 +97,9 @@ class SchedulerProbe:
         self._lookup_seconds = 0.0
         self._lookup_max = 0.0
         self._pending_retries = 0
+        self._counted: set[str] = set()
+        self._repeat_calls = 0
+        self._repeat_seconds = 0.0
         self._defer: dict[str, _HoldTotals] = {}
         self._load_prealloc = _HoldTotals()
         self._load_wait = _HoldTotals()
@@ -131,7 +139,15 @@ class SchedulerProbe:
         self._lookup_max = max(self._lookup_max, elapsed_s)
         num_tokens, is_async = result
         now = time.monotonic()
+        repeat = req_id in self._counted
+        if repeat:
+            self._repeat_calls += 1
+            self._repeat_seconds += elapsed_s
         reason = (defer_reason or "unknown") if num_tokens is None else ""
+        if reason and repeat:
+            reason += "_repeat"
+        if num_tokens is not None:
+            self._counted.add(req_id)
         for name, totals in self._defer.items():
             if name != reason:
                 totals.close(req_id, now)
@@ -168,6 +184,7 @@ class SchedulerProbe:
             num_blocks: Blocks the scheduler would otherwise free now.
             delayed: Whether the connector asked vLLM to delay freeing.
         """
+        self._counted.discard(req_id)
         if delayed:
             self._save_hold.start(req_id, time.monotonic(), num_blocks)
 
@@ -195,12 +212,15 @@ class SchedulerProbe:
             return
         self._next_log = now + self._interval_s
         logger.info(
-            "[PROBE] lookup n=%d s=%.2f max_ms=%.1f pending_retries=%d | "
-            "load_prealloc %s | load_wait %s | save_hold %s | defer %s",
+            "[PROBE] lookup n=%d s=%.2f max_ms=%.1f pending_retries=%d "
+            "repeat_n=%d repeat_s=%.2f | load_prealloc %s | load_wait %s | "
+            "save_hold %s | defer %s",
             self._lookup_calls,
             self._lookup_seconds,
             self._lookup_max * 1000,
             self._pending_retries,
+            self._repeat_calls,
+            self._repeat_seconds,
             self._load_prealloc.summary(),
             self._load_wait.summary(),
             self._save_hold.summary(),
