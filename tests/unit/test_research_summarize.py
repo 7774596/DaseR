@@ -369,3 +369,34 @@ def test_decode_rows_fit_tpot_against_overlapping_context(tmp_path: Path) -> Non
 
     assert "tpot_ms=25.0" in row
     assert "fit n=3 floor_ms=5.0 ms_per_100k_ctx=10.00" in row
+
+
+def test_slo_trim_flags_a_window_whose_load_drifts(tmp_path: Path) -> None:
+    """Growing prompts between the window halves flag NONSTATIONARY."""
+    arms = []
+    for name, late_ctx in (("flat", 1000), ("growing", 2000)):
+        arm_dir = tmp_path / name / "art" / "arm"
+        arm_dir.mkdir(parents=True)
+        with (arm_dir / "requests.jsonl").open("w") as f:
+            for i in range(20):
+                send = 0.5 * i
+                record = {
+                    "status": "completed",
+                    "ttft_ms": 100.0,
+                    "latency_ms": 200.0,
+                    "completion_tokens": 2,
+                    "prompt_tokens": 1000 if send < 5 else late_ctx,
+                    "session_id": i % 4,
+                    "send_offset_s": send,
+                    "completion_offset_s": send + 0.2,
+                }
+                f.write(json.dumps(record) + "\n")
+        (arm_dir / "summary.json").write_text(json.dumps({"wall_seconds": 10.0}))
+        arms.append(arm_dir)
+
+    flat, growing = slo_rows(arms, ttft_ms=500.0, tpot_ms=150.0, trim_frac=0.1)[1:]
+
+    assert "drift ctx=+0.00 done=+0.00" in flat and "NONSTATIONARY" not in flat
+    assert "drift ctx=+1.00" in growing and "NONSTATIONARY" in growing
+    # Every session spans 16 × 0.5 s of sends plus 0.2 s → 8.2 s lifetimes.
+    assert "life50_s=8" in flat

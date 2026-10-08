@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import re
+from typing import Any
 
 _COLUMNS = (
     "arm",
@@ -503,6 +504,47 @@ def _active_sessions(records: list[dict], begin: float, end: float) -> float:
     return covered / (end - begin) if end > begin else 0.0
 
 
+def _session_lifetime_p50(records: list[dict[str, Any]]) -> float:
+    """Median first-send to last-completion span over complete sessions."""
+    spans: dict[Any, list[float]] = {}
+    for record in records:
+        if "send_offset_s" not in record or "completion_offset_s" not in record:
+            continue
+        span = spans.setdefault(record.get("session_id"), [math.inf, -math.inf])
+        span[0] = min(span[0], float(record["send_offset_s"]))
+        span[1] = max(span[1], float(record["completion_offset_s"]))
+    lifetimes = sorted(end - start for start, end in spans.values())
+    return lifetimes[len(lifetimes) // 2] if lifetimes else 0.0
+
+
+def _window_drift(
+    records: list[dict[str, Any]], begin: float, end: float
+) -> tuple[float, float]:
+    """Relative change of median prompt length and completions, half to half."""
+    middle = (begin + end) / 2
+    halves = ((begin, middle), (middle, end))
+    ctx = []
+    done = []
+    for low, high in halves:
+        sent = sorted(
+            int(r.get("prompt_tokens", 0))
+            for r in records
+            if low <= float(r.get("send_offset_s", -1)) < high
+        )
+        ctx.append(sent[len(sent) // 2] if sent else 0)
+        done.append(
+            sum(
+                low <= float(r.get("completion_offset_s", -1)) < high
+                and r.get("status") == "completed"
+                for r in records
+            )
+        )
+    return (
+        ctx[1] / ctx[0] - 1 if ctx[0] else 0.0,
+        done[1] / done[0] - 1 if done[0] else 0.0,
+    )
+
+
 def slo_rows(
     arm_dirs: list[Path], ttft_ms: float, tpot_ms: float, trim_frac: float = 0.0
 ) -> list[str]:
@@ -518,12 +560,17 @@ def slo_rows(
         tpot_ms: TPOT SLO in milliseconds.
         trim_frac: Drop requests sent in the first and last ``trim_frac`` of
             the wall clock (ramp-up and drain), so the row describes the
-            steady state; goodput divides by the kept window.
+            steady state; goodput divides by the kept window. A trimmed row
+            also checks that the window is stationary: the median prompt
+            length and the completion count of its two halves must differ by
+            at most 15%, otherwise the row is flagged NONSTATIONARY and its
+            SLO numbers are not a steady-state reading.
 
     Returns:
         One line per arm: completed requests, TTFT and TPOT p90, summed TTFT,
-        mean active sessions, SLO attainment over the kept sent requests
-        (failures miss it), and goodput in SLO-meeting requests per second.
+        mean active sessions, median session lifetime, SLO attainment over the
+        kept sent requests (failures miss it), goodput in SLO-meeting requests
+        per second, and with trimming the half-to-half drift.
     """
     lines = [
         f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms, "
@@ -534,6 +581,8 @@ def slo_rows(
         wall = float(json.loads((arm_dir / "summary.json").read_text())["wall_seconds"])
         begin, end = trim_frac * wall, (1.0 - trim_frac) * wall
         active = _active_sessions(records, begin, end)
+        lifetime = _session_lifetime_p50(records)
+        drift = _window_drift(records, begin, end) if trim_frac else None
         if trim_frac:
             records = [
                 r for r in records if begin <= float(r.get("send_offset_s", 0)) < end
@@ -555,8 +604,15 @@ def slo_rows(
             f"  {arm_dir.parent.parent.name}/{arm_dir.name}: ok={len(done)} "
             f"ttft_p90={_p(ttft, 90):.0f} tpot_p90={_p(tpot, 90):.1f} "
             f"sum_ttft_s={sum(ttft) / 1000:.0f} active={active:.1f} "
+            f"life50_s={lifetime:.0f} "
             f"slo={_rate(good, len(records))} "
             f"goodput={good / wall if wall else 0:.3f}/s"
+            + (
+                ""
+                if drift is None
+                else f" drift ctx={drift[0]:+.2f} done={drift[1]:+.2f}"
+                + (" NONSTATIONARY" if max(map(abs, drift)) > 0.15 else "")
+            )
         )
     return lines
 
