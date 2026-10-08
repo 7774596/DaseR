@@ -1159,6 +1159,20 @@ class LoadPipeline:
             return released_buffer, False
         if not state.batches:
             self._log_request_timing(state)
+            if self._timeline is not None:
+                rows = state.completed
+                self._timeline.on_breakdown(
+                    state.request.req_ids,
+                    dispatch_s=time.perf_counter() - state.started_at,
+                    ipc_s=sum(row.ipc_ms for row in rows) / 1000,
+                    server_s=sum(
+                        row.transfer_open_ms
+                        + row.transfer_load_ms
+                        + row.transfer_sync_ms
+                        for row in rows
+                    )
+                    / 1000,
+                )
             if not state.request.future.done():
                 state.request.future.set_result(None)
             return released_buffer, True

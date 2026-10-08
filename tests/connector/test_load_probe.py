@@ -39,3 +39,12 @@ def test_timeline_disabled_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert LoadTimeline.from_env() is None
     monkeypatch.setenv("DASER_SCHED_PROBE_INTERVAL_S", "30")
     assert LoadTimeline.from_env() is not None
+
+
+def test_timeline_weights_breakdown_by_started_requests() -> None:
+    """A coalesced load's breakdown counts once per started request."""
+    timeline = LoadTimeline(interval_s=1e9)
+    timeline.on_start(["a", "b"], now=0.0)
+    timeline.on_breakdown(["a", "b", "never"], dispatch_s=0.5, ipc_s=0.4, server_s=0.1)
+    summary = timeline.summary()
+    assert "dispatch_s=1.0 ipc_s=0.8 server_s=0.2" in summary

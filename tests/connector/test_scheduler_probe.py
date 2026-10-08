@@ -62,7 +62,7 @@ def test_probe_accounts_load_wait_and_save_hold(probe_log: _Capture) -> None:
     assert "pending_retries=1" in line
     assert "load_wait n=1" in line
     assert "save_hold n=1" in line
-    assert line.count("open=0") == 2
+    assert line.count("open=0") == 3
 
 
 def test_probe_keeps_unfinished_intervals_open(probe_log: _Capture) -> None:
@@ -90,3 +90,23 @@ def test_probe_splits_deferral_time_by_reason(probe_log: _Capture) -> None:
     assert "pending_writer[n=1 " in line
     # "b" is still deferred: its interval stays open.
     assert "prefetch[n=0 " in line and "open=1]" in line
+
+
+def test_probe_weights_load_wait_from_allocation(
+    probe_log: _Capture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Time before vLLM allocates blocks is prealloc and holds no blocks."""
+    clock = [0.0]
+    monkeypatch.setattr(
+        "daser.connector.scheduler.probe.time.monotonic", lambda: clock[0]
+    )
+    probe = SchedulerProbe(interval_s=1e-9)
+    probe.on_lookup("load", 0.001, (256, True))  # hit while capacity is short
+    clock[0] = 2.0
+    probe.on_alloc("load", 10)  # blocks allocated
+    clock[0] = 3.0
+    probe.on_connector_output(finished_sending=[], finished_recving=["load"])
+
+    line = probe_log.lines[-1]
+    assert "load_prealloc n=1 s=2.0 blk_s=0" in line
+    assert "load_wait n=1 s=1.0 blk_s=10" in line

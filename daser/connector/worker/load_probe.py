@@ -11,6 +11,13 @@ the worker's share of the scheduler-side ``load_wait`` into:
 - report: from that completion until the next ``get_finished`` poll returns
   the request as ``finished_recving`` (step cadence on the worker).
 
+The io part is further split per finished load: ``dispatch`` is the time from
+the dispatcher picking the load up until it completes (``io - dispatch`` is
+queueing in the load thread before pickup), ``ipc`` the summed IPC round
+trips of its batches, and ``server`` the server-reported open + load + sync
+time inside them (``ipc - server`` is IPC transit plus server-side queueing
+before the transfer runs).
+
 It also reports the mean interval between ``get_finished`` polls (one per
 model step), so the remainder of the scheduler-side wait (allocation to
 ``start_load_kv`` and ``finished_recving`` to the scheduler seeing it) can be
@@ -56,6 +63,9 @@ class LoadTimeline:
         self._io_max = 0.0
         self._report_s = 0.0
         self._report_max = 0.0
+        self._dispatch_s = 0.0
+        self._ipc_s = 0.0
+        self._server_s = 0.0
         self._polls = 0
         self._poll_span_s = 0.0
         self._last_poll: float | None = None
@@ -97,6 +107,23 @@ class LoadTimeline:
             for req_id in req_ids:
                 if req_id in self._started:
                     self._done.setdefault(req_id, now)
+
+    def on_breakdown(
+        self, req_ids: Iterable[str], dispatch_s: float, ipc_s: float, server_s: float
+    ) -> None:
+        """Record where one finished load spent its io time.
+
+        Args:
+            req_ids: Base request IDs sharing the load (each is weighted).
+            dispatch_s: Dispatcher pickup to completion.
+            ipc_s: Summed IPC round trips of the load's batches.
+            server_s: Server-reported transfer open + load + sync time.
+        """
+        with self._lock:
+            weight = sum(1 for req_id in req_ids if req_id in self._started)
+            self._dispatch_s += weight * dispatch_s
+            self._ipc_s += weight * ipc_s
+            self._server_s += weight * server_s
 
     def on_collect(self, finished: Iterable[str], now: float | None = None) -> None:
         """Record one ``get_finished`` poll and the loads it reported.
@@ -140,5 +167,7 @@ class LoadTimeline:
         return (
             f"loads={self._loads} io_s={self._io_s:.1f} io_max_s={self._io_max:.2f} "
             f"report_s={self._report_s:.1f} report_max_s={self._report_max:.2f} "
+            f"dispatch_s={self._dispatch_s:.1f} ipc_s={self._ipc_s:.1f} "
+            f"server_s={self._server_s:.1f} "
             f"open={len(self._started)} polls={self._polls} step_ms={step_ms:.1f}"
         )

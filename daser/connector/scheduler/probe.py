@@ -11,9 +11,12 @@ seconds; the probe then logs cumulative totals at that interval. It measures:
   it waiting and asks again next step) and the next lookup that returns a
   count, split by the reason the connector deferred it (pending writer,
   prefetch, coalesce follower, ...).
-- load wait: time from an async external hit until ``finished_recving``,
-  weighted by the request's allocated blocks (block-seconds held while the
-  request sits in ``WAITING_FOR_REMOTE_KVS``).
+- load prealloc: time from an async external hit until vLLM allocates the
+  request's blocks (the hit is re-looked-up each step while capacity is
+  short; no blocks are held yet).
+- load wait: time from that allocation until ``finished_recving``, weighted
+  by the allocated blocks (block-seconds held while the request sits in
+  ``WAITING_FOR_REMOTE_KVS``).
 - save hold: time from a delayed ``request_finished`` until
   ``finished_sending``, weighted by the request's blocks.
 """
@@ -90,6 +93,7 @@ class SchedulerProbe:
         self._lookup_max = 0.0
         self._pending_retries = 0
         self._defer: dict[str, _HoldTotals] = {}
+        self._load_prealloc = _HoldTotals()
         self._load_wait = _HoldTotals()
         self._save_hold = _HoldTotals()
 
@@ -134,18 +138,27 @@ class SchedulerProbe:
         if num_tokens is None:
             self._pending_retries += 1
             self._defer.setdefault(reason, _HoldTotals()).start(req_id, now, 0)
-        elif is_async and num_tokens > 0:
-            self._load_wait.start(req_id, time.monotonic(), 0)
+        elif is_async and num_tokens > 0 and req_id not in self._load_wait.open:
+            self._load_prealloc.start(req_id, now, 0)
         self._maybe_log()
 
     def on_alloc(self, req_id: str, num_blocks: int) -> None:
-        """Attach the allocated block count to an open load wait.
+        """Start the block hold of an async load once its blocks exist.
+
+        Closes the request's prealloc interval and opens its load wait
+        weighted by ``num_blocks``; a later allocation for an open load wait
+        only updates the weight.
 
         Args:
             req_id: vLLM request ID.
             num_blocks: Blocks allocated to the request.
         """
-        self._load_wait.set_blocks(req_id, num_blocks)
+        if req_id in self._load_prealloc.open:
+            now = time.monotonic()
+            self._load_prealloc.close(req_id, now)
+            self._load_wait.start(req_id, now, num_blocks)
+        else:
+            self._load_wait.set_blocks(req_id, num_blocks)
 
     def on_request_finished(self, req_id: str, num_blocks: int, delayed: bool) -> None:
         """Open a save-hold interval when block freeing is delayed.
@@ -171,6 +184,7 @@ class SchedulerProbe:
         for req_id in finished_sending:
             self._save_hold.close(req_id, now)
         for req_id in finished_recving:
+            self._load_prealloc.close(req_id, now)
             self._load_wait.close(req_id, now)
         self._maybe_log()
 
@@ -182,11 +196,12 @@ class SchedulerProbe:
         self._next_log = now + self._interval_s
         logger.info(
             "[PROBE] lookup n=%d s=%.2f max_ms=%.1f pending_retries=%d | "
-            "load_wait %s | save_hold %s | defer %s",
+            "load_prealloc %s | load_wait %s | save_hold %s | defer %s",
             self._lookup_calls,
             self._lookup_seconds,
             self._lookup_max * 1000,
             self._pending_retries,
+            self._load_prealloc.summary(),
             self._load_wait.summary(),
             self._save_hold.summary(),
             " ".join(
