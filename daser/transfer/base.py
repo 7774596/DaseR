@@ -168,6 +168,19 @@ class TransferLayer(ABC):
         """
         return 0
 
+    def debug_state(self) -> dict[str, Any]:
+        """Return a small snapshot of in-flight work for stall diagnostics.
+
+        Returns:
+            Counts of in-flight loads, leases and writes; empty for backends
+            that keep no such state.
+
+        Async/thread-safety:
+            May be called from a diagnostic thread without the backend lock;
+            values are best-effort and must not be used for control flow.
+        """
+        return {}
+
     @abstractmethod
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
         """Load bytes into ``dst``.

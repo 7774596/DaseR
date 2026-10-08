@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
+from daser import stalldump
 from daser.config import STORAGE_FORMAT_RAW
 from daser.connector.helpers import PendingStore
 from daser.connector.ipc_client import PrefetchLookupResult
@@ -167,6 +168,18 @@ class RequestLifecycle:
         self._coalesce_followers: dict[str, tuple[int, float]] = {}
         self._follower_digests: dict[str, dict[int, int]] = {}
         self._coalesce_stats = {"followers": 0, "joined": 0, "missed": 0}
+        stalldump.register_state(
+            "scheduler",
+            lambda: {
+                "pending_async_saves": sorted(self._pending_async_saves),
+                "pending_loads": sorted(self._pending_loads),
+                "pending_stores": sorted(self._pending_stores),
+                "pending_alloc": len(self._pending_alloc),
+                "defer_deadlines": dict(self._lookup_defer_deadlines),
+                "inflight_loads": dict(self._inflight_loads),
+                "now": time.monotonic(),
+            },
+        )
 
     def on_new_request(self, request: "Request") -> None:
         """Start SSD readahead for a request entering vLLM's waiting queue.

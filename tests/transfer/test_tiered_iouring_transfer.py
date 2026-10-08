@@ -1465,6 +1465,32 @@ def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_debug_state_reports_held_lease(tmp_path) -> None:
+    """The stall snapshot lists a retained lease until it is released."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await layer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await layer.drain()
+            spans = [{"file_offset": 0, "nbytes": ALIGNMENT}]
+            assert await layer.classify_and_acquire_lease("req", spans) == "l1"
+            state = layer.debug_state()
+            assert state["leases"] == {"req": (ALIGNMENT, 0, False)}
+            assert state["loads_active"] == 0
+            await layer.release_lease("req")
+            assert layer.debug_state()["leases"] == {}
+        finally:
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_concurrent_leased_prefetches_share_one_l2_read(tmp_path) -> None:
     """Overlapping leased prefetches read L2 once and both leases complete."""
 

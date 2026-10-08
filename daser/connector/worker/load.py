@@ -17,6 +17,7 @@ import cupy
 import numpy as np
 import torch
 
+from daser import stalldump
 from daser.compression.format import IO_ALIGNMENT
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import (
@@ -401,6 +402,14 @@ class LoadPipeline:
         # and touched only by the load thread.
         self._header_host: torch.Tensor | None = None
         self._thread.start()
+        stalldump.register_loop("worker-load", self._loop)
+        stalldump.register_state(
+            "worker-load",
+            lambda: {
+                req_id: load.future.done()
+                for req_id, load in dict(self._pending).items()
+            },
+        )
 
     def configure(
         self,

@@ -14,6 +14,7 @@ from typing import Any
 import cupy
 import torch
 
+from daser import stalldump
 from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
@@ -135,6 +136,19 @@ class StorePipeline:
         self._producer_event_order = 0
         self._probe = StoreProbe.from_env()
         self._thread.start()
+        stalldump.register_loop("worker-store", self._loop)
+        stalldump.register_state(
+            "worker-store",
+            lambda: {
+                req_id: (
+                    save.finished,
+                    save.future is not None and save.future.done(),
+                    save.snapshot_done,
+                    save.completion_emitted,
+                )
+                for req_id, save in dict(self._pending_finished_saves).items()
+            },
+        )
 
     def configure(
         self,

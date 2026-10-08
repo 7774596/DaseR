@@ -2574,6 +2574,37 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stats.l1_evicted_unread_bytes = evicted["unread_bytes"]
         return self._stats
 
+    def debug_state(self) -> dict[str, Any]:
+        """Return in-flight loads, leases, readaheads and writes.
+
+        Returns:
+            Counts plus per-lease ``(remaining bytes, active loads, filling)``.
+
+        Async/thread-safety:
+            Read from a diagnostic thread without the transfer lock; dicts are
+            copied first, so values are best-effort.
+        """
+        leases = dict(self._request_leases)
+        return {
+            "loads_active": self._loads_active,
+            "leases": {
+                lease_id: (
+                    sum(size for _start, size in lease.remaining),
+                    lease.active_loads,
+                    lease.filling,
+                )
+                for lease_id, lease in leases.items()
+            },
+            "readaheads": len(dict(self._readaheads)),
+            "readahead_running": self._readahead_running,
+            "pending_l2_writes": sum(
+                not task.done() for task in list(self._pending_l2.values())
+            ),
+            "pending_l1_promotions": len(dict(self._pending_l1_promotions)),
+            "l1_bytes_used": self._l1.bytes_used,
+            "held_bytes": self._held_bytes,
+        }
+
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
         if self._pending_h2d:

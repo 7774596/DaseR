@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any
 
+from daser import stalldump
 from daser.config import (
     BATCH_DST_COPY_ENV,
     DEVICE_STASH_BYTES_ENV,
@@ -596,6 +597,11 @@ class IPCServer:
         """
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
+        stalldump.register_loop("server", asyncio.get_running_loop())
+        stalldump.register_state(
+            "server-transfer",
+            lambda: {} if self._transfer is None else self._transfer.debug_state(),
+        )
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=self._socket_path
         )
@@ -713,6 +719,12 @@ class IPCServer:
         ipc_labels = {"op": op}
         started = time.perf_counter()
         status = "error"
+        # Requests still running: a stalled op stays visible on /metrics.
+        inflight = self._metrics.gauge(
+            "daser_ipc_requests_inflight",
+            "IPC requests currently being handled, by operation.",
+        )
+        inflight.inc(labels=ipc_labels)
         try:
             handler = self._op_handlers.get(op)
             if handler is None:
@@ -725,6 +737,7 @@ class IPCServer:
             logger.exception("[IPC] request failed: %s", exc)
             return {"error": str(exc)}
         finally:
+            inflight.inc(-1.0, labels=ipc_labels)
             elapsed = time.perf_counter() - started
             self._metrics.counter(
                 "daser_ipc_requests_total",
