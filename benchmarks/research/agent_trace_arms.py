@@ -150,6 +150,66 @@ def _speculative_args(config: dict[str, Any] | None) -> tuple[str, ...]:
     return ("--speculative-config", json.dumps(config, separators=(",", ":")))
 
 
+def _drafter_kv_layers(config: dict[str, Any] | None) -> int:
+    """Return the KV layers an EAGLE drafter adds to the worker's KV cache.
+
+    Args:
+        config: ``--speculative-config`` object, or None for no speculation.
+
+    Returns:
+        The drafter's ``num_hidden_layers`` for ``eagle``/``eagle3`` with a
+        draft model, else 0 (n-gram and suffix drafting keep no KV).
+    """
+    if not config or config.get("method") not in ("eagle", "eagle3"):
+        return 0
+    draft = json.loads((Path(config["model"]) / "config.json").read_text())
+    return int(draft["num_hidden_layers"])
+
+
+def _probe_command(
+    args: argparse.Namespace, server_url: str, model_name: str, out_dir: Path
+) -> list[str]:
+    """Return the ``cache_state_probe`` command replacing an arm's replay.
+
+    Args:
+        args: Parsed runner arguments (``--cache-state-probe`` set).
+        server_url: vLLM URL to probe.
+        model_name: Served model name.
+        out_dir: Arm artifact directory receiving ``summary.json``.
+
+    Returns:
+        argv for ``subprocess.run``.
+
+    Raises:
+        ValueError: When the trace has no ``--session-tokens`` stream.
+    """
+    if args.session_tokens is None:
+        raise ValueError("--cache-state-probe needs --session-tokens")
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.research.cache_state_probe",
+        "--trace",
+        str(args.trace),
+        "--session-tokens",
+        str(args.session_tokens),
+        "--server-url",
+        server_url,
+        "--served-model-name",
+        model_name,
+        "--output-dir",
+        str(out_dir),
+        "--requests",
+        str(args.cache_state_probe),
+        "--max-tokens",
+        str(args.cache_state_probe_tokens),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--timeout",
+        str(args.timeout),
+    ]
+
+
 class MatchedServer(ServerManager):
     """ServerManager with prefix caching on and a fixed GPU KV byte budget."""
 
@@ -393,6 +453,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="vllm serve --speculative-config JSON for every arm, so arms "
         "compare under the same speculative-decoding baseline.",
     )
+    parser.add_argument(
+        "--cache-state-probe",
+        type=int,
+        default=0,
+        help="Instead of replaying the trace, send this many requests (one "
+        "per session) cold, GPU-cached and externally cached with "
+        "benchmarks.research.cache_state_probe; needs --session-tokens and "
+        "VLLM_SERVER_DEV_MODE=1 in the environment.",
+    )
+    parser.add_argument(
+        "--cache-state-probe-tokens",
+        type=int,
+        default=256,
+        help="Decode length of every --cache-state-probe request.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -497,6 +572,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         daser_l1_split_fraction=(
             args.daser_l1_split_fraction if arm.endswith("-split") else 0.0
         ),
+        daser_extra_kv_layers=_drafter_kv_layers(args.speculative_config),
         daser_l1_lru=args.daser_l1_lru,
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
@@ -662,7 +738,9 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
             gateway, gateway_url = await _start_gateway(args, manager, out_dir)
             server_urls = [gateway_url]
         replay = subprocess.run(
-            [
+            _probe_command(args, server_urls[0], model_name, out_dir)
+            if args.cache_state_probe
+            else [
                 sys.executable,
                 "-m",
                 "benchmarks.mooncake.benchmark",
