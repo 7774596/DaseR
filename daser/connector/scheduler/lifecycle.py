@@ -110,12 +110,24 @@ class RequestLifecycle:
         layerwise_load: bool = False,
         arrival_readahead: bool = False,
         writeback_low_blocks: int = 0,
+        reuse_retry_lookup: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
         # Why the last get_num_new_matched_tokens call returned None ("" when
         # it returned a count); read by the scheduler probe.
         self.last_defer_reason = ""
         self._arrival_readahead = arrival_readahead
+        # Research switch: when vLLM fails to allocate blocks for a request it
+        # asks again next step with the same prompt. Without a prefetch lease
+        # the answer only changes if the index lost a chunk (epoch advanced),
+        # so the previous result is reused after a token-free epoch check.
+        # Insertions since then are ignored: the reused prefix may be shorter
+        # than a fresh lookup, never longer. Entries are dropped once vLLM
+        # allocates (update_state_after_alloc) or the request leaves.
+        self._reuse_retry_lookup = reuse_retry_lookup
+        # req_id -> (num_computed_tokens, prefix length, epoch, chunks).
+        self._retry_lookups: dict[str, tuple[int, int, int, list[dict[str, Any]]]] = {}
+        self._retry_lookup_stats = {"reused": 0, "stale": 0}
         # Research switch: write-back stores. A finished request keeps its
         # vLLM blocks (and so its GPU prefix-cache residency) until free
         # blocks fall below this watermark; only then is its prompt KV
@@ -534,6 +546,12 @@ class RequestLifecycle:
         getattr(self, "_prefetch_signatures", {}).clear()
         if getattr(self, "_coalesce_loads", False):
             self._log_coalesce_stats()
+        if getattr(self, "_reuse_retry_lookup", False):
+            logger.info(
+                "[CONNECTOR] retry lookup reuse reused=%d stale=%d",
+                self._retry_lookup_stats["reused"],
+                self._retry_lookup_stats["stale"],
+            )
 
     def update_state_after_alloc(
         self,
@@ -550,6 +568,7 @@ class RequestLifecycle:
         """
         req_id = request.request_id
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
+        getattr(self, "_retry_lookups", {}).pop(req_id, None)
 
         if req_id in self._pending_loads:
             chunks = self._pending_loads[req_id]
@@ -760,6 +779,7 @@ class RequestLifecycle:
         pending_async_saves = self._pending_async_save_ids()
         for req_id in preempted_req_ids:
             base_req_id = str(req_id)
+            getattr(self, "_retry_lookups", {}).pop(base_req_id, None)
             pending_async_saves.discard(base_req_id)
             self._release_transfer_lease(base_req_id, force=True)
             getattr(self, "_prefetch_lookup_results", {}).pop(base_req_id, None)
@@ -915,17 +935,74 @@ class RequestLifecycle:
             # remote KV, and vLLM's waiting loop stops at the earlier
             # request's failed allocation every step (deadlock).
             return None
+        if getattr(self, "_reuse_retry_lookup", False):
+            reused = self._reuse_retry_lookup_result(
+                request_id, len(tokens), num_computed_tokens
+            )
+            if reused is not None:
+                return reused
         deadline = deadlines.setdefault(request_id, now + PENDING_LOOKUP_DEFER_S)
-        chunks = self._lookup_with_external_prefix_metrics(
-            tokens,
-            self._model_id,
-            queries,
-            num_computed_tokens,
-            defer_pending=now < deadline,
-        )
+        if getattr(self, "_reuse_retry_lookup", False):
+            chunks, epoch = self._ipc_sync.lookup_versioned(
+                tokens,
+                self._model_id,
+                external_prefix_queries=queries,
+                num_computed_tokens=num_computed_tokens,
+                defer_pending=now < deadline,
+            )
+            if chunks is not None and epoch is not None:
+                self._retry_lookups[request_id] = (
+                    num_computed_tokens,
+                    len(tokens),
+                    epoch,
+                    [dict(chunk) for chunk in chunks],
+                )
+        else:
+            chunks = self._lookup_with_external_prefix_metrics(
+                tokens,
+                self._model_id,
+                queries,
+                num_computed_tokens,
+                defer_pending=now < deadline,
+            )
         if chunks is not None:
             deadlines.pop(request_id, None)
         return chunks
+
+    def _reuse_retry_lookup_result(
+        self,
+        request_id: str,
+        prefix_len: int,
+        num_computed_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Return the previous lookup for an allocation retry if still valid.
+
+        Args:
+            request_id: vLLM request ID.
+            prefix_len: Length of the token prefix this call would look up.
+            num_computed_tokens: vLLM's local prefix hit for this call.
+
+        Returns:
+            A copy of the cached chunk list when the request asks again for
+            the same window and the server index epoch is unchanged, else
+            None (the stale entry is dropped and a fresh lookup follows).
+
+        Thread-safety:
+            Runs on the scheduler thread; the epoch check is one blocking RPC.
+        """
+        entry = self._retry_lookups.get(request_id)
+        if entry is None:
+            return None
+        start, length, epoch, chunks = entry
+        if start != num_computed_tokens or length != prefix_len:
+            self._retry_lookups.pop(request_id, None)
+            return None
+        if self._ipc_sync.index_epoch() != epoch:
+            self._retry_lookups.pop(request_id, None)
+            self._retry_lookup_stats["stale"] += 1
+            return None
+        self._retry_lookup_stats["reused"] += 1
+        return [dict(chunk) for chunk in chunks]
 
     def _defer_deadlines(self) -> dict[str, float]:
         """Return per-request pending-lookup deadlines, creating the map lazily."""
@@ -1246,6 +1323,7 @@ class RequestLifecycle:
             req_id: vLLM request ID.
         """
         self._pending_loads.pop(req_id, None)
+        getattr(self, "_retry_lookups", {}).pop(req_id, None)
         if req_id in self._pending_stores:
             self._drop_pending_store(req_id)
         for pending_req_id in list(self._pending_stores):

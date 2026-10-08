@@ -562,6 +562,7 @@ class IPCServer:
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
             "lookup": self._op_lookup,
+            "index_epoch": self._op_index_epoch,
             "lookup_prefetch": self._op_lookup_prefetch,
             "readahead_hint": self._op_readahead_hint,
             "split_prefill": self._op_split_prefill,
@@ -759,6 +760,9 @@ class IPCServer:
         synchronous caller can retry later, and False resolves immediately.
         """
         tokens = self._lookup_tokens(msg)
+        # Read before the lookup awaits: a removal during it advances the
+        # epoch past the reply's, so a caller never reuses a stale result.
+        epoch = self._core.index_epoch
         defer_pending = msg.get("defer_pending")
         if self._lookup_wait_pending and defer_pending is not None:
             chunks = await self._lookup_now(
@@ -783,7 +787,16 @@ class IPCServer:
                 spans = self._external_spans(chunks, num_computed_tokens, hits)
                 if spans:
                     await self._ensure_transfer().start_readahead(spans)
-        return {"chunks": self._chunk_payloads(chunks)}
+        return {"chunks": self._chunk_payloads(chunks), "index_epoch": epoch}
+
+    async def _op_index_epoch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle an ``index_epoch`` request.
+
+        Returns:
+            ``{"index_epoch": int}``; a lookup reply carrying the same value
+            still describes chunks that are all present in the index.
+        """
+        return {"index_epoch": self._core.index_epoch}
 
     async def _op_readahead_hint(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Start L2 readahead for a request that has not been scheduled yet.
