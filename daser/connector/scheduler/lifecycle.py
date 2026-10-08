@@ -112,6 +112,9 @@ class RequestLifecycle:
         writeback_low_blocks: int = 0,
     ) -> None:
         self._ipc_sync = ipc_client
+        # Why the last get_num_new_matched_tokens call returned None ("" when
+        # it returned a count); read by the scheduler probe.
+        self.last_defer_reason = ""
         self._arrival_readahead = arrival_readahead
         # Research switch: write-back stores. A finished request keeps its
         # vLLM blocks (and so its GPU prefix-cache residency) until free
@@ -238,8 +241,10 @@ class RequestLifecycle:
             num_computed_tokens: tokens already in vLLM's KV cache.
 
         Returns:
-            (num_external_tokens, is_async) - (0, False) on miss.
+            (num_external_tokens, is_async) - (0, False) on miss. A
+            ``None`` count sets :attr:`last_defer_reason`.
         """
+        self.last_defer_reason = ""
         tokens = list(request.prompt_token_ids)
         self._req_tokens[request.request_id] = tokens
         if not getattr(self, "_runtime_config_ready", True):
@@ -259,6 +264,7 @@ class RequestLifecycle:
             # GPU blocks were evicted), so the parked spans and any lease built
             # from them no longer match the window the worker will load.
             if prefetch_future is not None and not prefetch_future.done():
+                self.last_defer_reason = "prefetch"
                 return None, True
             prefetch_futures.pop(request.request_id, None)
             prefetch_future = None
@@ -268,6 +274,7 @@ class RequestLifecycle:
             prefetch_lookup_result = None
         if prefetch_future is not None:
             if not prefetch_future.done():
+                self.last_defer_reason = "prefetch"
                 return None, True
             try:
                 prefetch_future.result()
@@ -294,6 +301,7 @@ class RequestLifecycle:
             ):
                 # vLLM keeps the request waiting; once the in-flight load lands
                 # its blocks are a local prefix hit instead of a second load.
+                self.last_defer_reason = "coalesce"
                 return None, False
 
         start = num_computed_tokens
@@ -351,6 +359,7 @@ class RequestLifecycle:
                     if deferred_chunks is None:
                         # vLLM keeps the request waiting and asks again next
                         # step, so the scheduler never blocks on the writer.
+                        self.last_defer_reason = "pending_writer"
                         return None, False
                     chunks = deferred_chunks
             except Exception as exc:
@@ -429,6 +438,7 @@ class RequestLifecycle:
                     getattr(self, "_prefetch_lookup_results", {})[
                         request.request_id
                     ] = (num_computed_tokens, prefetch_lookup_result)
+                    self.last_defer_reason = "prefetch_limit"
                     return None, True
                 executor = getattr(self, "_prefetch_executor", None)
                 if executor is None:
@@ -450,6 +460,7 @@ class RequestLifecycle:
                     spans,
                 )
                 self._prefetch_futures = prefetch_futures
+                self.last_defer_reason = "prefetch"
                 return None, True
 
         if len(chunks) == 1:

@@ -37,7 +37,12 @@ class SchedulerConnectorMixin:
             num_computed_tokens,
         )
         if probe is not None:
-            probe.on_lookup(request.request_id, time.perf_counter() - started, result)
+            probe.on_lookup(
+                request.request_id,
+                time.perf_counter() - started,
+                result,
+                self._request_lifecycle.last_defer_reason,
+            )
         return result
 
     def update_state_after_alloc(

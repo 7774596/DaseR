@@ -7,6 +7,10 @@ seconds; the probe then logs cumulative totals at that interval. It measures:
 
 - lookup: wall time spent inside ``get_num_new_matched_tokens`` (synchronous
   IPC on the scheduler thread).
+- defer: time a request spends between a ``None`` lookup result (vLLM keeps
+  it waiting and asks again next step) and the next lookup that returns a
+  count, split by the reason the connector deferred it (pending writer,
+  prefetch, coalesce follower, ...).
 - load wait: time from an async external hit until ``finished_recving``,
   weighted by the request's allocated blocks (block-seconds held while the
   request sits in ``WAITING_FOR_REMOTE_KVS``).
@@ -85,6 +89,7 @@ class SchedulerProbe:
         self._lookup_seconds = 0.0
         self._lookup_max = 0.0
         self._pending_retries = 0
+        self._defer: dict[str, _HoldTotals] = {}
         self._load_wait = _HoldTotals()
         self._save_hold = _HoldTotals()
 
@@ -102,7 +107,11 @@ class SchedulerProbe:
         return cls(interval_s) if interval_s > 0 else None
 
     def on_lookup(
-        self, req_id: str, elapsed_s: float, result: tuple[int | None, bool]
+        self,
+        req_id: str,
+        elapsed_s: float,
+        result: tuple[int | None, bool],
+        defer_reason: str = "",
     ) -> None:
         """Record one ``get_num_new_matched_tokens`` call.
 
@@ -110,13 +119,21 @@ class SchedulerProbe:
             req_id: vLLM request ID.
             elapsed_s: Wall time spent in the call.
             result: The ``(num_external_tokens, is_async)`` return value.
+            defer_reason: Why the connector returned ``None`` (ignored when
+                it returned a count).
         """
         self._lookup_calls += 1
         self._lookup_seconds += elapsed_s
         self._lookup_max = max(self._lookup_max, elapsed_s)
         num_tokens, is_async = result
+        now = time.monotonic()
+        reason = (defer_reason or "unknown") if num_tokens is None else ""
+        for name, totals in self._defer.items():
+            if name != reason:
+                totals.close(req_id, now)
         if num_tokens is None:
             self._pending_retries += 1
+            self._defer.setdefault(reason, _HoldTotals()).start(req_id, now, 0)
         elif is_async and num_tokens > 0:
             self._load_wait.start(req_id, time.monotonic(), 0)
         self._maybe_log()
@@ -165,11 +182,16 @@ class SchedulerProbe:
         self._next_log = now + self._interval_s
         logger.info(
             "[PROBE] lookup n=%d s=%.2f max_ms=%.1f pending_retries=%d | "
-            "load_wait %s | save_hold %s",
+            "load_wait %s | save_hold %s | defer %s",
             self._lookup_calls,
             self._lookup_seconds,
             self._lookup_max * 1000,
             self._pending_retries,
             self._load_wait.summary(),
             self._save_hold.summary(),
+            " ".join(
+                f"{name}[{totals.summary()}]"
+                for name, totals in sorted(self._defer.items())
+            )
+            or "-",
         )

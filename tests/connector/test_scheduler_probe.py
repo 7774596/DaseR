@@ -75,3 +75,18 @@ def test_probe_keeps_unfinished_intervals_open(probe_log: _Capture) -> None:
     line = probe_log.lines[-1]
     assert "load_wait n=0" in line and "save_hold n=0" in line
     assert line.count("open=1") == 2
+
+
+def test_probe_splits_deferral_time_by_reason(probe_log: _Capture) -> None:
+    """A deferral lasts until a lookup returns a count, under its reason."""
+    probe = SchedulerProbe(interval_s=1e-9)
+    probe.on_lookup("a", 0.001, (None, False), "pending_writer")
+    probe.on_lookup("a", 0.001, (None, False), "pending_writer")
+    probe.on_lookup("b", 0.001, (None, True), "prefetch")
+    probe.on_lookup("a", 0.001, (512, True))
+
+    line = probe_log.lines[-1]
+    assert "pending_retries=3" in line
+    assert "pending_writer[n=1 " in line
+    # "b" is still deferred: its interval stays open.
+    assert "prefetch[n=0 " in line and "open=1]" in line
