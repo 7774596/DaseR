@@ -400,3 +400,33 @@ def test_slo_trim_flags_a_window_whose_load_drifts(tmp_path: Path) -> None:
     assert "drift ctx=+1.00" in growing and "NONSTATIONARY" in growing
     # Every session spans 16 × 0.5 s of sends plus 0.2 s → 8.2 s lifetimes.
     assert "life50_s=8" in flat
+
+
+def test_slo_population_window_starts_after_one_lifetime(tmp_path: Path) -> None:
+    """The window runs from the K-th session start plus a lifetime to the last."""
+    arm_dir = tmp_path / "pop" / "art" / "arm"
+    arm_dir.mkdir(parents=True)
+    with (arm_dir / "requests.jsonl").open("w") as f:
+        # Six sessions of lifetime 4 s starting at 0, 1, 4, 5, 8, 9 s; with a
+        # population of 2 the window is 1 + 4 = 5 s to the last start, 9 s.
+        for sid, start in enumerate((0.0, 1.0, 4.0, 5.0, 8.0, 9.0)):
+            for turn in range(2):
+                record = {
+                    "status": "completed",
+                    "ttft_ms": 100.0,
+                    "latency_ms": 200.0,
+                    "completion_tokens": 2,
+                    "prompt_tokens": 1000,
+                    "session_id": sid,
+                    "send_offset_s": start + 2.0 * turn,
+                    "completion_offset_s": start + 2.0 * turn + 2.0,
+                }
+                f.write(json.dumps(record) + "\n")
+    (arm_dir / "summary.json").write_text(json.dumps({"wall_seconds": 13.0}))
+
+    header, row = slo_rows([arm_dir], ttft_ms=500.0, tpot_ms=150.0, population=2)
+
+    assert "population 2 window" in header
+    assert "life50_s=4 window_s=5-9 " in row
+    # Sends in [5, 9): 5.0, 6.0, 7.0, 8.0 → 4 requests over 4 s.
+    assert "ok=4" in row and "goodput=1.000/s" in row

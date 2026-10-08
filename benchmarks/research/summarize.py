@@ -517,6 +517,17 @@ def _session_lifetime_p50(records: list[dict[str, Any]]) -> float:
     return lifetimes[len(lifetimes) // 2] if lifetimes else 0.0
 
 
+def _session_starts(records: list[dict[str, Any]]) -> list[float]:
+    """Sorted first-send offset of every session."""
+    starts: dict[Any, float] = {}
+    for record in records:
+        if "send_offset_s" in record:
+            sid = record.get("session_id")
+            send = float(record["send_offset_s"])
+            starts[sid] = min(starts.get(sid, send), send)
+    return sorted(starts.values())
+
+
 def _window_drift(
     records: list[dict[str, Any]], begin: float, end: float
 ) -> tuple[float, float]:
@@ -546,7 +557,11 @@ def _window_drift(
 
 
 def slo_rows(
-    arm_dirs: list[Path], ttft_ms: float, tpot_ms: float, trim_frac: float = 0.0
+    arm_dirs: list[Path],
+    ttft_ms: float,
+    tpot_ms: float,
+    trim_frac: float = 0.0,
+    population: int = 0,
 ) -> list[str]:
     """Report per-request SLO attainment and goodput per arm.
 
@@ -565,6 +580,12 @@ def slo_rows(
             length and the completion count of its two halves must differ by
             at most 15%, otherwise the row is flagged NONSTATIONARY and its
             SLO numbers are not a steady-state reading.
+        population: For a closed session population of this size, use the
+            steady window instead of ``trim_frac``: from the start of the
+            ``population``-th session plus one median session lifetime (the
+            population is full and its ages have mixed) to the start of the
+            last session (after it the population drains). The window gets
+            the same stationarity check.
 
     Returns:
         One line per arm: completed requests, TTFT and TPOT p90, summed TTFT,
@@ -574,16 +595,26 @@ def slo_rows(
     """
     lines = [
         f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms, "
-        f"trim {trim_frac:.2f})"
+        + (
+            f"population {population} window)"
+            if population
+            else f"trim {trim_frac:.2f})"
+        )
     ]
     for arm_dir in arm_dirs:
         records = [json.loads(line) for line in (arm_dir / "requests.jsonl").open()]
         wall = float(json.loads((arm_dir / "summary.json").read_text())["wall_seconds"])
-        begin, end = trim_frac * wall, (1.0 - trim_frac) * wall
-        active = _active_sessions(records, begin, end)
         lifetime = _session_lifetime_p50(records)
-        drift = _window_drift(records, begin, end) if trim_frac else None
-        if trim_frac:
+        if population:
+            starts = _session_starts(records)
+            begin = starts[min(population, len(starts)) - 1] + lifetime
+            end = max(starts[-1], begin)
+        else:
+            begin, end = trim_frac * wall, (1.0 - trim_frac) * wall
+        active = _active_sessions(records, begin, end)
+        windowed = bool(trim_frac or population)
+        drift = _window_drift(records, begin, end) if windowed else None
+        if windowed:
             records = [
                 r for r in records if begin <= float(r.get("send_offset_s", 0)) < end
             ]
@@ -604,7 +635,7 @@ def slo_rows(
             f"  {arm_dir.parent.parent.name}/{arm_dir.name}: ok={len(done)} "
             f"ttft_p90={_p(ttft, 90):.0f} tpot_p90={_p(tpot, 90):.1f} "
             f"sum_ttft_s={sum(ttft) / 1000:.0f} active={active:.1f} "
-            f"life50_s={lifetime:.0f} "
+            f"life50_s={lifetime:.0f} window_s={begin:.0f}-{end:.0f} "
             f"slo={_rate(good, len(records))} "
             f"goodput={good / wall if wall else 0:.3f}/s"
             + (
@@ -948,6 +979,13 @@ def main() -> None:
         "fraction of the wall clock (ramp-up and drain)",
     )
     parser.add_argument(
+        "--population",
+        type=int,
+        default=0,
+        help="with --slo-tpot-ms, read SLO rows on the steady window of a "
+        "closed session population of this size (overrides --trim-frac)",
+    )
+    parser.add_argument(
         "--warm-ms",
         type=float,
         default=0.0,
@@ -1017,7 +1055,15 @@ def main() -> None:
         print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
     if args.slo_tpot_ms is not None:
         print(
-            "\n".join(slo_rows(arm_dirs, args.slo_ms, args.slo_tpot_ms, args.trim_frac))
+            "\n".join(
+                slo_rows(
+                    arm_dirs,
+                    args.slo_ms,
+                    args.slo_tpot_ms,
+                    args.trim_frac,
+                    args.population,
+                )
+            )
         )
 
 
