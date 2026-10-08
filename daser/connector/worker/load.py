@@ -30,6 +30,7 @@ from daser.config import (
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqLoadSpec
+from daser.connector.worker.load_probe import LoadTimeline
 from daser.connector.worker.memory import (
     CudaStagingLease,
     FixedCudaStagingPool,
@@ -398,6 +399,7 @@ class LoadPipeline:
         self._time_gpu_stall = os.environ.get(LAYERWISE_GPU_STALL_ENV) == "1"
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._layerwise: _LayerwiseLoad | None = None
+        self._timeline = LoadTimeline.from_env()
         # Pinned landing buffer for layer-wise header pages, grown on demand
         # and touched only by the load thread.
         self._header_host: torch.Tensor | None = None
@@ -549,6 +551,11 @@ class LoadPipeline:
         for request in _coalesce_compressed_requests(requests):
             for req_id in request.req_ids:
                 self._pending[req_id] = request
+            if self._timeline is not None:
+                self._timeline.on_start(request.req_ids)
+                request.future.add_done_callback(
+                    lambda _f, t=self._timeline, ids=request.req_ids: t.on_done(ids)
+                )
             self._loop.call_soon_threadsafe(
                 self._enqueue,
                 request,
@@ -687,6 +694,8 @@ class LoadPipeline:
             finally:
                 del self._pending[req_id]
             finished.add(req_id)
+        if self._timeline is not None:
+            self._timeline.on_collect(finished)
         return finished
 
     def take_invalid_block_ids(self) -> set[int]:
