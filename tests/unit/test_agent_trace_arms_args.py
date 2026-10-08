@@ -3,10 +3,18 @@
 
 import json
 from pathlib import Path
+import signal
+import subprocess
+import sys
 
 import pytest
 
-from benchmarks.research.agent_trace_arms import _manager, parse_args
+from benchmarks.research.agent_trace_arms import (
+    ArmTerminated,
+    StopSignals,
+    _manager,
+    parse_args,
+)
 
 
 def _args(tmp_path: Path, *extra: str) -> list[str]:
@@ -74,3 +82,28 @@ def test_draft_free_speculation_adds_no_kv_layers(tmp_path: Path) -> None:
     for extra in ((), ("--speculative-config", ngram)):
         args = parse_args(_args(tmp_path, *extra))
         assert _manager("daser-raw", args).daser_extra_kv_layers == 0
+
+
+def test_stop_signal_without_replay_unwinds_once() -> None:
+    """The first stop signal outside a replay raises; later ones are ignored."""
+    stop = StopSignals()
+
+    with pytest.raises(ArmTerminated):
+        stop.handle(signal.SIGTERM, None)
+    stop.handle(signal.SIGTERM, None)
+
+    assert stop.requested
+
+
+def test_stop_signal_is_forwarded_to_the_running_replay() -> None:
+    """During a replay the signal goes to the replay, which then exits."""
+    stop = StopSignals()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    stop.child = child
+    try:
+        stop.handle(signal.SIGTERM, None)
+        assert child.wait(timeout=10) == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+    assert stop.requested

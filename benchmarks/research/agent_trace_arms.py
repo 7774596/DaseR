@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -105,6 +106,55 @@ def _wait_pids_exit(pid_file: Path, timeout_s: float = 60.0) -> bool:
             return True
         time.sleep(0.5)
     return False
+
+
+class ArmTerminated(Exception):
+    """Raised when SIGTERM/SIGINT arrives while no replay is running."""
+
+
+class StopSignals:
+    """Turn SIGTERM/SIGINT into an orderly stop of the current arm.
+
+    During a replay the signal is forwarded to the replay subprocess, which
+    writes its summary and exits; the arm then stops its services and deletes
+    its store as usual, and no further arm starts. Outside a replay the first
+    signal raises :class:`ArmTerminated` so ``run_arm``'s ``finally`` still
+    stops the services; later signals are ignored so teardown can finish.
+
+    Thread-safety:
+        Install and use from the main thread only; Python runs signal handlers
+        there.
+    """
+
+    def __init__(self) -> None:
+        """Create a handler with no replay attached."""
+        self.requested = False
+        self.child: subprocess.Popen[bytes] | None = None
+
+    def install(self) -> None:
+        """Route SIGTERM and SIGINT to :meth:`handle`."""
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, self.handle)
+
+    def handle(self, signum: int, frame: Any) -> None:
+        """Forward a stop signal to the replay, or unwind into teardown.
+
+        Args:
+            signum: Received signal number.
+            frame: Interrupted frame (unused).
+
+        Raises:
+            ArmTerminated: On the first signal while no replay is running.
+        """
+        del frame
+        first = not self.requested
+        self.requested = True
+        child = self.child
+        if child is not None and child.poll() is None:
+            child.send_signal(signal.SIGTERM)
+            return
+        if first:
+            raise ArmTerminated(f"signal {signum}")
 
 
 def _json_default(value: Any) -> Any:
@@ -710,12 +760,18 @@ async def _start_gateway(
     raise RuntimeError("gateway did not become ready")
 
 
-async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
+async def run_arm(
+    arm: str, args: argparse.Namespace, stop: StopSignals
+) -> dict[str, Any]:
     """Run one arm end to end and persist its artifacts.
+
+    Services are stopped and the scratch store deleted however the arm ends,
+    including a stop signal (see :class:`StopSignals`).
 
     Args:
         arm: Arm name.
         args: Parsed runner arguments.
+        stop: Installed stop-signal handler; the replay is attached to it.
 
     Returns:
         Result record written to ``<artifact>/<arm>.json``.
@@ -743,7 +799,7 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
         if args.gateway != "none" and arm.startswith("daser"):
             gateway, gateway_url = await _start_gateway(args, manager, out_dir)
             server_urls = [gateway_url]
-        replay = subprocess.run(
+        replay_command = (
             _probe_command(args, server_urls[0], model_name, out_dir)
             if args.cache_state_probe
             else [
@@ -824,12 +880,25 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                     if args.session_tokens is not None
                     else []
                 ),
-            ],
-            cwd=REPO_ROOT,
-            stdout=(out_dir / "replay.log").open("wb"),
-            stderr=subprocess.STDOUT,
-            check=False,
+            ]
         )
+        with (out_dir / "replay.log").open("wb") as replay_log:
+            replay = subprocess.Popen(
+                replay_command,
+                cwd=REPO_ROOT,
+                stdout=replay_log,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                stop.child = replay
+                replay.wait()
+            except ArmTerminated:
+                # The signal landed before the replay was attached.
+                replay.terminate()
+                replay.wait()
+                raise
+            finally:
+                stop.child = None
         daser_after = await _daser_metrics(arm, manager)
         vllm_after = await _vllm_metrics(manager)
         if arm == "lmcache":
@@ -883,8 +952,10 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
 async def main_async(args: argparse.Namespace) -> None:
     """Run the selected arms sequentially on one GPU."""
     args.artifact.mkdir(parents=True, exist_ok=True)
+    stop = StopSignals()
+    stop.install()
     for arm in args.arms:
-        result = await run_arm(arm, args)
+        result = await run_arm(arm, args, stop)
         summary = result["summary"] or {}
         ttft = summary.get("ttft_ms", {})
         print(
@@ -897,13 +968,19 @@ async def main_async(args: argparse.Namespace) -> None:
             f"prefix={summary.get('prefix_cache')}",
             flush=True,
         )
+        if stop.requested:
+            print(f"{arm}: stopped by signal; skipping remaining arms", flush=True)
+            break
 
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = parse_args(argv)
     check_runtime_environment()
-    asyncio.run(main_async(args))
+    try:
+        asyncio.run(main_async(args))
+    except ArmTerminated:
+        sys.exit(128 + signal.SIGTERM)
 
 
 if __name__ == "__main__":
