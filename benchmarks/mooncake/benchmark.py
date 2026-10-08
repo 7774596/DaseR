@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import random
 import statistics
 import threading
 import time
@@ -866,6 +867,8 @@ async def replay(
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
+    session_population: int = 0,
+    session_ramp_s: float = 0.0,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -928,6 +931,18 @@ async def replay(
             than this many requests wait, so background prefill never queues
             ahead of foreground turns. ``None`` disables the check. Prewarmed
             records carry ``prewarm_pieces`` and ``prewarm_yielded``.
+        session_population: When positive, run a closed session population:
+            at most this many sessions are active at once, sessions start in
+            trace order, and a session's slot frees when its last selected
+            request finishes, so the next session starts then instead of at
+            its timestamp. Requests inside a session keep their prefix
+            dependencies and gaps. Zero replays session starts by timestamp.
+        session_ramp_s: With a session population, spread the first
+            ``session_population`` session starts as a seeded Poisson process
+            of mean span ``session_ramp_s`` seconds instead of starting them
+            together, so the population reaches steady state without a
+            synchronized cold-start burst. Later sessions still start when a
+            slot frees.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -947,6 +962,10 @@ async def replay(
         raise ValueError("prewarm_chunk_tokens must be non-negative")
     if prewarm_max_waiting is not None and prewarm_max_waiting < 0:
         raise ValueError("prewarm_max_waiting must be non-negative")
+    if session_population < 0:
+        raise ValueError("session_population must be non-negative")
+    if session_ramp_s < 0:
+        raise ValueError("session_ramp_s must be non-negative")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
     scheduled_offset_seconds(0, time_scale)
@@ -976,6 +995,7 @@ async def replay(
             position - 1 if position else None
             for position in range(len(selection.eligible))
         ]
+    gates, last_rows = _session_gates(selection.eligible, session_population)
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -1014,10 +1034,21 @@ async def replay(
                         prewarm=prewarm,
                         prewarm_chunk_tokens=prewarm_chunk_tokens,
                         prewarm_max_waiting=prewarm_max_waiting,
+                        start_gate=gates.get(request.session_id),
+                        ends_session=position in last_rows,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
             ]
+            population = (
+                asyncio.create_task(
+                    _admit_sessions(
+                        list(gates.values()), session_population, session_ramp_s
+                    )
+                )
+                if gates
+                else None
+            )
             results: list[dict[str, Any]] = []
             failures = 0
             aborted = False
@@ -1036,6 +1067,9 @@ async def replay(
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
                     break
+            if population is not None:
+                population.cancel()
+                await asyncio.gather(population, return_exceptions=True)
     finally:
         writer.close()
     return results, time.perf_counter() - started_at, aborted
@@ -1102,6 +1136,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Prewarm in growing prefixes of this many more tokens each, "
         "stopping at the end of the idle gap (0 sends the whole prefix).",
+    )
+    parser.add_argument(
+        "--session-population",
+        type=int,
+        default=0,
+        help="Keep this many sessions active at once, starting the next "
+        "session in trace order when one finishes (0 replays start times).",
+    )
+    parser.add_argument(
+        "--session-ramp-s",
+        type=float,
+        default=0.0,
+        help="Spread the first --session-population session starts as a "
+        "Poisson process over about this many seconds (0 starts them together).",
     )
     parser.add_argument(
         "--prewarm-max-waiting",
@@ -1266,6 +1314,8 @@ async def main_async(args: argparse.Namespace) -> int:
         prewarm=args.prewarm_stripped,
         prewarm_chunk_tokens=args.prewarm_chunk_tokens,
         prewarm_max_waiting=args.prewarm_max_waiting,
+        session_population=args.session_population,
+        session_ramp_s=args.session_ramp_s,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1447,6 +1497,69 @@ async def _rebind_when_waiting(
     return None
 
 
+@dataclass
+class _SessionGate:
+    """Start and end signals of one session in a closed population."""
+
+    opened: asyncio.Event
+    finished: asyncio.Event
+
+
+def _session_gates(
+    requests: Sequence[TraceRequest], population: int
+) -> tuple[dict[int | None, _SessionGate], set[int]]:
+    """Build per-session gates in first-request order for a closed population.
+
+    Args:
+        requests: Eligible requests in replay order.
+        population: Maximum concurrently active sessions; zero disables.
+
+    Returns:
+        ``(gates, last_rows)``: a gate per session keyed by ``session_id`` in
+        the order sessions first appear, and the positions of each session's
+        last request. Both are empty when ``population`` is zero.
+    """
+    if not population:
+        return {}, set()
+    gates: dict[int | None, _SessionGate] = {}
+    last: dict[int | None, int] = {}
+    for position, request in enumerate(requests):
+        gates.setdefault(
+            request.session_id, _SessionGate(asyncio.Event(), asyncio.Event())
+        )
+        last[request.session_id] = position
+    return gates, set(last.values())
+
+
+async def _admit_sessions(
+    gates: list[_SessionGate], population: int, ramp_s: float = 0.0
+) -> None:
+    """Open session gates in order, keeping ``population`` sessions active.
+
+    The first ``population`` gates open at seeded exponential gaps of mean
+    ``ramp_s / population`` seconds (all at once when ``ramp_s`` is zero).
+    """
+    slots = asyncio.Semaphore(population)
+    rng = random.Random(0)
+
+    async def hold(gate: _SessionGate) -> None:
+        await gate.finished.wait()
+        slots.release()
+
+    holders = []
+    try:
+        for index, gate in enumerate(gates):
+            await slots.acquire()
+            if ramp_s > 0 and 0 < index < population:
+                await asyncio.sleep(rng.expovariate(population / ramp_s))
+            gate.opened.set()
+            holders.append(asyncio.create_task(hold(gate)))
+        await asyncio.gather(*holders)
+    finally:
+        for holder in holders:
+            holder.cancel()
+
+
 async def _prewarm_prefix(
     *,
     request: TraceRequest,
@@ -1595,12 +1708,15 @@ async def _run_request(
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
+    start_gate: _SessionGate | None = None,
+    ends_session: bool = False,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
             prewarm=prewarm,
             prewarm_chunk_tokens=prewarm_chunk_tokens,
             prewarm_max_waiting=prewarm_max_waiting,
+            start_gate=start_gate,
             dependency_gap_s=dependency_gap_s,
             admit_after=admit_after,
             admitted=admitted,
@@ -1622,6 +1738,8 @@ async def _run_request(
         done.set()
         if admitted is not None:
             admitted.set()
+        if ends_session and start_gate is not None:
+            start_gate.finished.set()
 
 
 async def _run_request_after_dependency(
@@ -1644,11 +1762,16 @@ async def _run_request_after_dependency(
     prewarm: bool = False,
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
+    start_gate: _SessionGate | None = None,
 ) -> dict[str, Any]:
     # A dependent request with a recorded gap is paced by its producer's
     # completion, not by its arrival timestamp.
     gap_paced = wait_for is not None and request.gap_ms is not None
-    if not gap_paced:
+    if start_gate is not None and not gap_paced:
+        # A closed population starts the session when it gets a slot.
+        await start_gate.opened.wait()
+        scheduled_offset = time.perf_counter() - started_at
+    elif not gap_paced:
         scheduled_offset = scheduled_offset_seconds(request.timestamp_ms, time_scale)
         await asyncio.sleep(
             max(0.0, started_at + scheduled_offset - time.perf_counter())

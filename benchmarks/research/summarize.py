@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import re
 
@@ -484,7 +485,27 @@ def stage_rows(arm_dirs: list[Path], stages_path: Path, slo_ms: float) -> list[s
     return lines
 
 
-def slo_rows(arm_dirs: list[Path], ttft_ms: float, tpot_ms: float) -> list[str]:
+def _active_sessions(records: list[dict], begin: float, end: float) -> float:
+    """Mean number of sessions active in ``[begin, end)`` seconds.
+
+    A session is active from its first send to its last completion.
+    """
+    spans: dict = {}
+    for r in records:
+        if "send_offset_s" not in r or "completion_offset_s" not in r:
+            continue
+        lo, hi = spans.get(r.get("session_id"), (math.inf, -math.inf))
+        spans[r.get("session_id")] = (
+            min(lo, float(r["send_offset_s"])),
+            max(hi, float(r["completion_offset_s"])),
+        )
+    covered = sum(max(0.0, min(hi, end) - max(lo, begin)) for lo, hi in spans.values())
+    return covered / (end - begin) if end > begin else 0.0
+
+
+def slo_rows(
+    arm_dirs: list[Path], ttft_ms: float, tpot_ms: float, trim_frac: float = 0.0
+) -> list[str]:
     """Report per-request SLO attainment and goodput per arm.
 
     A request meets the SLO when its TTFT is at most ``ttft_ms`` and its mean
@@ -495,16 +516,29 @@ def slo_rows(arm_dirs: list[Path], ttft_ms: float, tpot_ms: float) -> list[str]:
         arm_dirs: Arm artifact directories.
         ttft_ms: TTFT SLO in milliseconds.
         tpot_ms: TPOT SLO in milliseconds.
+        trim_frac: Drop requests sent in the first and last ``trim_frac`` of
+            the wall clock (ramp-up and drain), so the row describes the
+            steady state; goodput divides by the kept window.
 
     Returns:
-        One line per arm: completed requests, TTFT and TPOT p90, SLO attainment
-        over all sent requests (failures miss it), and goodput in SLO-meeting
-        requests per wall-clock second.
+        One line per arm: completed requests, TTFT and TPOT p90, summed TTFT,
+        mean active sessions, SLO attainment over the kept sent requests
+        (failures miss it), and goodput in SLO-meeting requests per second.
     """
-    lines = [f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms)"]
+    lines = [
+        f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms, "
+        f"trim {trim_frac:.2f})"
+    ]
     for arm_dir in arm_dirs:
         records = [json.loads(line) for line in (arm_dir / "requests.jsonl").open()]
         wall = float(json.loads((arm_dir / "summary.json").read_text())["wall_seconds"])
+        begin, end = trim_frac * wall, (1.0 - trim_frac) * wall
+        active = _active_sessions(records, begin, end)
+        if trim_frac:
+            records = [
+                r for r in records if begin <= float(r.get("send_offset_s", 0)) < end
+            ]
+        wall = end - begin
         done = [r for r in records if r["status"] == "completed"]
         ttft = [float(r["ttft_ms"]) for r in done]
         tpot = [
@@ -520,6 +554,7 @@ def slo_rows(arm_dirs: list[Path], ttft_ms: float, tpot_ms: float) -> list[str]:
         lines.append(
             f"  {arm_dir.parent.parent.name}/{arm_dir.name}: ok={len(done)} "
             f"ttft_p90={_p(ttft, 90):.0f} tpot_p90={_p(tpot, 90):.1f} "
+            f"sum_ttft_s={sum(ttft) / 1000:.0f} active={active:.1f} "
             f"slo={_rate(good, len(records))} "
             f"goodput={good / wall if wall else 0:.3f}/s"
         )
@@ -850,6 +885,13 @@ def main() -> None:
         help="TPOT SLO; adds per-arm SLO goodput rows with --slo-ms as TTFT SLO",
     )
     parser.add_argument(
+        "--trim-frac",
+        type=float,
+        default=0.0,
+        help="with --slo-tpot-ms, drop requests sent in the first and last "
+        "fraction of the wall clock (ramp-up and drain)",
+    )
+    parser.add_argument(
         "--warm-ms",
         type=float,
         default=0.0,
@@ -918,7 +960,9 @@ def main() -> None:
     if args.stages is not None:
         print("\n".join(stage_rows(arm_dirs, args.stages, args.slo_ms)))
     if args.slo_tpot_ms is not None:
-        print("\n".join(slo_rows(arm_dirs, args.slo_ms, args.slo_tpot_ms)))
+        print(
+            "\n".join(slo_rows(arm_dirs, args.slo_ms, args.slo_tpot_ms, args.trim_frac))
+        )
 
 
 if __name__ == "__main__":

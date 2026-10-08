@@ -679,6 +679,74 @@ def test_prewarm_yields_once_the_server_queue_exceeds_the_bound(
     assert by_index[1]["prewarm_yielded"] is False
 
 
+def _population_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    population: int,
+    ramp_s: float = 0.0,
+) -> list[tuple[int, str, float]]:
+    """Replay three two-turn sessions that all start at t=0; log send/finish."""
+    events: list[tuple[int, str, float]] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        index, prompt = args[2].sample_id, args[3]
+        events.append((index, "send", time.perf_counter()))
+        if kwargs.get("on_send"):
+            kwargs["on_send"]()
+        await asyncio.sleep(0.02)
+        events.append((index, "done", time.perf_counter()))
+        return RequestResult(index, "d", "", 1.0, 2.0, len(prompt), 1)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = []
+    for sid in range(3):
+        base = 10 * (sid + 1)
+        requests.append(TraceRequest(2 * sid, 0, 512, 1, (base,), session_id=sid))
+        requests.append(
+            TraceRequest(
+                2 * sid + 1, 0, 1024, 1, (base, base + 1), session_id=sid, gap_ms=0
+            )
+        )
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100_000),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://a",
+            served_model_name="m",
+            output_path=tmp_path / f"population{population}.jsonl",
+            max_inflight=8,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            prefix_dependencies=True,
+            session_population=population,
+            session_ramp_s=ramp_s,
+        )
+    )
+    return events
+
+
+def test_session_population_starts_a_session_when_one_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With population 2 the third session waits for a whole session to end."""
+    events = _population_replay(tmp_path, monkeypatch, population=2)
+    at = {(i, kind): t for i, kind, t in events}
+
+    # Sessions 0 and 1 start together; session 2 starts after the first of
+    # them finishes its last turn, never before.
+    assert abs(at[(0, "send")] - at[(2, "send")]) < 0.01
+    first_end = min(at[(1, "done")], at[(3, "done")])
+    assert at[(4, "send")] >= first_end
+    assert at[(4, "send")] - first_end < 0.01
+    assert at[(5, "send")] >= at[(4, "done")]
+
+    # Without a population all three sessions start at their timestamps.
+    events = _population_replay(tmp_path, monkeypatch, population=0)
+    sends = [t for i, kind, t in events if kind == "send" and i % 2 == 0]
+    assert max(sends) - min(sends) < 0.01
+
+
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
     """Blocks carry corpus text; equal hashes match and distinct hashes differ."""
     corpus = list(range(5000, 5000 + 3 * MOONCAKE_BLOCK_TOKENS))
@@ -1072,3 +1140,17 @@ def test_session_text_prompts_are_stream_prefixes(tmp_path: Path) -> None:
     path.write_text(json.dumps({**rows[0], "token_offset": -1}) + "\n")
     with pytest.raises(ValueError, match="token_offset"):
         load_trace(path)
+
+
+def test_session_ramp_staggers_the_first_population_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ramp delays the second initial session; the first starts at once."""
+    events = _population_replay(tmp_path, monkeypatch, population=3, ramp_s=0.6)
+    at = {(i, kind): t for i, kind, t in events}
+
+    starts = sorted(at[(2 * sid, "send")] for sid in range(3))
+    # Seeded exponential gaps of mean 0.2 s: the later starts are spread out
+    # instead of all landing within the 10 ms the unramped replay allows.
+    assert starts[2] - starts[0] > 0.05
+    assert starts[2] - starts[0] < 3.0

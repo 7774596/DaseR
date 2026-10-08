@@ -270,6 +270,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prewarm-stripped", action="store_true")
     parser.add_argument("--prewarm-chunk-tokens", type=int, default=0)
     parser.add_argument("--prewarm-max-waiting", type=int, default=None)
+    parser.add_argument("--session-population", type=int, default=0)
+    parser.add_argument("--session-ramp-s", type=float, default=0.0)
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument(
         "--gpu-util",
@@ -693,6 +695,16 @@ async def run_arm(arm: str, args: argparse.Namespace) -> dict[str, Any]:
                 *(
                     ["--prewarm-max-waiting", str(args.prewarm_max_waiting)]
                     if args.prewarm_max_waiting is not None
+                    else []
+                ),
+                *(
+                    ["--session-population", str(args.session_population)]
+                    if args.session_population
+                    else []
+                ),
+                *(
+                    ["--session-ramp-s", str(args.session_ramp_s)]
+                    if args.session_ramp_s
                     else []
                 ),
                 "--served-model-name",

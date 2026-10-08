@@ -265,6 +265,34 @@ def test_slo_goodput_needs_both_ttft_and_tpot(tmp_path: Path) -> None:
     assert "goodput=0.500/s" in line
 
 
+def test_slo_trim_keeps_the_steady_state_window(tmp_path: Path) -> None:
+    """Trimming drops ramp-up/drain sends and divides by the kept window."""
+    arm_dir = tmp_path / "pop" / "art" / "arm"
+    arm_dir.mkdir(parents=True)
+    with (arm_dir / "requests.jsonl").open("w") as f:
+        for i, send in enumerate((0.5, 3.0, 5.0, 9.5)):
+            record = {
+                "status": "completed",
+                "ttft_ms": 9000.0 if send < 1 else 100.0,
+                "latency_ms": 200.0,
+                "completion_tokens": 2,
+                "session_id": i % 2,
+                "send_offset_s": send,
+                "completion_offset_s": send + 0.2,
+            }
+            f.write(json.dumps(record) + "\n")
+    (arm_dir / "summary.json").write_text(json.dumps({"wall_seconds": 10.0}))
+
+    (full,) = slo_rows([arm_dir], ttft_ms=500.0, tpot_ms=150.0)[1:]
+    (kept,) = slo_rows([arm_dir], ttft_ms=500.0, tpot_ms=150.0, trim_frac=0.1)[1:]
+
+    assert "ok=4" in full and "slo=0.750" in full and "goodput=0.300/s" in full
+    assert "ok=2" in kept and "slo=1.000" in kept and "goodput=0.250/s" in kept
+    # Window 1-9 s: session 0 (0.5-5.2 s) covers 4.2 s, session 1 (3.0-9.7 s)
+    # covers 6.0 s → 10.2 / 8 = 1.3 active.
+    assert "active=1.3" in kept
+
+
 def test_arm_row_reports_speculative_acceptance_length(tmp_path: Path) -> None:
     """acc is generated tokens per engine step; "-" without step counts."""
     arm_dir = tmp_path / "spec" / "art" / "arm"
