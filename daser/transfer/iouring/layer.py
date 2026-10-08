@@ -4390,6 +4390,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                     gap_leased, gap_uncovered = _resolve_from_hits(
                         readahead_hits, gap_target, gap_offset, gap_nbytes
                     )
+                    if gap_leased:
+                        self._l1.mark_read(gap_offset, gap_nbytes)
                     leased.extend(gap_leased)
                     uncovered.extend(gap_uncovered)
                 if leased:

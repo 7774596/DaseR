@@ -312,3 +312,29 @@ def test_skip_pinned_eviction_keeps_owned_allocations_resident(
         pinned.clear()
     finally:
         cache.close()
+
+
+def test_mark_read_counts_lease_served_bytes_without_reordering() -> None:
+    """Lease-served spans are read for accounting but keep LRU order."""
+    cache = L1Cache(8192, 4096, lambda _key, _data: False)
+    try:
+        first = cache.reserve_untracked(4096)
+        second = cache.reserve_untracked(4096)
+        assert first is not None and second is not None
+        cache.put((0, 4096), first)
+        cache.put((4096, 4096), second)
+        # Partly overlaps the first range only.
+        cache.mark_read(1024, 1024)
+        # Recency unchanged: the first (oldest) range is still evicted first.
+        held = cache.reserve_untracked(4096)
+        assert cache.get((0, 4096)) is None
+        assert cache.get((4096, 4096)) is not None
+        assert cache.eviction_bytes == {
+            "bytes": 4096,
+            "pinned_bytes": 0,
+            "unread_bytes": 0,
+        }
+        if held is not None:
+            held.close()
+    finally:
+        cache.close()

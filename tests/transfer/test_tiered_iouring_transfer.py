@@ -3081,3 +3081,41 @@ def test_iouring_streaming_prefetch_loads_wait_for_their_phase(tmp_path) -> None
     asyncio.run(write())
     asyncio.run(scenario(streaming=True))
     asyncio.run(scenario(streaming=False))
+
+
+def test_iouring_readahead_served_bytes_are_not_evicted_as_unread(tmp_path) -> None:
+    """Bytes a load consumed from a readahead lease count as read in L1."""
+    blocks = 8
+    nbytes = ALIGNMENT * blocks
+    payload = b"".join(bytes(_block(bytes([ord("a") + i]))) for i in range(blocks))
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        layer = await _cold_readahead_layer(path, payload)
+        layer.close()
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=nbytes * 2,
+            l2_bytes=nbytes * 4,
+            readahead_piece_bytes=ALIGNMENT * 2,
+            readahead_window=1,
+        )
+        try:
+            span = {"file_offset": 0, "nbytes": nbytes}
+            assert await layer.start_readahead([span]) is True
+            dst = bytearray(nbytes)
+            load = [{"target_offset": 0, "file_offset": 0, "nbytes": nbytes}]
+            assert await layer.load_bytes_grouped(dst, load) == nbytes
+            assert bytes(dst) == payload
+            assert layer.stats.readahead_served_bytes == nbytes
+            # Filling L1 elsewhere evicts every served readahead range.
+            for offset in (nbytes, nbytes * 2):
+                await layer.store_bytes(payload, offset, nbytes)
+            await layer.drain()
+            assert layer.stats.l1_evicted_bytes >= nbytes
+            assert layer.stats.l1_evicted_unread_bytes == 0
+        finally:
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

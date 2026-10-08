@@ -238,6 +238,25 @@ class L1Cache:
             self._entries.move_to_end(hit.key)
             self._read.add(hit.key)
 
+    def mark_read(self, file_offset: int, nbytes: int) -> None:
+        """Count resident ranges overlapping a span as read, keeping recency.
+
+        Bytes served from a lease's retained slice references bypass
+        ``resolve_subranges``; this keeps ``unread_bytes`` eviction accounting
+        truthful for them without changing replacement order.
+
+        Args:
+            file_offset: L2 byte offset of the served span.
+            nbytes: Span length in bytes.
+        """
+        end = file_offset + nbytes
+        idx = max(bisect.bisect_right(self._starts, file_offset) - 1, 0)
+        while idx < len(self._starts) and self._starts[idx] < end:
+            key = self._by_start.get(self._starts[idx])
+            if key is not None and key[0] + key[1] > file_offset:
+                self._read.add(key)
+            idx += 1
+
     def touch(self, key: tuple[int, int]) -> None:
         """Refresh LRU recency for one resident key (used on in-place stores)."""
         self._policy.access(self._entries[key].allocation_id)
