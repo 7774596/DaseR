@@ -2538,6 +2538,9 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
                 (dst, streamed), ("gather", "memcpy", "batch")
             ):
                 dst.fill(0)
+                # The zero fill runs on the legacy stream, which a non-blocking
+                # copy stream does not wait for: finish it before loading.
+                cupy.cuda.Device().synchronize()
                 copied = await layer.load_leased_runs(
                     target, files, targets, sizes, "runs", copy_mode=copy_mode
                 )
@@ -2624,6 +2627,9 @@ def test_grouped_l1_copy_to_cuda_counts_runs(tmp_path, batch: bool) -> None:
                 for i, slot in enumerate(order)
             ]
             dst = cupy.zeros(records * record, dtype=cupy.uint8)
+            # The zero fill runs on the legacy stream, which a non-blocking
+            # copy stream does not wait for: finish it before loading.
+            cupy.cuda.Device().synchronize()
             streamed = StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
             assert await layer.load_bytes_grouped(streamed, spans) == records * record
             streamed.stream.synchronize()
