@@ -68,11 +68,14 @@ ARRIVAL_READAHEAD_ENV = "DASER_ARRIVAL_READAHEAD"
 #: finished request's vLLM blocks and write its prompt KV to DaseR only when
 #: free GPU blocks fall below this count (write-back instead of write-through).
 WRITEBACK_LOW_BLOCKS_ENV = "DASER_WRITEBACK_LOW_BLOCKS"
-#: Research switch: ``1`` makes the scheduler connector answer vLLM's repeat
+#: Research switch: makes the scheduler connector answer vLLM's repeat
 #: ``get_num_new_matched_tokens`` call after a failed block allocation from
-#: the previous lookup while the server index epoch is unchanged, replacing a
-#: full token lookup with an epoch check.
+#: the previous lookup while the server index epoch is unchanged. ``rpc``
+#: checks the epoch with one token-free RPC per reuse; ``step`` reads it at
+#: most once per scheduler step (from that step's first lookup reply or one
+#: RPC), so retries within a step cost no IPC.
 REUSE_RETRY_LOOKUP_ENV = "DASER_REUSE_RETRY_LOOKUP"
+REUSE_RETRY_LOOKUP_MODES = ("rpc", "step")
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"

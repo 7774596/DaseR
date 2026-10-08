@@ -64,7 +64,7 @@ class _EpochIPC:
         self.epoch += 1
 
 
-def _lifecycle(ipc: _EpochIPC, *, reuse: bool) -> RequestLifecycle:
+def _lifecycle(ipc: _EpochIPC, *, mode: str) -> RequestLifecycle:
     return RequestLifecycle(
         ipc_client=ipc,
         block_tokens=4,
@@ -72,7 +72,7 @@ def _lifecycle(ipc: _EpochIPC, *, reuse: bool) -> RequestLifecycle:
         model_id="model",
         cache_reuse_mode="chunk",
         runtime_config_ready=True,
-        reuse_retry_lookup=reuse,
+        reuse_retry_lookup=mode,
     )
 
 
@@ -89,25 +89,59 @@ def _alloc(lifecycle: RequestLifecycle, request: SimpleNamespace) -> None:
     lifecycle.update_state_after_alloc(request, blocks, 8)
 
 
-@pytest.mark.parametrize("reuse", [False, True])
-def test_allocation_retry_reuses_lookup_only_when_enabled(reuse: bool) -> None:
-    """A retry with an unchanged epoch skips the token lookup; default is off."""
+def _next_step(lifecycle: RequestLifecycle) -> None:
+    """End the current scheduler step."""
+    lifecycle.build_connector_meta(SimpleNamespace(num_scheduled_tokens={}))
+
+
+def test_unknown_mode_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        _lifecycle(_EpochIPC(), mode="1")
+
+
+@pytest.mark.parametrize(
+    ("mode", "lookups", "epoch_checks"), [("", 2, 0), ("rpc", 1, 1), ("step", 1, 1)]
+)
+def test_allocation_retry_reuses_lookup_only_when_enabled(
+    mode: str, lookups: int, epoch_checks: int
+) -> None:
+    """A next-step retry with an unchanged epoch skips the token lookup."""
     ipc = _EpochIPC()
-    lifecycle = _lifecycle(ipc, reuse=reuse)
+    lifecycle = _lifecycle(ipc, mode=mode)
     request = _request()
     assert lifecycle.get_num_new_matched_tokens(request, 0) == (8, True)
     # vLLM could not allocate blocks and asks again next step.
+    _next_step(lifecycle)
     assert lifecycle.get_num_new_matched_tokens(request, 0) == (8, True)
-    assert ipc.lookups == (1 if reuse else 2)
-    assert ipc.epoch_checks == (1 if reuse else 0)
+    assert ipc.lookups == lookups
+    assert ipc.epoch_checks == epoch_checks
 
 
-def test_removal_between_retries_forces_a_fresh_lookup() -> None:
+def test_step_mode_reads_the_epoch_once_per_step() -> None:
+    """Retries in one step share one epoch RPC; a lookup reply supplies it free."""
+    ipc = _EpochIPC()
+    lifecycle = _lifecycle(ipc, mode="step")
+    first, second = _request("a"), _request("b")
+    lifecycle.get_num_new_matched_tokens(first, 0)
+    lifecycle.get_num_new_matched_tokens(second, 0)
+    _next_step(lifecycle)
+    lifecycle.get_num_new_matched_tokens(first, 0)
+    lifecycle.get_num_new_matched_tokens(second, 0)
+    assert (ipc.lookups, ipc.epoch_checks) == (2, 1)
+    # The same step's lookup reply already carries the epoch.
+    lifecycle.get_num_new_matched_tokens(_request("c"), 0)
+    lifecycle.get_num_new_matched_tokens(first, 0)
+    assert (ipc.lookups, ipc.epoch_checks) == (3, 1)
+
+
+@pytest.mark.parametrize("mode", ["rpc", "step"])
+def test_removal_between_retries_forces_a_fresh_lookup(mode: str) -> None:
     """An advanced epoch invalidates the reused result, so no stale hit loads."""
     ipc = _EpochIPC()
-    lifecycle = _lifecycle(ipc, reuse=True)
+    lifecycle = _lifecycle(ipc, mode=mode)
     request = _request()
     assert lifecycle.get_num_new_matched_tokens(request, 0) == (8, True)
+    _next_step(lifecycle)
     ipc.evict()
     assert lifecycle.get_num_new_matched_tokens(request, 0) == (0, False)
     assert ipc.lookups == 2
@@ -116,7 +150,7 @@ def test_removal_between_retries_forces_a_fresh_lookup() -> None:
 def test_changed_window_forces_a_fresh_lookup() -> None:
     """A retry whose local prefix hit moved is not an identical lookup."""
     ipc = _EpochIPC()
-    lifecycle = _lifecycle(ipc, reuse=True)
+    lifecycle = _lifecycle(ipc, mode="rpc")
     request = _request()
     lifecycle.get_num_new_matched_tokens(request, 0)
     lifecycle.get_num_new_matched_tokens(request, 4)
@@ -127,7 +161,7 @@ def test_changed_window_forces_a_fresh_lookup() -> None:
 def test_successful_allocation_ends_reuse() -> None:
     """After vLLM allocates, the next call is a new decision and looks up."""
     ipc = _EpochIPC()
-    lifecycle = _lifecycle(ipc, reuse=True)
+    lifecycle = _lifecycle(ipc, mode="rpc")
     request = _request()
     lifecycle.get_num_new_matched_tokens(request, 0)
     _alloc(lifecycle, request)
@@ -138,7 +172,7 @@ def test_successful_allocation_ends_reuse() -> None:
 def test_reused_result_is_not_shared_with_pending_loads() -> None:
     """Trimming a pending load must not change the result kept for retries."""
     ipc = _EpochIPC()
-    lifecycle = _lifecycle(ipc, reuse=True)
+    lifecycle = _lifecycle(ipc, mode="rpc")
     request = _request()
     lifecycle.get_num_new_matched_tokens(request, 0)
     _alloc(lifecycle, request)

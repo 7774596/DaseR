@@ -127,7 +127,7 @@ class DaserConnector(
                 coalesce_loads=bool(extra.get("coalesce_loads", False)),
                 layerwise_load=bool(extra.get("layerwise_load", False)),
                 arrival_readahead=os.environ.get(ARRIVAL_READAHEAD_ENV) == "1",
-                reuse_retry_lookup=os.environ.get(REUSE_RETRY_LOOKUP_ENV) == "1",
+                reuse_retry_lookup=os.environ.get(REUSE_RETRY_LOOKUP_ENV, ""),
                 writeback_low_blocks=int(
                     os.environ.get(WRITEBACK_LOW_BLOCKS_ENV, "0") or 0
                 ),

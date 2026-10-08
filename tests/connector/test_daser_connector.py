@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import logging
 from pathlib import Path
 import threading
 import time
@@ -3601,3 +3602,78 @@ async def test_gds_roundtrip_with_kv_tensor(tmp_path):
     await gds.read_into_async(cp_recv, file_offset=0)
     assert torch.equal(kv[:, 0], recv)
     gds.close()
+
+
+def test_failed_parked_prefetch_is_logged_and_released_when_window_moves(
+    monkeypatch, caplog
+) -> None:
+    """A finished-but-failed prefetch dropped on a window change logs and releases."""
+
+    class LookupIPC:
+        def __init__(self) -> None:
+            self.released: list[str] = []
+
+        def lookup_with_prefetch(self, lease_id, tokens, model_id, **kwargs):
+            del lease_id, tokens, model_id
+            start = int(kwargs["num_computed_tokens"])
+            return PrefetchLookupResult(
+                chunks=[
+                    {
+                        "chunk_key": "cached",
+                        "start_slot": 0,
+                        "num_slots": 3,
+                        "file_offset": 0,
+                        "token_count": 12,
+                        "target_token_start": 0,
+                        "pos_offset": 0,
+                    }
+                ],
+                spans=[{"file_offset": start * 8, "nbytes": (12 - start) * 8}],
+                tier="l2",
+            )
+
+        def release_transfer_lease(self, lease_id: str) -> None:
+            self.released.append(lease_id)
+
+    attempts: list[int] = []
+
+    def failing_prefetch(socket_path, lease_id, spans):
+        del socket_path, spans
+        attempts.append(1)
+        raise RuntimeError(f"prefetch did not retain complete lease: {lease_id}")
+
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle._prefetch_external_spans",
+        failing_prefetch,
+    )
+    ipc = LookupIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        socket_path="/unused/daser.sock",
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+        prefetch_max_requests=1,
+    )
+    request = SimpleNamespace(
+        request_id="req",
+        prompt_token_ids=list(range(16)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+    try:
+        assert lifecycle.get_num_new_matched_tokens(request, 4) == (None, True)
+        deadline = time.monotonic() + 1.0
+        while not attempts and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.02)
+        with caplog.at_level(logging.WARNING):
+            assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, True)
+        assert ipc.released[:1] == ["req"]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("prefetch failed req=req parked_tokens=8" in m for m in messages), (
+            messages
+        )
+    finally:
+        lifecycle.shutdown()
