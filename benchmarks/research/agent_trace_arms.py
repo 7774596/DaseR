@@ -442,6 +442,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Cap LMCache fs_native L2 at --l2-size with LRU eviction.",
     )
     parser.add_argument(
+        "--lmcache-eager-prefetch",
+        action="store_true",
+        help="Submit LMCache lookups when requests enter vLLM's waiting queue.",
+    )
+    parser.add_argument(
         "--vllm-extra-args",
         default="",
         help="Extra vllm serve arguments for every arm (shell-split).",
@@ -581,6 +586,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         lmcache_l2_odirect=True,
         lmcache_l2_native_workers=args.lmcache_l2_native_workers,
         lmcache_l2_bounded=args.lmcache_l2_bounded,
+        lmcache_eager_prefetch=args.lmcache_eager_prefetch,
         extra_vllm_args=tuple(shlex.split(args.vllm_extra_args))
         + _speculative_args(args.speculative_config),
         **(

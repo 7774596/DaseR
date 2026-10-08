@@ -999,6 +999,28 @@ def test_lmcache_bounded_l2_caps_fs_native_at_l2_size(tmp_path: Path) -> None:
     assert l2_spec["eviction"]["eviction_policy"] == "LRU"
 
 
+def test_lmcache_eager_prefetch_reaches_connector_config(tmp_path: Path) -> None:
+    """``lmcache_eager_prefetch`` sets the MP connector's eager prefetch key."""
+
+    def extra(**kwargs: bool) -> dict:
+        manager = ServerManager(
+            run_id="run1",
+            backend="lmcache",
+            model="/models/qwen",
+            store_dir=tmp_path,
+            gpu_id="2",
+            gpu_util=0.85,
+            max_num_seqs=32,
+            l1_size_bytes=1024**3,
+            l2_size_bytes=2 * 1024**3,
+            **kwargs,
+        )
+        return manager.lmcache_kv_transfer_config()["kv_connector_extra_config"]
+
+    assert extra(lmcache_eager_prefetch=True)["lmcache.mp.eager_prefetch"] is True
+    assert "lmcache.mp.eager_prefetch" not in extra()
+
+
 def test_lmcache_bounded_l2_requires_fs_native(tmp_path: Path) -> None:
     """Bounding LMCache L2 without the fs_native adapter is rejected."""
     with pytest.raises(ValueError, match="fs_native"):

@@ -284,6 +284,7 @@ class ServerManager:
         lmcache_eviction_watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
         lmcache_l2_native_workers: int = 0,
         lmcache_l2_bounded: bool = False,
+        lmcache_eager_prefetch: bool = False,
         extra_vllm_args: tuple[str, ...] = (),
     ) -> None:
         """Initialize the service manager.
@@ -342,6 +343,9 @@ class ServerManager:
             lmcache_l2_bounded: cap the ``fs_native`` L2 at ``l2_size_bytes``
                 with LRU eviction so LMCache gets the same SSD capacity as a
                 DaseR arm; without it LMCache's fs L2 grows without bound.
+            lmcache_eager_prefetch: submit LMCache's lookup (and its L2 to
+                L1 prefetch) when a request enters vLLM's waiting queue
+                instead of when the scheduler first considers it.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
@@ -397,6 +401,7 @@ class ServerManager:
         self.lmcache_eviction_watermark = lmcache_eviction_watermark
         self.lmcache_l2_native_workers = lmcache_l2_native_workers
         self.lmcache_l2_bounded = lmcache_l2_bounded
+        self.lmcache_eager_prefetch = lmcache_eager_prefetch
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -592,6 +597,11 @@ class ServerManager:
             "kv_connector_extra_config": {
                 "lmcache.mp.host": LMCACHE_MP_HOST,
                 "lmcache.mp.port": LMCACHE_MP_PORT,
+                **(
+                    {"lmcache.mp.eager_prefetch": True}
+                    if self.lmcache_eager_prefetch
+                    else {}
+                ),
             },
         }
         return kv_config
