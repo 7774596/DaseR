@@ -775,6 +775,68 @@ def order_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def replay_concurrency(records: list[dict]) -> tuple[float, int, float]:
+    """Measure how many requests were actually in flight during a replay.
+
+    A request is in flight from its send to its completion. Nominal
+    ``--max-inflight`` overstates concurrency when session dependencies
+    serialize the trace, so this is read from the recorded offsets.
+
+    Args:
+        records: ``requests.jsonl`` records.
+
+    Returns:
+        ``(time-weighted mean in-flight requests, max in flight,
+        time-weighted mean in-flight prompt tokens)``; zeros when no record
+        has both offsets.
+    """
+    events = []
+    for r in records:
+        if r.get("send_offset_s") is None or r.get("completion_offset_s") is None:
+            continue
+        tokens = int(r.get("input_length") or r.get("prompt_tokens") or 0)
+        events.append((float(r["send_offset_s"]), 1, tokens))
+        events.append((float(r["completion_offset_s"]), -1, -tokens))
+    if not events:
+        return 0.0, 0, 0.0
+    # Completions sort before sends at the same instant.
+    events.sort(key=lambda e: (e[0], e[1]))
+    inflight = peak = tokens = 0
+    area = token_area = 0.0
+    last = events[0][0]
+    for t, step, delta in events:
+        area += inflight * (t - last)
+        token_area += tokens * (t - last)
+        last = t
+        inflight += step
+        tokens += delta
+        peak = max(peak, inflight)
+    span = events[-1][0] - events[0][0]
+    if span <= 0:
+        return float(peak), peak, float(tokens)
+    return area / span, peak, token_area / span
+
+
+def concurrency_rows(arm_dirs: list[Path]) -> list[str]:
+    """Report measured in-flight requests and prompt tokens per arm.
+
+    Args:
+        arm_dirs: Arm directories with ``requests.jsonl``.
+
+    Returns:
+        One line per arm.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        records = [json.loads(line) for line in (arm_dir / "requests.jsonl").open()]
+        mean, peak, tokens = replay_concurrency(records)
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: inflight_mean={mean:.2f} "
+            f"max={peak} inflight_ctx_mean={tokens / 1e3:.0f}k"
+        )
+    return lines
+
+
 def live_clock_rows(arm_dirs: list[Path]) -> list[str]:
     """Check that the live-victim arena clock counted one tick per request.
 
@@ -1024,6 +1086,8 @@ def main() -> None:
         print("\n".join(walls))
     print("send order vs trace order")
     print("\n".join(order_rows(arm_dirs)))
+    print("measured concurrency (send..completion)")
+    print("\n".join(concurrency_rows(arm_dirs)))
     clocks = live_clock_rows(arm_dirs)
     if clocks:
         print("live-victim arena clock")

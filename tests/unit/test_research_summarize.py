@@ -10,6 +10,7 @@ from benchmarks.research.summarize import (
     live_clock_rows,
     order_rows,
     overlap_bound_rows,
+    replay_concurrency,
     request_hit_rows,
     slo_rows,
     vllm_tick_rows,
@@ -430,3 +431,32 @@ def test_slo_population_window_starts_after_one_lifetime(tmp_path: Path) -> None
     assert "life50_s=4 window_s=5-9 " in row
     # Sends in [5, 9): 5.0, 6.0, 7.0, 8.0 → 4 requests over 4 s.
     assert "ok=4" in row and "goodput=1.000/s" in row
+
+
+def test_replay_concurrency_weights_in_flight_requests_by_time() -> None:
+    """Overlapping spans count together; back-to-back spans do not."""
+    records = [
+        {"send_offset_s": 0.0, "completion_offset_s": 2.0, "input_length": 100},
+        {"send_offset_s": 1.0, "completion_offset_s": 3.0, "input_length": 300},
+        {"send_offset_s": 3.0, "completion_offset_s": 4.0, "input_length": 50},
+        {"send_offset_s": None, "completion_offset_s": None, "input_length": 9},
+    ]
+
+    mean, peak, tokens = replay_concurrency(records)
+
+    # In flight: 1 over [0,1), 2 over [1,2), 1 over [2,4) -> 5 / 4.
+    assert peak == 2
+    assert mean == 1.25
+    # Tokens: 100 + 400 + 300 + 50 over 4 s.
+    assert tokens == 212.5
+
+
+def test_replay_concurrency_serial_replay_never_exceeds_one() -> None:
+    """A completion and the next send at the same instant do not overlap."""
+    records = [
+        {"send_offset_s": float(i), "completion_offset_s": i + 1.0, "input_length": 10}
+        for i in range(3)
+    ]
+
+    assert replay_concurrency(records) == (1.0, 1, 10.0)
+    assert replay_concurrency([]) == (0.0, 0, 0.0)
