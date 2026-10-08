@@ -280,9 +280,15 @@ class RequestLifecycle:
                 prefetch_future.result()
                 getattr(self, "_leased_request_ids", set()).add(request.request_id)
             except Exception as exc:  # noqa: BLE001
+                # parked_tokens bounds what the fresh lookup below can lose.
                 logger.warning(
-                    "[CONNECTOR] prefetch failed req=%s: %s",
+                    "[CONNECTOR] prefetch failed req=%s parked_tokens=%d: %s",
                     request.request_id[:8],
+                    0
+                    if prefetch_lookup_result is None
+                    else _contiguous_prefix_tokens(
+                        prefetch_lookup_result.chunks, num_computed_tokens
+                    ),
                     exc,
                 )
                 getattr(self, "_prefetch_lookup_results", {}).pop(

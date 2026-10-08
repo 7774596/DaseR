@@ -1472,7 +1472,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         return nbytes
                 await asyncio.gather(*waiters)
 
-        await self._wait_for_overlapping_leases(file_offset, nbytes)
+        lease_wait_since = await self._wait_for_overlapping_leases(file_offset, nbytes)
         data = await self._reserve_l1_buffer(key, nbytes, accounting)
         try:
             # The source snapshot is immutable while this copy runs. Offload
@@ -1509,7 +1509,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                         # executor.  This yields only once; it does not wait
                         # for the SSD write and keeps the store API async.
                         break
-                await self._wait_lease_waiters(waiters)
+                lease_wait_since = await self._wait_lease_waiters(
+                    waiters, lease_wait_since
+                )
             await asyncio.sleep(0)
             return nbytes
         except BaseException:
@@ -1628,8 +1630,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         src: Any,
         spans: list[dict[str, Any]],
+        *,
+        lease_wait_since: float | None = None,
     ) -> int:
-        """Admit one source-contiguous packed run and schedule its L2 writes."""
+        """Admit one source-contiguous packed run and schedule its L2 writes.
+
+        ``lease_wait_since`` carries the start of a lease wait across the
+        publication retry so the wait is accounted as one episode.
+        """
         if not spans:
             return 0
         total = sum(int(span["nbytes"]) for span in spans)
@@ -1708,7 +1716,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                             self._l1.register_pool_waiter(waiter)
                             waiters = {waiter}
             if lease_waiters:
-                await self._wait_lease_waiters(lease_waiters)
+                lease_wait_since = await self._wait_lease_waiters(
+                    lease_waiters, lease_wait_since
+                )
                 continue
             if waiters:
                 await asyncio.gather(*waiters)
@@ -1803,13 +1813,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                     await asyncio.sleep(0)
                     return total
             data.close()
-            await self._wait_lease_waiters(waiters)
+            lease_wait_since = await self._wait_lease_waiters(waiters, lease_wait_since)
         except BaseException:
             data.close()
             for _key, child in children:
                 child.close()
             raise
-        return await self._store_packed_source_group(src, spans)
+        return await self._store_packed_source_group(
+            src, spans, lease_wait_since=lease_wait_since
+        )
 
     async def prefetch_bytes_grouped(
         self,
@@ -4259,27 +4271,50 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         file_offset: int,
         nbytes: int,
-    ) -> None:
-        """Wait until no request lease blocks a fresh-slice store range."""
+    ) -> float | None:
+        """Wait until no request lease blocks a fresh-slice store range.
+
+        Returns:
+            The ``time.perf_counter()`` start of the lease wait, or None when
+            the store did not wait.
+        """
+        since: float | None = None
         while True:
             async with self._lock:
                 waiters = self._overlapping_lease_waiters_locked(
                     file_offset, nbytes, retained_ok=True
                 )
             if not waiters:
-                return
-            await self._wait_lease_waiters(waiters)
+                return since
+            since = await self._wait_lease_waiters(waiters, since)
 
     async def _wait_lease_waiters(
-        self, waiters: Iterable[asyncio.Future[None]]
-    ) -> None:
+        self, waiters: Iterable[asyncio.Future[None]], since: float | None
+    ) -> float:
         """Wait for a blocking lease to be released or to retain its range.
 
         A prefetch attaching its promoted slices makes a lease stop blocking
         ``retained_ok`` stores without resolving ``released``, so the caller
         rechecks at the pool retry interval.
+
+        Args:
+            waiters: Release futures of the blocking leases.
+            since: Start of this store's lease wait, or None on its first wait.
+
+        Returns:
+            The wait start to pass to the next call of the same store. The
+            time waited is added to ``store_lease_wait_us`` and the store's
+            wait so far updates ``store_lease_wait_max_us``.
         """
+        mark = time.perf_counter()
+        since = mark if since is None else since
         await asyncio.wait(set(waiters), timeout=_POOL_RETRY_S)
+        now = time.perf_counter()
+        self._stats.store_lease_wait_us += int((now - mark) * 1_000_000)
+        self._stats.store_lease_wait_max_us = max(
+            self._stats.store_lease_wait_max_us, int((now - since) * 1_000_000)
+        )
+        return since
 
     def _take_bypass_readahead(
         self, misses: list[dict[str, Any]]

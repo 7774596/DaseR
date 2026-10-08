@@ -1565,6 +1565,9 @@ def test_iouring_store_waits_for_lease_until_prefetch_retains_it(tmp_path) -> No
             await asyncio.wait_for(prefetch, timeout=1.0)
             # The lease is still held, but now retains its bytes.
             assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
+            # The wait is accounted as one episode of at least the gated time.
+            assert layer.stats.store_lease_wait_max_us >= 200_000
+            assert layer.stats.store_lease_wait_us >= 200_000
 
             dst = bytearray(ALIGNMENT)
             await layer.load_leased_bytes_grouped(

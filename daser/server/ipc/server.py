@@ -499,6 +499,7 @@ class IPCServer:
         self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
+        self._prev_store_lease_wait_us = 0
         self._prev_l1_bypass_bytes = 0
         self._prev_load_phase_us: dict[str, int] = {}
         self._prev_dst_copy: dict[str, int] = {}
@@ -1997,6 +1998,17 @@ class IPCServer:
                 "L2 load bytes read around L1 by split-residency bypass.",
             ).inc(bypass_delta)
         self._prev_l1_bypass_bytes = stats.l1_bypass_bytes
+        lease_wait_delta = stats.store_lease_wait_us - self._prev_store_lease_wait_us
+        if lease_wait_delta > 0:
+            self._metrics.counter(
+                "daser_store_lease_wait_seconds_total",
+                "Time stores waited for a request lease to retain their range.",
+            ).inc(lease_wait_delta / 1e6)
+        self._prev_store_lease_wait_us = stats.store_lease_wait_us
+        self._metrics.gauge(
+            "daser_store_lease_wait_max_seconds",
+            "Longest lease wait of a single store.",
+        ).set(stats.store_lease_wait_max_us / 1e6)
         prev_hits = getattr(self, "_prev_l1_hits", 0)
         prev_misses = getattr(self, "_prev_l1_misses", 0)
         prev_l2_reads = getattr(self, "_prev_l2_reads", 0)

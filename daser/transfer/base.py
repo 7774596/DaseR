@@ -64,6 +64,9 @@ class TransferStats:
         l1_evicted_pinned_bytes: of those, still owned by an L2 writer or a
             lease, so residency was dropped without freeing pool memory.
         l1_evicted_unread_bytes: of those, never hit since insertion.
+        store_lease_wait_us: time stores waited for a request lease that
+            did not yet retain the stored range.
+        store_lease_wait_max_us: longest such wait of a single store.
     """
 
     l1_hits: int = 0
@@ -101,6 +104,8 @@ class TransferStats:
     l1_evicted_bytes: int = 0
     l1_evicted_pinned_bytes: int = 0
     l1_evicted_unread_bytes: int = 0
+    store_lease_wait_us: int = 0
+    store_lease_wait_max_us: int = 0
 
 
 class LeaseIncompleteError(RuntimeError):
