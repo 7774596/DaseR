@@ -55,7 +55,7 @@ from daser.server.admission import (
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 from daser.server.session_predictor import SessionPredictor
-from daser.transfer import TransferLayer
+from daser.transfer import LeaseIncompleteError, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
@@ -1152,25 +1152,33 @@ class IPCServer:
         transfer = self._ensure_transfer()
         lease_id = str(msg.get("lease_id", "")) or None
         spans = list(msg.get("spans", []))
-        if lease_id is None:
-            result = await transfer.prefetch_bytes_grouped(spans)
-        elif self._streaming_phases:
-            record_bytes = int(self._runtime_config.get("slot_size", 0)) // max(
-                1, int(self._runtime_config.get("tensor_parallel_size", 1))
-            )
-            result = await transfer.prefetch_bytes_grouped(
-                _phase_prefetch_spans(
-                    spans, record_bytes=record_bytes, phases=self._streaming_phases
-                ),
-                lease_id=lease_id,
-                streaming=True,
-            )
-        else:
-            result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
-        self._metrics.counter(
+        operations = self._metrics.counter(
             "daser_prefetch_operations_total",
             "Host-tier prefetch operations by result.",
-        ).inc(labels={"status": "ok"})
+        )
+        try:
+            if lease_id is None:
+                result = await transfer.prefetch_bytes_grouped(spans)
+            elif self._streaming_phases:
+                record_bytes = int(self._runtime_config.get("slot_size", 0)) // max(
+                    1, int(self._runtime_config.get("tensor_parallel_size", 1))
+                )
+                result = await transfer.prefetch_bytes_grouped(
+                    _phase_prefetch_spans(
+                        spans, record_bytes=record_bytes, phases=self._streaming_phases
+                    ),
+                    lease_id=lease_id,
+                    streaming=True,
+                )
+            else:
+                result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
+        except LeaseIncompleteError as exc:
+            # Expected when the looked-up chunk lost its slots before the
+            # prefetch ran; the connector releases the lease and looks again.
+            operations.inc(labels={"status": "incomplete"})
+            logger.warning("[IPC] transfer_prefetch: %s", exc)
+            return {"error": str(exc)}
+        operations.inc(labels={"status": "ok"})
         bytes_counter = self._metrics.counter(
             "daser_prefetch_bytes_total",
             "Host-tier prefetch bytes by tier.",

@@ -15,6 +15,7 @@ from daser.replacement import ReplacementPolicy, SplitResidencyPolicy
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.replacement.next_use import NextUseReplacementPolicy
 from daser.transfer.base import (
+    LeaseIncompleteError,
     PrefetchResult,
     TransferLayer,
     TransferStats,
@@ -4003,7 +4004,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 [(hit.file_offset, hit.nbytes)],
             )
         if uncovered:
-            raise RuntimeError(f"prefetch did not retain complete lease: {lease_id}")
+            raise LeaseIncompleteError(
+                f"prefetch did not retain complete lease: {lease_id}"
+            )
 
     def _lease_filling_locked(self, lease_id: str) -> bool:
         """Return whether a streaming fill still promotes into a lease."""
