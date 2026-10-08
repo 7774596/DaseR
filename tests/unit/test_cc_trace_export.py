@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-from benchmarks.research.cc_trace_export import export
+from benchmarks.research.cc_trace_export import export, live_context
 
 
 def _session(requests: list[tuple[float, int, int]]) -> dict:
@@ -68,6 +68,19 @@ def test_round_robin_interleaves_live_sessions_and_refills(tmp_path: Path) -> No
     for sid in set(order):
         lengths = [r["input_length"] for r in rows if r["session_id"] == sid]
         assert lengths == sorted(lengths)
+
+
+def test_live_context_sums_latest_inputs_of_live_sessions() -> None:
+    """Live sessions span first..last row and count at their latest input."""
+    rows = [
+        {"session_id": 0, "input_length": 100},
+        {"session_id": 1, "input_length": 50},
+        {"session_id": 0, "input_length": 300},
+        {"session_id": 2, "input_length": 70},
+        {"session_id": 1, "input_length": 80},
+    ]
+
+    assert live_context(rows) == [(1, 100), (2, 150), (2, 350), (2, 120), (1, 80)]
 
 
 def test_real_time_export_caps_gaps_and_keeps_arrivals(tmp_path: Path) -> None:

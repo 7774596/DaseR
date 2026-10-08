@@ -25,6 +25,9 @@ chain is re-rendered, so its blocks get new IDs, and the user-turn row carries
 ``--round-robin K`` instead models K closed-loop agents sharing one server
 (tool waits longer than the other agents' service): K sessions are live and
 take turns one request each; a finished session's slot goes to the next one.
+The summary line reports the live sessions and their summed context (each
+live session counted at its latest input) over the first ``--report-window``
+rows, so a window can be checked to overflow GPU KV before it is replayed.
 """
 
 import argparse
@@ -36,6 +39,32 @@ import random
 CC_BLOCK_TOKENS = 64
 OUT_BLOCK_TOKENS = 512
 GROUP = OUT_BLOCK_TOKENS // CC_BLOCK_TOKENS
+
+
+def live_context(rows: list[dict]) -> list[tuple[int, int]]:
+    """Return, per replay row, the live sessions and their summed context.
+
+    A session is live from its first to its last row in replay order and
+    contributes the input length of its latest row so far.
+
+    Args:
+        rows: exported rows in replay order (``session_id``, ``input_length``).
+
+    Returns:
+        ``(live sessions, summed live context tokens)`` for each row.
+    """
+    first: dict[int, int] = {}
+    last: dict[int, int] = {}
+    for index, row in enumerate(rows):
+        first.setdefault(row["session_id"], index)
+        last[row["session_id"]] = index
+    latest: dict[int, int] = {}
+    out = []
+    for index, row in enumerate(rows):
+        latest[row["session_id"]] = row["input_length"]
+        live = [sid for sid in latest if first[sid] <= index <= last[sid]]
+        out.append((len(live), sum(latest[sid] for sid in live)))
+    return out
 
 
 def _block_ids(
@@ -363,6 +392,12 @@ def main() -> None:
         default=0.0,
         help="Strip past reasoning at user turns idle longer than this (seconds).",
     )
+    p.add_argument(
+        "--report-window",
+        type=int,
+        default=0,
+        help="Report live sessions/context over the first N rows (0 = all).",
+    )
     a = p.parse_args()
     rows = export(
         a.cc_traces,
@@ -388,6 +423,15 @@ def main() -> None:
         f"requests={len(rows)} sessions={len({r['session_id'] for r in rows})} "
         f"unique_blocks={blocks} ({blocks * OUT_BLOCK_TOKENS / 1e6:.2f}M tok) "
         f"input_tok={tokens / 1e6:.2f}M"
+    )
+    window = live_context(rows)[: a.report_window or None]
+    live = sorted(n for n, _ in window)
+    ctx = sorted(c for _, c in window)
+    print(
+        f"window={len(window)} live_sessions p50={live[len(live) // 2]} "
+        f"max={live[-1]} live_ctx p10/p50/p90="
+        f"{ctx[len(ctx) // 10] / 1e3:.0f}k/{ctx[len(ctx) // 2] / 1e3:.0f}k/"
+        f"{ctx[len(ctx) * 9 // 10] / 1e3:.0f}k"
     )
 
 
