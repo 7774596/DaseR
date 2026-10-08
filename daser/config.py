@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 
@@ -350,6 +350,9 @@ class DaserConfig:
             read into concurrently submitted IOs (0 = one serial read).
         l1_split_fraction: research switch for iouring L1 split residency;
             protected-segment share of L1 (0 = off).
+        extra_kv_layers: attention layers the vLLM worker registers beyond
+            the model's own, for example an EAGLE drafter's; they share the
+            target layers' KV shape and are stored in every slot.
     """
 
     model_path: str = ""
@@ -371,6 +374,7 @@ class DaserConfig:
     prefetch_lease_budget_bytes: int = 0
     l2_read_stripe_bytes: int = 0
     l1_split_fraction: float = 0.0
+    extra_kv_layers: int = 0
 
     def __post_init__(self) -> None:
         """Validate startup-immutable transfer settings."""
@@ -384,6 +388,8 @@ class DaserConfig:
             raise ValueError("l2_read_stripe_bytes must be non-negative")
         if not 0.0 <= self.l1_split_fraction < 1.0:
             raise ValueError("l1_split_fraction must be in [0, 1)")
+        if self.extra_kv_layers < 0:
+            raise ValueError("extra_kv_layers must be non-negative")
 
     @property
     def store_path(self) -> str:
@@ -450,7 +456,7 @@ class DaserConfig:
         Raises:
             ValueError: If the model geometry cannot fit the online envelope.
         """
-        geometry = model_geometry_from_path(self.model_path)
+        geometry = self.model_geometry()
         local_slot_size = self.resolved_local_slot_size()
         return CompressedStoreGeometry(
             num_slots=self.physical_total_slots,
@@ -463,6 +469,16 @@ class DaserConfig:
             tile_scalars=ONLINE_TILE_SCALARS,
         ).online_min_stored_length
 
+    def model_geometry(self) -> ModelGeometry:
+        """Return the KV geometry of every layer the worker registers.
+
+        Returns:
+            Geometry from ``model_path/config.json`` with ``extra_kv_layers``
+            added to its layer count.
+        """
+        geometry = model_geometry_from_path(self.model_path)
+        return replace(geometry, num_layers=geometry.num_layers + self.extra_kv_layers)
+
     @property
     def l2_size_bytes(self) -> int:
         """Return SSD-tier capacity in bytes."""
@@ -474,7 +490,7 @@ class DaserConfig:
         Returns:
             Slot size in bytes.
         """
-        return model_geometry_from_path(self.model_path).slot_size_for_block_tokens(
+        return self.model_geometry().slot_size_for_block_tokens(
             self.block_tokens, self.tensor_parallel_size
         )
 
@@ -484,9 +500,9 @@ class DaserConfig:
         Returns:
             Per-rank KV slot bytes derived from model and TP configuration.
         """
-        return model_geometry_from_path(
-            self.model_path
-        ).local_slot_size_for_block_tokens(self.block_tokens, self.tensor_parallel_size)
+        return self.model_geometry().local_slot_size_for_block_tokens(
+            self.block_tokens, self.tensor_parallel_size
+        )
 
     def runtime_config(self) -> dict[str, object]:
         """Return connector runtime config owned by DaseR server.

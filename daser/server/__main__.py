@@ -31,7 +31,6 @@ from daser.config import (
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
     DaserConfig,
-    model_geometry_from_path,
 )
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
@@ -269,6 +268,14 @@ def _parse_args() -> argparse.Namespace:
         "concurrently (default 0: off, BIP/LRU replacement).",
     )
     parser.add_argument(
+        "--extra-kv-layers",
+        type=int,
+        default=0,
+        help="Attention layers vLLM registers beyond the model's own, stored "
+        "in every slot with the same KV shape (for example 1 for a one-layer "
+        "EAGLE drafter; default 0).",
+    )
+    parser.add_argument(
         "--l1-accounting",
         choices=L1_ACCOUNTING_MODES,
         default="stored",
@@ -406,6 +413,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
         l2_read_stripe_bytes=int(getattr(args, "l2_read_stripe", 0)),
         l1_split_fraction=float(getattr(args, "l1_split_fraction", 0.0)),
+        extra_kv_layers=int(getattr(args, "extra_kv_layers", 0)),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -423,7 +431,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     if cfg.prefetch_lease_budget_bytes > cfg.l1_size_bytes:
         raise ValueError("--prefetch-lease-budget must not exceed --l1-size")
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-        geometry = model_geometry_from_path(cfg.model_path)
+        geometry = cfg.model_geometry()
         violations = []
         if cfg.transfer_mode != "iouring":
             violations.append("--transfer-mode=iouring")
@@ -626,7 +634,7 @@ async def run_server(args: argparse.Namespace) -> None:
 
     runtime_config = cfg.runtime_config()
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-        model = model_geometry_from_path(cfg.model_path)
+        model = cfg.model_geometry()
         geometry = CompressedStoreGeometry(
             num_slots=cfg.physical_total_slots,
             slot_size=cfg.resolved_local_slot_size(),

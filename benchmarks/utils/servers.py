@@ -270,6 +270,7 @@ class ServerManager:
         daser_prefetch_lease_budget_bytes: int = 0,
         daser_l2_read_stripe_bytes: int = 0,
         daser_l1_split_fraction: float = 0.0,
+        daser_extra_kv_layers: int = 0,
         daser_l1_lru: bool = False,
         daser_l1_accounting: str = "stored",
         daser_coalesce_loads: bool = False,
@@ -316,6 +317,8 @@ class ServerManager:
                 the server default of one serial read per extent).
             daser_l1_split_fraction: DaseR ``--l1-split-fraction`` (0 leaves
                 split residency off).
+            daser_extra_kv_layers: DaseR ``--extra-kv-layers``, the KV layers
+                vLLM registers beyond the target model's (an EAGLE drafter).
             daser_l1_lru: pass ``--no-bip-enabled`` so L1 inserts at the MRU
                 end (plain LRU) instead of BIP.
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
@@ -388,6 +391,7 @@ class ServerManager:
         self.daser_prefetch_lease_budget_bytes = daser_prefetch_lease_budget_bytes
         self.daser_l2_read_stripe_bytes = daser_l2_read_stripe_bytes
         self.daser_l1_split_fraction = daser_l1_split_fraction
+        self.daser_extra_kv_layers = daser_extra_kv_layers
         self.daser_l1_lru = daser_l1_lru
         self.lmcache_l2_odirect = lmcache_l2_odirect
         self.lmcache_eviction_watermark = lmcache_eviction_watermark
@@ -726,6 +730,8 @@ class ServerManager:
             cmd.extend(["--l2-read-stripe", str(self.daser_l2_read_stripe_bytes)])
         if self.daser_l1_split_fraction:
             cmd.extend(["--l1-split-fraction", str(self.daser_l1_split_fraction)])
+        if self.daser_extra_kv_layers:
+            cmd.extend(["--extra-kv-layers", str(self.daser_extra_kv_layers)])
         if self.daser_l1_lru:
             cmd.append("--no-bip-enabled")
         if self.daser_l1_accounting != "stored":

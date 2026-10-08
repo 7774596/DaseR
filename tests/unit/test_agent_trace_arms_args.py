@@ -55,3 +55,22 @@ def test_speculative_config_rejects_non_objects(tmp_path: Path) -> None:
     """A malformed config fails at parse time, before any server starts."""
     with pytest.raises(SystemExit):
         parse_args(_args(tmp_path, "--speculative-config", "[5]"))
+
+
+def test_eagle_drafter_layers_reach_the_daser_server(tmp_path: Path) -> None:
+    """An EAGLE drafter's layers are added to DaseR's KV slot geometry."""
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+    spec = json.dumps({"method": "eagle3", "model": str(drafter)})
+    args = parse_args(_args(tmp_path, "--speculative-config", spec))
+
+    assert _manager("daser-raw", args).daser_extra_kv_layers == 1
+
+
+def test_draft_free_speculation_adds_no_kv_layers(tmp_path: Path) -> None:
+    """N-gram drafting and no speculation keep the target geometry."""
+    ngram = '{"method": "ngram_gpu", "num_speculative_tokens": 5}'
+    for extra in ((), ("--speculative-config", ngram)):
+        args = parse_args(_args(tmp_path, *extra))
+        assert _manager("daser-raw", args).daser_extra_kv_layers == 0
