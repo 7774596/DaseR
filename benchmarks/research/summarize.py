@@ -591,7 +591,9 @@ def slo_rows(
         One line per arm: completed requests, TTFT and TPOT p90, summed TTFT,
         mean active sessions, median session lifetime, SLO attainment over the
         kept sent requests (failures miss it), goodput in SLO-meeting requests
-        per second, and with trimming the half-to-half drift.
+        per second, the TTFT p99 of the longest-prompt fifth of completed
+        requests (a fairness check: reordering that helps short requests must
+        not starve long ones), and with trimming the half-to-half drift.
     """
     lines = [
         f"SLO goodput (TTFT <= {ttft_ms:.0f} ms, TPOT <= {tpot_ms:.1f} ms, "
@@ -626,6 +628,8 @@ def slo_rows(
             / max(int(r.get("completion_tokens", 1)) - 1, 1)
             for r in done
         ]
+        by_ctx = sorted(done, key=lambda r: int(r.get("prompt_tokens", 0)))
+        long_ttft = [float(r["ttft_ms"]) for r in by_ctx[len(by_ctx) * 4 // 5 :]]
         good = sum(
             first <= ttft_ms
             and (int(r.get("completion_tokens", 1)) <= 1 or t <= tpot_ms)
@@ -634,6 +638,7 @@ def slo_rows(
         lines.append(
             f"  {arm_dir.parent.parent.name}/{arm_dir.name}: ok={len(done)} "
             f"ttft_p90={_p(ttft, 90):.0f} tpot_p90={_p(tpot, 90):.1f} "
+            f"long20_ttft_p99={_p(long_ttft, 99):.0f} "
             f"sum_ttft_s={sum(ttft) / 1000:.0f} active={active:.1f} "
             f"life50_s={lifetime:.0f} window_s={begin:.0f}-{end:.0f} "
             f"slo={_rate(good, len(records))} "

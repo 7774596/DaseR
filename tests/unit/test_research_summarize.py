@@ -294,6 +294,29 @@ def test_slo_trim_keeps_the_steady_state_window(tmp_path: Path) -> None:
     assert "active=1.3" in kept
 
 
+def test_slo_reports_ttft_tail_of_longest_prompts(tmp_path: Path) -> None:
+    """long20_ttft_p99 only looks at the longest-prompt fifth of requests."""
+    arm_dir = tmp_path / "long" / "art" / "arm"
+    arm_dir.mkdir(parents=True)
+    with (arm_dir / "requests.jsonl").open("w") as f:
+        for i in range(10):
+            record = {
+                "status": "completed",
+                "prompt_tokens": 1000 * (i + 1),
+                # The slowest request has a short prompt; the two longest
+                # prompts (the top fifth) take 800 and 900 ms.
+                "ttft_ms": 5000.0 if i == 0 else 100.0 * i,
+                "latency_ms": 6000.0,
+                "completion_tokens": 2,
+            }
+            f.write(json.dumps(record) + "\n")
+    (arm_dir / "summary.json").write_text(json.dumps({"wall_seconds": 10.0}))
+
+    (line,) = slo_rows([arm_dir], ttft_ms=500.0, tpot_ms=1e6)[1:]
+
+    assert "long20_ttft_p99=900" in line
+
+
 def test_arm_row_reports_speculative_acceptance_length(tmp_path: Path) -> None:
     """acc is generated tokens per engine step; "-" without step counts."""
     arm_dir = tmp_path / "spec" / "art" / "arm"
