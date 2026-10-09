@@ -6,10 +6,13 @@ Usage::
     python -m benchmarks.research.nsys_gpu_busy <report.sqlite> [...]
 
 Each argument is an ``nsys export -t sqlite`` file. One block per report:
-window length, GPU busy share (union of kernel intervals), idle gaps between
-kernels (count and total above 1 ms / 10 ms), kernel-time shares by category,
-the top kernels, and H2D/D2H bytes with the share of copy time that overlaps
-a running kernel.
+window length, GPU busy share (union of kernel and CUDA-graph replay
+intervals), idle gaps between them (count and total above 1 ms / 10 ms),
+kernel-time shares by category, the top kernels, and H2D/D2H bytes with the
+share of copy time that overlaps a running kernel. With graph-level tracing
+(the nsys default) kernels inside a replayed CUDA graph are not recorded
+individually; each replay is one ``cuda_graph`` interval, counted as busy and
+listed as its own kernel-share category.
 
 With ``--requests <requests.jsonl>`` the idle gaps above 1 ms are also split
 by request phase: waiting for the first token (external load + prefill),
@@ -40,6 +43,11 @@ CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("norm/act", re.compile(r"norm|silu|gelu|act_and_mul|rotary|rope", re.I)),
 )
 _COPY_KINDS = {1: "H2D", 2: "D2H"}
+_GRAPH_TABLE = "CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
+_BUSY_QUERIES = (
+    "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL",
+    f"SELECT start, end FROM {_GRAPH_TABLE}",
+)
 _PHASES = ("first_token", "decode", "no_request")
 
 
@@ -86,6 +94,8 @@ def overlap_ns(
 
 def category(name: str) -> str:
     """Return the kernel category of a demangled kernel name."""
+    if name == "cuda_graph":
+        return name
     for label, pattern in CATEGORIES:
         if pattern.search(name):
             return label
@@ -187,6 +197,10 @@ def summarize(path: Path, top: int = 6) -> list[str]:
         if "CUPTI_ACTIVITY_KIND_KERNEL" in tables
         else []
     )
+    if _GRAPH_TABLE in tables:
+        kernels += con.execute(
+            f"SELECT start, end, 'cuda_graph' FROM {_GRAPH_TABLE}"
+        ).fetchall()
     copies = (
         con.execute(
             "SELECT start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY"
@@ -239,13 +253,15 @@ def _session_start_ns(path: Path) -> int:
     return int(start)
 
 
-def _intervals(path: Path, query: str) -> list[tuple[int, int]]:
-    """Return merged ``(start, end)`` rows of ``query`` (empty if no table)."""
+def _intervals(path: Path, *queries: str) -> list[tuple[int, int]]:
+    """Return merged ``(start, end)`` rows of ``queries`` (missing tables skip)."""
     con = sqlite3.connect(path)
-    try:
-        rows = con.execute(query).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    rows: list[tuple[int, int]] = []
+    for query in queries:
+        try:
+            rows += con.execute(query).fetchall()
+        except sqlite3.OperationalError:
+            continue
     con.close()
     return merge((int(s), int(e)) for s, e in rows)
 
@@ -271,7 +287,7 @@ def request_phase_lines(
         One line per phase plus the window length.
     """
     origin = _session_start_ns(report)
-    busy = _intervals(report, "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL")
+    busy = _intervals(report, *_BUSY_QUERIES)
     if not busy:
         return [f"{report.name}: no kernels"]
 

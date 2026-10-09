@@ -46,6 +46,30 @@ def test_copy_only_report_still_lists_copies(tmp_path: Path) -> None:
     assert lines[1].startswith("  D2H: n=1 GB=2.0 ")
 
 
+def test_cuda_graph_replays_count_as_busy(tmp_path: Path) -> None:
+    """Graph-traced replays fill the gaps between eager kernels."""
+    db = tmp_path / "graphs.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE StringIds (id INT, value TEXT)")
+    con.execute("INSERT INTO StringIds VALUES (1, 'flash_fwd_kernel')")
+    con.execute(
+        "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+        "(start INT, end INT, demangledName INT, shortName INT)"
+    )
+    con.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0, 2000000, 1, 1)")
+    con.execute(
+        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (8000000, 10000000, 1, 1)"
+    )
+    con.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start INT, end INT)")
+    con.execute("INSERT INTO CUPTI_ACTIVITY_KIND_GRAPH_TRACE VALUES (2000000, 8000000)")
+    con.commit()
+    con.close()
+    lines = summarize(db)
+    assert " busy=1.000 " in lines[0]
+    assert "gaps>1ms n=0 " in lines[0]
+    assert lines[1] == "  kernel share: cuda_graph=0.600 attention=0.400"
+
+
 def test_phase_gaps_assigns_each_gap_to_its_dominant_phase() -> None:
     """Gaps go to first-token, decode or idle by coverage; copies are measured."""
     busy = [
