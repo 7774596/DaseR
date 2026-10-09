@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import asyncio
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
@@ -507,6 +508,19 @@ class PromptBuilder:
         del prompt[request.input_length :]
         return prompt
 
+    def record(
+        self, request: TraceRequest, prompt: list[int], output: list[int]
+    ) -> None:
+        """Observe a finished request's sent prompt and generated tokens.
+
+        The base builder derives prompts from the trace alone and ignores this.
+
+        Args:
+            request: The finished request.
+            prompt: Token IDs that were sent.
+            output: Token IDs the server generated (empty on failure).
+        """
+
     def _block(self, hash_id: int) -> tuple[int, ...]:
         cached = self._blocks.get(hash_id)
         if cached is not None:
@@ -622,6 +636,75 @@ class SessionTextPromptBuilder(PromptBuilder):
         if end > len(self._stream):
             raise ValueError(f"row {request.index}: prompt runs past the token stream")
         return [int(token) for token in self._stream[start:end]]
+
+
+class ChainedPromptBuilder(PromptBuilder):
+    """Splice each turn's real generated tokens into its successor's prompt.
+
+    A trace row records only lengths, so a replay normally fills the
+    positions a turn's own output occupies in the next turn with synthetic
+    tokens. With a chain parent (see :func:`chain_parents`) the child's prompt
+    is instead the parent's sent prompt, then the parent's generated tokens,
+    then the child's own trace tokens for the remaining positions, truncated
+    to ``input_length``. The next turn's prefix then matches what the server
+    actually computed, decode tokens included.
+
+    Args:
+        base: Builder for rows without a chain parent and for new tokens.
+        parents: Chain parent of each request, keyed by ``TraceRequest.index``.
+
+    Thread-safety:
+        Same as :class:`PromptBuilder`. A parent's history is kept until its
+        last child is built, so callers must record a parent before building
+        its children.
+    """
+
+    def __init__(self, base: PromptBuilder, parents: dict[int, int | None]) -> None:
+        self._base = base
+        self._parents = parents
+        self._pending: dict[int, int] = {}
+        for parent in parents.values():
+            if parent is not None:
+                self._pending[parent] = self._pending.get(parent, 0) + 1
+        self._history: dict[int, array] = {}
+
+    def build(self, request: TraceRequest) -> list[int]:
+        """Return the request's prompt, prefixed by its parent's real history.
+
+        Args:
+            request: Request (or a prewarm prefix of it, same ``index``).
+
+        Returns:
+            ``input_length`` token IDs.
+        """
+        fresh = self._base.build(request)
+        history = self._history.get(self._parents.get(request.index, -1), None)
+        if history is None:
+            return fresh
+        prompt = history[: request.input_length].tolist()
+        prompt.extend(fresh[len(prompt) :])
+        return prompt
+
+    def record(
+        self, request: TraceRequest, prompt: list[int], output: list[int]
+    ) -> None:
+        """Keep the request's history for its children; drop spent parents.
+
+        Args:
+            request: The finished request.
+            prompt: Token IDs that were sent.
+            output: Token IDs the server generated (empty on failure, in
+                which case children fall back to synthetic output positions).
+        """
+        if self._pending.get(request.index):
+            self._history[request.index] = array("l", prompt + output)
+        parent = self._parents.get(request.index)
+        if parent is None or parent not in self._pending:
+            return
+        self._pending[parent] -= 1
+        if self._pending[parent] == 0:
+            del self._pending[parent]
+            self._history.pop(parent, None)
 
 
 def load_trace(
@@ -775,6 +858,45 @@ def prefix_predecessors(requests: Sequence[TraceRequest]) -> list[int | None]:
     return predecessors
 
 
+def chain_parents(requests: Sequence[TraceRequest]) -> list[int | None]:
+    """Find the earlier turn whose prompt and output each request extends.
+
+    A parent is the latest earlier request of the same session whose prompt
+    plus output fits in this request's prompt and whose full 512-token
+    prompt blocks are a prefix of this request's ``hash_ids``: this request
+    is then the next turn after it, so the parent's generated tokens sit at
+    ``[parent.input_length, parent.input_length + parent.output_length)``.
+
+    Args:
+        requests: Requests in replay order.
+
+    Returns:
+        Position (into ``requests``) of each request's chain parent, or None.
+
+    Thread-safety:
+        Pure function.
+    """
+
+    by_session: dict[int, list[int]] = {}
+    parents: list[int | None] = []
+    for position, request in enumerate(requests):
+        parent: int | None = None
+        if request.session_id is not None:
+            earlier = by_session.setdefault(request.session_id, [])
+            for candidate in reversed(earlier):
+                prior = requests[candidate]
+                full = prior.input_length // MOONCAKE_BLOCK_TOKENS
+                if (
+                    prior.input_length + prior.output_length <= request.input_length
+                    and request.hash_ids[:full] == prior.hash_ids[:full]
+                ):
+                    parent = candidate
+                    break
+            earlier.append(position)
+        parents.append(parent)
+    return parents
+
+
 def summarise(
     selection: TraceSelection,
     results: Sequence[dict[str, Any]],
@@ -863,6 +985,7 @@ async def replay(
     route_saturation_s: float = 10.0,
     rebind_after_s: float | None = None,
     strict_order: bool = False,
+    chain_outputs: bool = False,
     dependency_gap_s: float = 0.0,
     ordered_admission: bool = False,
     prewarm: bool = False,
@@ -908,6 +1031,10 @@ async def replay(
             the send order is exactly the trace order (implies prefix
             dependencies). Without it, closed-loop replay sends ready
             requests in semaphore wake-up order, not trace order.
+        chain_outputs: Research. Wait for each request's chain parent and
+            splice the parent's generated tokens into its prompt (see
+            :class:`ChainedPromptBuilder`). Exclusive with ``strict_order``
+            and ``prefix_dependencies``.
         dependency_gap_s: Idle seconds between a dependency's completion
             and the dependent request (tool execution / think time). The
             gap is excluded from client queue time and TTFT.
@@ -971,6 +1098,8 @@ async def replay(
         raise ValueError("session_ramp_s must be non-negative")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
+    if chain_outputs and (strict_order or prefix_dependencies):
+        raise ValueError("chain_outputs sets its own dependencies")
     scheduled_offset_seconds(0, time_scale)
     router = InstanceRouter(
         [server_url] if isinstance(server_url, str) else server_url,
@@ -998,6 +1127,21 @@ async def replay(
             position - 1 if position else None
             for position in range(len(selection.eligible))
         ]
+    if chain_outputs:
+        # A child's prompt holds its parent's real output, so it must wait
+        # for the parent.
+        predecessors = chain_parents(selection.eligible)
+        prompt_builder = ChainedPromptBuilder(
+            prompt_builder,
+            {
+                request.index: (
+                    None if parent is None else selection.eligible[parent].index
+                )
+                for request, parent in zip(
+                    selection.eligible, predecessors, strict=True
+                )
+            },
+        )
     gates, last_rows = _session_gates(selection.eligible, session_population)
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
@@ -1232,6 +1376,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chain-outputs",
+        action="store_true",
+        help=(
+            "Research: send each turn after its chain parent (same session, "
+            "prompt plus output is a prefix) and put the parent's real "
+            "generated tokens at the output positions of its prompt."
+        ),
+    )
+    parser.add_argument(
         "--ordered-admission",
         action="store_true",
         help=(
@@ -1325,6 +1478,7 @@ async def main_async(args: argparse.Namespace) -> int:
         route_saturation_s=args.route_saturation_s,
         rebind_after_s=args.rebind_after_s,
         strict_order=args.strict_order,
+        chain_outputs=args.chain_outputs,
         dependency_gap_s=args.dependency_gap_s,
         ordered_admission=args.ordered_admission,
         prewarm=args.prewarm_stripped,
@@ -1914,6 +2068,7 @@ async def _run_request_after_dependency(
                 ttft_ms=result.ttft_ms + shift_ms,
                 latency_ms=result.latency_ms + shift_ms,
             )
+    prompt_builder.record(request, prompt, result.generated_token_ids)
     record = _result_record(
         request=request,
         result=result,
@@ -1951,6 +2106,7 @@ def _result_record(
 ) -> dict[str, Any]:
     payload = asdict(result)
     payload.pop("generated_text", None)
+    payload.pop("generated_token_ids", None)
     payload.pop("queue_ms", None)
     decode_tokens = result.completion_tokens - 1
     tpot_ms = (

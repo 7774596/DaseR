@@ -87,6 +87,27 @@ def test_classify_skips_requests_without_bracketing_samples() -> None:
     assert [row["sample_id"] for row in classify(requests, samples)] == [3]
 
 
+def test_classify_names_tier_from_ssd_byte_share() -> None:
+    """With stored bytes per token, the SSD byte share names the tier."""
+    samples = [
+        _sample(float(t), 4 * t, 900 * min(t, 2) + 100 * (t >= 3)) for t in range(5)
+    ]
+    requests = [
+        _request(1, 0.1, 0.5),  # 900 SSD bytes of 1000 and L1 hits: l2
+        _request(2, 1.1, 0.5),  # 900 of 1000: l2
+        _request(3, 2.1, 0.5),  # 100 of 1000 with L1 hits: l1
+        _request(4, 3.1, 0.5),  # 0 SSD bytes, L1 hits only: l1
+    ]
+    for record in requests:
+        record["prompt_tokens"] = 10
+    rows = classify(requests, samples, l2_bytes_per_token=100.0)
+    assert [row["tier"] for row in rows] == ["l2", "l2", "l1", "l1"]
+    assert rows[0]["ssd_share"] == 0.9
+    assert classify(requests, samples)[0]["tier"] == "mixed"
+    half = [dict(requests[0], prompt_tokens=18)]
+    assert classify(half, samples, l2_bytes_per_token=100.0)[0]["tier"] == "mixed"
+
+
 class _Metrics(BaseHTTPRequestHandler):
     hits = 0
 

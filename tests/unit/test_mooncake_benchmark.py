@@ -21,6 +21,7 @@ from benchmarks.mooncake.benchmark import (
     PromptBuilder,
     SessionTextPromptBuilder,
     TraceRequest,
+    chain_parents,
     load_trace,
     prefix_predecessors,
     replay,
@@ -1195,3 +1196,77 @@ def test_session_ramp_staggers_the_first_population_starts(
     # instead of all landing within the 10 ms the unramped replay allows.
     assert starts[2] - starts[0] > 0.05
     assert starts[2] - starts[0] < 3.0
+
+
+def test_chain_parent_is_the_latest_turn_the_request_extends() -> None:
+    """Only same-session turns whose prompt and output fit and match count."""
+    block = MOONCAKE_BLOCK_TOKENS
+    requests = [
+        TraceRequest(0, 0, block + 10, 20, (1, 2), session_id=0),
+        # Same session, extends turn 0 (its full block 1 matches).
+        TraceRequest(1, 0, 3 * block, 30, (1, 9, 3), session_id=0),
+        # Other session with the same blocks: not a chain child.
+        TraceRequest(2, 0, 3 * block, 1, (1, 9, 3), session_id=1),
+        # Extends turn 1 (latest), not turn 0.
+        TraceRequest(3, 0, 4 * block, 1, (1, 9, 3, 4), session_id=0),
+        # Too short to hold turn 3's prompt plus output.
+        TraceRequest(4, 0, 4 * block, 1, (1, 9, 3, 4), session_id=0),
+        # Diverges at block 0: no parent.
+        TraceRequest(5, 0, 5 * block, 1, (7,), session_id=0),
+        TraceRequest(6, 0, 10, 1, (1,)),
+    ]
+
+    assert chain_parents(requests) == [None, 0, None, 1, 1, None, None]
+
+
+def test_chained_replay_splices_the_parent_output_into_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The child's prompt is parent prompt + parent output + its own tail."""
+    prompts: dict[int, list[int]] = {}
+    outputs = {0: [901, 902, 903], 1: [911]}
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        sample, prompt = args[2], args[3]
+        kwargs["on_send"]()
+        prompts[sample.sample_id] = list(prompt)
+        return RequestResult(
+            sample.sample_id,
+            "d",
+            "",
+            1.0,
+            1.0,
+            len(prompt),
+            1,
+            None,
+            generated_token_ids=outputs[sample.sample_id],
+        )
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 5, 3, (1,), session_id=0),
+        TraceRequest(1, 0, 12, 1, (1,), session_id=0),
+    ]
+    builder = PromptBuilder(vocab_size=1000, special_token_ids=[])
+    results, _, _ = asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=builder,
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=4,
+            timeout_seconds=120.0,
+            time_scale=1.0,
+            seed=0,
+            chain_outputs=True,
+        )
+    )
+
+    synthetic = builder.build(requests[1])
+    assert prompts[0] == synthetic[:5]
+    assert prompts[1] == synthetic[:5] + [901, 902, 903] + synthetic[8:]
+    assert len(prompts[1]) == 12
+    assert all("generated_token_ids" not in r for r in results)
+    written = (tmp_path / "requests.jsonl").read_text()
+    assert "generated_token_ids" not in written

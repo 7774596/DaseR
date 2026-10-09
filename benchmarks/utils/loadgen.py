@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import statistics
 import time
@@ -61,6 +61,8 @@ class RequestResult:
     #: is the request's engine steps, so completion_tokens / token_events is
     #: its mean speculative acceptance length (tokens per step).
     token_events: int = 0
+    #: Generated token IDs in stream order (from ``return_token_ids``).
+    generated_token_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -629,6 +631,7 @@ async def vllm_completion_stream(
     first_nonempty_text = False
     queue_ms = 0.0
     token_events = 0
+    generated: list[int] = []
     try:
         async with sem:
             t0 = time.perf_counter()
@@ -660,6 +663,8 @@ async def vllm_completion_stream(
                         token_ids = choice.get("token_ids")
                         has_token = isinstance(token_ids, list) and bool(token_ids)
                         token_events += has_token
+                        if has_token:
+                            generated.extend(int(token) for token in token_ids)
                         if first_token_at is None and (fragment or has_token):
                             first_token_at = time.perf_counter()
                             if on_first_token is not None:
@@ -725,6 +730,7 @@ async def vllm_completion_stream(
         sent_at_s=t0,
         first_token_at_s=first_token_at,
         token_events=token_events,
+        generated_token_ids=generated,
     )
 
 
