@@ -14,15 +14,29 @@ _SSD = 'daser_l2_read_bytes_total{inflight="1",write="0"}'
 _SSD_W = 'daser_l2_read_bytes_total{inflight="4",write="1"}'
 
 
-def _sample(t: float, hits: float, ssd: float, ssd_w: float = 0.0) -> dict:
+_DROPPED = 'daser_readahead_bytes_total{outcome="dropped"}'
+
+
+def _sample(
+    t: float, hits: float, ssd: float, ssd_w: float = 0.0, dropped: float = 0.0
+) -> dict:
     return {
         "t": t,
-        "c": {"daser_l1_hits_total": hits, _SSD: ssd, _SSD_W: ssd_w},
+        "c": {
+            "daser_l1_hits_total": hits,
+            _SSD: ssd,
+            _SSD_W: ssd_w,
+            _DROPPED: dropped,
+        },
     }
 
 
-def _request(sample_id: int, sent: float, latency_s: float) -> dict:
-    return {"sample_id": sample_id, "sent_at_s": sent, "latency_ms": latency_s * 1e3}
+def _request(sample_id: int, sent: float, ttft_s: float) -> dict:
+    return {
+        "sample_id": sample_id,
+        "sent_at_s": sent,
+        "first_token_at_s": sent + ttft_s,
+    }
 
 
 def test_classify_names_tier_from_bracketing_samples() -> None:
@@ -44,6 +58,27 @@ def test_classify_names_tier_from_bracketing_samples() -> None:
     assert [row["tier"] for row in rows] == ["l1", "l2", "mixed", "none"]
     assert rows[1]["ssd_read_bytes"] == 150
     assert rows[2]["l1_hits"] == 2
+    assert all(row["clean"] for row in rows)
+
+
+def test_classify_flags_overlapping_windows_and_dropped_readahead() -> None:
+    samples = [
+        _sample(0.0, 0, 0),
+        _sample(1.0, 1, 0),
+        _sample(2.0, 1, 0, dropped=64),
+        _sample(3.0, 1, 0, dropped=64),
+        _sample(4.0, 1, 0, dropped=64),
+    ]
+    # Requests 1 and 2 load in the same window; request 3 dropped readahead;
+    # request 4 is alone in its window.
+    requests = [
+        _request(1, 0.2, 0.5),
+        _request(2, 0.4, 0.3),
+        _request(3, 1.2, 0.5),
+        _request(4, 3.1, 0.5),
+    ]
+    clean = {row["sample_id"]: row["clean"] for row in classify(requests, samples)}
+    assert clean == {1: False, 2: False, 3: False, 4: True}
 
 
 def test_classify_skips_requests_without_bracketing_samples() -> None:

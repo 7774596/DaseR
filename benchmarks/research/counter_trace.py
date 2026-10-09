@@ -4,12 +4,15 @@
 
 ``CounterTrace`` polls a DaseR ``/metrics`` endpoint on a background thread and
 appends ``{"t": perf_counter, "c": {name: value}}`` lines for the tier
-counters only. With serial replay (one request in flight) the counter deltas
-between the sample before a request is sent and the first sample after it
-completes are that request's tier traffic, which ``classify`` turns into the
-tier that served the request's external hit: ``none``, ``l1``, ``l2`` or
-``mixed``. Timestamps use ``time.perf_counter`` like the replay's
-``sent_at_s``; both are the system-wide monotonic clock on Linux.
+counters only. With serial replay the counter deltas between the sample
+before a request is sent and the first sample after its first token are that
+request's load traffic (lookup readahead included: it reads the request's own
+L2 ranges), which ``classify`` turns into the tier that served the request's
+external hit: ``none``, ``l1``, ``l2`` or ``mixed``. Windows that overlap
+another request's load phase, or in which readahead bytes were dropped
+unused, are flagged so callers can exclude them. Timestamps use
+``time.perf_counter`` like the replay's ``sent_at_s``; both are the
+system-wide monotonic clock on Linux.
 
 Usage::
 
@@ -36,6 +39,7 @@ TIER_COUNTERS = (
     "daser_transfer_bytes_total",
 )
 _L1_HITS = "daser_l1_hits_total"
+_RA_DROPPED = 'daser_readahead_bytes_total{outcome="dropped"}'
 
 
 def _parse(text: str) -> dict[str, float]:
@@ -117,29 +121,41 @@ def classify(
     """Attribute counter deltas to each request and name its serving tier.
 
     A request's window runs from the last sample at or before ``sent_at_s``
-    to the first sample at or after its completion. The window is only
-    exclusive to the request when requests do not overlap, i.e. serial replay.
+    to the first sample at or after ``first_token_at_s`` (the load finishes
+    before the first token; decode moves no tier counters).
 
     Args:
         requests: replay records with ``sample_id``, ``sent_at_s`` and
-            ``latency_ms``.
+            ``first_token_at_s``.
         samples: ``CounterTrace`` lines sorted by ``t``.
 
     Returns:
         One dict per request with a sample bracketing it: ``sample_id``,
-        ``l1_hits``, ``ssd_read_bytes`` and ``tier`` (``none`` when neither
-        moved, ``l1``/``l2`` when only one did, ``mixed`` when both did).
+        ``l1_hits``, ``ssd_read_bytes``, ``tier`` (``none`` when neither
+        moved, ``l1``/``l2`` when only one did, ``mixed`` when both did) and
+        ``clean``: false when the window overlaps another request's
+        ``[sent_at_s, first_token_at_s]`` or readahead bytes were dropped.
     """
     times = [sample["t"] for sample in samples]
+    phases = sorted(
+        (float(r["sent_at_s"]), float(r["first_token_at_s"]), r["sample_id"])
+        for r in requests
+    )
     rows = []
     for record in requests:
         sent = float(record["sent_at_s"])
-        done = sent + float(record["latency_ms"]) / 1000.0
+        first = float(record["first_token_at_s"])
         lo = bisect.bisect_right(times, sent) - 1
-        hi = bisect.bisect_left(times, done)
+        hi = bisect.bisect_left(times, first)
         if lo < 0 or hi >= len(samples):
             continue
+        start, end = times[lo], times[hi]
+        overlap = any(
+            other != record["sample_id"] and o_sent < end and o_first > start
+            for o_sent, o_first, other in phases
+        )
         before, after = samples[lo]["c"], samples[hi]["c"]
+        dropped = after.get(_RA_DROPPED, 0.0) - before.get(_RA_DROPPED, 0.0)
         hits = after.get(_L1_HITS, 0.0) - before.get(_L1_HITS, 0.0)
         ssd = _ssd_read_bytes(after) - _ssd_read_bytes(before)
         tier = {
@@ -154,6 +170,7 @@ def classify(
                 "l1_hits": hits,
                 "ssd_read_bytes": ssd,
                 "tier": tier,
+                "clean": not overlap and dropped <= 0,
             }
         )
     return rows
