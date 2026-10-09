@@ -19,6 +19,10 @@ Checks per tick:
   run's completions in the same window;
 - a service process exiting while the replay still runs;
 - free disk below the thresholds.
+
+Before the replay starts, the watchdog also exits once the arm runner
+(``agent_trace_arms`` with the parent of ``--output-dir`` as an argument) has
+been seen and is gone, instead of waiting out ``--startup-timeout``.
 """
 
 from __future__ import annotations
@@ -43,6 +47,8 @@ from benchmarks.utils.servers import (
 
 _METRIC = re.compile(r"^(vllm:[a-z_]+)(?:\{[^}]*\})? ([0-9.eE+-]+)$")
 _LOG_ALARM = re.compile(r"Traceback|\bERROR\b")
+_REPLAY_MODULE = "benchmarks.mooncake.benchmark"
+_RUNNER_MODULE = "benchmarks.research.agent_trace_arms"
 
 
 def _pid_running(pid: int) -> bool:
@@ -54,9 +60,9 @@ def _pid_running(pid: int) -> bool:
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
-def _find_replay_pid(output_dir: Path) -> int | None:
-    """Return the PID of the replay client writing to ``output_dir``."""
-    needle = str(output_dir.resolve())
+def _find_pid(module: str, path: Path) -> int | None:
+    """Return the PID of a ``python -m module`` process given ``path`` as an arg."""
+    needle = str(path.resolve())
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
@@ -65,9 +71,19 @@ def _find_replay_pid(output_dir: Path) -> int | None:
         except OSError:
             continue
         args = [part.decode(errors="replace") for part in argv]
-        if "benchmarks.mooncake.benchmark" in args and needle in args:
+        if module in args and needle in args:
             return int(proc.name)
     return None
+
+
+def _find_replay_pid(output_dir: Path) -> int | None:
+    """Return the PID of the replay client writing to ``output_dir``."""
+    return _find_pid(_REPLAY_MODULE, output_dir)
+
+
+def _find_runner_pid(output_dir: Path) -> int | None:
+    """Return the PID of the arm runner whose artifact dir holds ``output_dir``."""
+    return _find_pid(_RUNNER_MODULE, output_dir.parent)
 
 
 def _vllm_counters(url: str) -> dict[str, float] | None:
@@ -194,10 +210,19 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
         ``(ok, message)`` where ``ok`` is False for an anomaly.
     """
     deadline = time.monotonic() + args.startup_timeout
+    runner_seen = False
     replay_pid = _find_replay_pid(args.output_dir)
     while replay_pid is None:
         if time.monotonic() > deadline:
             return False, "replay client never started"
+        # A runner that exits before starting the replay (service startup
+        # failed) would otherwise leave the watchdog waiting out the timeout.
+        runner_alive = _find_runner_pid(args.output_dir) is not None
+        runner_seen |= runner_alive
+        if runner_seen and not runner_alive:
+            if (args.output_dir / "requests.jsonl").is_file():
+                return True, "replay exited before the first tick"
+            return False, "runner exited before the replay client started"
         time.sleep(args.interval / 4)
         replay_pid = _find_replay_pid(args.output_dir)
 
