@@ -1033,8 +1033,8 @@ async def replay(
             requests in semaphore wake-up order, not trace order.
         chain_outputs: Research. Wait for each request's chain parent and
             splice the parent's generated tokens into its prompt (see
-            :class:`ChainedPromptBuilder`). Exclusive with ``strict_order``
-            and ``prefix_dependencies``.
+            :class:`ChainedPromptBuilder`); rows without a chain parent keep
+            their prefix predecessor. Exclusive with ``strict_order``.
         dependency_gap_s: Idle seconds between a dependency's completion
             and the dependent request (tool execution / think time). The
             gap is excluded from client queue time and TTFT.
@@ -1098,8 +1098,8 @@ async def replay(
         raise ValueError("session_ramp_s must be non-negative")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
-    if chain_outputs and (strict_order or prefix_dependencies):
-        raise ValueError("chain_outputs sets its own dependencies")
+    if chain_outputs and strict_order:
+        raise ValueError("chain_outputs and strict_order are exclusive")
     scheduled_offset_seconds(0, time_scale)
     router = InstanceRouter(
         [server_url] if isinstance(server_url, str) else server_url,
@@ -1129,17 +1129,19 @@ async def replay(
         ]
     if chain_outputs:
         # A child's prompt holds its parent's real output, so it must wait
-        # for the parent.
-        predecessors = chain_parents(selection.eligible)
+        # for the parent; rows without one keep their prefix predecessor.
+        chain = chain_parents(selection.eligible)
+        predecessors = [
+            parent if parent is not None else prior
+            for parent, prior in zip(chain, predecessors, strict=True)
+        ]
         prompt_builder = ChainedPromptBuilder(
             prompt_builder,
             {
                 request.index: (
                     None if parent is None else selection.eligible[parent].index
                 )
-                for request, parent in zip(
-                    selection.eligible, predecessors, strict=True
-                )
+                for request, parent in zip(selection.eligible, chain, strict=True)
             },
         )
     gates, last_rows = _session_gates(selection.eligible, session_population)

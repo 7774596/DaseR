@@ -1259,6 +1259,7 @@ def test_chained_replay_splices_the_parent_output_into_the_child(
             timeout_seconds=120.0,
             time_scale=1.0,
             seed=0,
+            prefix_dependencies=True,
             chain_outputs=True,
         )
     )
