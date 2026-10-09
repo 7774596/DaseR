@@ -42,6 +42,7 @@ class SchedulerConnectorMixin:
                 time.perf_counter() - started,
                 result,
                 self._request_lifecycle.last_defer_reason,
+                num_computed_tokens,
             )
         return result
 
@@ -54,7 +55,12 @@ class SchedulerConnectorMixin:
         """Bind allocated vLLM blocks to pending lifecycle work."""
         probe = getattr(self, "_scheduler_probe", None)
         if probe is not None:
-            probe.on_alloc(request.request_id, len(blocks.blocks[0]))
+            probe.on_alloc(
+                request.request_id,
+                len(blocks.blocks[0]),
+                len(request.prompt_token_ids),
+                num_external_tokens,
+            )
         self._request_lifecycle.update_state_after_alloc(
             request,
             blocks,

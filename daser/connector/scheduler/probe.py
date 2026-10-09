@@ -104,6 +104,9 @@ class SchedulerProbe:
         self._load_prealloc = _HoldTotals()
         self._load_wait = _HoldTotals()
         self._save_hold = _HoldTotals()
+        # req_id -> GPU prefix-cache hit at its latest lookup.
+        self._gpu_hits: dict[str, int] = {}
+        self._admitted: set[str] = set()
 
     @classmethod
     def from_env(cls) -> SchedulerProbe | None:
@@ -124,6 +127,7 @@ class SchedulerProbe:
         elapsed_s: float,
         result: tuple[int | None, bool],
         defer_reason: str = "",
+        num_computed_tokens: int = 0,
     ) -> None:
         """Record one ``get_num_new_matched_tokens`` call.
 
@@ -133,7 +137,9 @@ class SchedulerProbe:
             result: The ``(num_external_tokens, is_async)`` return value.
             defer_reason: Why the connector returned ``None`` (ignored when
                 it returned a count).
+            num_computed_tokens: vLLM's GPU prefix-cache hit for the request.
         """
+        self._gpu_hits[req_id] = num_computed_tokens
         self._lookup_calls += 1
         self._lookup_seconds += elapsed_s
         self._lookup_max = max(self._lookup_max, elapsed_s)
@@ -158,17 +164,37 @@ class SchedulerProbe:
             self._load_prealloc.start(req_id, now, 0)
         self._maybe_log()
 
-    def on_alloc(self, req_id: str, num_blocks: int) -> None:
+    def on_alloc(
+        self,
+        req_id: str,
+        num_blocks: int,
+        num_prompt_tokens: int = 0,
+        num_external_tokens: int = 0,
+    ) -> None:
         """Start the block hold of an async load once its blocks exist.
 
         Closes the request's prealloc interval and opens its load wait
         weighted by ``num_blocks``; a later allocation for an open load wait
-        only updates the weight.
+        only updates the weight. The first allocation of each request also
+        logs one ``[ADMIT]`` line with its prompt length, GPU prefix-cache
+        hit and external (DaseR) hit, so offline analysis can split every
+        prompt into GPU-hit, external-hit and recomputed tokens.
 
         Args:
             req_id: vLLM request ID.
             num_blocks: Blocks allocated to the request.
+            num_prompt_tokens: Prompt length of the request.
+            num_external_tokens: Tokens the connector loads for the request.
         """
+        if req_id not in self._admitted:
+            self._admitted.add(req_id)
+            logger.info(
+                "[ADMIT] req=%s prompt=%d gpu=%d ext=%d",
+                req_id,
+                num_prompt_tokens,
+                self._gpu_hits.get(req_id, 0),
+                num_external_tokens,
+            )
         if req_id in self._load_prealloc.open:
             now = time.monotonic()
             self._load_prealloc.close(req_id, now)
@@ -185,6 +211,8 @@ class SchedulerProbe:
             delayed: Whether the connector asked vLLM to delay freeing.
         """
         self._counted.discard(req_id)
+        self._gpu_hits.pop(req_id, None)
+        self._admitted.discard(req_id)
         if delayed:
             self._save_hold.start(req_id, time.monotonic(), num_blocks)
 

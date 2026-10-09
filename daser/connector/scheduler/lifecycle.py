@@ -111,6 +111,7 @@ class RequestLifecycle:
         arrival_readahead: bool = False,
         writeback_low_blocks: int = 0,
         reuse_retry_lookup: str = "",
+        decode_save: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
         # Why the last get_num_new_matched_tokens call returned None ("" when
@@ -154,6 +155,20 @@ class RequestLifecycle:
         self._writeback_held: dict[str, tuple[Request, list[int]]] = {}
         self._writeback_released: set[str] = set()
         self._writeback_stats = {"held": 0, "saved": 0, "superseded": 0}
+        # Research switch: at finish, store the full blocks computed past the
+        # prompt (generated tokens) as rolling-prefix slots that continue the
+        # prompt's, held like a write-back release until the worker has them.
+        # Skipped while the prompt store is still unallocated (its rolling
+        # key is not known yet) and under write-back, which owns finish holds.
+        self._decode_save = decode_save
+        # Finished requests whose decode stores are published this step.
+        self._decode_flush: set[str] = set()
+        self._decode_stats = {
+            "saved": 0,
+            "blocks": 0,
+            "tail_blocks": 0,
+            "skipped": 0,
+        }
         self._gpu_block_pool: Any = None
         self._block_tokens = block_tokens
         self._slot_size = slot_size
@@ -674,6 +689,9 @@ class RequestLifecycle:
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
         meta.writeback_req_ids = self._release_writeback_holds()
+        decode_flush: set[str] = getattr(self, "_decode_flush", set())
+        self._decode_flush = set()
+        meta.writeback_req_ids |= decode_flush
 
         for req_id, chunks in list(self._pending_loads.items()):
             if req_id in getattr(self, "_layerwise_request_ids", set()):
@@ -744,6 +762,14 @@ class RequestLifecycle:
             pending_async_saves = self._pending_async_save_ids()
             for req_id in meta.reqs_to_store:
                 pending_async_saves.add(_base_req_id(req_id))
+        if decode_flush:
+            stored = {_base_req_id(req_id) for req_id in meta.reqs_to_store}
+            for req_id in decode_flush - stored:
+                # Every decode slot was dropped (already stored or evicted).
+                # A prompt save still pending reports the request itself;
+                # reporting it unsaved now would free blocks under that save.
+                if req_id in self._pending_async_save_ids():
+                    meta.writeback_req_ids.discard(req_id)
 
         if logger.isEnabledFor(logging.DEBUG):
             for req_id, load_spec in meta.reqs_to_load.items():
@@ -1495,6 +1521,83 @@ class RequestLifecycle:
             )
         return released
 
+    def _plan_decode_save(self, request: "Request", block_ids: list[int]) -> bool:
+        """Allocate stores for the full blocks a finished request decoded.
+
+        The stores continue the prompt's rolling-prefix slots over prompt plus
+        generated tokens, so a later prompt that replays this output matches
+        them. Only blocks past the prompt's last full block are new; the
+        first may mix the prompt's sub-block tail with generated tokens.
+
+        Args:
+            request: Finished vLLM request.
+            block_ids: The request's blocks covering its computed tokens.
+
+        Returns:
+            True when decode stores were allocated; the caller then holds the
+            blocks until the worker reports the request finished sending.
+
+        Async/thread-safety:
+            Runs on the scheduler thread inside ``request_finished`` and
+            performs synchronous control-plane allocation IPC.
+        """
+        req_id = request.request_id
+        prompt_tokens = list(request.prompt_token_ids)
+        prompt_slots = len(prompt_tokens) // self._block_tokens
+        # Tokens still in flight under async scheduling have no KV yet.
+        computed = int(request.num_computed_tokens) - int(
+            getattr(request, "num_in_flight_tokens", 0) or 0
+        )
+        slots = min(computed // self._block_tokens, len(block_ids))
+        if slots <= prompt_slots:
+            return False
+        if _get_kv_transfer_flag(request, "daser_skip_save"):
+            return False
+        if self._writeback_enabled() or req_id in self._pending_alloc:
+            # Write-back owns finish holds; an unallocated prompt store has no
+            # rolling key to continue from yet.
+            self._decode_stats["skipped"] += 1
+            return False
+        tokens = (prompt_tokens + list(request.output_token_ids))[
+            : slots * self._block_tokens
+        ]
+        pending_store = self._reuse_strategy().extend_store(
+            slots * self._block_tokens, prompt_slots
+        )
+        if pending_store is None:
+            return False
+        pending_store.block_ids = list(block_ids[:slots])
+        self._req_tokens[req_id] = tokens
+        self._pending_alloc[req_id] = pending_store
+        before = {
+            store_id
+            for store_id in self._pending_stores
+            if _matches_request_or_store_id(store_id, req_id)
+        }
+        self._maybe_allocate_pending_store(req_id, pending_store)
+        self._pending_alloc.pop(req_id, None)
+        new_stores = [
+            store_id
+            for store_id in self._pending_stores
+            if _matches_request_or_store_id(store_id, req_id) and store_id not in before
+        ]
+        if not new_stores:
+            self._req_tokens[req_id] = prompt_tokens
+            return False
+        stats = self._decode_stats
+        stats["saved"] += 1
+        stats["blocks"] += len(new_stores)
+        stats["tail_blocks"] += int(len(prompt_tokens) % self._block_tokens > 0)
+        if stats["saved"] % 64 == 1:
+            logger.info(
+                "[CONNECTOR] decode save: saved=%d blocks=%d tail_blocks=%d skipped=%d",
+                stats["saved"],
+                stats["blocks"],
+                stats["tail_blocks"],
+                stats["skipped"],
+            )
+        return True
+
     def _pending_async_save_ids(self) -> set[str]:
         """Return request IDs whose worker-side saves are still pending.
 
@@ -1614,7 +1717,13 @@ class RequestLifecycle:
             self._writeback_held[request.request_id] = (request, list(block_ids))
             self._writeback_stats["held"] += 1
             return True, None
+        decode_flush = getattr(self, "_decode_save", False) and self._plan_decode_save(
+            request, block_ids
+        )
         self._report_finish(request)
+        if decode_flush:
+            self._decode_flush.add(request.request_id)
+            return True, None
         if request.request_id in self._pending_async_save_ids():
             return True, None
         self._req_tokens.pop(request.request_id, None)

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # First Party
 from daser.config import (
     ARRIVAL_READAHEAD_ENV,
+    DECODE_SAVE_ENV,
     REUSE_RETRY_LOOKUP_ENV,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -131,6 +132,7 @@ class DaserConnector(
                 writeback_low_blocks=int(
                     os.environ.get(WRITEBACK_LOW_BLOCKS_ENV, "0") or 0
                 ),
+                decode_save=os.environ.get(DECODE_SAVE_ENV) == "1",
             )
             self._request_lifecycle.refresh_runtime_config()
             self._scheduler_probe = SchedulerProbe.from_env()

@@ -74,6 +74,21 @@ class CacheReuseStrategy(ABC):
             Pending store state, or None when no store should be scheduled.
         """
 
+    def extend_store(self, aligned_tokens: int, first_slot: int) -> PendingStore | None:
+        """Return store state for slots past an already stored prefix.
+
+        Args:
+            aligned_tokens: block-aligned token count the store must cover.
+            first_slot: first slot index to store; earlier slots are already
+                stored by the prompt.
+
+        Returns:
+            Pending store state, or None when the strategy cannot extend a
+            stored prefix (whole-prefix chunk keys).
+        """
+        del aligned_tokens, first_slot
+        return None
+
     def ready_to_allocate(self, pending_store: PendingStore) -> bool:
         """Return whether the pending store has enough blocks to allocate.
 
@@ -225,6 +240,29 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             start_slot_index=cached_slots,
             rolling_key=rolling_key,
             rolling_slot_index=cached_slots,
+        )
+
+    def extend_store(self, aligned_tokens: int, first_slot: int) -> PendingStore | None:
+        """Return rolling-prefix store state for slots from ``first_slot``.
+
+        Keys are rebuilt from the seed so they chain over the stored prefix;
+        only slots from ``first_slot`` on produce store intents.
+
+        Args:
+            aligned_tokens: block-aligned token count the store must cover.
+            first_slot: first slot index to store.
+
+        Returns:
+            Pending store state, or None when nothing lies past ``first_slot``.
+        """
+        if aligned_tokens <= first_slot * self._block_tokens:
+            return None
+        return PendingStore(
+            chunk_key="",
+            token_count=aligned_tokens,
+            start_slot_index=first_slot,
+            rolling_key=ROLLING_PREFIX_SEED,
+            rolling_slot_index=0,
         )
 
     def ready_to_allocate(self, pending_store: PendingStore) -> bool:

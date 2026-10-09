@@ -68,6 +68,10 @@ ARRIVAL_READAHEAD_ENV = "DASER_ARRIVAL_READAHEAD"
 #: finished request's vLLM blocks and write its prompt KV to DaseR only when
 #: free GPU blocks fall below this count (write-back instead of write-through).
 WRITEBACK_LOW_BLOCKS_ENV = "DASER_WRITEBACK_LOW_BLOCKS"
+#: Research switch: ``1`` makes the scheduler connector also store the full
+#: KV blocks a finished request computed past its prompt (the generated
+#: tokens), so a next turn whose prompt replays that output can load it.
+DECODE_SAVE_ENV = "DASER_DECODE_SAVE"
 #: Research switch: makes the scheduler connector answer vLLM's repeat
 #: ``get_num_new_matched_tokens`` call after a failed block allocation from
 #: the previous lookup while the server index epoch is unchanged. ``rpc``
