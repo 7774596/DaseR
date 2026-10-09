@@ -41,6 +41,162 @@ LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
 MIN_VLLM_VERSION = (0, 30)
 
 
+def _proc_table() -> dict[int, tuple[int, int, str]]:
+    """Map every PID to ``(ppid, pgid, state)`` from ``/proc``.
+
+    Returns:
+        PID -> (parent PID, process group ID, state letter, ``Z`` = zombie);
+        processes that exit while the table is read are skipped.
+    """
+    table: dict[int, tuple[int, int, str]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        # The command name may contain spaces or parentheses; fields after the
+        # last ')' are: state ppid pgrp ...
+        fields = stat.rsplit(")", 1)[1].split()
+        table[int(entry.name)] = (int(fields[1]), int(fields[2]), fields[0])
+    return table
+
+
+def descendant_process_groups(roots: list[int]) -> list[int]:
+    """Return the process groups of ``roots`` and all their descendants.
+
+    A service may start children in their own sessions (a profiler wrapper,
+    an engine core under ``setsid``); signalling the root's group alone then
+    misses them. The caller's own group is never returned.
+
+    Args:
+        roots: PIDs whose process trees are scanned.
+
+    Returns:
+        Sorted distinct PGIDs, excluding the calling process's group.
+    """
+    table = _proc_table()
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _pgid, _state) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    groups: set[int] = set()
+    stack = [pid for pid in roots if pid in table]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        groups.add(table[pid][1])
+        stack.extend(children.get(pid, []))
+    groups.discard(os.getpgrp())
+    return sorted(groups)
+
+
+def read_process_groups(path: str | Path) -> list[int]:
+    """Read a PGID file written by ``ServerManager`` (one PGID per line).
+
+    Args:
+        path: PGID file path; a missing file yields an empty list.
+
+    Returns:
+        Recorded PGIDs in file order.
+    """
+    pgid_path = Path(path)
+    if not pgid_path.is_file():
+        return []
+    return [int(line) for line in pgid_path.read_text().split() if line.isdigit()]
+
+
+def pgid_file_for(pid_file: str | Path) -> Path:
+    """Return the PGID file that sits next to a benchmark pid file.
+
+    Args:
+        pid_file: ``pids.json`` path.
+
+    Returns:
+        ``pgids`` path in the same directory.
+    """
+    return Path(pid_file).with_name("pgids")
+
+
+def record_process_groups(path: str | Path, roots: list[int]) -> list[int]:
+    """Add the process groups under ``roots`` to a PGID file.
+
+    Recorded groups are kept: a group whose leader already exited (a
+    profiler wrapper) may still hold live members that are no longer
+    descendants of any root.
+
+    Args:
+        path: PGID file path (one PGID per line), rewritten in place.
+        roots: Service PIDs whose process trees are scanned.
+
+    Returns:
+        All recorded PGIDs after the merge.
+    """
+    groups = set(read_process_groups(path))
+    groups.update(descendant_process_groups(roots))
+    ordered = sorted(groups)
+    Path(path).write_text("".join(f"{g}\n" for g in ordered))
+    return ordered
+
+
+def stop_process_groups(path: str | Path, grace_s: float = 15.0) -> list[int]:
+    """SIGTERM every group in a PGID file, then SIGKILL the ones still alive.
+
+    Args:
+        path: PGID file path.
+        grace_s: Seconds to wait between SIGTERM and SIGKILL.
+
+    Returns:
+        PGIDs that needed SIGKILL.
+
+    Thread-safety:
+        Sends process signals and should be called by one owner.
+    """
+    groups = [g for g in read_process_groups(path) if g != os.getpgrp()]
+    alive = [g for g in groups if _signal_group(g, signal.SIGTERM)]
+    deadline = time.monotonic() + grace_s
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.2)
+        alive = [g for g in alive if group_running(g)]
+    for group in alive:
+        _signal_group(group, signal.SIGKILL)
+    return alive
+
+
+def group_running(pgid: int) -> bool:
+    """Return whether group ``pgid`` has a live, non-zombie member.
+
+    A zombie still answers ``killpg(pgid, 0)`` until its parent reaps it, so
+    signal probes overstate liveness after a SIGTERM.
+
+    Args:
+        pgid: Process group ID.
+
+    Returns:
+        True if any member is alive and not a zombie.
+    """
+    return any(g == pgid and st != "Z" for _p, g, st in _proc_table().values())
+
+
+def _signal_group(pgid: int, sig: int) -> bool:
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _service_running(pid: int) -> bool:
+    """Return whether a service's group, or the PID alone, is alive (not zombie)."""
+    if group_running(pid):
+        return True
+    state = _proc_table().get(pid)
+    return state is not None and state[2] != "Z"
+
+
 def _signal_service(pid: int, sig: int) -> bool:
     """Send ``sig`` to a service's process group, or to the PID alone.
 
@@ -413,6 +569,9 @@ class ServerManager:
         self.extra_vllm_args = tuple(extra_vllm_args)
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
+        # Every process group under the services, for teardown by a parent
+        # that outlives a killed runner (chain traps, watchdog).
+        self.pgid_file = pgid_file_for(self.pid_file)
         self.socket_path = self.store_dir / "daser.sock"
         self._procs: list[tuple[subprocess.Popen[bytes], str]] = []
 
@@ -968,6 +1127,9 @@ class ServerManager:
             for proc, visible in self._procs
         ]
         self.pid_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Merge with groups seen earlier: a group whose leader already exited
+        # (a profiler wrapper) may still hold live members.
+        record_process_groups(self.pgid_file, [proc.pid for proc, _ in self._procs])
 
     def _ensure_ports_available(self) -> None:
         ports = [int(url.rsplit(":", 1)[1]) for url in self.vllm_urls]
@@ -1020,7 +1182,8 @@ def stop_from_pid_file(path: str | Path) -> None:
     Each recorded PID leads its own process group (services start in a new
     session), so the whole group is signalled: descendants left behind by an
     exited wrapper are stopped too. A PID that is not a group leader is
-    signalled alone.
+    signalled alone. Finally every group recorded in the sibling ``pgids``
+    file (children that started their own session) is stopped.
 
     Args:
         path: PID JSON path.
@@ -1031,15 +1194,20 @@ def stop_from_pid_file(path: str | Path) -> None:
     pid_path = Path(path)
     if not pid_path.is_file():
         return
+    pgid_path = pgid_file_for(pid_path)
     payload = json.loads(pid_path.read_text(encoding="utf-8"))
+    # Catch groups started after the last record (e.g. engine workers).
+    record_process_groups(pgid_path, [int(item["pid"]) for item in payload])
     for item in reversed(payload):
         _signal_service(int(item["pid"]), signal.SIGTERM)
     deadline = time.monotonic() + 15.0
     for item in reversed(payload):
         pid = int(item["pid"])
         while time.monotonic() < deadline:
-            if not _signal_service(pid, 0):
+            if not _service_running(pid):
                 break
             time.sleep(0.2)
         else:
             _signal_service(pid, signal.SIGKILL)
+    # Groups outside the services' own (setsid children) are stopped last.
+    stop_process_groups(pgid_path)

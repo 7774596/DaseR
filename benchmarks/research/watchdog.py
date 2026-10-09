@@ -6,7 +6,9 @@ Runs next to ``agent_trace_arms`` in the background. It is silent while the
 arm is healthy, rewrites a one-line status file every tick, and exits with a
 single line when the replay finishes (exit 0) or an anomaly is detected
 (exit 1). On an anomaly it sends SIGTERM to the replay client so the runner
-collects artifacts, stops services, and deletes the store as usual.
+collects artifacts, stops services, and deletes the store as usual; any
+service process group still alive after ``--reap-grace-s`` (runner killed
+or its teardown failed) is then stopped from the ``pgids`` record.
 
 Checks per tick:
 - failed requests in ``requests.jsonl``;
@@ -33,6 +35,12 @@ import sys
 import time
 import urllib.request
 
+from benchmarks.utils.servers import (
+    group_running,
+    pgid_file_for,
+    read_process_groups,
+)
+
 _METRIC = re.compile(r"^(vllm:[a-z_]+)(?:\{[^}]*\})? ([0-9.eE+-]+)$")
 _LOG_ALARM = re.compile(r"Traceback|\bERROR\b")
 
@@ -44,24 +52,6 @@ def _pid_running(pid: int) -> bool:
     except (FileNotFoundError, ProcessLookupError):
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
-
-
-def _group_running(pgid: int) -> bool:
-    """Return whether any live, non-zombie process is in group ``pgid``.
-
-    Services lead their own process group, so a wrapper (``nsys profile``)
-    exiting while the server it started still runs is not a service exit.
-    """
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        if fields[0] != "Z" and int(fields[2]) == pgid:
-            return True
-    return False
 
 
 def _find_replay_pid(output_dir: Path) -> int | None:
@@ -180,6 +170,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to wait for the replay client to appear.",
     )
     parser.add_argument(
+        "--reap-grace-s",
+        type=float,
+        default=180.0,
+        help="After an anomaly stop, seconds the runner gets to stop its "
+        "services before the watchdog stops the recorded groups itself.",
+    )
+    parser.add_argument(
         "--no-stop",
         action="store_true",
         help="Report anomalies without stopping the replay.",
@@ -257,7 +254,7 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
         if pid_file.is_file():
             for item in json.loads(pid_file.read_text()):
                 pid = int(item["pid"])
-                if not _pid_running(pid) and not _group_running(pid):
+                if not _pid_running(pid) and not group_running(pid):
                     name = " ".join(item.get("cmd", [])[:2]) or item["pid"]
                     return False, f"service {name} exited; {history[0]}"
 
@@ -302,6 +299,29 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
                     )
 
 
+def _reap_after_teardown(args: argparse.Namespace) -> None:
+    """Stop service groups the runner's own teardown left behind.
+
+    The runner normally stops its services after the replay exits; it gets
+    ``--reap-grace-s`` to do so. Any group still recorded in ``pgids`` after
+    that (runner killed, teardown raised) is stopped here.
+    """
+    # Read the record now: the runner deletes the store, pgids included, once
+    # its own teardown has finished.
+    groups = read_process_groups(pgid_file_for(args.service_dir / "pids.json"))
+    deadline = time.monotonic() + args.reap_grace_s
+    while groups and time.monotonic() < deadline:
+        groups = [g for g in groups if group_running(g)]
+        time.sleep(2.0)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if groups:
+        print(f"watchdog: SIGKILL leftover service groups {groups}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = parse_args(argv)
@@ -312,6 +332,7 @@ def main(argv: list[str] | None = None) -> None:
         if pid is not None:
             os.kill(pid, signal.SIGTERM)
             print(f"watchdog: sent SIGTERM to replay pid {pid}", flush=True)
+        _reap_after_teardown(args)
     sys.exit(0 if ok else 1)
 
 
