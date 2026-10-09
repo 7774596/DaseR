@@ -1943,6 +1943,31 @@ class IPCServer:
                     "L2 executor queue wait and native IO time.",
                 ).inc(delta / 1_000_000, labels={"kind": kind, "phase": phase})
         self._prev_l2_timing_us = timing
+        contention = getattr(transfer, "l2_read_contention", None) or {}
+        prev_contention = getattr(self, "_prev_l2_read_contention", {})
+        for (bucket, writing), current in contention.items():
+            labels = {"inflight": str(bucket), "write": str(writing).lower()}
+            prev = prev_contention.get((bucket, writing), (0, 0, 0))
+            for name, description, delta in (
+                (
+                    "daser_l2_read_jobs_total",
+                    "L2 read jobs by read concurrency and write activity at start.",
+                    current[0] - prev[0],
+                ),
+                (
+                    "daser_l2_read_io_seconds_total",
+                    "L2 read native IO time by read concurrency and write activity.",
+                    (current[1] - prev[1]) / 1_000_000,
+                ),
+                (
+                    "daser_l2_read_bytes_total",
+                    "L2 bytes read by read concurrency and write activity.",
+                    current[2] - prev[2],
+                ),
+            ):
+                if delta > 0:
+                    self._metrics.counter(name, description).inc(delta, labels=labels)
+        self._prev_l2_read_contention = contention
         for cause, current in (
             ("l2_write", stats.promotion_wait_l2_write_us),
             ("promotion", stats.promotion_wait_promotion_us),

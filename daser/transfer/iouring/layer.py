@@ -2761,6 +2761,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         return {} if self._l2 is None else self._l2.timing_us
 
     @property
+    def l2_read_contention(self) -> dict[tuple[int, bool], tuple[int, int, int]]:
+        """Return L2 read jobs grouped by SSD concurrency at job start.
+
+        Returns:
+            ``{(read concurrency bucket, write in flight): (jobs, io_us,
+            bytes)}`` totals, empty when L2 is disabled.
+        """
+        return {} if self._l2 is None else self._l2.read_contention
+
+    @property
     def l1_bytes_used(self) -> int:
         """Return resident L1 memory-tier bytes."""
         return self._l1.bytes_used

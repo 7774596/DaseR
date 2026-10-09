@@ -137,6 +137,33 @@ def _bucket_quantile(
     return next(bound for bound, count in buckets if count >= q * total)
 
 
+def _ssd_contention(before: dict[str, float], after: dict[str, float]) -> str:
+    """Format L2 read latency and bandwidth by SSD read concurrency.
+
+    Args:
+        before: server counters scraped before the run.
+        after: server counters scraped after the run.
+
+    Returns:
+        `` ssd[<inflight><w if a write was in flight>=jobs/mean ms/GB/s ...]``
+        over the nonempty groups, or ``""`` when no L2 read was recorded.
+    """
+    groups = []
+    for bucket in (1, 2, 4, 8, 16, 32):
+        for write in ("false", "true"):
+            labels = f'{{inflight="{bucket}",write="{write}"}}'
+            jobs = _delta(before, after, f"daser_l2_read_jobs_total{labels}")
+            if jobs <= 0:
+                continue
+            io_s = _delta(before, after, f"daser_l2_read_io_seconds_total{labels}")
+            nbytes = _delta(before, after, f"daser_l2_read_bytes_total{labels}")
+            groups.append(
+                f"{bucket}{'w' if write == 'true' else ''}={jobs:.0f}/"
+                f"{io_s / jobs * 1000:.1f}ms/{nbytes / io_s / 1e9 if io_s else 0:.2f}"
+            )
+    return " ssd[" + " ".join(groups) + "]" if groups else ""
+
+
 def _rate(part: float, total: float) -> str:
     """Format ``part / total`` or ``-`` when vLLM metrics were not captured."""
     return f"{part / total:.3f}" if total else "-"
@@ -390,6 +417,7 @@ def load_rows(arm_dirs: list[Path]) -> list[str]:
             if any(session.values())
             else ""
         )
+        h2d += _ssd_contention(before, after)
         lines.append(
             f"  {arm_dir.parent.name}/{arm_dir.name}: n={count:.0f} "
             f"mean={seconds / count * 1000:.0f}ms p90<={p90 * 1000:.0f}ms "

@@ -8,6 +8,7 @@ from benchmarks.research.summarize import (
     arm_row,
     decode_rows,
     live_clock_rows,
+    load_rows,
     order_rows,
     overlap_bound_rows,
     replay_concurrency,
@@ -483,3 +484,21 @@ def test_replay_concurrency_serial_replay_never_exceeds_one() -> None:
 
     assert replay_concurrency(records) == (1.0, 1, 10.0)
     assert replay_concurrency([]) == (0.0, 0, 0.0)
+
+
+def test_load_rows_report_ssd_read_contention(tmp_path: Path) -> None:
+    arm_dir = tmp_path / "arm"
+    arm_dir.mkdir()
+    (arm_dir / "daser_metrics_before.prom").write_text("")
+    (arm_dir / "daser_metrics_after.prom").write_text(
+        'daser_transfer_duration_seconds_count{op="load"} 4\n'
+        'daser_transfer_duration_seconds_sum{op="load"} 2\n'
+        'daser_l2_read_jobs_total{inflight="1",write="false"} 10\n'
+        'daser_l2_read_io_seconds_total{inflight="1",write="false"} 0.05\n'
+        'daser_l2_read_bytes_total{inflight="1",write="false"} 100000000\n'
+        'daser_l2_read_jobs_total{inflight="8",write="true"} 4\n'
+        'daser_l2_read_io_seconds_total{inflight="8",write="true"} 0.2\n'
+        'daser_l2_read_bytes_total{inflight="8",write="true"} 200000000\n'
+    )
+    (line,) = load_rows([arm_dir])
+    assert "ssd[1=10/5.0ms/2.00 8w=4/50.0ms/1.00]" in line

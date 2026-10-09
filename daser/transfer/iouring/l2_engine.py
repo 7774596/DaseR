@@ -26,6 +26,16 @@ _GATE_CHUNK_BYTES = 16 << 20
 #: Longest a gated write piece waits for reads to drain before it proceeds,
 #: so a continuous read stream cannot starve writes that hold L1 memory.
 _GATE_MAX_WAIT_S = 0.05
+#: Largest read-concurrency bucket; deeper concurrency is counted here.
+_CONTENTION_MAX_BUCKET = 32
+
+
+def _contention_bucket(level: int) -> int:
+    """Return the power-of-two bucket (1, 2, 4, ... 32) holding ``level``."""
+    bucket = 1
+    while bucket < level and bucket < _CONTENTION_MAX_BUCKET:
+        bucket <<= 1
+    return bucket
 
 
 class L2IoEngine:
@@ -86,6 +96,11 @@ class L2IoEngine:
         # until it reaches zero.
         self._reads_cond = threading.Condition()
         self._reads_active = 0
+        # Read jobs by (concurrency bucket, write in flight) at job start:
+        # [jobs, native IO microseconds, bytes]; guarded by ``_timing_lock``,
+        # as is the count of write jobs in native IO.
+        self._read_contention: dict[tuple[int, bool], list[int]] = {}
+        self._writes_active = 0
 
     @property
     def ring_count(self) -> int:
@@ -118,6 +133,25 @@ class L2IoEngine:
         with self._timing_lock:
             return dict(self._timing_us)
 
+    @property
+    def read_contention(self) -> dict[tuple[int, bool], tuple[int, int, int]]:
+        """Return cumulative read jobs grouped by the contention they met.
+
+        A read job is classified when it enters native IO by how many read
+        jobs were then in native IO, itself included, rounded up to a power
+        of two and capped at 32, and by whether a write job was in native IO.
+        The per-group IO time over bytes gives read latency and bandwidth as
+        a function of SSD concurrency.
+
+        Returns:
+            ``{(bucket, write_in_flight): (jobs, io_us, bytes)}``.
+
+        Async/thread-safety:
+            Safe from any thread; executor threads update under a lock.
+        """
+        with self._timing_lock:
+            return {key: tuple(value) for key, value in self._read_contention.items()}
+
     def timed(self, kind: str, fn: Any) -> Any:
         """Wrap a blocking job so its queue and IO time are counted.
 
@@ -133,11 +167,22 @@ class L2IoEngine:
         def run(*args: Any) -> Any:
             start = time.perf_counter()
             reading = kind == "read"
+            key = None
             if reading:
                 with self._reads_cond:
                     self._reads_active += 1
+                    level = self._reads_active
+                with self._timing_lock:
+                    key = (_contention_bucket(level), self._writes_active > 0)
+            else:
+                with self._timing_lock:
+                    self._writes_active += 1
+            nbytes = 0
             try:
-                return fn(*args)
+                result = fn(*args)
+                if isinstance(result, int):
+                    nbytes = result
+                return result
             finally:
                 if reading:
                     with self._reads_cond:
@@ -145,11 +190,19 @@ class L2IoEngine:
                         if not self._reads_active:
                             self._reads_cond.notify_all()
                 end = time.perf_counter()
+                io_us = int((end - start) * 1_000_000)
                 with self._timing_lock:
                     self._timing_us[f"{kind}_queue"] += int(
                         (start - submitted) * 1_000_000
                     )
-                    self._timing_us[f"{kind}_io"] += int((end - start) * 1_000_000)
+                    self._timing_us[f"{kind}_io"] += io_us
+                    if key is None:
+                        self._writes_active -= 1
+                    else:
+                        group = self._read_contention.setdefault(key, [0, 0, 0])
+                        group[0] += 1
+                        group[1] += io_us
+                        group[2] += nbytes
 
         return run
 
