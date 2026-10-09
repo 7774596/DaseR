@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 
 from benchmarks.mooncake.benchmark import ROUTES
+from benchmarks.research.counter_trace import CounterTrace
 from benchmarks.utils.servers import (
     LMCACHE_HTTP_PORT,
     ServerManager,
@@ -580,6 +581,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gateway-dispatch-slots", type=int, default=4)
     parser.add_argument("--gateway-dispatch-refresh", type=int, default=8)
     parser.add_argument("--gateway-dispatch-attn-tokens", type=float, default=13500.0)
+    parser.add_argument(
+        "--counter-trace-interval-s",
+        type=float,
+        default=0.0,
+        help="Poll DaseR tier counters this often during the replay into "
+        "counter_trace.jsonl for per-request tier attribution (0 = off).",
+    )
     return parser.parse_args(argv)
 
 
@@ -882,6 +890,17 @@ async def run_arm(
                 ),
             ]
         )
+        counter_trace = (
+            CounterTrace(
+                manager.daser_url,
+                out_dir / "counter_trace.jsonl",
+                args.counter_trace_interval_s,
+            )
+            if args.counter_trace_interval_s > 0 and arm.startswith("daser")
+            else None
+        )
+        if counter_trace is not None:
+            counter_trace.start()
         with (out_dir / "replay.log").open("wb") as replay_log:
             replay = subprocess.Popen(
                 replay_command,
@@ -899,6 +918,8 @@ async def run_arm(
                 raise
             finally:
                 stop.child = None
+                if counter_trace is not None:
+                    counter_trace.stop()
         daser_after = await _daser_metrics(arm, manager)
         vllm_after = await _vllm_metrics(manager)
         if arm == "lmcache":
