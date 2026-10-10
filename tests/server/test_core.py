@@ -1248,3 +1248,31 @@ async def test_store_range_ignores_write_to_a_reallocated_key() -> None:
     assert await core.record_store_ranges([span(stale)], **geometry) == []
     assert core.is_current_allocation(key, fresh.start_slot, fresh.num_slots)
     assert await core.record_store_ranges([span(fresh)], **geometry) == [key]
+
+
+@pytest.mark.asyncio
+async def test_ghost_admission_declines_first_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under DASER_GHOST_ADMIT a key is stored only on its second store."""
+    monkeypatch.setenv("DASER_GHOST_ADMIT", "fixed")
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    first = await core.alloc_chunks(
+        [{"chunk_key": key, "token_count": 4}], model_id="m"
+    )
+    assert first[0].skipped
+    assert core.chunk_manager.free_slots == 64
+    assert await core.lookup(tokens, "m") == []
+
+    second = await core.match_and_alloc(tokens, key, "m")
+    assert second.alloc is not None and not second.alloc.skipped
+    await core.commit_chunk(key)
+    assert len(await core.lookup(tokens, "m")) == 1
+    # A committed key is never filtered again.
+    again = await core.alloc_chunks(
+        [{"chunk_key": key, "token_count": 4}], model_id="m"
+    )
+    assert again[0].skipped and again[0].start_slot == 0
