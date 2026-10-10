@@ -16,17 +16,18 @@ from daser.compression.layer_major import (
     plan_layer_group,
     plan_layer_groups,
     rebased_headers,
+    record_header_bytes,
     stage_layer_group,
     staged_descriptor_patch,
 )
 
 
-def _geometry() -> CompressedStoreGeometry:
+def _geometry(num_layers: int = 3, block_tokens: int = 128) -> CompressedStoreGeometry:
     return CompressedStoreGeometry(
         num_slots=2,
-        slot_size=3 * 2 * 128 * 2 * 64 * 2,
-        block_tokens=128,
-        num_layers=3,
+        slot_size=num_layers * 2 * block_tokens * 2 * 64 * 2,
+        block_tokens=block_tokens,
+        num_layers=num_layers,
         num_kv_heads=2,
         head_dim=64,
         tile_scalars=1024,
@@ -53,7 +54,10 @@ def _records(geometry: CompressedStoreGeometry) -> list[bytes]:
 
 def _headers(records: list[bytes]) -> np.ndarray:
     return np.stack(
-        [np.frombuffer(r, dtype=np.uint8, count=IO_ALIGNMENT) for r in records]
+        [
+            np.frombuffer(r, dtype=np.uint8, count=record_header_bytes(r))
+            for r in records
+        ]
     )
 
 
@@ -154,3 +158,51 @@ def test_rejects_raw_records_and_bad_ranges() -> None:
         plan_layer_group(headers, (0, 100))
     with pytest.raises(ValueError):
         plan_layer_group(headers[:, :100], (0, 2))
+
+
+def test_deep_records_stage_every_header_page() -> None:
+    """48-layer records carry two header pages; groups past page one decode."""
+    geometry = _geometry(num_layers=48, block_tokens=16)
+    records = _records(geometry)
+    assert all(record_header_bytes(r) == 2 * IO_ALIGNMENT for r in records)
+    headers = _headers(records)
+    assert headers.shape == (2, 2 * IO_ALIGNMENT)
+    plans = plan_layer_groups(headers, [(2 * layer, 2) for layer in range(48)])
+    assert (plans[0].source_begin == 2 * IO_ALIGNMENT).all()
+    for plan in (plans[0], plans[44], plans[47]):
+        assert plan.header_bytes == 2 * IO_ALIGNMENT
+        image = stage_layer_group(records, plan)
+        shifted = rebased_headers(headers, plan)
+        staging = np.zeros(plan.staging_bytes, dtype=np.uint8)
+        for index, page in enumerate(plan.staging_offsets):
+            staging[page : page + 2 * IO_ALIGNMENT] = headers[index]
+        indices, values = staged_descriptor_patch(headers, plan)
+        staging.view(np.int32)[indices] = values
+        first = plan.plane_range[0]
+        for index, record in enumerate(records):
+            page = int(plan.staging_offsets[index])
+            assert (
+                bytes(image[page : page + 2 * IO_ALIGNMENT]) == shifted[index].tobytes()
+            )
+            assert np.array_equal(
+                staging[page : page + 2 * IO_ALIGNMENT], shifted[index]
+            )
+            words = headers[index, 120 : 120 + 96 * 48].view(np.uint32)
+            moved = shifted[index, 120 : 120 + 96 * 48].view(np.uint32)
+            for plane in (first, first + 1):
+                start, length = (int(w) for w in words[plane * 12 + 3 : plane * 12 + 5])
+                staged = int(moved[plane * 12 + 3])
+                assert (
+                    bytes(image[page + staged : page + staged + length])
+                    == record[start : start + length]
+                )
+
+
+def test_rejects_headers_cut_below_the_declared_length() -> None:
+    """A deep record's first page alone does not describe its planes."""
+    records = _records(_geometry(num_layers=48, block_tokens=16))
+    headers = _headers(records)
+    with pytest.raises(ValueError, match="header length"):
+        plan_layer_group(np.ascontiguousarray(headers[:, :IO_ALIGNMENT]), (0, 2))
+    with pytest.raises(ValueError):
+        record_header_bytes(bytes(IO_ALIGNMENT))

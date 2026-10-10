@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from daser import stalldump
-from daser.compression.format import IO_ALIGNMENT
+from daser.compression.format import IO_ALIGNMENT, slot_header_bytes
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import (
     LAYERWISE_COPY_ENV,
@@ -1568,7 +1568,11 @@ class LoadPipeline:
         pool = self._staging_pool
         assert pool is not None
         records = len(files)
-        header_bytes = records * IO_ALIGNMENT
+        layers = len(state.ready)
+        # Deep models spill the descriptor table past one 4 KiB page.
+        record_header = slot_header_bytes(2 * layers)
+        header_pages = record_header // IO_ALIGNMENT
+        header_bytes = records * record_header
         tail = (pool.buffer_bytes - header_bytes) // IO_ALIGNMENT * IO_ALIGNMENT
         if tail <= 0:
             raise ValueError("layer-wise header pages exceed staging")
@@ -1576,8 +1580,8 @@ class LoadPipeline:
             1,
             os.getpid(),
             files,
-            tail + np.arange(records, dtype=np.int64) * IO_ALIGNMENT,
-            np.full(records, IO_ALIGNMENT, dtype=np.int64),
+            tail + np.arange(records, dtype=np.int64) * record_header,
+            np.full(records, record_header, dtype=np.int64),
             lease_id,
         )
         host = self._header_host
@@ -1587,12 +1591,11 @@ class LoadPipeline:
         with torch.cuda.stream(stream):
             landed = buffers[1][tail : tail + header_bytes]
             host[:header_bytes].copy_(landed, non_blocking=True)
-            pages = landed.clone().view(records, IO_ALIGNMENT)
+            pages = landed.clone().view(records * header_pages, IO_ALIGNMENT)
             copied = torch.cuda.Event()
             copied.record(stream)
         await self._wait_for_cuda_event(copied)
-        headers = host[:header_bytes].numpy().reshape(records, IO_ALIGNMENT)
-        layers = len(state.ready)
+        headers = host[:header_bytes].numpy().reshape(records, record_header)
         plans = plan_layer_groups(headers, [(2 * layer, 2) for layer in range(layers)])
         views = carve(plans[0].staging_bytes)
         words = [view.view(torch.int32) for view in views]
@@ -1600,9 +1603,10 @@ class LoadPipeline:
         bounds = np.concatenate(([0], np.cumsum([len(p[0]) for p in patches])))
         device = buffers[0].device
         with torch.cuda.stream(stream):
-            pages_at = torch.from_numpy(plans[0].staging_offsets // IO_ALIGNMENT).to(
-                device
-            )
+            first_pages = plans[0].staging_offsets // IO_ALIGNMENT
+            pages_at = torch.from_numpy(
+                (first_pages[:, None] + np.arange(header_pages)).reshape(-1)
+            ).to(device)
             # The header landing area may overlap a slot of buffer 1; ``pages``
             # is a clone and these copies precede every slot transfer.
             for view in views:

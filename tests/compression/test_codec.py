@@ -21,8 +21,8 @@ from daser.compression.format import (
     PREFIX_GROUP_TILES,
     SlotHeader,
     digest_bytes,
-    max_slot_layers,
     prefix_table_bytes,
+    slot_header_bytes,
 )
 
 
@@ -358,17 +358,43 @@ def _layer_geometry(num_layers: int) -> CompressedStoreGeometry:
     )
 
 
-def test_geometry_rejects_layers_beyond_the_header_page() -> None:
-    # A 48-layer MoE model needs 96 plane descriptors; one page holds 82.
-    assert max_slot_layers() == 41
-    geometry = _layer_geometry(max_slot_layers())
-    slot = _slot(geometry, seed=7)
+@pytest.mark.parametrize(
+    ("num_layers", "header_pages"), [(41, 1), (42, 2), (48, 2), (64, 2)]
+)
+def test_deep_models_round_trip_with_multi_page_headers(
+    num_layers: int, header_pages: int
+) -> None:
+    # One page holds 82 plane descriptors; deeper models spill to more pages.
+    geometry = _layer_geometry(num_layers)
+    assert geometry.header_bytes == slot_header_bytes(2 * num_layers)
+    assert geometry.header_bytes == header_pages * IO_ALIGNMENT
+    codebooks = default_online_codebooks(geometry)
+    slot = _slot(geometry, seed=num_layers)
+    encoded = encode_slot(slot, slot_id=0, geometry=geometry, codebooks=codebooks)
+    assert encoded.mode is SlotMode.COMPRESSED
+    header = SlotHeader.parse(encoded.payload, expected_geometry=geometry)
+    assert header.descriptors[0].record_offset == geometry.header_bytes
+    assert len(header.descriptors) == 2 * num_layers
+    decoded = decode_slot(
+        encoded.payload,
+        mode=encoded.mode,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+    )
+    assert decoded == slot
+
+
+def test_parse_rejects_a_header_length_that_does_not_fit_the_planes() -> None:
+    geometry = _layer_geometry(48)
     encoded = encode_slot(
-        slot,
+        _slot(geometry, seed=1),
         slot_id=0,
         geometry=geometry,
         codebooks=default_online_codebooks(geometry),
     )
-    assert encoded.mode is SlotMode.COMPRESSED
-    with pytest.raises(ValueError, match="at most 41 layers"):
-        _layer_geometry(max_slot_layers() + 1)
+    payload = bytearray(encoded.payload)
+    # header_bytes is the third little-endian u32 of the fixed header.
+    payload[12:16] = IO_ALIGNMENT.to_bytes(4, "little")
+    with pytest.raises(ValueError, match="header length"):
+        SlotHeader.parse(bytes(payload), expected_geometry=geometry)

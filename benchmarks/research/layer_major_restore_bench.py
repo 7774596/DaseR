@@ -23,10 +23,11 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import IO_ALIGNMENT, ONLINE_TILE_SCALARS
+from daser.compression.format import ONLINE_TILE_SCALARS
 from daser.compression.layer_major import (
     plan_layer_group,
     plan_layer_groups,
+    record_header_bytes,
     stage_layer_group,
 )
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
@@ -155,7 +156,10 @@ def main() -> None:
     payloads = [unique[i % len(unique)] for i in range(args.records)]
     record_bytes = sum(len(p) for p in payloads)
     headers = np.stack(
-        [np.frombuffer(p, dtype=np.uint8, count=IO_ALIGNMENT) for p in payloads]
+        [
+            np.frombuffer(p, dtype=np.uint8, count=record_header_bytes(p))
+            for p in payloads
+        ]
     )
     blocks = list(np.random.default_rng(7).permutation(args.records).tolist())
     stream = torch.cuda.Stream()
