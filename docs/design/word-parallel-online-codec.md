@@ -59,6 +59,31 @@ directly in the vLLM KV cache. The fixed geometry permits vector stores where
 aligned. Multiple destinations reuse the same decoded values; they do not
 require an intermediate raw payload.
 
+Research switches select load-kernel variants for the 256-scalar decoder;
+all default off. `DASER_LOAD_UNCHECKED_BOUNDS=1` (with word reads) compiles
+the kernel without TileLang's per-access bounds guards. Containment of a
+corrupt record (media bit flip, torn write or packer bug) then rests on
+three properties instead of the guards:
+
+- Every global write address derives from host-validated metadata only:
+  destination block IDs, the plane range and grid indices. Record bytes
+  choose written values, never written locations.
+- Every read addressed by record bytes (descriptor offsets, prefixes, ranks)
+  is clamped to `[0, staging extent)`: word reads clamp both aligned word
+  indices, and the raw escape byte read is clamped explicitly.
+- Header, descriptor, codebook and metadata reads use offsets the host has
+  already range-checked against the staging tensor.
+
+A corrupt record therefore restores wrong scalars into its own destination
+blocks and nothing else. A GPU fuzz test flips bits in descriptors, prefix
+tables and payload with and without the switch and checks for CUDA faults and
+writes to neighbouring blocks.
+
+The codec does not detect corruption. GPU-packed records carry no digest of
+the raw bytes (the CPU reference stores a SHA-256 that only its own decoder
+checks), so lossless restore assumes the storage path returns the bytes that
+were written.
+
 All buffer budgets, stream ownership, staging leases and transfer/commit
 boundaries remain unchanged. Completion still covers every destination write.
 Both decoder variants and the store bundle compile and execute during startup;

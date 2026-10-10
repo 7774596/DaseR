@@ -11,7 +11,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import PREFIX_GROUP_TILES
+from daser.compression.format import PREFIX_GROUP_TILES, SlotHeader
 from daser.config import (
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
@@ -338,3 +338,71 @@ def test_vector_stores_reject_head_dims_not_divisible_by_eight(
             ring_depth=1,
             max_slots_per_buffer=1,
         )
+
+
+@pytest.mark.parametrize("unchecked", ["0", "1"])
+@pytest.mark.parametrize("region", ["header", "prefix", "payload"])
+def test_corrupt_records_only_change_their_own_destination(
+    monkeypatch: pytest.MonkeyPatch, unchecked: str, region: str
+) -> None:
+    """Bit flips in a record never fault or write outside its destination."""
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=2 * 2 * 16 * 2 * 128 * 2,
+        block_tokens=16,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tile_scalars=256,
+    )
+    codebooks = default_online_codebooks(geometry)
+    record = encode_slot(
+        _slot(geometry, 81),
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+        prefix_group_tiles=PREFIX_GROUP_TILES,
+    ).payload
+    first = SlotHeader.parse(record).descriptors[0]
+    prefix = first.prefix_offset  # descriptor offsets are slot-relative
+    regions = {
+        # Plane descriptors drive every per-plane record offset.
+        "header": range(120, 120 + 48 * 2 * geometry.num_layers),
+        "prefix": range(prefix, prefix + 16),
+        "payload": range(geometry.header_bytes, len(record)),
+    }
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, "1")
+    monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, "1")
+    monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
+    cache = _cache(3, geometry)
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=cache,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        ring_depth=1,
+        max_slots_per_buffer=1,
+    )
+    stream = torch.cuda.Stream()
+    rng = np.random.default_rng(91)
+    sentinel = torch.full_like(cache[0], 0x5A5A, dtype=torch.int16).view(cache.dtype)
+    for _ in range(16):
+        corrupt = bytearray(record)
+        for offset in rng.choice(regions[region], size=8, replace=False):
+            corrupt[offset] ^= 1 << int(rng.integers(0, 8))
+        blob = bytes(corrupt) + b"\x00" * ((-len(corrupt)) % 4)
+        staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
+        cache[0].copy_(sentinel)
+        cache[2].copy_(sentinel)
+        decoder.decode(
+            staging=staging,
+            staging_offsets=[0],
+            block_ids=[1],
+            modes=[1],
+            buffer_index=0,
+            stream=stream,
+        )
+        # An illegal address would surface here as a CUDA error.
+        stream.synchronize()
+        assert torch.equal(cache[0], sentinel)
+        assert torch.equal(cache[2], sentinel)

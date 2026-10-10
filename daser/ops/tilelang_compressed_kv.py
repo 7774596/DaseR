@@ -87,10 +87,12 @@ def _unaligned_word(words: Any, address: Any, word_count: Any) -> Any:
     (two loads instead of four byte loads). Word indices are clamped to the
     staging extent; callers only consume bytes inside the record, so the
     clamped tail bytes of a record ending at the extent are never used.
+    The lower clamp keeps reads in bounds when a corrupt record's signed
+    prefix drives ``address`` below zero.
     """
     index = address // 4
-    first = T.min(index, word_count - 1)
-    second = T.min(index + 1, word_count - 1)
+    first = T.max(T.min(index, word_count - 1), 0)
+    second = T.max(T.min(index + 1, word_count - 1), 0)
     low = T.cast(T.cast(words[first], T.uint32), T.uint64)
     high = T.cast(T.cast(words[second], T.uint32), T.uint64)
     pair = low | (high << 32)
@@ -1431,12 +1433,13 @@ def _build_wordparallel_load(
     Requires a head dimension that is a multiple of eight.
 
     ``unchecked_bounds`` builds the kernel for compilation without TileLang's
-    per-access bounds guards. Staging reads of packer-written records stay
-    inside the tensor without them: word reads clamp their indices, the raw
-    escape byte read is clamped here, and the host validates headers, raw
-    records, plane ranges and destination blocks before launch. Records are
-    trusted: corrupt descriptors are not range-checked. Requires
-    ``word_reads``.
+    per-access bounds guards. Every global write address derives only from
+    host-validated metadata (destination blocks, plane range, grid indices),
+    never from record bytes. Reads addressed by record bytes are clamped to
+    the staging tensor (word reads in ``_unaligned_word``, the raw escape byte
+    here); descriptor, codebook and metadata reads use host-validated
+    offsets. A corrupt record therefore yields wrong scalars in its own
+    destination blocks only. Requires ``word_reads``.
     """
     if vector_stores and head_dim % 8:
         raise ValueError("vector stores require a head dimension divisible by 8")
@@ -1758,8 +1761,8 @@ def _build_wordparallel_load(
                                         raw_bytes_start + raw_start + local_raw
                                     )
                                     if unchecked_bounds:
-                                        raw_address = T.min(
-                                            raw_address, staging_extent - 1
+                                        raw_address = T.max(
+                                            T.min(raw_address, staging_extent - 1), 0
                                         )
                                     high = T.cast(staging[raw_address], T.uint16)
                             elif code != 7:
