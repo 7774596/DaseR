@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -12,9 +14,14 @@ from daser.compression import (
 )
 from daser.compression.format import (
     CODEBOOK_ENTRIES,
+    FORMAT_VERSION,
+    GROUP_PREFIX_FORMAT_VERSION,
     IO_ALIGNMENT,
+    ONLINE_TILE_SCALARS,
+    PREFIX_GROUP_TILES,
     SlotHeader,
     digest_bytes,
+    prefix_table_bytes,
 )
 
 
@@ -237,3 +244,102 @@ def test_slot_header_rejects_corrupt_descriptor() -> None:
             geometry=geometry,
             codebooks=codebooks,
         )
+
+
+def test_grouped_prefix_version_round_trips_and_shrinks_records() -> None:
+    """Version 2 stores one prefix per eight tiles and stays byte exact."""
+    geometry = replace(_geometry(), tile_scalars=ONLINE_TILE_SCALARS)
+    codebooks = default_online_codebooks(geometry)
+    raw = _slot(geometry, seed=41, escaped_high_byte=0x7E)
+    tiles = (geometry.plane_scalars + ONLINE_TILE_SCALARS - 1) // ONLINE_TILE_SCALARS
+    assert tiles % PREFIX_GROUP_TILES
+
+    v1 = encode_slot(raw, slot_id=0, geometry=geometry, codebooks=codebooks)
+    v2 = encode_slot(
+        raw,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+        prefix_group_tiles=PREFIX_GROUP_TILES,
+    )
+
+    assert v2.mode is SlotMode.COMPRESSED
+    first = SlotHeader.parse(v1.payload, expected_geometry=geometry)
+    second = SlotHeader.parse(v2.payload, expected_geometry=geometry)
+    assert first.format_version == FORMAT_VERSION
+    assert second.format_version == GROUP_PREFIX_FORMAT_VERSION
+    saved = prefix_table_bytes(tiles, 1) - prefix_table_bytes(tiles, PREFIX_GROUP_TILES)
+    assert saved > 0
+    assert all(
+        a.record_length - b.record_length == saved
+        for a, b in zip(first.descriptors, second.descriptors, strict=True)
+    )
+    for encoded in (v1, v2):
+        assert (
+            decode_slot(
+                encoded.payload,
+                mode=encoded.mode,
+                slot_id=0,
+                geometry=geometry,
+                codebooks=codebooks,
+            )
+            == raw
+        )
+
+
+def test_grouped_prefix_tables_hold_group_boundary_ranks() -> None:
+    """Each version-2 entry equals the version-1 prefix at its group start."""
+    geometry = replace(_geometry(num_slots=1), tile_scalars=ONLINE_TILE_SCALARS)
+    codebooks = default_online_codebooks(geometry)
+    raw = _slot(geometry, seed=43, escaped_high_byte=0x7E)
+    tiles = (geometry.plane_scalars + ONLINE_TILE_SCALARS - 1) // ONLINE_TILE_SCALARS
+    groups = (tiles + PREFIX_GROUP_TILES - 1) // PREFIX_GROUP_TILES
+    v1 = encode_slot(raw, slot_id=0, geometry=geometry, codebooks=codebooks)
+    v2 = encode_slot(
+        raw,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+        prefix_group_tiles=PREFIX_GROUP_TILES,
+    )
+    for a, b in zip(
+        SlotHeader.parse(v1.payload).descriptors,
+        SlotHeader.parse(v2.payload).descriptors,
+        strict=True,
+    ):
+        per_tile = np.frombuffer(
+            v1.payload, dtype="<u4", count=2 * (tiles + 1), offset=a.prefix_offset
+        ).reshape(2, tiles + 1)
+        grouped = np.frombuffer(
+            v2.payload, dtype="<u4", count=2 * (groups + 1), offset=b.prefix_offset
+        ).reshape(2, groups + 1)
+        boundaries = np.minimum(np.arange(groups + 1) * PREFIX_GROUP_TILES, tiles)
+        assert (grouped == per_tile[:, boundaries]).all()
+
+
+def test_grouped_prefix_version_requires_online_tiles() -> None:
+    geometry = _geometry(num_slots=1)
+    codebooks = default_online_codebooks(geometry)
+    raw = _slot(geometry, seed=45)
+
+    with pytest.raises(ValueError, match="256-scalar"):
+        encode_slot(
+            raw,
+            slot_id=0,
+            geometry=geometry,
+            codebooks=codebooks,
+            prefix_group_tiles=PREFIX_GROUP_TILES,
+        )
+    with pytest.raises(ValueError, match="granularity"):
+        encode_slot(
+            raw, slot_id=0, geometry=geometry, codebooks=codebooks, prefix_group_tiles=4
+        )
+    payload = bytearray(
+        encode_slot(raw, slot_id=0, geometry=geometry, codebooks=codebooks).payload
+    )
+    payload[8] = GROUP_PREFIX_FORMAT_VERSION
+    with pytest.raises(ValueError, match="256-scalar"):
+        SlotHeader.parse(payload, expected_geometry=geometry)
+    payload[8] = 3
+    with pytest.raises(ValueError, match="version"):
+        SlotHeader.parse(payload, expected_geometry=geometry)

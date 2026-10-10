@@ -17,6 +17,8 @@ from daser.compression.format import (
     SlotMode,
     digest_bytes,
     online_fixed_envelope_geometry,
+    online_prefix_group_tiles,
+    prefix_table_bytes,
 )
 from daser.config import (
     LOAD_REGISTER_CODEBOOK_ENV,
@@ -40,8 +42,27 @@ def _kv_bits(kv_cache: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _prefix_group_tiles(tile_scalars: int) -> int:
+    """Return the persisted prefix granularity for online records.
+
+    Args:
+        tile_scalars (int): Codec tile size of the online records.
+
+    Returns:
+        Tiles per escape-prefix entry: the ``DASER_PACKED_GROUP_PREFIX``
+        research switch selects format version 2 for 256-scalar tiles; every
+        other configuration writes version 1.
+    """
+    return online_prefix_group_tiles() if tile_scalars == 256 else 1
+
+
 def _fixed_envelope_geometry(
-    *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
+    *,
+    slot_stride: int,
+    num_planes: int,
+    plane_scalars: int,
+    max_tiles: int,
+    prefix_group_tiles: int,
 ) -> tuple[int, int, int] | None:
     """Return the online 3-bit plane envelope and its escape capacity.
 
@@ -60,6 +81,7 @@ def _fixed_envelope_geometry(
         num_planes=num_planes,
         plane_scalars=plane_scalars,
         max_tiles=max_tiles,
+        prefix_group_tiles=prefix_group_tiles,
     )
 
 
@@ -77,6 +99,7 @@ def _fixed_single_read_geometry(
         num_planes=num_planes,
         plane_scalars=plane_scalars,
         max_tiles=max_tiles,
+        prefix_group_tiles=1,
     )
     if envelope is None or max_tiles <= 0:
         return None
@@ -159,12 +182,14 @@ def _warm_tilelang_codec(
     head_dim = int(kv_cache.shape[5])
     block_tokens = int(kv_cache.shape[3])
     num_blocks = int(kv_cache.shape[0])
+    prefix_group_tiles = _prefix_group_tiles(tile_scalars)
     store = compile_store_kernels(
         num_blocks=num_blocks,
         num_planes=num_planes,
         plane_scalars=plane_scalars,
         head_dim=head_dim,
         tile_scalars=tile_scalars,
+        prefix_group_tiles=prefix_group_tiles,
     )
     variant = _load_variant(tile_scalars)
     loads = tuple(
@@ -186,6 +211,7 @@ def _warm_tilelang_codec(
         num_planes=num_planes,
         plane_scalars=plane_scalars,
         max_tiles=max_tiles,
+        prefix_group_tiles=prefix_group_tiles,
     )
     single_read = _fixed_single_read_geometry(
         slot_stride=int(kv_cache[0].nbytes),
@@ -356,12 +382,15 @@ class FusedOnlineKVPacker:
         self._lookup = torch.from_numpy(lookup.reshape(-1).copy()).to(self._device)
         from daser.ops.tilelang_compressed_kv import compile_store_kernels
 
+        # Research switch: version-2 records persist one prefix per group.
+        self._prefix_group_tiles = _prefix_group_tiles(self._tile_scalars)
         self._tilelang_store = compile_store_kernels(
             num_blocks=self._num_blocks,
             num_planes=self._num_planes,
             plane_scalars=self._plane_scalars,
             head_dim=self._geometry.head_dim,
             tile_scalars=self._tile_scalars,
+            prefix_group_tiles=self._prefix_group_tiles,
         )
         # Store uses the TileLang bundle exclusively. Raw fallback records are
         # emitted by the compact stage when a packed record overflows.
@@ -374,6 +403,7 @@ class FusedOnlineKVPacker:
             num_planes=self._num_planes,
             plane_scalars=self._plane_scalars,
             max_tiles=max_tiles,
+            prefix_group_tiles=self._prefix_group_tiles,
         )
         if envelope is None or max_tiles > 1024:
             raise ValueError(
@@ -700,7 +730,10 @@ class FusedOnlineKVPacker:
             main_bits = np.where(symbol_bits_host == 4, 4, 3)
             secondary_bits = np.where(symbol_bits_host == 5, 3, 4)
             symbol_lengths = (self._plane_scalars * main_bits + 7) // 8
-            prefix_lengths = np.where(symbol_bits_host == 4, 4, 8) * (max_tiles + 1)
+            prefix_entries = (
+                prefix_table_bytes(max_tiles, self._prefix_group_tiles) // 8
+            )
+            prefix_lengths = np.where(symbol_bits_host == 4, 4, 8) * prefix_entries
             escape_lengths = np.where(
                 symbol_bits_host[:, None] == 4,
                 plane_raw_totals,

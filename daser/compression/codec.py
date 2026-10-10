@@ -14,6 +14,7 @@ from daser.compression.format import (
     ESCAPE_SYMBOL_BITS,
     IO_ALIGNMENT,
     KV_PLANES,
+    ONLINE_TILE_SCALARS,
     SYMBOL_BITS,
     CompressedStoreGeometry,
     PlaneDescriptor,
@@ -21,6 +22,7 @@ from daser.compression.format import (
     SlotMode,
     align_up,
     digest_bytes,
+    format_version_for_prefix_group,
 )
 
 # The online format always uses the model-independent palette. Calibration is
@@ -91,6 +93,7 @@ def encode_slot(
     slot_id: int,
     geometry: CompressedStoreGeometry,
     codebooks: bytes,
+    prefix_group_tiles: int = 1,
 ) -> EncodedSlot:
     """Encode one raw BF16 slot into its fixed envelope.
 
@@ -107,6 +110,9 @@ def encode_slot(
         slot_id: Logical fixed-envelope slot ID.
         geometry: Exact model and store geometry.
         codebooks: Plane-major static tables.
+        prefix_group_tiles: Tiles covered by one escape-prefix entry. ``1``
+            writes format version 1; ``PREFIX_GROUP_TILES`` writes version 2,
+            whose per-group tables shrink the record by about 2% of raw.
 
     Returns:
         EncodedSlot. Incompressible payloads use explicit RAW mode.
@@ -120,6 +126,10 @@ def encode_slot(
     _validate_codec_inputs(raw_slot, geometry, codebooks)
     if slot_id < 0 or slot_id >= geometry.num_slots:
         raise ValueError("slot_id is outside the compressed store")
+    format_version = format_version_for_prefix_group(prefix_group_tiles)
+    if prefix_group_tiles > 1 and geometry.tile_scalars != ONLINE_TILE_SCALARS:
+        raise ValueError("grouped tile prefixes require online 256-scalar tiles")
+    prefix_scalars = geometry.tile_scalars * prefix_group_tiles
     raw_bytes = bytes(raw_slot)
     raw_hash = digest_bytes(raw_bytes)
     codebook_hash = digest_bytes(codebooks)
@@ -148,7 +158,7 @@ def encode_slot(
         # tokens, and entry 14 or an unmapped byte is stored raw.
         escape_mask = codes >= escape_code
         raw_mask = codes >= escape_code + raw_code
-        prefixes = _escape_prefixes(escape_mask, geometry.tile_scalars)
+        prefixes = _escape_prefixes(escape_mask, prefix_scalars)
         escape_codes = np.where(
             raw_mask[escape_mask], raw_code, codes[escape_mask] - escape_code
         ).astype(np.uint8, copy=False)
@@ -159,7 +169,7 @@ def encode_slot(
         escape_count = len(escape_codes)
         prefix_bytes = (
             prefixes.astype("<u4", copy=False).tobytes()
-            + _escape_prefixes(raw_mask, geometry.tile_scalars)
+            + _escape_prefixes(raw_mask, prefix_scalars)
             .astype("<u4", copy=False)
             .tobytes()
         )
@@ -178,7 +188,8 @@ def encode_slot(
             layer=layer,
             kv=kv,
             scalar_count=geometry.plane_scalars,
-            tile_count=len(prefixes) - 1,
+            tile_count=(geometry.plane_scalars + geometry.tile_scalars - 1)
+            // geometry.tile_scalars,
             record_offset=record_offset,
             record_length=record_length,
             low_offset=low_offset,
@@ -209,6 +220,7 @@ def encode_slot(
         codebook_hash=codebook_hash,
         raw_hash=raw_hash,
         descriptors=tuple(record[0] for record in records),
+        format_version=format_version,
     )
     payload = bytearray(stored_length)
     payload[:IO_ALIGNMENT] = header.pack()
