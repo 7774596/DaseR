@@ -54,7 +54,7 @@ class TileLangStoreKernels:
 
 
 _STORE_CACHE: dict[tuple[int, int, int, int, int, int], TileLangStoreKernels] = {}
-_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool, bool], Any] = {}
+_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool, bool, int], Any] = {}
 
 
 def _vllm_kv_shape(
@@ -185,6 +185,7 @@ def compile_load_kernel(
     staging_bytes: int,
     fanout: bool = False,
     word_reads: bool = False,
+    tile_groups: int = 1,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -202,6 +203,8 @@ def compile_load_kernel(
             that reads compressed record fields as aligned ``uint32`` words
             instead of single bytes. Requires a 4-byte aligned staging tensor
             whose length is a multiple of four.
+        tile_groups: Research grid coarsening of the 256-scalar word-parallel
+            decoder; each CTA decodes this many eight-tile groups of one plane.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -209,7 +212,8 @@ def compile_load_kernel(
 
     Raises:
         ValueError: If geometry is not positive, the tile count is too large,
-            or word reads are requested for a tile size other than 256.
+            or word reads or tile groups other than 1 are requested for a
+            tile size other than 256.
 
     Async/thread-safety:
         Compilation is synchronous and should happen before request traffic.
@@ -233,14 +237,23 @@ def compile_load_kernel(
         tile_scalars,
         fanout,
         word_reads,
+        tile_groups,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
-    if word_reads and tile_scalars != 256:
-        raise ValueError("word reads require the 256-scalar word-parallel load")
+    if tile_groups < 1:
+        raise ValueError("TileLang load tile groups must be positive")
+    if (word_reads or tile_groups != 1) and tile_scalars != 256:
+        raise ValueError(
+            "word reads and tile groups require the 256-scalar word-parallel load"
+        )
     builder = _build_wordparallel_load if tile_scalars == 256 else _build_load
-    extra = {"word_reads": word_reads} if tile_scalars == 256 else {}
+    extra = (
+        {"word_reads": word_reads, "tile_groups": tile_groups}
+        if tile_scalars == 256
+        else {}
+    )
     kernel = tilelang.compile(
         builder(
             num_blocks=num_blocks,
@@ -1311,6 +1324,7 @@ def _build_wordparallel_load(
     staging_bytes: int,
     fanout: bool,
     word_reads: bool = False,
+    tile_groups: int = 1,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1325,7 +1339,12 @@ def _build_wordparallel_load(
     secondary symbols, tile prefixes) are read through a ``uint32`` view of
     the staging tensor with funnel shifts instead of single-byte loads; the
     decoded scalars are identical. Raw records keep the byte path.
+
+    ``tile_groups`` coarsens the grid: each CTA reads the plane descriptor
+    once and then decodes that many consecutive eight-tile groups, dividing
+    the CTA count by ``tile_groups`` without changing any scalar's lane.
     """
+    tile_ctas = ((tiles_per_plane + 7) // 8 + tile_groups - 1) // tile_groups
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
     # while still fitting in the configured staging lease, so shape extents
     # and the generated bounds checks must remain 64-bit.  The default
@@ -1353,9 +1372,7 @@ def _build_wordparallel_load(
         plane_base,
         plane_count,
     ):
-        with T.Kernel(
-            n_slots, plane_count, (tiles_per_plane + 7) // 8, threads=256
-        ) as (
+        with T.Kernel(n_slots, plane_count, tile_ctas, threads=256) as (
             bx,
             by,
             bz,
@@ -1364,9 +1381,6 @@ def _build_wordparallel_load(
             values = T.alloc_local((8,), "uint16")
             tx = T.get_thread_binding()
             lane = tx & 31
-            tile = bz * 8 + tx // 32
-            scalar_start = tile * 256 + lane * 8
-            valid = T.min(T.max(plane_scalars - scalar_start, 0), 8)
             slot_base = staging_offsets[bx]
             mode = modes[bx]
             global_plane = plane_base + by
@@ -1387,201 +1401,213 @@ def _build_wordparallel_load(
                     | (T.cast(staging[address + 3], T.uint32) << 24)
                 )
             T.sync_threads()
-            if mode == 0:
-                for i in T.unroll(8):
-                    raw_address = (
-                        slot_base
-                        + (global_plane * plane_scalars + scalar_start + i) * 2
-                    )
-                    values[i] = (
-                        T.cast(staging[raw_address], T.uint16)
-                        | (T.cast(staging[raw_address + 1], T.uint16) << 8)
-                        if i < valid
-                        else 0
-                    )
-            else:
-                primary_word = T.alloc_var(T.uint32, init=0)
-                primary_address = slot_base + descriptor[1] + scalar_start * 3 // 8
-                if word_reads:
-                    if valid > 0:
-                        primary_word = _unaligned_word(
-                            words, primary_address, word_count
-                        ) & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
+            # Coarsened CTAs reuse one descriptor read for tile_groups
+            # consecutive eight-tile groups of the same plane.
+            for group in T.serial(tile_groups):
+                tile = (bz * tile_groups + group) * 8 + tx // 32
+                scalar_start = tile * 256 + lane * 8
+                valid = T.min(T.max(plane_scalars - scalar_start, 0), 8)
+                if mode == 0:
+                    for i in T.unroll(8):
+                        raw_address = (
+                            slot_base
+                            + (global_plane * plane_scalars + scalar_start + i) * 2
+                        )
+                        values[i] = (
+                            T.cast(staging[raw_address], T.uint16)
+                            | (T.cast(staging[raw_address + 1], T.uint16) << 8)
+                            if i < valid
+                            else 0
+                        )
                 else:
-                    for byte in T.unroll(3):
-                        if byte * 8 < valid * 3:
-                            primary_word = primary_word | (
-                                T.cast(staging[primary_address + byte], T.uint32)
+                    primary_word = T.alloc_var(T.uint32, init=0)
+                    primary_address = slot_base + descriptor[1] + scalar_start * 3 // 8
+                    if word_reads:
+                        if valid > 0:
+                            primary_word = _unaligned_word(
+                                words, primary_address, word_count
+                            ) & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
+                    else:
+                        for byte in T.unroll(3):
+                            if byte * 8 < valid * 3:
+                                primary_word = primary_word | (
+                                    T.cast(staging[primary_address + byte], T.uint32)
+                                    << (byte * 8)
+                                )
+                    # In each three-bit symbol, the low bit of 111 survives this
+                    # intersection. Spaced bits avoid carries between symbols;
+                    # the final mask excludes padding in a partial lane word.
+                    primary_mask = (
+                        primary_word
+                        & (primary_word >> 1)
+                        & (primary_word >> 2)
+                        & T.cast(0x249249, T.uint32)
+                        & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
+                    )
+                    # Scan indices are signed: subtracting this lane's count
+                    # forms an exclusive prefix. Keep packed words unsigned for
+                    # logical shifts, but do not mix unsigned rank subtraction
+                    # into the compiler's bounds analysis.
+                    primary_count = T.cast(T.popcount(primary_mask), T.int32)
+                    primary_scan = T.alloc_var(T.int32, init=primary_count)
+                    for step in T.unroll(5):
+                        prior = T.shfl_up(primary_scan, 1 << step)
+                        if lane >= (1 << step):
+                            primary_scan = primary_scan + prior
+                    prefix = T.alloc_var(T.uint32, init=0)
+                    raw_prefix = T.alloc_var(T.uint32, init=0)
+                    # All lanes, including an inactive final warp, participate
+                    # in the warp scans. Only real tiles may read prefix tables.
+                    if word_reads:
+                        if tile < tiles_per_plane:
+                            prefix = _unaligned_word(
+                                words, slot_base + descriptor[2] + tile * 4, word_count
+                            )
+                            raw_prefix = _unaligned_word(
+                                words,
+                                slot_base
+                                + descriptor[2]
+                                + (tiles_per_plane + 1 + tile) * 4,
+                                word_count,
+                            )
+                    elif tile < tiles_per_plane:
+                        for byte in T.unroll(4):
+                            prefix = prefix | (
+                                T.cast(
+                                    staging[
+                                        slot_base + descriptor[2] + tile * 4 + byte
+                                    ],
+                                    T.uint32,
+                                )
                                 << (byte * 8)
                             )
-                # In each three-bit symbol, the low bit of 111 survives this
-                # intersection. Spaced bits avoid carries between symbols;
-                # the final mask excludes padding in a partial lane word.
-                primary_mask = (
-                    primary_word
-                    & (primary_word >> 1)
-                    & (primary_word >> 2)
-                    & T.cast(0x249249, T.uint32)
-                    & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
-                )
-                # Scan indices are signed: subtracting this lane's count
-                # forms an exclusive prefix. Keep packed words unsigned for
-                # logical shifts, but do not mix unsigned rank subtraction
-                # into the compiler's bounds analysis.
-                primary_count = T.cast(T.popcount(primary_mask), T.int32)
-                primary_scan = T.alloc_var(T.int32, init=primary_count)
-                for step in T.unroll(5):
-                    prior = T.shfl_up(primary_scan, 1 << step)
-                    if lane >= (1 << step):
-                        primary_scan = primary_scan + prior
-                prefix = T.alloc_var(T.uint32, init=0)
-                raw_prefix = T.alloc_var(T.uint32, init=0)
-                # All lanes, including an inactive final warp, participate
-                # in the warp scans. Only real tiles may read prefix tables.
-                if word_reads:
-                    if tile < tiles_per_plane:
-                        prefix = _unaligned_word(
-                            words, slot_base + descriptor[2] + tile * 4, word_count
-                        )
-                        raw_prefix = _unaligned_word(
-                            words,
-                            slot_base
-                            + descriptor[2]
-                            + (tiles_per_plane + 1 + tile) * 4,
-                            word_count,
-                        )
-                elif tile < tiles_per_plane:
-                    for byte in T.unroll(4):
-                        prefix = prefix | (
-                            T.cast(
-                                staging[slot_base + descriptor[2] + tile * 4 + byte],
-                                T.uint32,
-                            )
-                            << (byte * 8)
-                        )
-                        raw_prefix = raw_prefix | (
-                            T.cast(
-                                staging[
-                                    slot_base
-                                    + descriptor[2]
-                                    + (tiles_per_plane + 1 + tile) * 4
-                                    + byte
-                                ],
-                                T.uint32,
-                            )
-                            << (byte * 8)
-                        )
-                secondary_start = T.cast(prefix, T.int32) + primary_scan - primary_count
-                secondary_shift = (secondary_start * 3) & 7
-                secondary_word = T.alloc_var(T.uint32, init=0)
-                if word_reads:
-                    if primary_count > 0:
-                        secondary_word = _unaligned_word(
-                            words,
-                            slot_base + descriptor[3] + secondary_start * 3 // 8,
-                            word_count,
-                        )
-                else:
-                    # Eight secondary symbols plus a possible seven-bit initial
-                    # offset fit in one uint32. Load only bytes intersecting live
-                    # symbols so an empty/final word cannot cross its payload.
-                    for byte in T.unroll(4):
-                        if (
-                            primary_count > 0
-                            and byte * 8 < secondary_shift + primary_count * 3
-                        ):
-                            secondary_word = secondary_word | (
+                            raw_prefix = raw_prefix | (
                                 T.cast(
                                     staging[
                                         slot_base
-                                        + descriptor[3]
-                                        + secondary_start * 3 // 8
+                                        + descriptor[2]
+                                        + (tiles_per_plane + 1 + tile) * 4
                                         + byte
                                     ],
                                     T.uint32,
                                 )
                                 << (byte * 8)
                             )
-                secondary_word = secondary_word >> secondary_shift
-                secondary_mask = (
-                    secondary_word
-                    & (secondary_word >> 1)
-                    & (secondary_word >> 2)
-                    & T.cast(0x249249, T.uint32)
-                    & ((T.cast(1, T.uint32) << (primary_count * 3)) - 1)
-                )
-                secondary_count = T.cast(T.popcount(secondary_mask), T.int32)
-                secondary_scan = T.alloc_var(T.int32, init=secondary_count)
-                for step in T.unroll(5):
-                    prior_raw = T.shfl_up(secondary_scan, 1 << step)
-                    if lane >= (1 << step):
-                        secondary_scan = secondary_scan + prior_raw
-                raw_start = (
-                    T.cast(raw_prefix, T.int32) + secondary_scan - secondary_count
-                )
-                raw_bytes_start = (
-                    slot_base + descriptor[3] + (descriptor[4] * 3 + 7) // 8
-                )
-                low_address = slot_base + descriptor[0] + scalar_start
-                low_first = T.alloc_var(T.uint32, init=0)
-                low_second = T.alloc_var(T.uint32, init=0)
-                if word_reads:
-                    if valid > 0:
-                        low_first = _unaligned_word(words, low_address, word_count)
-                    if valid > 4:
-                        low_second = _unaligned_word(words, low_address + 4, word_count)
-                for i in T.unroll(8):
-                    code = T.cast((primary_word >> (i * 3)) & 7, T.int32)
-                    local_primary = T.popcount(
-                        primary_mask & ((T.cast(1, T.uint32) << (i * 3)) - 1)
+                    secondary_start = (
+                        T.cast(prefix, T.int32) + primary_scan - primary_count
                     )
-                    secondary = T.cast(
-                        (secondary_word >> (local_primary * 3)) & 7, T.int32
-                    )
-                    local_raw = T.popcount(
-                        secondary_mask
-                        & ((T.cast(1, T.uint32) << (local_primary * 3)) - 1)
-                    )
-                    high = T.alloc_var(T.uint16, init=0)
-                    if i < valid:
-                        if code != 7:
-                            high = T.cast(
-                                codebooks[global_plane * _CODEBOOK_ENTRIES + code],
-                                T.uint16,
-                            )
-                        elif secondary != 7:
-                            high = T.cast(
-                                codebooks[
-                                    global_plane * _CODEBOOK_ENTRIES + 7 + secondary
-                                ],
-                                T.uint16,
-                            )
-                        else:
-                            high = T.cast(
-                                staging[raw_bytes_start + raw_start + local_raw],
-                                T.uint16,
-                            )
-                        if word_reads:
-                            low_word = low_first if i < 4 else low_second
-                            values[i] = T.cast(
-                                (low_word >> ((i % 4) * 8)) & 0xFF, T.uint16
-                            ) | (high << 8)
-                        else:
-                            values[i] = T.cast(staging[low_address + i], T.uint16) | (
-                                high << 8
+                    secondary_shift = (secondary_start * 3) & 7
+                    secondary_word = T.alloc_var(T.uint32, init=0)
+                    if word_reads:
+                        if primary_count > 0:
+                            secondary_word = _unaligned_word(
+                                words,
+                                slot_base + descriptor[3] + secondary_start * 3 // 8,
+                                word_count,
                             )
                     else:
-                        values[i] = 0
-            for target in range(destination_begin, destination_end):
-                for i in T.vectorized(8):
-                    if scalar_start + i < plane_scalars:
-                        dst[
-                            block_ids[target],
-                            global_plane // 2,
-                            (scalar_start + i) // head_dim,
-                            global_plane % 2,
-                            (scalar_start + i) % head_dim,
-                        ] = values[i]
+                        # Eight secondary symbols plus a possible seven-bit initial
+                        # offset fit in one uint32. Load only bytes intersecting live
+                        # symbols so an empty/final word cannot cross its payload.
+                        for byte in T.unroll(4):
+                            if (
+                                primary_count > 0
+                                and byte * 8 < secondary_shift + primary_count * 3
+                            ):
+                                secondary_word = secondary_word | (
+                                    T.cast(
+                                        staging[
+                                            slot_base
+                                            + descriptor[3]
+                                            + secondary_start * 3 // 8
+                                            + byte
+                                        ],
+                                        T.uint32,
+                                    )
+                                    << (byte * 8)
+                                )
+                    secondary_word = secondary_word >> secondary_shift
+                    secondary_mask = (
+                        secondary_word
+                        & (secondary_word >> 1)
+                        & (secondary_word >> 2)
+                        & T.cast(0x249249, T.uint32)
+                        & ((T.cast(1, T.uint32) << (primary_count * 3)) - 1)
+                    )
+                    secondary_count = T.cast(T.popcount(secondary_mask), T.int32)
+                    secondary_scan = T.alloc_var(T.int32, init=secondary_count)
+                    for step in T.unroll(5):
+                        prior_raw = T.shfl_up(secondary_scan, 1 << step)
+                        if lane >= (1 << step):
+                            secondary_scan = secondary_scan + prior_raw
+                    raw_start = (
+                        T.cast(raw_prefix, T.int32) + secondary_scan - secondary_count
+                    )
+                    raw_bytes_start = (
+                        slot_base + descriptor[3] + (descriptor[4] * 3 + 7) // 8
+                    )
+                    low_address = slot_base + descriptor[0] + scalar_start
+                    low_first = T.alloc_var(T.uint32, init=0)
+                    low_second = T.alloc_var(T.uint32, init=0)
+                    if word_reads:
+                        if valid > 0:
+                            low_first = _unaligned_word(words, low_address, word_count)
+                        if valid > 4:
+                            low_second = _unaligned_word(
+                                words, low_address + 4, word_count
+                            )
+                    for i in T.unroll(8):
+                        code = T.cast((primary_word >> (i * 3)) & 7, T.int32)
+                        local_primary = T.popcount(
+                            primary_mask & ((T.cast(1, T.uint32) << (i * 3)) - 1)
+                        )
+                        secondary = T.cast(
+                            (secondary_word >> (local_primary * 3)) & 7, T.int32
+                        )
+                        local_raw = T.popcount(
+                            secondary_mask
+                            & ((T.cast(1, T.uint32) << (local_primary * 3)) - 1)
+                        )
+                        high = T.alloc_var(T.uint16, init=0)
+                        if i < valid:
+                            if code != 7:
+                                high = T.cast(
+                                    codebooks[global_plane * _CODEBOOK_ENTRIES + code],
+                                    T.uint16,
+                                )
+                            elif secondary != 7:
+                                high = T.cast(
+                                    codebooks[
+                                        global_plane * _CODEBOOK_ENTRIES + 7 + secondary
+                                    ],
+                                    T.uint16,
+                                )
+                            else:
+                                high = T.cast(
+                                    staging[raw_bytes_start + raw_start + local_raw],
+                                    T.uint16,
+                                )
+                            if word_reads:
+                                low_word = low_first if i < 4 else low_second
+                                values[i] = T.cast(
+                                    (low_word >> ((i % 4) * 8)) & 0xFF, T.uint16
+                                ) | (high << 8)
+                            else:
+                                values[i] = T.cast(
+                                    staging[low_address + i], T.uint16
+                                ) | (high << 8)
+                        else:
+                            values[i] = 0
+                for target in range(destination_begin, destination_end):
+                    for i in T.vectorized(8):
+                        if scalar_start + i < plane_scalars:
+                            dst[
+                                block_ids[target],
+                                global_plane // 2,
+                                (scalar_start + i) // head_dim,
+                                global_plane % 2,
+                                (scalar_start + i) % head_dim,
+                            ] = values[i]
 
     if word_reads:
 

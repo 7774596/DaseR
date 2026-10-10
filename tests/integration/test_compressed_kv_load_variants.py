@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Word-read variant of the 256-scalar fused compressed-KV decoder."""
+"""Research load variants of the 256-scalar fused compressed-KV decoder."""
 
 import numpy as np
 import pytest
@@ -11,7 +11,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.config import LOAD_WORD_READS_ENV
+from daser.config import LOAD_TILE_GROUPS_ENV, LOAD_WORD_READS_ENV
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -151,3 +151,39 @@ def test_word_reads_reject_misaligned_staging(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv(LOAD_WORD_READS_ENV, "1")
     with pytest.raises(ValueError, match="4-byte aligned"):
         _restore(staging, [0], [1], geometry, codebooks)
+
+
+@pytest.mark.parametrize("word_reads", ["0", "1"])
+@pytest.mark.parametrize("groups", [2, 3, 5])
+def test_tile_groups_restore_byte_exact(
+    monkeypatch: pytest.MonkeyPatch, groups: int, word_reads: str
+) -> None:
+    """Coarsened CTAs, including groups past the last tile, restore exactly."""
+    geometry = _geometry()
+    codebooks = default_online_codebooks(geometry)
+    raws = [_slot(geometry, seed) for seed in (41, 42, 43)]
+    encoded = encode_slot(raws[0], slot_id=0, geometry=geometry, codebooks=codebooks)
+    second = encode_slot(raws[2], slot_id=1, geometry=geometry, codebooks=codebooks)
+    blob = b"\x01\x02\x03" + encoded.payload + raws[1] + second.payload
+    blob += b"\x00" * ((-len(blob)) % 4)
+    offsets = [3, 3 + len(encoded.payload), 3 + len(encoded.payload) + len(raws[1])]
+    staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
+    monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, str(groups))
+    cache = _restore(staging, offsets, [1, 0, 1], geometry, codebooks)
+    for block, raw in enumerate(raws):
+        assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
+
+
+def test_tile_groups_reject_non_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zero coarsening factor is refused when the decoder compiles."""
+    geometry = _geometry()
+    monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        FusedCompressedKVDecoder(
+            kv_cache=_cache(1, geometry),
+            codebooks=default_online_codebooks(geometry),
+            tile_scalars=geometry.tile_scalars,
+            ring_depth=1,
+            max_slots_per_buffer=1,
+        )

@@ -53,6 +53,10 @@ PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
 #: Research switch: ``1`` compiles the 256-scalar compressed load kernel with
 #: ``uint32`` word reads of the packed record fields instead of byte loads.
 LOAD_WORD_READS_ENV = "DASER_LOAD_WORD_READS"
+
+#: Research switch: a positive integer ``K`` makes each 256-scalar compressed
+#: load CTA decode ``K`` consecutive eight-tile groups of one plane (unset = 1).
+LOAD_TILE_GROUPS_ENV = "DASER_LOAD_TILE_GROUPS"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"

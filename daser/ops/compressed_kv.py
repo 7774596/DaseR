@@ -18,7 +18,11 @@ from daser.compression.format import (
     digest_bytes,
     online_fixed_envelope_geometry,
 )
-from daser.config import LOAD_WORD_READS_ENV, PACKED_FORCE_RAW_ENV
+from daser.config import (
+    LOAD_TILE_GROUPS_ENV,
+    LOAD_WORD_READS_ENV,
+    PACKED_FORCE_RAW_ENV,
+)
 from daser.logging import init_logger
 from daser.ops.kv_layout import physical_kv_view
 
@@ -97,6 +101,27 @@ def _word_reads_enabled(tile_scalars: int) -> bool:
     return os.environ.get(LOAD_WORD_READS_ENV) == "1" and tile_scalars == 256
 
 
+def _load_tile_groups(tile_scalars: int) -> int:
+    """Return the research CTA coarsening factor of the compressed load.
+
+    Args:
+        tile_scalars (int): Codec tile size of the decoded records.
+
+    Returns:
+        The positive ``DASER_LOAD_TILE_GROUPS`` value for the 256-scalar
+        word-parallel decoder, otherwise 1 (one eight-tile group per CTA).
+
+    Raises:
+        ValueError: If the switch is set to a non-positive integer.
+    """
+    if tile_scalars != 256:
+        return 1
+    groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
+    if groups < 1:
+        raise ValueError(f"{LOAD_TILE_GROUPS_ENV} must be a positive integer")
+    return groups
+
+
 def warm_fused_online_kv_packer(
     kv_cache: torch.Tensor, max_slots_per_buffer: int, tile_scalars: int = 1024
 ) -> None:
@@ -158,6 +183,7 @@ def _warm_tilelang_codec(
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
             word_reads=_word_reads_enabled(tile_scalars),
+            tile_groups=_load_tile_groups(tile_scalars),
         )
         for fanout in (False, True)
     )
@@ -960,6 +986,7 @@ class FusedCompressedKVDecoder:
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,
                 word_reads=self._word_reads,
+                tile_groups=_load_tile_groups(tile_scalars),
             )
             for fanout in (False, True)
         )
