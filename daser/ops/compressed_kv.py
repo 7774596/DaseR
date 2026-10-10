@@ -18,7 +18,7 @@ from daser.compression.format import (
     digest_bytes,
     online_fixed_envelope_geometry,
 )
-from daser.config import PACKED_FORCE_RAW_ENV
+from daser.config import LOAD_WORD_READS_ENV, PACKED_FORCE_RAW_ENV
 from daser.logging import init_logger
 from daser.ops.kv_layout import physical_kv_view
 
@@ -84,6 +84,19 @@ def _fixed_single_read_geometry(
     return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
 
 
+def _word_reads_enabled(tile_scalars: int) -> bool:
+    """Return whether the research word-read load variant applies.
+
+    Args:
+        tile_scalars (int): Codec tile size of the decoded records.
+
+    Returns:
+        True when the switch is on and the tile uses the 256-scalar
+        word-parallel decoder; other tile sizes keep the byte decoder.
+    """
+    return os.environ.get(LOAD_WORD_READS_ENV) == "1" and tile_scalars == 256
+
+
 def warm_fused_online_kv_packer(
     kv_cache: torch.Tensor, max_slots_per_buffer: int, tile_scalars: int = 1024
 ) -> None:
@@ -144,6 +157,7 @@ def _warm_tilelang_codec(
             tile_scalars=tile_scalars,
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
+            word_reads=_word_reads_enabled(tile_scalars),
         )
         for fanout in (False, True)
     )
@@ -239,9 +253,11 @@ def _warm_tilelang_codec(
             block_tokens,
             int(kv_cache[0].nbytes),
         )
+        words = (output.view(torch.int32),) if _word_reads_enabled(tile_scalars) else ()
         for load in loads:
             load(
                 output,
+                *words,
                 slot_offsets,
                 ids,
                 torch.arange(2, dtype=torch.int32, device=device),
@@ -763,6 +779,8 @@ class PreparedKVRestore:
         stream: Stream on which metadata was uploaded and kernels will launch.
         plane_range: ``(first, count)`` layer/K-or-V planes to decode; the
             default ``None`` decodes every plane.
+        word_reads: Whether ``kernel`` is the word-read variant, which also
+            takes the staging bytes as an int32 word view.
 
     Async/thread-safety:
         The load thread exclusively owns this plan and its metadata ring. The
@@ -784,9 +802,11 @@ class PreparedKVRestore:
         destination: torch.Tensor,
         stream: torch.cuda.Stream,
         plane_range: tuple[int, int] | None = None,
+        word_reads: bool = False,
     ) -> None:
         self._kernel = kernel
         self._staging = staging
+        self._word_reads = word_reads
         self._offsets = offsets
         self._blocks = blocks
         self._destination_offsets = destination_offsets
@@ -870,9 +890,11 @@ class PreparedKVRestore:
 
     def _launch(self, staging: torch.Tensor, first: int, count: int) -> None:
         """Enqueue the decoder for planes ``[first, first + count)``."""
+        words = (staging.view(torch.int32),) if self._word_reads else ()
         with torch.cuda.stream(self._stream):
             self._kernel(
                 staging,
+                *words,
                 self._offsets,
                 self._blocks,
                 self._destination_offsets,
@@ -926,6 +948,7 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed codebooks do not match KV layer geometry")
         from daser.ops.tilelang_compressed_kv import compile_load_kernel
 
+        self._word_reads = _word_reads_enabled(tile_scalars)
         self._kv_bits = _kv_bits(kv_cache)
         self._kernels = tuple(
             compile_load_kernel(
@@ -936,6 +959,7 @@ class FusedCompressedKVDecoder:
                 tile_scalars=self._tile_scalars,
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,
+                word_reads=self._word_reads,
             )
             for fanout in (False, True)
         )
@@ -1036,6 +1060,8 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed restore exceeds metadata ring capacity")
         if staging.device != self._kv_cache.device or staging.dtype is not torch.uint8:
             raise ValueError("compressed staging must be a CUDA byte tensor")
+        if self._word_reads and (staging.data_ptr() % 4 or staging.numel() % 4):
+            raise ValueError("word-read restore needs 4-byte aligned staging")
         if any(offset < 0 or offset >= staging.numel() for offset in staging_offsets):
             raise ValueError("compressed restore staging offset is out of bounds")
         if any(block < 0 or block >= self._num_blocks for block in block_ids):
@@ -1133,6 +1159,7 @@ class FusedCompressedKVDecoder:
             destination=self._kv_bits,
             stream=stream,
             plane_range=plane_range,
+            word_reads=self._word_reads,
         )
 
     @staticmethod

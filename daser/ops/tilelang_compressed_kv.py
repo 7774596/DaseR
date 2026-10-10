@@ -54,7 +54,7 @@ class TileLangStoreKernels:
 
 
 _STORE_CACHE: dict[tuple[int, int, int, int, int, int], TileLangStoreKernels] = {}
-_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool], Any] = {}
+_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool, bool], Any] = {}
 
 
 def _vllm_kv_shape(
@@ -68,6 +68,27 @@ def _validate_head_dim(num_planes: int, plane_scalars: int, head_dim: int) -> No
     """Reject geometries that do not split into K/V planes of whole heads."""
     if head_dim <= 0 or num_planes % 2 or plane_scalars % head_dim:
         raise ValueError("KV planes must hold whole K or V heads")
+
+
+def _unaligned_word(words: Any, address: Any, word_count: Any) -> Any:
+    """Return the little-endian ``uint32`` starting at any staging byte.
+
+    ``words`` is the int32 view of the staging bytes; values are widened
+    through uint32 so sign extension cannot leak into the shifted pair.
+
+    Records start at arbitrary byte offsets, so the value is assembled from
+    the two aligned words covering ``address`` with one 64-bit funnel shift
+    (two loads instead of four byte loads). Word indices are clamped to the
+    staging extent; callers only consume bytes inside the record, so the
+    clamped tail bytes of a record ending at the extent are never used.
+    """
+    index = address // 4
+    first = T.min(index, word_count - 1)
+    second = T.min(index + 1, word_count - 1)
+    low = T.cast(T.cast(words[first], T.uint32), T.uint64)
+    high = T.cast(T.cast(words[second], T.uint32), T.uint64)
+    pair = low | (high << 32)
+    return T.cast(pair >> (T.cast(address % 4, T.uint64) * 8), T.uint32)
 
 
 def compile_store_kernels(
@@ -163,6 +184,7 @@ def compile_load_kernel(
     tile_scalars: int,
     staging_bytes: int,
     fanout: bool = False,
+    word_reads: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -176,13 +198,18 @@ def compile_load_kernel(
             the compiled kernel accepts the actual extent at runtime.
         fanout: Whether sources may have multiple destination blocks. Both
             variants are compiled at startup; fanout counts remain dynamic.
+        word_reads: Research variant of the 256-scalar word-parallel decoder
+            that reads compressed record fields as aligned ``uint32`` words
+            instead of single bytes. Requires a 4-byte aligned staging tensor
+            whose length is a multiple of four.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
         dimensions, so request metadata does not trigger compilation.
 
     Raises:
-        ValueError: If geometry is not positive or the tile count is too large.
+        ValueError: If geometry is not positive, the tile count is too large,
+            or word reads are requested for a tile size other than 256.
 
     Async/thread-safety:
         Compilation is synchronous and should happen before request traffic.
@@ -205,11 +232,15 @@ def compile_load_kernel(
         head_dim,
         tile_scalars,
         fanout,
+        word_reads,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
+    if word_reads and tile_scalars != 256:
+        raise ValueError("word reads require the 256-scalar word-parallel load")
     builder = _build_wordparallel_load if tile_scalars == 256 else _build_load
+    extra = {"word_reads": word_reads} if tile_scalars == 256 else {}
     kernel = tilelang.compile(
         builder(
             num_blocks=num_blocks,
@@ -220,6 +251,7 @@ def compile_load_kernel(
             tiles_per_plane=tiles_per_plane,
             staging_bytes=staging_bytes,
             fanout=fanout,
+            **extra,
         ),
         target="cuda",
         execution_backend="cython",
@@ -1278,6 +1310,7 @@ def _build_wordparallel_load(
     tiles_per_plane: int,
     staging_bytes: int,
     fanout: bool,
+    word_reads: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1287,6 +1320,11 @@ def _build_wordparallel_load(
     the persisted scalar order without eight serial ballot/carry rounds.
     Values stay in registers across fanout destinations and permit aligned
     128-bit stores where the fixed plane geometry supports them.
+
+    With ``word_reads`` the compressed fields (low bytes, primary and
+    secondary symbols, tile prefixes) are read through a ``uint32`` view of
+    the staging tensor with funnel shifts instead of single-byte loads; the
+    decoded scalars are identical. Raw records keep the byte path.
     """
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
     # while still fitting in the configured staging lease, so shape extents
@@ -1295,21 +1333,25 @@ def _build_wordparallel_load(
     # source records into out-of-bounds zero reads at the 2 GiB boundary.
     n_slots = T.dynamic("N", "int64")
     n_destinations = T.dynamic("D", "int64")
-    staging_extent = T.dynamic("S", "int64")
+    # Word reads take the same staging bytes a second time as an int32 word
+    # view. Its extent W is the only staging extent variable then (bytes are
+    # 4 * W); a second unbound extent would become a stray kernel argument.
+    word_count = T.dynamic("W", "int64") if word_reads else None
+    staging_extent = word_count * 4 if word_reads else T.dynamic("S", "int64")
+    kv_shape = _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim)
 
-    @T.prim_func
-    def main(
-        staging: T.Tensor((staging_extent,), "uint8"),
-        staging_offsets: T.Tensor((n_slots,), "int64"),
-        block_ids: T.Tensor((n_destinations,), "int32"),
-        destination_offsets: T.Tensor((n_slots + 1,), "int32"),
-        modes: T.Tensor((n_slots,), "int32"),
-        codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
-        dst: T.Tensor(
-            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
-        ),
-        plane_base: T.int32,
-        plane_count: T.int32,
+    @T.macro
+    def body(
+        staging,
+        words,
+        staging_offsets,
+        block_ids,
+        destination_offsets,
+        modes,
+        codebooks,
+        dst,
+        plane_base,
+        plane_count,
     ):
         with T.Kernel(
             n_slots, plane_count, (tiles_per_plane + 7) // 8, threads=256
@@ -1359,20 +1401,19 @@ def _build_wordparallel_load(
                     )
             else:
                 primary_word = T.alloc_var(T.uint32, init=0)
-                for byte in T.unroll(3):
-                    if byte * 8 < valid * 3:
-                        primary_word = primary_word | (
-                            T.cast(
-                                staging[
-                                    slot_base
-                                    + descriptor[1]
-                                    + scalar_start * 3 // 8
-                                    + byte
-                                ],
-                                T.uint32,
+                primary_address = slot_base + descriptor[1] + scalar_start * 3 // 8
+                if word_reads:
+                    if valid > 0:
+                        primary_word = _unaligned_word(
+                            words, primary_address, word_count
+                        ) & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
+                else:
+                    for byte in T.unroll(3):
+                        if byte * 8 < valid * 3:
+                            primary_word = primary_word | (
+                                T.cast(staging[primary_address + byte], T.uint32)
+                                << (byte * 8)
                             )
-                            << (byte * 8)
-                        )
                 # In each three-bit symbol, the low bit of 111 survives this
                 # intersection. Spaced bits avoid carries between symbols;
                 # the final mask excludes padding in a partial lane word.
@@ -1397,7 +1438,19 @@ def _build_wordparallel_load(
                 raw_prefix = T.alloc_var(T.uint32, init=0)
                 # All lanes, including an inactive final warp, participate
                 # in the warp scans. Only real tiles may read prefix tables.
-                if tile < tiles_per_plane:
+                if word_reads:
+                    if tile < tiles_per_plane:
+                        prefix = _unaligned_word(
+                            words, slot_base + descriptor[2] + tile * 4, word_count
+                        )
+                        raw_prefix = _unaligned_word(
+                            words,
+                            slot_base
+                            + descriptor[2]
+                            + (tiles_per_plane + 1 + tile) * 4,
+                            word_count,
+                        )
+                elif tile < tiles_per_plane:
                     for byte in T.unroll(4):
                         prefix = prefix | (
                             T.cast(
@@ -1421,26 +1474,34 @@ def _build_wordparallel_load(
                 secondary_start = T.cast(prefix, T.int32) + primary_scan - primary_count
                 secondary_shift = (secondary_start * 3) & 7
                 secondary_word = T.alloc_var(T.uint32, init=0)
-                # Eight secondary symbols plus a possible seven-bit initial
-                # offset fit in one uint32. Load only bytes intersecting live
-                # symbols so an empty/final word cannot cross its payload.
-                for byte in T.unroll(4):
-                    if (
-                        primary_count > 0
-                        and byte * 8 < secondary_shift + primary_count * 3
-                    ):
-                        secondary_word = secondary_word | (
-                            T.cast(
-                                staging[
-                                    slot_base
-                                    + descriptor[3]
-                                    + secondary_start * 3 // 8
-                                    + byte
-                                ],
-                                T.uint32,
-                            )
-                            << (byte * 8)
+                if word_reads:
+                    if primary_count > 0:
+                        secondary_word = _unaligned_word(
+                            words,
+                            slot_base + descriptor[3] + secondary_start * 3 // 8,
+                            word_count,
                         )
+                else:
+                    # Eight secondary symbols plus a possible seven-bit initial
+                    # offset fit in one uint32. Load only bytes intersecting live
+                    # symbols so an empty/final word cannot cross its payload.
+                    for byte in T.unroll(4):
+                        if (
+                            primary_count > 0
+                            and byte * 8 < secondary_shift + primary_count * 3
+                        ):
+                            secondary_word = secondary_word | (
+                                T.cast(
+                                    staging[
+                                        slot_base
+                                        + descriptor[3]
+                                        + secondary_start * 3 // 8
+                                        + byte
+                                    ],
+                                    T.uint32,
+                                )
+                                << (byte * 8)
+                            )
                 secondary_word = secondary_word >> secondary_shift
                 secondary_mask = (
                     secondary_word
@@ -1461,6 +1522,14 @@ def _build_wordparallel_load(
                 raw_bytes_start = (
                     slot_base + descriptor[3] + (descriptor[4] * 3 + 7) // 8
                 )
+                low_address = slot_base + descriptor[0] + scalar_start
+                low_first = T.alloc_var(T.uint32, init=0)
+                low_second = T.alloc_var(T.uint32, init=0)
+                if word_reads:
+                    if valid > 0:
+                        low_first = _unaligned_word(words, low_address, word_count)
+                    if valid > 4:
+                        low_second = _unaligned_word(words, low_address + 4, word_count)
                 for i in T.unroll(8):
                     code = T.cast((primary_word >> (i * 3)) & 7, T.int32)
                     local_primary = T.popcount(
@@ -1492,10 +1561,15 @@ def _build_wordparallel_load(
                                 staging[raw_bytes_start + raw_start + local_raw],
                                 T.uint16,
                             )
-                        values[i] = T.cast(
-                            staging[slot_base + descriptor[0] + scalar_start + i],
-                            T.uint16,
-                        ) | (high << 8)
+                        if word_reads:
+                            low_word = low_first if i < 4 else low_second
+                            values[i] = T.cast(
+                                (low_word >> ((i % 4) * 8)) & 0xFF, T.uint16
+                            ) | (high << 8)
+                        else:
+                            values[i] = T.cast(staging[low_address + i], T.uint16) | (
+                                high << 8
+                            )
                     else:
                         values[i] = 0
             for target in range(destination_begin, destination_end):
@@ -1508,6 +1582,61 @@ def _build_wordparallel_load(
                             global_plane % 2,
                             (scalar_start + i) % head_dim,
                         ] = values[i]
+
+    if word_reads:
+
+        @T.prim_func
+        def main(
+            staging: T.Tensor((staging_extent,), "uint8"),
+            words: T.Tensor((word_count,), "int32"),
+            staging_offsets: T.Tensor((n_slots,), "int64"),
+            block_ids: T.Tensor((n_destinations,), "int32"),
+            destination_offsets: T.Tensor((n_slots + 1,), "int32"),
+            modes: T.Tensor((n_slots,), "int32"),
+            codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
+            dst: T.Tensor(kv_shape, "uint16"),
+            plane_base: T.int32,
+            plane_count: T.int32,
+        ):
+            body(
+                staging,
+                words,
+                staging_offsets,
+                block_ids,
+                destination_offsets,
+                modes,
+                codebooks,
+                dst,
+                plane_base,
+                plane_count,
+            )
+
+    else:
+
+        @T.prim_func
+        def main(
+            staging: T.Tensor((staging_extent,), "uint8"),
+            staging_offsets: T.Tensor((n_slots,), "int64"),
+            block_ids: T.Tensor((n_destinations,), "int32"),
+            destination_offsets: T.Tensor((n_slots + 1,), "int32"),
+            modes: T.Tensor((n_slots,), "int32"),
+            codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
+            dst: T.Tensor(kv_shape, "uint16"),
+            plane_base: T.int32,
+            plane_count: T.int32,
+        ):
+            body(
+                staging,
+                None,
+                staging_offsets,
+                block_ids,
+                destination_offsets,
+                modes,
+                codebooks,
+                dst,
+                plane_base,
+                plane_count,
+            )
 
     return main
 
