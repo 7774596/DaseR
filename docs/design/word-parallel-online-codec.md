@@ -70,7 +70,8 @@ three properties instead of the guards:
   choose written values, never written locations.
 - Every read addressed by record bytes (descriptor offsets, prefixes, ranks)
   is clamped to `[0, staging extent)`: word reads clamp both aligned word
-  indices, and the raw escape byte read is clamped explicitly.
+  indices, and the raw escape byte read is clamped explicitly (or, with
+  branchless decode, read through the clamped word path).
 - Header, descriptor, codebook and metadata reads use offsets the host has
   already range-checked against the staging tensor.
 
@@ -78,6 +79,16 @@ A corrupt record therefore restores wrong scalars into its own destination
 blocks and nothing else. A GPU fuzz test flips bits in descriptors, prefix
 tables and payload with and without the switch and checks for CUDA faults and
 writes to neighbouring blocks.
+
+`DASER_LOAD_BRANCHLESS_DECODE=1` (with word reads and vector stores) removes
+the per-scalar escape branches, which diverge in most warps because escapes
+are scattered across lanes. Codebooks are repacked to 16 bytes per plane
+(primary entries in bytes 0-6, secondary in 8-14) so each level is one PRMT
+byte pair. Each lane loads its raw escape bytes, fewer than eight, as one
+eight-byte window; per scalar it computes the primary, secondary and raw
+candidates with three PRMTs and selects one, advancing a secondary cursor and
+a raw rank instead of recomputing prefix popcounts. Two PRMTs per output word
+interleave low and high bytes before the 128-bit store.
 
 The codec does not detect corruption. GPU-packed records carry no digest of
 the raw bytes (the CPU reference stores a SHA-256 that only its own decoder

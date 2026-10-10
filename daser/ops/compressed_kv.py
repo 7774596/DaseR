@@ -22,6 +22,7 @@ from daser.compression.format import (
     slot_header_bytes,
 )
 from daser.config import (
+    LOAD_BRANCHLESS_DECODE_ENV,
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
     LOAD_UNCHECKED_BOUNDS_ENV,
@@ -122,8 +123,8 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
 
     Returns:
         ``compile_load_kernel`` keyword arguments ``word_reads``,
-        ``tile_groups``, ``register_codebook``, ``vector_stores`` and
-        ``unchecked_bounds``. The
+        ``tile_groups``, ``register_codebook``, ``vector_stores``,
+        ``unchecked_bounds`` and ``branchless_decode``. The
         switches only apply to the 256-scalar word-parallel decoder; other
         tile sizes get defaults.
 
@@ -137,18 +138,23 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
             "register_codebook": False,
             "vector_stores": False,
             "unchecked_bounds": False,
+            "branchless_decode": False,
         }
     groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
     if groups < 1:
         raise ValueError(f"{LOAD_TILE_GROUPS_ENV} must be a positive integer")
     word_reads = os.environ.get(LOAD_WORD_READS_ENV) == "1"
+    vector_stores = os.environ.get(LOAD_VECTOR_STORES_ENV) == "1"
     return {
         "word_reads": word_reads,
         "tile_groups": groups,
         "register_codebook": os.environ.get(LOAD_REGISTER_CODEBOOK_ENV) == "1",
-        "vector_stores": os.environ.get(LOAD_VECTOR_STORES_ENV) == "1",
+        "vector_stores": vector_stores,
         "unchecked_bounds": word_reads
         and os.environ.get(LOAD_UNCHECKED_BOUNDS_ENV) == "1",
+        "branchless_decode": word_reads
+        and vector_stores
+        and os.environ.get(LOAD_BRANCHLESS_DECODE_ENV) == "1",
     }
 
 
@@ -182,6 +188,7 @@ def _warm_tilelang_codec(
     path can therefore trigger TileLang JIT compilation.
     """
     from daser.ops.tilelang_compressed_kv import (
+        BRANCHLESS_CODEBOOK_BYTES,
         compile_load_kernel,
         compile_store_kernels,
     )
@@ -325,7 +332,14 @@ def _warm_tilelang_codec(
                 # cache block is restored after synchronized warmup.
                 torch.ones(1, dtype=torch.int32, device=device),
                 torch.zeros(
-                    num_planes * CODEBOOK_ENTRIES, dtype=torch.uint8, device=device
+                    num_planes
+                    * (
+                        BRANCHLESS_CODEBOOK_BYTES
+                        if variant["branchless_decode"]
+                        else CODEBOOK_ENTRIES
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
                 ),
                 bits,
                 0,
@@ -1012,7 +1026,10 @@ class FusedCompressedKVDecoder:
         expected_codebooks = self._num_planes * CODEBOOK_ENTRIES
         if len(codebooks) != expected_codebooks:
             raise ValueError("compressed codebooks do not match KV layer geometry")
-        from daser.ops.tilelang_compressed_kv import compile_load_kernel
+        from daser.ops.tilelang_compressed_kv import (
+            compile_load_kernel,
+            pack_branchless_codebooks,
+        )
 
         variant = _load_variant(tile_scalars)
         self._word_reads = variant["word_reads"]
@@ -1030,6 +1047,8 @@ class FusedCompressedKVDecoder:
             )
             for fanout in (False, True)
         )
+        if variant["branchless_decode"]:
+            codebooks = pack_branchless_codebooks(codebooks, self._num_planes)
         self._codebooks = torch.from_numpy(
             np.frombuffer(codebooks, dtype=np.uint8).copy()
         ).to(kv_cache.device)

@@ -13,6 +13,7 @@ from daser.compression import (
 )
 from daser.compression.format import PREFIX_GROUP_TILES, SlotHeader
 from daser.config import (
+    LOAD_BRANCHLESS_DECODE_ENV,
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
     LOAD_UNCHECKED_BOUNDS_ENV,
@@ -255,13 +256,15 @@ def test_grouped_prefix_records_restore_beside_version_one(
 
 
 @pytest.mark.parametrize(
-    ("word_reads", "groups", "register", "unchecked"),
+    ("word_reads", "groups", "register", "unchecked", "branchless"),
     [
-        ("0", "1", "0", "0"),
-        ("1", "1", "1", "0"),
-        ("1", "2", "1", "0"),
-        ("1", "1", "1", "1"),
-        ("1", "2", "0", "1"),
+        ("0", "1", "0", "0", "0"),
+        ("1", "1", "1", "0", "0"),
+        ("1", "2", "1", "0", "0"),
+        ("1", "1", "1", "1", "0"),
+        ("1", "2", "0", "1", "0"),
+        ("1", "1", "0", "0", "1"),
+        ("1", "2", "0", "1", "1"),
     ],
 )
 def test_vector_stores_restore_byte_exact_with_fanout(
@@ -270,6 +273,7 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     groups: str,
     register: str,
     unchecked: str,
+    branchless: str,
 ) -> None:
     """128-bit stores restore v2, raw and v1 records, a partial tile and fanout."""
     # 3 tokens x 1 head x 128 = 384 scalars: the second tile is half empty.
@@ -301,6 +305,7 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, register)
     monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
     monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
+    monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, branchless)
     cache = _cache(5, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=cache,
@@ -340,10 +345,12 @@ def test_vector_stores_reject_head_dims_not_divisible_by_eight(
         )
 
 
-@pytest.mark.parametrize("unchecked", ["0", "1"])
+@pytest.mark.parametrize(
+    ("unchecked", "branchless"), [("0", "0"), ("1", "0"), ("1", "1")]
+)
 @pytest.mark.parametrize("region", ["header", "prefix", "payload"])
 def test_corrupt_records_only_change_their_own_destination(
-    monkeypatch: pytest.MonkeyPatch, unchecked: str, region: str
+    monkeypatch: pytest.MonkeyPatch, unchecked: str, branchless: str, region: str
 ) -> None:
     """Bit flips in a record never fault or write outside its destination."""
     geometry = CompressedStoreGeometry(
@@ -375,6 +382,7 @@ def test_corrupt_records_only_change_their_own_destination(
     monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, "1")
     monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
     monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
+    monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, branchless)
     cache = _cache(3, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=cache,
@@ -406,3 +414,48 @@ def test_corrupt_records_only_change_their_own_destination(
         stream.synchronize()
         assert torch.equal(cache[0], sentinel)
         assert torch.equal(cache[2], sentinel)
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_branchless_decode_restores_lanes_full_of_raw_escapes(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """Lanes whose eight scalars are all raw escapes restore byte-exact."""
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=2 * 2 * 16 * 2 * 128 * 2,
+        block_tokens=16,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tile_scalars=256,
+    )
+    codebooks = default_online_codebooks(geometry)
+    rng = np.random.default_rng(97)
+    scalars = geometry.slot_size // 2
+    raw = np.empty(geometry.slot_size, dtype=np.uint8)
+    raw[0::2] = rng.integers(0, 256, scalars, dtype=np.uint8)
+    high = np.full(scalars, 0x3F, dtype=np.uint8)
+    # Every eighth lane gets eight bytes outside both codebook levels; its
+    # neighbours keep the slot compressible.
+    lane = np.arange(scalars) // 8
+    noisy = lane % 8 == 1
+    high[noisy] = rng.integers(0xD0, 0xF0, int(noisy.sum()), dtype=np.uint8)
+    raw[1::2] = high
+    encoded = encode_slot(
+        raw.tobytes(),
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+        prefix_group_tiles=PREFIX_GROUP_TILES if version == "v2" else 1,
+    )
+    assert encoded.mode == SlotMode.COMPRESSED
+    blob = b"\x01\x02" + encoded.payload
+    blob += b"\x00" * ((-len(blob)) % 4)
+    staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, "1")
+    monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, "1")
+    monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, "1")
+    cache = _restore(staging, [2], [1], geometry, codebooks)
+    assert cache[0].view(torch.uint8).cpu().numpy().tobytes() == raw.tobytes()

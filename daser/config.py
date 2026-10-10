@@ -70,6 +70,12 @@ LOAD_VECTOR_STORES_ENV = "DASER_LOAD_VECTOR_STORES"
 #: TileLang's per-access bounds guards (staging reads are clamped explicitly).
 #: Only takes effect together with ``DASER_LOAD_WORD_READS=1``.
 LOAD_UNCHECKED_BOUNDS_ENV = "DASER_LOAD_UNCHECKED_BOUNDS"
+
+#: Research switch: ``1`` makes the 256-scalar compressed load kernel resolve
+#: high bytes with byte permutes and selects instead of per-scalar branches.
+#: Only takes effect together with ``DASER_LOAD_WORD_READS=1`` and
+#: ``DASER_LOAD_VECTOR_STORES=1``.
+LOAD_BRANCHLESS_DECODE_ENV = "DASER_LOAD_BRANCHLESS_DECODE"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
