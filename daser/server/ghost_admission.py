@@ -11,10 +11,12 @@ arena and its FIFO replacement are unchanged.
 
 A fixed filter costs every first-reuse miss, which hurts a single tenant whose
 whole working set fits. The adaptive mode decides with a miniature simulation
-(Waldspurger et al., ATC'17): two shadow LRU caches of ``capacity / sample``
+(Waldspurger et al., ATC'17): two shadow FIFO caches of ``capacity / sample``
 keys see a ``1 / sample`` key sample of every looked-up prompt. One always
 admits and the other admits on ghost. The real filter is on while the ghost
-shadow has fewer decayed misses.
+shadow has fewer decayed misses. The shadows replace in insertion order like
+the packed arena; LRU shadows overrate always-admit and keep the filter off
+when the arena is losing a reused working set to scans.
 """
 
 from __future__ import annotations
@@ -35,15 +37,12 @@ DEFAULT_SAMPLE = 16
 _MISS_DECAY = 0.999
 
 
-def _lru_touch(cache: OrderedDict[str, None], key: str, capacity: int) -> bool:
-    """Reference ``key`` in an LRU set; return whether it was present."""
-    if key in cache:
-        cache.move_to_end(key)
-        return True
+def _insert(cache: OrderedDict[str, None], key: str, capacity: int) -> None:
+    """Insert ``key`` as the newest entry, dropping the oldest past capacity."""
     cache[key] = None
+    cache.move_to_end(key)
     if len(cache) > capacity:
         cache.popitem(last=False)
-    return False
 
 
 class GhostAdmission:
@@ -122,16 +121,16 @@ class GhostAdmission:
         for key in chunk_keys:
             if zlib.crc32(key.encode()) % self.sample:
                 continue
-            if not _lru_touch(admit_all, key, self._shadow_capacity):
+            if key not in admit_all:
                 self._shadow_misses[0] += 1
+                _insert(admit_all, key, self._shadow_capacity)
             if key in filtered:
-                filtered.move_to_end(key)
                 continue
             self._shadow_misses[1] += 1
-            if key in self._shadow_ghosts:
-                _lru_touch(filtered, key, self._shadow_capacity)
+            if self._shadow_ghosts.pop(key, False) is None:
+                _insert(filtered, key, self._shadow_capacity)
             else:
-                _lru_touch(self._shadow_ghosts, key, self._shadow_capacity)
+                _insert(self._shadow_ghosts, key, self._shadow_capacity)
         self._shadow_misses[0] *= _MISS_DECAY
         self._shadow_misses[1] *= _MISS_DECAY
 
@@ -146,10 +145,9 @@ class GhostAdmission:
             caller writes nothing and a later store of the key is admitted
             while the ghost is remembered.
         """
-        if not self.filtering or chunk_key in self._ghosts:
-            self._ghosts.pop(chunk_key, None)
+        if self._ghosts.pop(chunk_key, False) is None or not self.filtering:
             self.admitted += 1
             return True
-        _lru_touch(self._ghosts, chunk_key, self.capacity)
+        _insert(self._ghosts, chunk_key, self.capacity)
         self.denied += 1
         return False
