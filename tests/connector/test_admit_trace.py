@@ -76,5 +76,25 @@ def test_trace_logs_first_lookup_alloc_and_load(
 def test_trace_off_by_default_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
     """Without the switch no admission line is written."""
     caplog.set_level(logging.INFO)
-    _drive(_lifecycle(admit_trace=False))
+    lifecycle = _lifecycle(admit_trace=False)
+    _drive(lifecycle)
+    lifecycle.trace_match("a", 0, 8, 12)
     assert _admit_lines(caplog) == []
+
+
+def test_trace_match_logs_only_changed_splits(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Retries with the same split are silent; a resume lookup is logged."""
+    caplog.set_level(logging.INFO)
+    lifecycle = _lifecycle(admit_trace=True)
+    lifecycle.trace_match("a", 0, None, 12)
+    lifecycle.trace_match("a", 0, 8, 12)
+    lifecycle.trace_match("a", 0, 8, 12)  # allocation retry
+    lifecycle.trace_match("a", 4, 4, 12)  # resumed after preemption
+    fields = [line.split()[2:6] for line in _admit_lines(caplog)]
+    assert fields == [
+        ["a", "local=0", "ext=None", "total=12"],
+        ["a", "local=0", "ext=8", "total=12"],
+        ["a", "local=4", "ext=4", "total=12"],
+    ]

@@ -44,6 +44,12 @@ class SchedulerConnectorMixin:
                 self._request_lifecycle.last_defer_reason,
                 num_computed_tokens,
             )
+        self._request_lifecycle.trace_match(
+            request.request_id,
+            num_computed_tokens,
+            result[0],
+            len(request.prompt_token_ids),
+        )
         return result
 
     def update_state_after_alloc(

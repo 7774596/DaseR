@@ -117,6 +117,10 @@ class RequestLifecycle:
         # Research switch: requests whose first lookup was traced, or None
         # when admission tracing is off (see _trace_admit).
         self._admit_traced: set[str] | None = set() if admit_trace else None
+        # Last (local, external) token split traced per request (see trace_match).
+        self._admit_matches: dict[str, tuple[int, int | None]] | None = (
+            {} if admit_trace else None
+        )
         # Why the last get_num_new_matched_tokens call returned None ("" when
         # it returned a count); read by the scheduler probe.
         self.last_defer_reason = ""
@@ -545,6 +549,44 @@ class RequestLifecycle:
             return extra_tokens, False
         layerwise_ids.discard(request.request_id)
         return extra_tokens, True
+
+    def trace_match(
+        self,
+        req_id: str,
+        num_computed_tokens: int,
+        num_external_tokens: int | None,
+        num_prompt_tokens: int,
+    ) -> None:
+        """Log a lookup's local/external/total token split under admit tracing.
+
+        A line is written only when the split differs from the last one traced
+        for the request, so allocation retries add nothing while a preempted
+        request's resume lookup does.
+
+        Args:
+            req_id: vLLM request id.
+            num_computed_tokens: tokens vLLM already holds locally (GPU prefix
+                cache) at this lookup.
+            num_external_tokens: DaseR credit returned by the lookup, ``None``
+                when the request was deferred.
+            num_prompt_tokens: prompt length of the request.
+
+        Async/thread-safety:
+            Called on the scheduler thread only; no-op when tracing is off.
+        """
+        matches = getattr(self, "_admit_matches", None)
+        split = (num_computed_tokens, num_external_tokens)
+        if matches is None or matches.get(req_id) == split:
+            return
+        matches[req_id] = split
+        logger.info(
+            "[ADMIT] match %s local=%d ext=%s total=%d t=%.3f",
+            req_id,
+            num_computed_tokens,
+            num_external_tokens,
+            num_prompt_tokens,
+            time.monotonic(),
+        )
 
     def shutdown(self) -> None:
         """Stop scheduler-side prefetch workers and release their resources.
