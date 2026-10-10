@@ -14,6 +14,7 @@ import uvicorn
 from daser.compression import (
     CompressedStoreGeometry,
     default_online_codebooks,
+    load_calibrated_codebooks,
 )
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 
@@ -235,6 +236,13 @@ def _parse_args() -> argparse.Namespace:
         default=STORAGE_FORMAT_RAW,
         help="Physical KV storage format. compressed-online losslessly packs "
         "KV on store and decodes it on load.",
+    )
+    parser.add_argument(
+        "--compressed-codebooks",
+        default=None,
+        help="Directory of an offline calibration artifact (metadata.json, "
+        "codebooks.bin) whose per-plane codebooks replace the generic palette "
+        "for --storage-format=compressed-online (default: generic palette).",
     )
     parser.add_argument(
         "--bip-enabled",
@@ -605,6 +613,57 @@ async def _shutdown_server(
     logger.info("[SERVER] shutdown complete")
 
 
+def _compression_runtime_config(
+    cfg: DaserConfig, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Select the online codec tables published to workers over IPC.
+
+    Args:
+        cfg: Finalized server config.
+        args: Parsed CLI arguments; ``compressed_codebooks`` optionally names
+            an offline calibration artifact directory.
+
+    Returns:
+        Runtime-config entries for compressed-online, or an empty dict for
+        the raw storage format.
+
+    Raises:
+        ValueError: If the calibration artifact does not match the geometry.
+
+    Async/thread-safety:
+        Synchronous startup file read before the IPC server starts.
+    """
+    if cfg.storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
+        return {}
+    model = cfg.model_geometry()
+    geometry = CompressedStoreGeometry(
+        num_slots=cfg.physical_total_slots,
+        slot_size=cfg.resolved_local_slot_size(),
+        block_tokens=cfg.block_tokens,
+        num_layers=model.num_layers,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+        dtype_bytes=model.dtype_bytes,
+        tile_scalars=ONLINE_TILE_SCALARS,
+    )
+    codebooks_dir = getattr(args, "compressed_codebooks", None)
+    codebooks = (
+        load_calibrated_codebooks(codebooks_dir, geometry)
+        if codebooks_dir
+        else default_online_codebooks(geometry)
+    )
+    logger.info(
+        "[SERVER] online codebooks=%s sha256=%s",
+        "calibrated" if codebooks_dir else "generic",
+        digest_bytes(codebooks).hex()[:16],
+    )
+    return {
+        "compressed_codebooks": codebooks,
+        "compressed_codebook_hash": digest_bytes(codebooks),
+        "compressed_tile_scalars": geometry.tile_scalars,
+    }
+
+
 def _consume_completed_task(task: asyncio.Task[Any]) -> None:
     """Read a completed server task result without surfacing cancellation.
 
@@ -633,26 +692,7 @@ async def run_server(args: argparse.Namespace) -> None:
     core = await _build_core(cfg)
 
     runtime_config = cfg.runtime_config()
-    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-        model = cfg.model_geometry()
-        geometry = CompressedStoreGeometry(
-            num_slots=cfg.physical_total_slots,
-            slot_size=cfg.resolved_local_slot_size(),
-            block_tokens=cfg.block_tokens,
-            num_layers=model.num_layers,
-            num_kv_heads=model.num_kv_heads,
-            head_dim=model.head_dim,
-            dtype_bytes=model.dtype_bytes,
-            tile_scalars=ONLINE_TILE_SCALARS,
-        )
-        codebooks = default_online_codebooks(geometry)
-        runtime_config.update(
-            {
-                "compressed_codebooks": codebooks,
-                "compressed_codebook_hash": digest_bytes(codebooks),
-                "compressed_tile_scalars": geometry.tile_scalars,
-            }
-        )
+    runtime_config.update(_compression_runtime_config(cfg, args))
 
     ipc_server = IPCServer(
         socket_path=cfg.ipc_socket_path,

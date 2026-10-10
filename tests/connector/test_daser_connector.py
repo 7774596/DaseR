@@ -14,6 +14,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
+from daser.compression.format import digest_bytes
 from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import (
     ROLLING_PREFIX_SEED,
@@ -3677,3 +3678,61 @@ def test_failed_parked_prefetch_is_logged_and_released_when_window_moves(
         )
     finally:
         lifecycle.shutdown()
+
+
+def test_worker_refresh_rebinds_calibrated_codebooks_after_prewarm(
+    monkeypatch,
+) -> None:
+    """Server-calibrated codebooks replace the prewarmed generic palette."""
+    served = {"codebooks": b"\x01" * 30, "tile_scalars": 256}
+
+    class DummyIPCClient:
+        def __init__(self, socket_path: str) -> None:
+            del socket_path
+
+        def get_runtime_config(self) -> dict[str, object]:
+            return {
+                "slot_size": 1024,
+                "transfer_mode": "iouring",
+                "skip_l2": True,
+                "storage_format": "compressed-online",
+                "compressed_codebooks": served["codebooks"],
+                "compressed_tile_scalars": served["tile_scalars"],
+            }
+
+        def close(self) -> None:
+            return
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.bound: list[bytes] = []
+
+        def configure_compression(self, **kwargs: object) -> None:
+            self.bound.append(kwargs["codebooks"])
+
+    monkeypatch.setattr("daser.connector.worker.runtime.IPCClientSync", DummyIPCClient)
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._socket_path = "/unused/daser.sock"  # noqa: SLF001
+    connector._store_path = ""  # noqa: SLF001
+    connector._slot_size = 0  # noqa: SLF001
+    connector._server_tp_size = 1  # noqa: SLF001
+    connector._rank_stride_bytes = 0  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+    connector._declared_storage_format = None  # noqa: SLF001
+    connector._load_pipeline = Pipeline()  # noqa: SLF001
+    connector._store_pipeline = Pipeline()  # noqa: SLF001
+    # Prewarm bound the generic palette before the server answered.
+    connector._compression_configured = True  # noqa: SLF001
+    connector._compression_codebook_hash = digest_bytes(b"\x00" * 30)  # noqa: SLF001
+    connector._compression_tile_scalars = 256  # noqa: SLF001
+
+    connector._refresh_runtime_config()  # noqa: SLF001
+    connector._refresh_runtime_config()  # noqa: SLF001
+
+    assert connector._load_pipeline.bound == [served["codebooks"]]  # noqa: SLF001
+    assert connector._store_pipeline.bound == [served["codebooks"]]  # noqa: SLF001
+
+    served["tile_scalars"] = 1024
+    with pytest.raises(ValueError, match="tile geometry"):
+        connector._refresh_runtime_config()  # noqa: SLF001

@@ -11,6 +11,12 @@ from typing import Any
 import pytest
 
 # First Party
+from daser.compression import (
+    CompressedStoreGeometry,
+    calibrate_codebooks,
+    default_online_codebooks,
+    write_calibration_artifact,
+)
 from daser.config import DEFAULT_IOURING_L1_BYTES, model_geometry_from_path
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
@@ -25,6 +31,7 @@ from daser.server.__main__ import (
     _build_daser_config,
     _build_http_config,
     _build_index_components,
+    _compression_runtime_config,
     _consume_completed_task,
     _ensure_store_file,
     _log_startup_banner,
@@ -563,6 +570,90 @@ def test_compressed_online_rejects_fp16_model(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="BF16 KV dtype"):
         _build_daser_config(args)
+
+
+def _calibrated_dir(tmp_path: Path, cfg: Any, *, num_layers: int) -> Path:
+    """Fit a calibration artifact whose high bytes favor a fixed palette."""
+    model = cfg.model_geometry()
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=num_layers * 2 * 128 * model.num_kv_heads * model.head_dim * 2,
+        block_tokens=128,
+        num_layers=num_layers,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+    )
+    raw = bytearray(geometry.slot_size)
+    high = bytes([0x05, 0x06, 0x07]) * (geometry.slot_size // 6 + 1)
+    raw[1::2] = high[: geometry.slot_size // 2]
+    artifact = calibrate_codebooks(
+        [bytes(raw)], model_id="test/model", geometry=geometry
+    )
+    out = tmp_path / f"calibration-{num_layers}"
+    write_calibration_artifact(artifact, out)
+    return out
+
+
+def test_compression_runtime_config_defaults_to_generic_palette(
+    tmp_path: Path,
+) -> None:
+    args = _compressed_args(tmp_path)
+    cfg = _build_daser_config(args)
+    model = cfg.model_geometry()
+
+    runtime = _compression_runtime_config(cfg, args)
+
+    geometry = CompressedStoreGeometry(
+        num_slots=cfg.physical_total_slots,
+        slot_size=cfg.resolved_local_slot_size(),
+        block_tokens=128,
+        num_layers=model.num_layers,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+    )
+    assert args.compressed_codebooks is None
+    assert runtime["compressed_codebooks"] == default_online_codebooks(geometry)
+
+
+def test_compression_runtime_config_publishes_calibrated_codebooks(
+    tmp_path: Path,
+) -> None:
+    args = _compressed_args(tmp_path)
+    cfg = _build_daser_config(args)
+    calibrated = _calibrated_dir(
+        tmp_path, cfg, num_layers=cfg.model_geometry().num_layers
+    )
+    (tmp_path / "second").mkdir()
+    args = _compressed_args(
+        tmp_path / "second", extra=["--compressed-codebooks", str(calibrated)]
+    )
+    cfg = _build_daser_config(args)
+
+    runtime = _compression_runtime_config(cfg, args)
+
+    assert (
+        runtime["compressed_codebooks"] == (calibrated / "codebooks.bin").read_bytes()
+    )
+    assert runtime["compressed_codebooks"][:3] == bytes([0x05, 0x06, 0x07])
+
+
+def test_compression_runtime_config_rejects_foreign_geometry(tmp_path: Path) -> None:
+    args = _compressed_args(tmp_path)
+    cfg = _build_daser_config(args)
+    args.compressed_codebooks = str(
+        _calibrated_dir(tmp_path, cfg, num_layers=cfg.model_geometry().num_layers + 1)
+    )
+
+    with pytest.raises(ValueError, match="num_layers"):
+        _compression_runtime_config(cfg, args)
+
+
+def test_compression_runtime_config_is_empty_for_raw_storage(tmp_path: Path) -> None:
+    args = _compressed_args(tmp_path)
+    args.storage_format = "raw"
+    cfg = _build_daser_config(args)
+
+    assert _compression_runtime_config(cfg, args) == {}
 
 
 @pytest.mark.asyncio

@@ -595,39 +595,39 @@ class WorkerRuntime:
                 f"{self._declared_storage_format} != {server_storage_format}"
             )
         self._storage_format = server_storage_format
-        if not getattr(self, "_compression_configured", False):
-            load_pipeline = getattr(self, "_load_pipeline", None)
-            store_pipeline = getattr(self, "_store_pipeline", None)
-            if load_pipeline is not None and store_pipeline is not None:
-                codebooks = config.get("compressed_codebooks", b"")
-                if not isinstance(codebooks, bytes):
-                    raise ValueError("compressed codebooks must be a byte payload")
-                tile_scalars = int(config.get("compressed_tile_scalars", 1024))
-                load_pipeline.configure_compression(
-                    storage_format=self._storage_format,
-                    codebooks=codebooks,
-                    tile_scalars=tile_scalars,
-                )
-                store_pipeline.configure_compression(
-                    storage_format=self._storage_format,
-                    codebooks=codebooks,
-                    tile_scalars=tile_scalars,
-                )
-                self._compression_configured = True
-                self._compression_codebook_hash = digest_bytes(codebooks)
-                self._compression_tile_scalars = tile_scalars
-        elif self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-            codebooks = config.get("compressed_codebooks", b"")
-            if not isinstance(codebooks, bytes):
-                raise ValueError("compressed codebooks must be a byte payload")
-            expected_hash = self._compression_codebook_hash
-            if expected_hash is not None and digest_bytes(codebooks) != expected_hash:
-                raise ValueError("server compressed codebooks changed after prewarm")
-            configured_tile_scalars = int(config.get("compressed_tile_scalars", 1024))
-            if configured_tile_scalars != self._compression_tile_scalars:
+        codebooks = config.get("compressed_codebooks", b"")
+        if not isinstance(codebooks, bytes):
+            raise ValueError("compressed codebooks must be a byte payload")
+        tile_scalars = int(config.get("compressed_tile_scalars", 1024))
+        if getattr(self, "_compression_configured", False):
+            if self._storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
+                return
+            if tile_scalars != self._compression_tile_scalars:
                 raise ValueError(
                     "server compressed tile geometry changed after configuration"
                 )
+            if digest_bytes(codebooks) == self._compression_codebook_hash:
+                return
+            # Prewarm binds the generic palette. A server started with
+            # calibrated codebooks rebinds them here, before the first
+            # transfer; the compiled kernels take codebooks as runtime data.
+        load_pipeline = getattr(self, "_load_pipeline", None)
+        store_pipeline = getattr(self, "_store_pipeline", None)
+        if load_pipeline is None or store_pipeline is None:
+            return
+        load_pipeline.configure_compression(
+            storage_format=self._storage_format,
+            codebooks=codebooks,
+            tile_scalars=tile_scalars,
+        )
+        store_pipeline.configure_compression(
+            storage_format=self._storage_format,
+            codebooks=codebooks,
+            tile_scalars=tile_scalars,
+        )
+        self._compression_configured = True
+        self._compression_codebook_hash = digest_bytes(codebooks)
+        self._compression_tile_scalars = tile_scalars
 
     def _init_server_transfer(self) -> None:
         """Initialize both pipeline-owned transfer clients.

@@ -5,6 +5,7 @@
 from daser.compression.calibration import (
     CalibrationArtifact,
     calibrate_codebooks,
+    load_calibrated_codebooks,
     write_calibration_artifact,
 )
 from daser.compression.codec import (
@@ -27,5 +28,6 @@ __all__ = [
     "calibrate_codebooks",
     "decode_slot",
     "encode_slot",
+    "load_calibrated_codebooks",
     "write_calibration_artifact",
 ]

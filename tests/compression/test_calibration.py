@@ -3,12 +3,14 @@
 import json
 
 import numpy as np
+import pytest
 
 from daser.compression import (
     CompressedStoreGeometry,
     calibrate_codebooks,
     decode_slot,
     encode_slot,
+    load_calibrated_codebooks,
     write_calibration_artifact,
 )
 from daser.compression.format import CODEBOOK_ENTRIES, KV_PLANES
@@ -76,3 +78,28 @@ def test_calibration_binds_model_identity_and_round_trips(tmp_path) -> None:
     write_calibration_artifact(artifact, tmp_path)
     assert (tmp_path / "codebooks.bin").read_bytes() == artifact.codebooks
     assert json.loads((tmp_path / "metadata.json").read_text()) == metadata
+
+
+def test_load_calibrated_codebooks_validates_artifact(tmp_path) -> None:
+    geometry = _geometry()
+    artifact = calibrate_codebooks(
+        [_slot(geometry, seed=3)], model_id="example/model", geometry=geometry
+    )
+    write_calibration_artifact(artifact, tmp_path)
+
+    assert load_calibrated_codebooks(tmp_path, geometry) == artifact.codebooks
+
+    other = CompressedStoreGeometry(
+        num_slots=2,
+        slot_size=geometry.slot_size,
+        block_tokens=128,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=16,
+    )
+    with pytest.raises(ValueError, match="num_kv_heads"):
+        load_calibrated_codebooks(tmp_path, other)
+
+    (tmp_path / "codebooks.bin").write_bytes(bytes(len(artifact.codebooks)))
+    with pytest.raises(ValueError, match="digest"):
+        load_calibrated_codebooks(tmp_path, geometry)

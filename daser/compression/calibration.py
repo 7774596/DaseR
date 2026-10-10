@@ -148,6 +148,45 @@ def calibrate_codebooks(
     )
 
 
+def load_calibrated_codebooks(
+    artifact_dir: str | Path,
+    geometry: CompressedStoreGeometry,
+) -> bytes:
+    """Read and validate calibrated codebooks for one serving geometry.
+
+    Args:
+        artifact_dir: Directory written by ``write_calibration_artifact``.
+        geometry: KV geometry of the serving deployment.
+
+    Returns:
+        Plane-major 15-entry codebook bytes.
+
+    Raises:
+        ValueError: If the artifact was fitted for another KV geometry, its
+            digest does not match, or a plane table repeats an entry.
+
+    Thread-safety:
+        Synchronous startup file read; safe to call from any thread.
+    """
+    artifact_path = Path(artifact_dir)
+    metadata = json.loads((artifact_path / "metadata.json").read_text("utf-8"))
+    codebooks = (artifact_path / "codebooks.bin").read_bytes()
+    fitted = metadata.get("geometry", {})
+    for field in ("num_layers", "num_kv_heads", "head_dim", "dtype_bytes"):
+        if fitted.get(field) != getattr(geometry, field):
+            raise ValueError(f"calibrated codebooks were fitted for another {field}")
+    if metadata.get("codebook_sha256") != digest_bytes(codebooks).hex():
+        raise ValueError("calibrated codebook digest mismatch")
+    if len(codebooks) != geometry.plane_count * CODEBOOK_ENTRIES:
+        raise ValueError("calibrated codebooks do not match the plane count")
+    tables = np.frombuffer(codebooks, dtype=np.uint8).reshape(
+        geometry.plane_count, CODEBOOK_ENTRIES
+    )
+    if any(len(np.unique(row)) != CODEBOOK_ENTRIES for row in tables):
+        raise ValueError("calibrated codebook plane repeats an entry")
+    return codebooks
+
+
 def write_calibration_artifact(
     artifact: CalibrationArtifact,
     output_dir: str | Path,
@@ -175,5 +214,6 @@ def write_calibration_artifact(
 __all__ = [
     "CalibrationArtifact",
     "calibrate_codebooks",
+    "load_calibrated_codebooks",
     "write_calibration_artifact",
 ]
