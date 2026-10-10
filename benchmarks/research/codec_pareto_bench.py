@@ -11,6 +11,7 @@ measures, on the remaining slots of the same card:
   (``FusedCompressedKVDecoder``) for each load-kernel preset and record format;
 - optionally nvCOMP algorithms with and without a BF16 byte shuffle, the
   shuffle and unshuffle kernels included in the timed region;
+- optionally the SplitZip GPU codec, calibrated on the same slots as DaseR;
 - optionally single-core CPU zstd over byte-shuffled slots.
 
 Every decode row is checked byte-exact. One JSON object per arm is printed
@@ -336,6 +337,34 @@ def _nvcomp_rows(
     return rows
 
 
+def _splitzip_rows(
+    raw: np.ndarray, calibration: np.ndarray, splitzip_path: str, repeats: int
+) -> list[dict[str, Any]]:
+    """Time the SplitZip GPU codec, calibrated on the DaseR calibration slots."""
+    sys.path.insert(0, splitzip_path)
+    from codec_gpu import ChunkLocalSplitZipGPU
+
+    codec = ChunkLocalSplitZipGPU(device="cuda", chunk_size=1024)
+    codec.calibrate(torch.from_numpy(calibration.view(np.int16)).cuda().view(-1))
+    data = torch.from_numpy(raw.view(np.int16)).cuda().view(-1)
+    encoded = codec.encode(data)
+    exact = torch.equal(codec.decode(encoded).view(torch.int16), data)
+    stream = torch.cuda.current_stream()
+    return [
+        {
+            "arm": "splitzip",
+            "ratio": encoded.compressed_bytes / raw.nbytes,
+            "enc_gbs": raw.nbytes
+            / _best_ms(lambda: codec.encode(data), stream, repeats)
+            / 1e6,
+            "dec_gbs": raw.nbytes
+            / _best_ms(lambda: codec.decode(encoded), stream, repeats)
+            / 1e6,
+            "exact": exact,
+        }
+    ]
+
+
 def _cpu_zstd_rows(raw: np.ndarray, level: int) -> list[dict[str, Any]]:
     """Time single-core zstd over byte-shuffled slots (per-core throughput)."""
     import zstandard
@@ -384,6 +413,11 @@ def main() -> None:
     parser.add_argument(
         "--cpu-zstd-level", type=int, default=None, help="add a CPU zstd row"
     )
+    parser.add_argument(
+        "--splitzip-path",
+        default=None,
+        help="directory holding the SplitZip codec_gpu module",
+    )
     args = parser.parse_args()
 
     slots = np.load(args.slots)
@@ -411,6 +445,10 @@ def main() -> None:
         if args.nvcomp_path:
             rows += _nvcomp_rows(
                 evaluate, args.nvcomp_path, args.nvcomp_algorithms, args.repeats
+            )
+        if args.splitzip_path:
+            rows += _splitzip_rows(
+                evaluate, slots[:ncal], args.splitzip_path, args.repeats
             )
     if args.cpu_zstd_level is not None:
         for row in _cpu_zstd_rows(evaluate, args.cpu_zstd_level):
