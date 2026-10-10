@@ -88,28 +88,29 @@ def _byte_perm(low: Any, high: Any, selector: Any) -> Any:
     return T.call_extern("uint32", "__byte_perm", low, high, T.cast(selector, T.uint32))
 
 
-def _unaligned_word(words: Any, address: Any, word_count: Any) -> Any:
-    """Return the little-endian ``uint32`` starting at any staging byte.
+def _record_word(words: Any, word_base: Any, lead: Any, offset: Any, last: Any) -> Any:
+    """Return the little-endian ``uint32`` at a byte offset inside a record.
 
-    ``words`` is the int32 view of the staging bytes; values are widened
-    through uint32 so sign extension cannot leak into the shifted pair.
+    ``words`` is the int32 view of the staging bytes; the record starts
+    ``lead`` (0-3) bytes into word ``word_base``. The value is assembled from
+    the two aligned words covering the byte with one funnel shift (two loads
+    instead of four byte loads).
 
-    Records start at arbitrary byte offsets, so the value is assembled from
-    the two aligned words covering ``address`` with one funnel shift (two
-    loads instead of four byte loads). Word indices are clamped to the
-    staging extent; callers only consume bytes inside the record, so the
-    clamped tail bytes of a record ending at the extent are never used.
-    The lower clamp keeps reads in bounds when a corrupt record's signed
-    prefix drives ``address`` below zero.
+    Offsets are unsigned 32-bit, so a corrupt negative rank wraps to a large
+    offset, and both word indices are clamped to ``last``, the final staging
+    word relative to ``word_base``. Every read therefore stays inside the
+    staging tensor with 32-bit arithmetic; callers only consume bytes inside
+    the record, so clamped tail bytes of a record at the extent are unused.
     """
-    first = T.max(T.min(address // 4, word_count - 1), 0)
-    second = T.min(first + 1, word_count - 1)
+    total = lead + T.cast(offset, T.uint32)
+    first = T.min(total >> 2, last)
+    second = T.min(first + 1, last)
     return T.call_extern(
         "uint32",
         "__funnelshift_r",
-        T.cast(words[first], T.uint32),
-        T.cast(words[second], T.uint32),
-        T.cast(address % 4, T.uint32) * 8,
+        T.cast(words[word_base + first], T.uint32),
+        T.cast(words[word_base + second], T.uint32),
+        (total & 3) * 8,
     )
 
 
@@ -1491,7 +1492,7 @@ def _build_wordparallel_load(
     per-access bounds guards. Every global write address derives only from
     host-validated metadata (destination blocks, plane range, grid indices),
     never from record bytes. Reads addressed by record bytes are clamped to
-    the staging tensor (word reads in ``_unaligned_word``, the raw escape byte
+    the staging tensor (word reads in ``_record_word``, the raw escape byte
     here or the raw window of ``branchless_decode``); descriptor, codebook and
     metadata reads use host-validated offsets. A corrupt record therefore
     yields wrong scalars in its own destination blocks only. Requires
@@ -1561,6 +1562,14 @@ def _build_wordparallel_load(
             lane = tx & 31
             slot_base = staging_offsets[bx]
             mode = modes[bx]
+            if word_reads:
+                # Word reads address the record relative to its first word.
+                word_base = slot_base // 4
+                word_lead = T.cast(slot_base % 4, T.uint32)
+                word_last = T.cast(
+                    T.min(word_count - 1 - word_base, T.cast(0xFFFFFFFF, T.int64)),
+                    T.uint32,
+                )
             global_plane = plane_base + by
             destination_begin = destination_offsets[bx] if fanout else bx
             destination_end = destination_offsets[bx + 1] if fanout else bx + 1
@@ -1635,8 +1644,12 @@ def _build_wordparallel_load(
                     primary_address = slot_base + descriptor[1] + scalar_start * 3 // 8
                     if word_reads:
                         if valid > 0:
-                            primary_word = _unaligned_word(
-                                words, primary_address, word_count
+                            primary_word = _record_word(
+                                words,
+                                word_base,
+                                word_lead,
+                                descriptor[1] + T.cast(scalar_start * 3 // 8, T.uint32),
+                                word_last,
                             ) & ((T.cast(1, T.uint32) << (valid * 3)) - 1)
                     else:
                         for byte in T.unroll(3):
@@ -1691,17 +1704,22 @@ def _build_wordparallel_load(
                     # in the warp scans. Only real tiles may read prefix tables.
                     if word_reads:
                         if tile < tiles_per_plane:
-                            prefix = _unaligned_word(
+                            prefix = _record_word(
                                 words,
-                                slot_base + descriptor[2] + prefix_entry * 4,
-                                word_count,
+                                word_base,
+                                word_lead,
+                                descriptor[2] + T.cast(prefix_entry * 4, T.uint32),
+                                word_last,
                             )
-                            raw_prefix = _unaligned_word(
+                            raw_prefix = _record_word(
                                 words,
-                                slot_base
-                                + descriptor[2]
-                                + (prefix_entries + 1 + prefix_entry) * 4,
-                                word_count,
+                                word_base,
+                                word_lead,
+                                descriptor[2]
+                                + T.cast(
+                                    (prefix_entries + 1 + prefix_entry) * 4, T.uint32
+                                ),
+                                word_last,
                             )
                     elif tile < tiles_per_plane:
                         for byte in T.unroll(4):
@@ -1737,10 +1755,13 @@ def _build_wordparallel_load(
                     secondary_word = T.alloc_var(T.uint32, init=0)
                     if word_reads:
                         if primary_count > 0:
-                            secondary_word = _unaligned_word(
+                            secondary_word = _record_word(
                                 words,
-                                slot_base + descriptor[3] + secondary_start * 3 // 8,
-                                word_count,
+                                word_base,
+                                word_lead,
+                                descriptor[3]
+                                + (T.cast(secondary_start, T.uint32) * 3 >> 3),
+                                word_last,
                             )
                     else:
                         # Eight secondary symbols plus a possible seven-bit initial
@@ -1801,10 +1822,20 @@ def _build_wordparallel_load(
                     low_second = T.alloc_var(T.uint32, init=0)
                     if word_reads:
                         if valid > 0:
-                            low_first = _unaligned_word(words, low_address, word_count)
+                            low_first = _record_word(
+                                words,
+                                word_base,
+                                word_lead,
+                                descriptor[0] + T.cast(scalar_start, T.uint32),
+                                word_last,
+                            )
                         if valid > 4:
-                            low_second = _unaligned_word(
-                                words, low_address + 4, word_count
+                            low_second = _record_word(
+                                words,
+                                word_base,
+                                word_lead,
+                                descriptor[0] + T.cast(scalar_start + 4, T.uint32),
+                                word_last,
                             )
                     if branchless_decode:
                         # Walk the lane's symbols with running counters instead
@@ -1816,10 +1847,16 @@ def _build_wordparallel_load(
                         raw_window[0] = 0
                         raw_window[1] = 0
                         if secondary_count > 0:
-                            raw_base = raw_bytes_start + raw_start
-                            raw_window[0] = _unaligned_word(words, raw_base, word_count)
-                            raw_window[1] = _unaligned_word(
-                                words, raw_base + 4, word_count
+                            raw_offset = (
+                                descriptor[3]
+                                + ((descriptor[4] * 3 + 7) >> 3)
+                                + T.cast(raw_start, T.uint32)
+                            )
+                            raw_window[0] = _record_word(
+                                words, word_base, word_lead, raw_offset, word_last
+                            )
+                            raw_window[1] = _record_word(
+                                words, word_base, word_lead, raw_offset + 4, word_last
                             )
                         pending = T.alloc_var(T.uint32, init=secondary_word)
                         raw_rank = T.alloc_var(T.uint32, init=0)

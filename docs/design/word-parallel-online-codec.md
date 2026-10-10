@@ -69,8 +69,9 @@ three properties instead of the guards:
   destination block IDs, the plane range and grid indices. Record bytes
   choose written values, never written locations.
 - Every read addressed by record bytes (descriptor offsets, prefixes, ranks)
-  is clamped to `[0, staging extent)`: word reads clamp both aligned word
-  indices, and the raw escape byte read is clamped explicitly (or, with
+  is clamped to `[0, staging extent)`: word reads take unsigned 32-bit
+  offsets from the record's first word (a corrupt negative rank wraps high)
+  and clamp both aligned word indices to the last staging word, and the raw escape byte read is clamped explicitly (or, with
   branchless decode, read through the clamped word path).
 - Header, descriptor, codebook and metadata reads use offsets the host has
   already range-checked against the staging tensor.
