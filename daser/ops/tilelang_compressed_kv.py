@@ -54,7 +54,7 @@ class TileLangStoreKernels:
 
 
 _STORE_CACHE: dict[tuple[int, int, int, int, int, int], TileLangStoreKernels] = {}
-_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool, bool, int], Any] = {}
+_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool, bool, int, bool], Any] = {}
 
 
 def _vllm_kv_shape(
@@ -186,6 +186,7 @@ def compile_load_kernel(
     fanout: bool = False,
     word_reads: bool = False,
     tile_groups: int = 1,
+    register_codebook: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -205,6 +206,9 @@ def compile_load_kernel(
             whose length is a multiple of four.
         tile_groups: Research grid coarsening of the 256-scalar word-parallel
             decoder; each CTA decodes this many eight-tile groups of one plane.
+        register_codebook: Research variant of the 256-scalar word-parallel
+            decoder that packs the plane codebook into registers so primary
+            and secondary symbols resolve without global codebook reads.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -212,8 +216,8 @@ def compile_load_kernel(
 
     Raises:
         ValueError: If geometry is not positive, the tile count is too large,
-            or word reads or tile groups other than 1 are requested for a
-            tile size other than 256.
+            or a research variant is requested for a tile size other than
+            256.
 
     Async/thread-safety:
         Compilation is synchronous and should happen before request traffic.
@@ -238,19 +242,24 @@ def compile_load_kernel(
         fanout,
         word_reads,
         tile_groups,
+        register_codebook,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
     if tile_groups < 1:
         raise ValueError("TileLang load tile groups must be positive")
-    if (word_reads or tile_groups != 1) and tile_scalars != 256:
+    if (word_reads or tile_groups != 1 or register_codebook) and tile_scalars != 256:
         raise ValueError(
-            "word reads and tile groups require the 256-scalar word-parallel load"
+            "research load variants require the 256-scalar word-parallel load"
         )
     builder = _build_wordparallel_load if tile_scalars == 256 else _build_load
     extra = (
-        {"word_reads": word_reads, "tile_groups": tile_groups}
+        {
+            "word_reads": word_reads,
+            "tile_groups": tile_groups,
+            "register_codebook": register_codebook,
+        }
         if tile_scalars == 256
         else {}
     )
@@ -1325,6 +1334,7 @@ def _build_wordparallel_load(
     fanout: bool,
     word_reads: bool = False,
     tile_groups: int = 1,
+    register_codebook: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1343,6 +1353,10 @@ def _build_wordparallel_load(
     ``tile_groups`` coarsens the grid: each CTA reads the plane descriptor
     once and then decodes that many consecutive eight-tile groups, dividing
     the CTA count by ``tile_groups`` without changing any scalar's lane.
+
+    ``register_codebook`` packs the plane's seven primary and seven secondary
+    high bytes into two ``uint64`` registers once per CTA. Symbols then pick
+    their byte with a shift, so only raw escapes read memory per scalar.
     """
     tile_ctas = ((tiles_per_plane + 7) // 8 + tile_groups - 1) // tile_groups
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
@@ -1401,6 +1415,24 @@ def _build_wordparallel_load(
                     | (T.cast(staging[address + 3], T.uint32) << 24)
                 )
             T.sync_threads()
+            primary_book = T.alloc_var(T.uint64, init=0)
+            secondary_book = T.alloc_var(T.uint64, init=0)
+            if register_codebook:
+                for entry in T.unroll(7):
+                    primary_book = primary_book | (
+                        T.cast(
+                            codebooks[global_plane * _CODEBOOK_ENTRIES + entry],
+                            T.uint64,
+                        )
+                        << (entry * 8)
+                    )
+                    secondary_book = secondary_book | (
+                        T.cast(
+                            codebooks[global_plane * _CODEBOOK_ENTRIES + 7 + entry],
+                            T.uint64,
+                        )
+                        << (entry * 8)
+                    )
             # Coarsened CTAs reuse one descriptor read for tile_groups
             # consecutive eight-tile groups of the same plane.
             for group in T.serial(tile_groups):
@@ -1570,7 +1602,30 @@ def _build_wordparallel_load(
                         )
                         high = T.alloc_var(T.uint16, init=0)
                         if i < valid:
-                            if code != 7:
+                            if register_codebook:
+                                if code != 7:
+                                    high = T.cast(
+                                        (primary_book >> T.cast(code * 8, T.uint64))
+                                        & 0xFF,
+                                        T.uint16,
+                                    )
+                                elif secondary != 7:
+                                    high = T.cast(
+                                        (
+                                            secondary_book
+                                            >> T.cast(secondary * 8, T.uint64)
+                                        )
+                                        & 0xFF,
+                                        T.uint16,
+                                    )
+                                else:
+                                    high = T.cast(
+                                        staging[
+                                            raw_bytes_start + raw_start + local_raw
+                                        ],
+                                        T.uint16,
+                                    )
+                            elif code != 7:
                                 high = T.cast(
                                     codebooks[global_plane * _CODEBOOK_ENTRIES + code],
                                     T.uint16,

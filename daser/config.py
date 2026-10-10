@@ -57,6 +57,10 @@ LOAD_WORD_READS_ENV = "DASER_LOAD_WORD_READS"
 #: Research switch: a positive integer ``K`` makes each 256-scalar compressed
 #: load CTA decode ``K`` consecutive eight-tile groups of one plane (unset = 1).
 LOAD_TILE_GROUPS_ENV = "DASER_LOAD_TILE_GROUPS"
+
+#: Research switch: ``1`` makes the 256-scalar compressed load kernel keep the
+#: plane codebook in registers and select escape bytes without memory reads.
+LOAD_REGISTER_CODEBOOK_ENV = "DASER_LOAD_REGISTER_CODEBOOK"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"

@@ -11,7 +11,11 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.config import LOAD_TILE_GROUPS_ENV, LOAD_WORD_READS_ENV
+from daser.config import (
+    LOAD_REGISTER_CODEBOOK_ENV,
+    LOAD_TILE_GROUPS_ENV,
+    LOAD_WORD_READS_ENV,
+)
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -171,6 +175,30 @@ def test_tile_groups_restore_byte_exact(
     monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
     monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, str(groups))
     cache = _restore(staging, offsets, [1, 0, 1], geometry, codebooks)
+    for block, raw in enumerate(raws):
+        assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
+
+
+@pytest.mark.parametrize(("word_reads", "groups"), [("0", "1"), ("1", "3")])
+def test_register_codebook_restore_byte_exact(
+    monkeypatch: pytest.MonkeyPatch, word_reads: str, groups: str
+) -> None:
+    """Register codebooks decode primary, secondary and raw escapes exactly."""
+    geometry = _geometry()
+    codebooks = default_online_codebooks(geometry)
+    raws = [_slot(geometry, seed) for seed in (51, 52)]
+    encoded = [
+        encode_slot(raw, slot_id=i, geometry=geometry, codebooks=codebooks)
+        for i, raw in enumerate(raws)
+    ]
+    blob = b"\x07\x07" + encoded[0].payload + encoded[1].payload
+    blob += b"\x00" * ((-len(blob)) % 4)
+    offsets = [2, 2 + len(encoded[0].payload)]
+    staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
+    monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, groups)
+    monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, "1")
+    cache = _restore(staging, offsets, [1, 1], geometry, codebooks)
     for block, raw in enumerate(raws):
         assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
 

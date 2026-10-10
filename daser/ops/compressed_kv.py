@@ -19,6 +19,7 @@ from daser.compression.format import (
     online_fixed_envelope_geometry,
 )
 from daser.config import (
+    LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
     LOAD_WORD_READS_ENV,
     PACKED_FORCE_RAW_ENV,
@@ -88,38 +89,30 @@ def _fixed_single_read_geometry(
     return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
 
 
-def _word_reads_enabled(tile_scalars: int) -> bool:
-    """Return whether the research word-read load variant applies.
+def _load_variant(tile_scalars: int) -> dict[str, Any]:
+    """Return the research load-kernel variant selected by the environment.
 
     Args:
         tile_scalars (int): Codec tile size of the decoded records.
 
     Returns:
-        True when the switch is on and the tile uses the 256-scalar
-        word-parallel decoder; other tile sizes keep the byte decoder.
-    """
-    return os.environ.get(LOAD_WORD_READS_ENV) == "1" and tile_scalars == 256
-
-
-def _load_tile_groups(tile_scalars: int) -> int:
-    """Return the research CTA coarsening factor of the compressed load.
-
-    Args:
-        tile_scalars (int): Codec tile size of the decoded records.
-
-    Returns:
-        The positive ``DASER_LOAD_TILE_GROUPS`` value for the 256-scalar
-        word-parallel decoder, otherwise 1 (one eight-tile group per CTA).
+        ``compile_load_kernel`` keyword arguments ``word_reads``,
+        ``tile_groups`` and ``register_codebook``. The switches only apply to
+        the 256-scalar word-parallel decoder; other tile sizes get defaults.
 
     Raises:
-        ValueError: If the switch is set to a non-positive integer.
+        ValueError: If ``DASER_LOAD_TILE_GROUPS`` is not a positive integer.
     """
     if tile_scalars != 256:
-        return 1
+        return {"word_reads": False, "tile_groups": 1, "register_codebook": False}
     groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
     if groups < 1:
         raise ValueError(f"{LOAD_TILE_GROUPS_ENV} must be a positive integer")
-    return groups
+    return {
+        "word_reads": os.environ.get(LOAD_WORD_READS_ENV) == "1",
+        "tile_groups": groups,
+        "register_codebook": os.environ.get(LOAD_REGISTER_CODEBOOK_ENV) == "1",
+    }
 
 
 def warm_fused_online_kv_packer(
@@ -173,6 +166,7 @@ def _warm_tilelang_codec(
         head_dim=head_dim,
         tile_scalars=tile_scalars,
     )
+    variant = _load_variant(tile_scalars)
     loads = tuple(
         compile_load_kernel(
             num_blocks=num_blocks,
@@ -182,8 +176,7 @@ def _warm_tilelang_codec(
             tile_scalars=tile_scalars,
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
-            word_reads=_word_reads_enabled(tile_scalars),
-            tile_groups=_load_tile_groups(tile_scalars),
+            **variant,
         )
         for fanout in (False, True)
     )
@@ -279,7 +272,7 @@ def _warm_tilelang_codec(
             block_tokens,
             int(kv_cache[0].nbytes),
         )
-        words = (output.view(torch.int32),) if _word_reads_enabled(tile_scalars) else ()
+        words = (output.view(torch.int32),) if variant["word_reads"] else ()
         for load in loads:
             load(
                 output,
@@ -974,7 +967,8 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed codebooks do not match KV layer geometry")
         from daser.ops.tilelang_compressed_kv import compile_load_kernel
 
-        self._word_reads = _word_reads_enabled(tile_scalars)
+        variant = _load_variant(tile_scalars)
+        self._word_reads = variant["word_reads"]
         self._kv_bits = _kv_bits(kv_cache)
         self._kernels = tuple(
             compile_load_kernel(
@@ -985,8 +979,7 @@ class FusedCompressedKVDecoder:
                 tile_scalars=self._tile_scalars,
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,
-                word_reads=self._word_reads,
-                tile_groups=_load_tile_groups(tile_scalars),
+                **variant,
             )
             for fanout in (False, True)
         )
