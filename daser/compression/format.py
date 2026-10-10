@@ -37,6 +37,20 @@ ESCAPE_SYMBOL_BITS = 3
 _ONLINE_LAYOUT_FLAGS = SYMBOL_BITS | 0x80 | 0x40
 
 
+def max_slot_layers() -> int:
+    """Return the most KV layers one compressed slot header can describe.
+
+    Returns:
+        Largest layer count whose fixed header, per-plane descriptors, and
+        layout flags byte fit in the single ``IO_ALIGNMENT`` header page.
+
+    Async/thread-safety:
+        Pure; safe from any thread.
+    """
+    planes = (IO_ALIGNMENT - _SLOT_HEADER.size - 1) // _PLANE_DESCRIPTOR.size
+    return planes // KV_PLANES
+
+
 def online_prefix_group_tiles() -> int:
     """Return the tile count covered by one online prefix-table entry.
 
@@ -245,6 +259,15 @@ class CompressedStoreGeometry:
             )
         if self.slot_size % IO_ALIGNMENT:
             raise ValueError("slot_size must be 4 KiB aligned for O_DIRECT")
+        # The descriptor table and layout flags byte share the one header
+        # page that precedes the first plane record; GPU packers write past
+        # it into payload bytes instead of failing.
+        header_bytes = _SLOT_HEADER.size + self.plane_count * _PLANE_DESCRIPTOR.size + 1
+        if header_bytes > IO_ALIGNMENT:
+            raise ValueError(
+                f"{self.num_layers} layers need a {header_bytes}-byte slot "
+                f"header; the format supports at most {max_slot_layers()} layers"
+            )
 
     @property
     def plane_count(self) -> int:

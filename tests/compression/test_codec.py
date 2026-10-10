@@ -21,6 +21,7 @@ from daser.compression.format import (
     PREFIX_GROUP_TILES,
     SlotHeader,
     digest_bytes,
+    max_slot_layers,
     prefix_table_bytes,
 )
 
@@ -343,3 +344,31 @@ def test_grouped_prefix_version_requires_online_tiles() -> None:
     payload[8] = 3
     with pytest.raises(ValueError, match="version"):
         SlotHeader.parse(payload, expected_geometry=geometry)
+
+
+def _layer_geometry(num_layers: int) -> CompressedStoreGeometry:
+    return CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=num_layers * 2 * 16 * 8 * 128 * 2,
+        block_tokens=16,
+        num_layers=num_layers,
+        num_kv_heads=8,
+        head_dim=128,
+        tile_scalars=ONLINE_TILE_SCALARS,
+    )
+
+
+def test_geometry_rejects_layers_beyond_the_header_page() -> None:
+    # A 48-layer MoE model needs 96 plane descriptors; one page holds 82.
+    assert max_slot_layers() == 41
+    geometry = _layer_geometry(max_slot_layers())
+    slot = _slot(geometry, seed=7)
+    encoded = encode_slot(
+        slot,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=default_online_codebooks(geometry),
+    )
+    assert encoded.mode is SlotMode.COMPRESSED
+    with pytest.raises(ValueError, match="at most 41 layers"):
+        _layer_geometry(max_slot_layers() + 1)
