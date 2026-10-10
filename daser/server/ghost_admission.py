@@ -25,6 +25,10 @@ from collections import OrderedDict
 import os
 import zlib
 
+from daser.logging import init_logger
+
+logger = init_logger(__name__)
+
 # Research switch: "fixed" always filters first stores through the ghost list;
 # "adaptive" filters only while the miniature simulation favours it. Unset
 # admits every store.
@@ -117,6 +121,7 @@ class GhostAdmission:
         """
         if not self.adaptive:
             return
+        was_filtering = self.filtering
         admit_all, filtered = self._shadows
         for key in chunk_keys:
             if zlib.crc32(key.encode()) % self.sample:
@@ -133,6 +138,16 @@ class GhostAdmission:
                 _insert(self._shadow_ghosts, key, self._shadow_capacity)
         self._shadow_misses[0] *= _MISS_DECAY
         self._shadow_misses[1] *= _MISS_DECAY
+        if self.filtering != was_filtering:
+            logger.info(
+                "ghost admission filtering=%s shadow_misses=%.1f/%.1f "
+                "admitted=%d denied=%d",
+                self.filtering,
+                self._shadow_misses[0],
+                self._shadow_misses[1],
+                self.admitted,
+                self.denied,
+            )
 
     def admit(self, chunk_key: str) -> bool:
         """Decide whether the first writer of an unstored key may write it.
