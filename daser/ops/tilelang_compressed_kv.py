@@ -202,6 +202,7 @@ def compile_load_kernel(
     word_reads: bool = False,
     tile_groups: int = 1,
     register_codebook: bool = False,
+    vector_stores: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -224,6 +225,9 @@ def compile_load_kernel(
         register_codebook: Research variant of the 256-scalar word-parallel
             decoder that packs the plane codebook into registers so primary
             and secondary symbols resolve without global codebook reads.
+        vector_stores: Research variant of the 256-scalar word-parallel
+            decoder that writes each lane's eight scalars as one 128-bit
+            store. Requires a head dimension divisible by eight.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -258,13 +262,15 @@ def compile_load_kernel(
         word_reads,
         tile_groups,
         register_codebook,
+        vector_stores,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
     if tile_groups < 1:
         raise ValueError("TileLang load tile groups must be positive")
-    if (word_reads or tile_groups != 1 or register_codebook) and tile_scalars != 256:
+    research = word_reads or tile_groups != 1 or register_codebook or vector_stores
+    if research and tile_scalars != 256:
         raise ValueError(
             "research load variants require the 256-scalar word-parallel load"
         )
@@ -274,6 +280,7 @@ def compile_load_kernel(
             "word_reads": word_reads,
             "tile_groups": tile_groups,
             "register_codebook": register_codebook,
+            "vector_stores": vector_stores,
         }
         if tile_scalars == 256
         else {}
@@ -1374,6 +1381,7 @@ def _build_wordparallel_load(
     word_reads: bool = False,
     tile_groups: int = 1,
     register_codebook: bool = False,
+    vector_stores: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1396,7 +1404,16 @@ def _build_wordparallel_load(
     ``register_codebook`` packs the plane's seven primary and seven secondary
     high bytes into two ``uint64`` registers once per CTA. Symbols then pick
     their byte with a shift, so only raw escapes read memory per scalar.
+
+    ``vector_stores`` writes each lane's eight scalars through a flat
+    ``[elements / 8, 8]`` view of the destination. The index is then an
+    explicit multiple of eight scalars, which lets NVVM prove 16-byte
+    alignment and emit one 128-bit store instead of four 32-bit stores.
+    Requires a head dimension that is a multiple of eight.
     """
+    if vector_stores and head_dim % 8:
+        raise ValueError("vector stores require a head dimension divisible by 8")
+    head_words = head_dim // 8
     tile_ctas = ((tiles_per_plane + 7) // 8 + tile_groups - 1) // tile_groups
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
     # while still fitting in the configured staging lease, so shape extents
@@ -1411,6 +1428,8 @@ def _build_wordparallel_load(
     word_count = T.dynamic("W", "int64") if word_reads else None
     staging_extent = word_count * 4 if word_reads else T.dynamic("S", "int64")
     kv_shape = _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim)
+    rows = kv_shape[2]
+    kv_words = num_blocks * num_planes * plane_scalars // 8
 
     @T.macro
     def body(
@@ -1740,16 +1759,33 @@ def _build_wordparallel_load(
                                 ) | (high << 8)
                         else:
                             values[i] = 0
-                for target in range(destination_begin, destination_end):
-                    for i in T.vectorized(8):
-                        if scalar_start + i < plane_scalars:
-                            dst[
-                                block_ids[target],
-                                global_plane // 2,
-                                (scalar_start + i) // head_dim,
-                                global_plane % 2,
-                                (scalar_start + i) % head_dim,
-                            ] = values[i]
+                if vector_stores:
+                    # Lane word ``word`` holds plane scalars [8 * word, 8 * word + 8),
+                    # which never straddle a head because head_dim % 8 == 0.
+                    word = tile * 32 + lane
+                    flat = T.view(dst, (kv_words,), "uint32x4")
+                    packed = T.view(values, (1,), "uint32x4")
+                    for target in range(destination_begin, destination_end):
+                        if scalar_start < plane_scalars:
+                            row = (
+                                T.cast(block_ids[target], T.int64) * (num_planes // 2)
+                                + global_plane // 2
+                            ) * rows + (word // head_words)
+                            flat[
+                                (row * 2 + global_plane % 2) * head_words
+                                + word % head_words
+                            ] = packed[0]
+                else:
+                    for target in range(destination_begin, destination_end):
+                        for i in T.vectorized(8):
+                            if scalar_start + i < plane_scalars:
+                                dst[
+                                    block_ids[target],
+                                    global_plane // 2,
+                                    (scalar_start + i) // head_dim,
+                                    global_plane % 2,
+                                    (scalar_start + i) % head_dim,
+                                ] = values[i]
 
     if word_reads:
 

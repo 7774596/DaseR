@@ -24,6 +24,7 @@ from daser.compression.format import (
 from daser.config import (
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
+    LOAD_VECTOR_STORES_ENV,
     LOAD_WORD_READS_ENV,
     PACKED_FORCE_RAW_ENV,
 )
@@ -120,14 +121,20 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
 
     Returns:
         ``compile_load_kernel`` keyword arguments ``word_reads``,
-        ``tile_groups`` and ``register_codebook``. The switches only apply to
-        the 256-scalar word-parallel decoder; other tile sizes get defaults.
+        ``tile_groups``, ``register_codebook`` and ``vector_stores``. The
+        switches only apply to the 256-scalar word-parallel decoder; other
+        tile sizes get defaults.
 
     Raises:
         ValueError: If ``DASER_LOAD_TILE_GROUPS`` is not a positive integer.
     """
     if tile_scalars != 256:
-        return {"word_reads": False, "tile_groups": 1, "register_codebook": False}
+        return {
+            "word_reads": False,
+            "tile_groups": 1,
+            "register_codebook": False,
+            "vector_stores": False,
+        }
     groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
     if groups < 1:
         raise ValueError(f"{LOAD_TILE_GROUPS_ENV} must be a positive integer")
@@ -135,6 +142,7 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
         "word_reads": os.environ.get(LOAD_WORD_READS_ENV) == "1",
         "tile_groups": groups,
         "register_codebook": os.environ.get(LOAD_REGISTER_CODEBOOK_ENV) == "1",
+        "vector_stores": os.environ.get(LOAD_VECTOR_STORES_ENV) == "1",
     }
 
 

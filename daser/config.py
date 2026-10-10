@@ -61,6 +61,10 @@ LOAD_TILE_GROUPS_ENV = "DASER_LOAD_TILE_GROUPS"
 #: Research switch: ``1`` makes the 256-scalar compressed load kernel keep the
 #: plane codebook in registers and select escape bytes without memory reads.
 LOAD_REGISTER_CODEBOOK_ENV = "DASER_LOAD_REGISTER_CODEBOOK"
+
+#: Research switch: ``1`` makes the 256-scalar compressed load kernel write
+#: each lane's eight decoded scalars with one 128-bit store.
+LOAD_VECTOR_STORES_ENV = "DASER_LOAD_VECTOR_STORES"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"

@@ -15,6 +15,7 @@ from daser.compression.format import PREFIX_GROUP_TILES
 from daser.config import (
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
+    LOAD_VECTOR_STORES_ENV,
     LOAD_WORD_READS_ENV,
 )
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
@@ -248,3 +249,78 @@ def test_grouped_prefix_records_restore_beside_version_one(
     cache = _restore(staging, offsets, [1, 0, 1], geometry, codebooks)
     for block, raw in enumerate(raws):
         assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
+
+
+@pytest.mark.parametrize(
+    ("word_reads", "groups", "register"),
+    [("0", "1", "0"), ("1", "1", "1"), ("1", "2", "1")],
+)
+def test_vector_stores_restore_byte_exact_with_fanout(
+    monkeypatch: pytest.MonkeyPatch, word_reads: str, groups: str, register: str
+) -> None:
+    """128-bit stores restore v2, raw and v1 records, a partial tile and fanout."""
+    # 3 tokens x 1 head x 128 = 384 scalars: the second tile is half empty.
+    geometry = CompressedStoreGeometry(
+        num_slots=3,
+        slot_size=3 * 2 * 3 * 1 * 128 * 2,
+        block_tokens=3,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=128,
+        tile_scalars=256,
+    )
+    codebooks = default_online_codebooks(geometry)
+    raws = [_slot(geometry, seed) for seed in (71, 72, 73)]
+    grouped = encode_slot(
+        raws[0],
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+        prefix_group_tiles=PREFIX_GROUP_TILES,
+    )
+    per_tile = encode_slot(raws[2], slot_id=2, geometry=geometry, codebooks=codebooks)
+    blob = b"\x03" + grouped.payload + raws[1] + per_tile.payload
+    blob += b"\x00" * ((-len(blob)) % 4)
+    offsets = [1, 1 + len(grouped.payload), 1 + len(grouped.payload) + len(raws[1])]
+    staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
+    monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, groups)
+    monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, register)
+    monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    cache = _cache(5, geometry)
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=cache,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        ring_depth=1,
+        max_slots_per_buffer=5,
+    )
+    stream = torch.cuda.Stream()
+    # Blocks 3 and 4 repeat sources 0 and 2, which selects the fanout kernel.
+    decoder.decode(
+        staging=staging,
+        staging_offsets=offsets + [offsets[0], offsets[2]],
+        block_ids=[0, 1, 2, 3, 4],
+        modes=[1, 0, 1, 1, 1],
+        buffer_index=0,
+        stream=stream,
+    )
+    stream.synchronize()
+    for block, raw in enumerate(raws + [raws[0], raws[2]]):
+        assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
+
+
+def test_vector_stores_reject_head_dims_not_divisible_by_eight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 128-bit store layout needs whole eight-scalar words per head."""
+    geometry = _geometry()
+    monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    with pytest.raises(ValueError, match="divisible by 8"):
+        FusedCompressedKVDecoder(
+            kv_cache=_cache(1, geometry),
+            codebooks=default_online_codebooks(geometry),
+            tile_scalars=geometry.tile_scalars,
+            ring_depth=1,
+            max_slots_per_buffer=1,
+        )
