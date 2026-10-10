@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from daser import stalldump
-from daser.config import REUSE_RETRY_LOOKUP_MODES, STORAGE_FORMAT_RAW
+from daser.config import STORAGE_FORMAT_RAW
 from daser.connector.helpers import PendingStore
 from daser.connector.ipc_client import PrefetchLookupResult
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
@@ -110,7 +110,6 @@ class RequestLifecycle:
         layerwise_load: bool = False,
         arrival_readahead: bool = False,
         writeback_low_blocks: int = 0,
-        reuse_retry_lookup: str = "",
         decode_save: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
@@ -118,33 +117,11 @@ class RequestLifecycle:
         # it returned a count); read by the scheduler probe.
         self.last_defer_reason = ""
         self._arrival_readahead = arrival_readahead
-        # Research switch: when vLLM fails to allocate blocks for a request it
-        # asks again next step with the same prompt. Without a prefetch lease
-        # the answer only changes if the index lost a chunk (epoch advanced),
-        # so the previous result is reused after an epoch check ("rpc": one
-        # token-free RPC per reuse; "step": the epoch is read once per
-        # scheduler step, so a removal later in the same step is seen next
-        # step, the same window as any lookup-to-load gap). Insertions since
-        # then are ignored: the reused prefix may be shorter than a fresh
-        # lookup, never longer. Entries are dropped once vLLM allocates
-        # (update_state_after_alloc) or the request leaves.
-        if reuse_retry_lookup not in ("", *REUSE_RETRY_LOOKUP_MODES):
-            raise ValueError(f"unknown reuse_retry_lookup mode: {reuse_retry_lookup}")
-        self._reuse_retry_lookup = reuse_retry_lookup
-        # req_id -> (num_computed_tokens, prefix length, epoch, chunks).
+        # Last lookup per request kept for vLLM's allocation retries:
+        # (num_computed_tokens, prefix length, index epoch, chunks).
         self._retry_lookups: dict[str, tuple[int, int, int, list[dict[str, Any]]]] = {}
-        # "step" mode: epoch observed in the current scheduler step.
+        # Server index epoch already read in this scheduler step, if any.
         self._step_epoch: int | None = None
-        # Counts and wall seconds of the lookups and epoch RPCs on this path.
-        self._retry_lookup_stats: dict[str, float] = {
-            "reused": 0,
-            "stale": 0,
-            "lookups": 0,
-            "lookup_s": 0.0,
-            "epoch_rpcs": 0,
-            "epoch_s": 0.0,
-        }
-        self._retry_lookup_logged = time.monotonic()
         # Research switch: write-back stores. A finished request keeps its
         # vLLM blocks (and so its GPU prefix-cache residency) until free
         # blocks fall below this watermark; only then is its prompt KV
@@ -590,8 +567,6 @@ class RequestLifecycle:
         getattr(self, "_prefetch_signatures", {}).clear()
         if getattr(self, "_coalesce_loads", False):
             self._log_coalesce_stats()
-        if getattr(self, "_reuse_retry_lookup", ""):
-            self._log_retry_lookup_stats(force=True)
 
     def update_state_after_alloc(
         self,
@@ -675,9 +650,7 @@ class RequestLifecycle:
         """
         meta = DaserConnectorMeta()
         self._age_landed_loads()
-        if getattr(self, "_reuse_retry_lookup", ""):
-            self._step_epoch = None
-            self._log_retry_lookup_stats()
+        self._step_epoch = None
         # Published stores have left _pending_stores but still reference model
         # blocks on the worker. Capture their cancellation before dropping the
         # scheduler hold; the worker must discard those unsent specifications.
@@ -989,47 +962,72 @@ class RequestLifecycle:
             # remote KV, and vLLM's waiting loop stops at the earlier
             # request's failed allocation every step (deadlock).
             return None
-        if getattr(self, "_reuse_retry_lookup", ""):
-            reused = self._reuse_retry_lookup_result(
-                request_id, len(tokens), num_computed_tokens
-            )
-            if reused is not None:
-                return reused
+        reused = self._reuse_retry_lookup(request_id, len(tokens), num_computed_tokens)
+        if reused is not None:
+            return reused
         deadline = deadlines.setdefault(request_id, now + PENDING_LOOKUP_DEFER_S)
-        if getattr(self, "_reuse_retry_lookup", ""):
-            started = time.perf_counter()
-            chunks, epoch = self._ipc_sync.lookup_versioned(
-                tokens,
-                self._model_id,
-                external_prefix_queries=queries,
-                num_computed_tokens=num_computed_tokens,
-                defer_pending=now < deadline,
-            )
-            stats = self._retry_lookup_stats
-            stats["lookups"] += 1
-            stats["lookup_s"] += time.perf_counter() - started
-            if epoch is not None and self._step_epoch is None:
-                self._step_epoch = epoch
-            if chunks is not None and epoch is not None:
-                self._retry_lookups[request_id] = (
-                    num_computed_tokens,
-                    len(tokens),
-                    epoch,
-                    [dict(chunk) for chunk in chunks],
-                )
-        else:
-            chunks = self._lookup_with_external_prefix_metrics(
-                tokens,
-                self._model_id,
-                queries,
+        chunks, epoch = self._lookup_versioned(
+            tokens,
+            queries,
+            num_computed_tokens,
+            defer_pending=now < deadline,
+        )
+        if epoch is not None and self._step_epoch is None:
+            self._step_epoch = epoch
+        if chunks is not None and epoch is not None:
+            self._retry_lookups[request_id] = (
                 num_computed_tokens,
-                defer_pending=now < deadline,
+                len(tokens),
+                epoch,
+                [dict(chunk) for chunk in chunks],
             )
         if chunks is not None:
             deadlines.pop(request_id, None)
         return chunks
 
-    def _reuse_retry_lookup_result(
+    def _lookup_versioned(
+        self,
+        tokens: list[int],
+        queries: int,
+        num_computed_tokens: int,
+        *,
+        defer_pending: bool,
+    ) -> tuple[list[dict[str, Any]] | None, int | None]:
+        """Look up chunks together with the index epoch they belong to.
+
+        Args:
+            tokens: Token prefix sent to the DaseR lookup.
+            queries: vLLM external prefix query token count.
+            num_computed_tokens: Tokens already computed locally by vLLM.
+            defer_pending: Whether the server may answer pending.
+
+        Returns:
+            ``(chunks, epoch)``; ``chunks`` is None when the lookup was
+            deferred, and ``epoch`` is None when the result must not be
+            reused (deferred, or a client that reports no epoch).
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client.
+        """
+        lookup_versioned = getattr(self._ipc_sync, "lookup_versioned", None)
+        if lookup_versioned is None:
+            chunks = self._lookup_with_external_prefix_metrics(
+                tokens,
+                self._model_id,
+                queries,
+                num_computed_tokens,
+                defer_pending=defer_pending,
+            )
+            return chunks, None
+        return lookup_versioned(
+            tokens,
+            self._model_id,
+            external_prefix_queries=queries,
+            num_computed_tokens=num_computed_tokens,
+            defer_pending=defer_pending,
+        )
+
+    def _reuse_retry_lookup(
         self,
         request_id: str,
         prefix_len: int,
@@ -1043,66 +1041,29 @@ class RequestLifecycle:
             num_computed_tokens: vLLM's local prefix hit for this call.
 
         Returns:
-            A copy of the cached chunk list when the request asks again for
-            the same window and the server index epoch is unchanged, else
-            None (the stale entry is dropped and a fresh lookup follows).
+            A copy of the kept chunk list when the request asks again for the
+            same window and the server index epoch is unchanged, else None
+            (a stale entry is dropped and a fresh lookup follows).
 
         Thread-safety:
-            Runs on the scheduler thread; the epoch check is one blocking RPC.
+            Runs on the scheduler thread. The epoch is read at most once per
+            scheduler step, so a removal later in the same step is seen next
+            step; that is the same window as between any lookup and its load.
         """
-        entry = self._retry_lookups.get(request_id)
+        retry_lookups = getattr(self, "_retry_lookups", {})
+        entry = retry_lookups.get(request_id)
         if entry is None:
             return None
         start, length, epoch, chunks = entry
         if start != num_computed_tokens or length != prefix_len:
-            self._retry_lookups.pop(request_id, None)
+            retry_lookups.pop(request_id, None)
             return None
-        if self._current_epoch() != epoch:
-            self._retry_lookups.pop(request_id, None)
-            self._retry_lookup_stats["stale"] += 1
+        if getattr(self, "_step_epoch", None) is None:
+            self._step_epoch = self._ipc_sync.index_epoch()
+        if self._step_epoch != epoch:
+            retry_lookups.pop(request_id, None)
             return None
-        self._retry_lookup_stats["reused"] += 1
         return [dict(chunk) for chunk in chunks]
-
-    def _current_epoch(self) -> int:
-        """Return the server index epoch under the configured reuse mode.
-
-        Returns:
-            In ``rpc`` mode a fresh epoch from one RPC. In ``step`` mode the
-            epoch already seen this scheduler step, or one RPC on first use.
-        """
-        if self._reuse_retry_lookup == "step" and self._step_epoch is not None:
-            return self._step_epoch
-        started = time.perf_counter()
-        epoch = self._ipc_sync.index_epoch()
-        stats = self._retry_lookup_stats
-        stats["epoch_rpcs"] += 1
-        stats["epoch_s"] += time.perf_counter() - started
-        self._step_epoch = epoch
-        return epoch
-
-    def _log_retry_lookup_stats(self, *, force: bool = False) -> None:
-        """Log retry-lookup reuse counters and mean RPC times every 30 s.
-
-        Args:
-            force: Log now regardless of the interval (shutdown).
-        """
-        now = time.monotonic()
-        if not force and now - self._retry_lookup_logged < 30.0:
-            return
-        self._retry_lookup_logged = now
-        stats = self._retry_lookup_stats
-        logger.info(
-            "[CONNECTOR] retry lookup reuse mode=%s reused=%d stale=%d "
-            "lookups=%d lookup_ms=%.3f epoch_rpcs=%d epoch_ms=%.3f",
-            self._reuse_retry_lookup,
-            stats["reused"],
-            stats["stale"],
-            stats["lookups"],
-            1000.0 * stats["lookup_s"] / max(1, stats["lookups"]),
-            stats["epoch_rpcs"],
-            1000.0 * stats["epoch_s"] / max(1, stats["epoch_rpcs"]),
-        )
 
     def _defer_deadlines(self) -> dict[str, float]:
         """Return per-request pending-lookup deadlines, creating the map lazily."""
