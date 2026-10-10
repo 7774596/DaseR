@@ -15,6 +15,7 @@ from daser.compression.format import PREFIX_GROUP_TILES
 from daser.config import (
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
+    LOAD_UNCHECKED_BOUNDS_ENV,
     LOAD_VECTOR_STORES_ENV,
     LOAD_WORD_READS_ENV,
 )
@@ -98,9 +99,10 @@ def _restore(
     return cache
 
 
+@pytest.mark.parametrize("unchecked", ["0", "1"])
 @pytest.mark.parametrize("lead", [0, 1, 2, 3])
 def test_word_reads_restore_misaligned_records_byte_exact(
-    monkeypatch: pytest.MonkeyPatch, lead: int
+    monkeypatch: pytest.MonkeyPatch, lead: int, unchecked: str
 ) -> None:
     """Records at every byte phase, the last ending at the extent, are exact."""
     geometry = _geometry()
@@ -118,6 +120,7 @@ def test_word_reads_restore_misaligned_records_byte_exact(
     offsets = [lead, len(first) + pad]
     staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
     monkeypatch.setenv(LOAD_WORD_READS_ENV, "1")
+    monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
     cache = _restore(staging, offsets, [1, 1], geometry, codebooks)
     for block, raw in enumerate(raws):
         assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
@@ -252,11 +255,21 @@ def test_grouped_prefix_records_restore_beside_version_one(
 
 
 @pytest.mark.parametrize(
-    ("word_reads", "groups", "register"),
-    [("0", "1", "0"), ("1", "1", "1"), ("1", "2", "1")],
+    ("word_reads", "groups", "register", "unchecked"),
+    [
+        ("0", "1", "0", "0"),
+        ("1", "1", "1", "0"),
+        ("1", "2", "1", "0"),
+        ("1", "1", "1", "1"),
+        ("1", "2", "0", "1"),
+    ],
 )
 def test_vector_stores_restore_byte_exact_with_fanout(
-    monkeypatch: pytest.MonkeyPatch, word_reads: str, groups: str, register: str
+    monkeypatch: pytest.MonkeyPatch,
+    word_reads: str,
+    groups: str,
+    register: str,
+    unchecked: str,
 ) -> None:
     """128-bit stores restore v2, raw and v1 records, a partial tile and fanout."""
     # 3 tokens x 1 head x 128 = 384 scalars: the second tile is half empty.
@@ -287,6 +300,7 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, groups)
     monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, register)
     monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
     cache = _cache(5, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=cache,

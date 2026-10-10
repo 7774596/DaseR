@@ -26,6 +26,7 @@ from typing import Any
 
 import tilelang
 import tilelang.language as T
+from tilelang.transform import PassConfigKey
 
 from daser.compression.format import IO_ALIGNMENT, slot_header_bytes
 
@@ -203,6 +204,7 @@ def compile_load_kernel(
     tile_groups: int = 1,
     register_codebook: bool = False,
     vector_stores: bool = False,
+    unchecked_bounds: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -228,6 +230,9 @@ def compile_load_kernel(
         vector_stores: Research variant of the 256-scalar word-parallel
             decoder that writes each lane's eight scalars as one 128-bit
             store. Requires a head dimension divisible by eight.
+        unchecked_bounds: Research variant of the 256-scalar word-parallel
+            decoder compiled without TileLang's per-access bounds guards;
+            reads are clamped explicitly instead. Requires ``word_reads``.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -263,13 +268,20 @@ def compile_load_kernel(
         tile_groups,
         register_codebook,
         vector_stores,
+        unchecked_bounds,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
     if tile_groups < 1:
         raise ValueError("TileLang load tile groups must be positive")
-    research = word_reads or tile_groups != 1 or register_codebook or vector_stores
+    research = (
+        word_reads
+        or tile_groups != 1
+        or register_codebook
+        or vector_stores
+        or unchecked_bounds
+    )
     if research and tile_scalars != 256:
         raise ValueError(
             "research load variants require the 256-scalar word-parallel load"
@@ -281,6 +293,7 @@ def compile_load_kernel(
             "tile_groups": tile_groups,
             "register_codebook": register_codebook,
             "vector_stores": vector_stores,
+            "unchecked_bounds": unchecked_bounds,
         }
         if tile_scalars == 256
         else {}
@@ -299,6 +312,11 @@ def compile_load_kernel(
         ),
         target="cuda",
         execution_backend="cython",
+        pass_configs=(
+            {PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True}
+            if unchecked_bounds
+            else None
+        ),
     )
     _LOAD_CACHE[key] = kernel
     return kernel
@@ -1382,6 +1400,7 @@ def _build_wordparallel_load(
     tile_groups: int = 1,
     register_codebook: bool = False,
     vector_stores: bool = False,
+    unchecked_bounds: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1410,9 +1429,19 @@ def _build_wordparallel_load(
     explicit multiple of eight scalars, which lets NVVM prove 16-byte
     alignment and emit one 128-bit store instead of four 32-bit stores.
     Requires a head dimension that is a multiple of eight.
+
+    ``unchecked_bounds`` builds the kernel for compilation without TileLang's
+    per-access bounds guards. Staging reads of packer-written records stay
+    inside the tensor without them: word reads clamp their indices, the raw
+    escape byte read is clamped here, and the host validates headers, raw
+    records, plane ranges and destination blocks before launch. Records are
+    trusted: corrupt descriptors are not range-checked. Requires
+    ``word_reads``.
     """
     if vector_stores and head_dim % 8:
         raise ValueError("vector stores require a head dimension divisible by 8")
+    if unchecked_bounds and not word_reads:
+        raise ValueError("unchecked bounds require word reads")
     head_words = head_dim // 8
     tile_ctas = ((tiles_per_plane + 7) // 8 + tile_groups - 1) // tile_groups
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
@@ -1725,12 +1754,14 @@ def _build_wordparallel_load(
                                         T.uint16,
                                     )
                                 else:
-                                    high = T.cast(
-                                        staging[
-                                            raw_bytes_start + raw_start + local_raw
-                                        ],
-                                        T.uint16,
+                                    raw_address = (
+                                        raw_bytes_start + raw_start + local_raw
                                     )
+                                    if unchecked_bounds:
+                                        raw_address = T.min(
+                                            raw_address, staging_extent - 1
+                                        )
+                                    high = T.cast(staging[raw_address], T.uint16)
                             elif code != 7:
                                 high = T.cast(
                                     codebooks[global_plane * _CODEBOOK_ENTRIES + code],

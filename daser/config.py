@@ -65,6 +65,11 @@ LOAD_REGISTER_CODEBOOK_ENV = "DASER_LOAD_REGISTER_CODEBOOK"
 #: Research switch: ``1`` makes the 256-scalar compressed load kernel write
 #: each lane's eight decoded scalars with one 128-bit store.
 LOAD_VECTOR_STORES_ENV = "DASER_LOAD_VECTOR_STORES"
+
+#: Research switch: ``1`` compiles the 256-scalar compressed load kernel without
+#: TileLang's per-access bounds guards (staging reads are clamped explicitly).
+#: Only takes effect together with ``DASER_LOAD_WORD_READS=1``.
+LOAD_UNCHECKED_BOUNDS_ENV = "DASER_LOAD_UNCHECKED_BOUNDS"
 #: Research switch for striped L2 reads: copy each stripe part to the
 #: destination as soon as its completion arrives instead of after the extent.
 STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
