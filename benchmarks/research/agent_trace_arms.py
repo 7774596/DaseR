@@ -61,8 +61,10 @@ ARMS = (
     "daser-compressed-piecewise",
     "daser-raw-layerwise",
     "daser-raw-piecewise",
-    # LMCache MP server (L1 + O_DIRECT fs L2) through its vLLM connector.
+    # LMCache MP server (L1 + O_DIRECT fs L2) through its vLLM connector,
+    # raw and with the DaseR lossless chunk codec (codec-patched checkout).
     "lmcache",
+    "lmcache-codec",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_MODES = ("none", "pass", "split", "fill")
@@ -503,6 +505,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Submit LMCache lookups when requests enter vLLM's waiting queue.",
     )
     parser.add_argument(
+        "--lmcache-pythonpath",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="LMCache checkout plus extra dependency dirs to put first on "
+        "PYTHONPATH (lmcache arms; default: the sibling LMCache checkout).",
+    )
+    parser.add_argument(
+        "--lmcache-codec-capacity",
+        type=float,
+        default=None,
+        help="Stored capacity fraction of a raw chunk (lmcache-codec arm only).",
+    )
+    parser.add_argument(
+        "--lmcache-codec-codebooks",
+        type=Path,
+        default=None,
+        help="Calibrated codebook directory (lmcache-codec arm only).",
+    )
+    parser.add_argument(
         "--vllm-extra-args",
         default="",
         help="Extra vllm serve arguments for every arm (shell-split).",
@@ -604,7 +626,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         backend=(
             "daser"
             if arm.startswith("daser")
-            else ("lmcache" if arm == "lmcache" else "vllm")
+            else ("lmcache" if arm.startswith("lmcache") else "vllm")
         ),
         model=args.model,
         store_dir=args.scratch / arm,
@@ -650,8 +672,20 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         lmcache_l2_native_workers=args.lmcache_l2_native_workers,
         lmcache_l2_bounded=args.lmcache_l2_bounded,
         lmcache_eager_prefetch=args.lmcache_eager_prefetch,
+        lmcache_daser_codec=arm == "lmcache-codec",
+        lmcache_codec_capacity=(
+            args.lmcache_codec_capacity if arm == "lmcache-codec" else None
+        ),
+        lmcache_codec_codebooks=(
+            args.lmcache_codec_codebooks if arm == "lmcache-codec" else None
+        ),
         extra_vllm_args=tuple(shlex.split(args.vllm_extra_args))
         + _speculative_args(args.speculative_config),
+        **(
+            {"lmcache_pythonpath": tuple(args.lmcache_pythonpath)}
+            if args.lmcache_pythonpath
+            else {}
+        ),
         **(
             {"lmcache_eviction_watermark": args.lmcache_eviction_watermark}
             if args.lmcache_eviction_watermark is not None
@@ -928,7 +962,7 @@ async def run_arm(
                     counter_trace.stop()
         daser_after = await _daser_metrics(arm, manager)
         vllm_after = await _vllm_metrics(manager)
-        if arm == "lmcache":
+        if arm.startswith("lmcache"):
             # LMCache L1/L2 occupancy and tier state after the replay.
             (out_dir / "lmcache_status_after.json").write_text(
                 await _text(f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status")
@@ -947,7 +981,7 @@ async def run_arm(
                 if arm.startswith("daser")
                 else (
                     manager.lmcache_kv_transfer_config()
-                    if arm == "lmcache"
+                    if arm.startswith("lmcache")
                     else (manager.offload_config() if arm in _SERVER_TYPES else None)
                 )
             ),

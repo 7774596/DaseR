@@ -72,6 +72,7 @@ from benchmarks.utils.prompts import (
     build_full_prompt,
 )
 from benchmarks.utils.servers import (
+    LMCACHE_CLI_MAIN,
     LMCACHE_MP_CONNECTOR_MODULE,
     LMCACHE_MP_CONNECTOR_NAME,
     LMCACHE_REPO_ROOT,
@@ -4178,3 +4179,77 @@ async def test_vllm_stream_counts_token_events_per_step() -> None:
 
     assert result.completion_tokens == 4
     assert result.token_events == 2
+
+
+def test_lmcache_server_runs_the_cli_module_of_the_configured_checkout(
+    tmp_path: Path,
+) -> None:
+    """The MP server is the LMCache CLI module of the PYTHONPATH checkout."""
+    checkout, deps = tmp_path / "lmcache-src", tmp_path / "deps"
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        lmcache_pythonpath=(checkout, deps),
+    )
+
+    cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
+    entries = manager.lmcache_process_env()["PYTHONPATH"].split(os.pathsep)
+
+    assert cmd[:4] == [sys.executable, "-c", LMCACHE_CLI_MAIN, "server"]
+    assert entries[:2] == [str(checkout), str(deps)]
+    assert "LMCACHE_DASER_CODEC" not in manager.lmcache_process_env()
+
+
+def test_lmcache_daser_codec_switches_reach_lmcache_processes(tmp_path: Path) -> None:
+    """The codec arm exports the switch, capacity class and codebook dir."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        lmcache_daser_codec=True,
+        lmcache_codec_capacity=0.72,
+        lmcache_codec_codebooks=tmp_path / "books",
+    )
+
+    env = manager.lmcache_process_env()
+
+    assert env["LMCACHE_DASER_CODEC"] == "1"
+    assert float(env["LMCACHE_DASER_CODEC_CAPACITY"]) == 0.72
+    assert env["LMCACHE_DASER_CODEC_CODEBOOKS"] == str(tmp_path / "books")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"lmcache_codec_capacity": 0.75},
+        {"lmcache_daser_codec": True, "lmcache_codec_capacity": 1.5},
+    ],
+)
+def test_lmcache_codec_options_are_validated(tmp_path: Path, options: dict) -> None:
+    """Codec options need the codec switch and a capacity in (0, 1]."""
+    with pytest.raises(ValueError):
+        ServerManager(
+            run_id="run1",
+            backend="lmcache",
+            model="/models/qwen",
+            store_dir=tmp_path,
+            gpu_id="2",
+            gpu_util=0.85,
+            max_num_seqs=32,
+            l1_size_bytes=1024**3,
+            l2_size_bytes=2 * 1024**3,
+            **options,
+        )

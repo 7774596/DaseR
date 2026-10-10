@@ -107,3 +107,24 @@ def test_stop_signal_is_forwarded_to_the_running_replay() -> None:
         if child.poll() is None:
             child.kill()
     assert stop.requested
+
+
+def test_lmcache_codec_arm_enables_the_codec_only_there(tmp_path: Path) -> None:
+    """``lmcache-codec`` is an LMCache arm with the codec; ``lmcache`` stays raw."""
+    args = parse_args(_args(tmp_path, "--lmcache-codec-capacity", "0.72"))
+
+    codec, raw = _manager("lmcache-codec", args), _manager("lmcache", args)
+
+    assert codec.backend == raw.backend == "lmcache"
+    assert codec.lmcache_daser_codec and codec.lmcache_codec_capacity == 0.72
+    assert not raw.lmcache_daser_codec and raw.lmcache_codec_capacity is None
+
+
+def test_lmcache_pythonpath_reaches_lmcache_arms(tmp_path: Path) -> None:
+    """``--lmcache-pythonpath`` selects the LMCache checkout and dependency dirs."""
+    paths = [str(tmp_path / "src"), str(tmp_path / "deps")]
+    args = parse_args(_args(tmp_path, "--lmcache-pythonpath", *paths))
+
+    assert [str(p) for p in _manager("lmcache-codec", args).lmcache_pythonpath] == (
+        paths
+    )

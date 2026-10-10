@@ -33,6 +33,7 @@ LMCACHE_MP_PORT = 5555
 LMCACHE_HTTP_PORT = 8080
 LMCACHE_MP_CONNECTOR_NAME = "DaseRBenchLMCacheMPConnector"
 LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
+LMCACHE_CLI_MAIN = "from lmcache.cli.main import main; main()"
 DEFAULT_DASER_PREFETCH_MAX_REQUESTS = 2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
@@ -441,6 +442,10 @@ class ServerManager:
         lmcache_l2_native_workers: int = 0,
         lmcache_l2_bounded: bool = False,
         lmcache_eager_prefetch: bool = False,
+        lmcache_pythonpath: tuple[Path, ...] = (LMCACHE_REPO_ROOT,),
+        lmcache_daser_codec: bool = False,
+        lmcache_codec_capacity: float | None = None,
+        lmcache_codec_codebooks: Path | None = None,
         extra_vllm_args: tuple[str, ...] = (),
     ) -> None:
         """Initialize the service manager.
@@ -502,6 +507,16 @@ class ServerManager:
             lmcache_eager_prefetch: submit LMCache's lookup (and its L2 to
                 L1 prefetch) when a request enters vLLM's waiting queue
                 instead of when the scheduler first considers it.
+            lmcache_pythonpath: entries put first on ``PYTHONPATH`` of the
+                LMCache server and its vLLM: the LMCache checkout to run, then
+                any directories holding its extra pure-Python dependencies.
+            lmcache_daser_codec: enable the DaseR lossless chunk codec of a
+                codec-patched LMCache checkout (``LMCACHE_DASER_CODEC=1``).
+            lmcache_codec_capacity: stored capacity class as a fraction of the
+                raw chunk (``LMCACHE_DASER_CODEC_CAPACITY``); ``None`` keeps
+                the LMCache-side default.
+            lmcache_codec_codebooks: calibrated codebook directory for the
+                codec; ``None`` uses the generic codebooks.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
@@ -525,6 +540,12 @@ class ServerManager:
             raise ValueError("online_pack_batch_slots must be positive")
         if lmcache_l2_bounded and lmcache_l2_native_workers <= 0:
             raise ValueError("lmcache_l2_bounded requires the fs_native L2 adapter")
+        if not lmcache_daser_codec and (
+            lmcache_codec_capacity is not None or lmcache_codec_codebooks is not None
+        ):
+            raise ValueError("LMCache codec options require lmcache_daser_codec")
+        if lmcache_codec_capacity is not None and not 0 < lmcache_codec_capacity <= 1:
+            raise ValueError("lmcache_codec_capacity must be in (0, 1]")
         if extra_vllm_gpu_ids and backend != "daser":
             raise ValueError("extra vLLM instances require the daser backend")
         self.run_id = run_id
@@ -558,6 +579,10 @@ class ServerManager:
         self.lmcache_l2_native_workers = lmcache_l2_native_workers
         self.lmcache_l2_bounded = lmcache_l2_bounded
         self.lmcache_eager_prefetch = lmcache_eager_prefetch
+        self.lmcache_pythonpath = lmcache_pythonpath
+        self.lmcache_daser_codec = lmcache_daser_codec
+        self.lmcache_codec_capacity = lmcache_codec_capacity
+        self.lmcache_codec_codebooks = lmcache_codec_codebooks
         self.daser_l1_accounting = daser_l1_accounting
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
@@ -665,8 +690,13 @@ class ServerManager:
             adapter is enabled.
         """
         l1_gb = bytes_to_lmcache_gb(self.l1_size_bytes)
+        # Run the CLI of the checkout on PYTHONPATH, the same LMCache the vLLM
+        # connector imports, rather than whatever is on PATH. Not every
+        # release makes lmcache.cli.main runnable with -m, so call main().
         cmd = [
-            "lmcache",
+            sys.executable,
+            "-c",
+            LMCACHE_CLI_MAIN,
             "server",
             "--host",
             "localhost",
@@ -769,17 +799,26 @@ class ServerManager:
         """Return environment overrides for LMCache benchmark subprocesses.
 
         Returns:
-            Environment entries that make the sibling ``../LMCache`` checkout
-            take precedence over installed LMCache packages and vLLM built-ins.
+            Environment entries that make the configured LMCache checkout
+            (by default the sibling ``../LMCache``) take precedence over
+            installed LMCache packages and vLLM built-ins, plus the codec
+            switches when the DaseR codec is enabled.
 
         Thread-safety:
             Reads the current process environment without mutating it.
         """
         pythonpath = os.environ.get("PYTHONPATH")
-        entries = [str(LMCACHE_REPO_ROOT), str(REPO_ROOT)]
+        entries = [*map(str, self.lmcache_pythonpath), str(REPO_ROOT)]
         if pythonpath:
             entries.append(pythonpath)
-        return {"PYTHONPATH": os.pathsep.join(entries)}
+        env = {"PYTHONPATH": os.pathsep.join(entries)}
+        if self.lmcache_daser_codec:
+            env["LMCACHE_DASER_CODEC"] = "1"
+            if self.lmcache_codec_capacity is not None:
+                env["LMCACHE_DASER_CODEC_CAPACITY"] = str(self.lmcache_codec_capacity)
+            if self.lmcache_codec_codebooks is not None:
+                env["LMCACHE_DASER_CODEC_CODEBOOKS"] = str(self.lmcache_codec_codebooks)
+        return env
 
     async def start_vllm_daser(self) -> None:
         """Start every vLLM instance with the DaseR connector.
