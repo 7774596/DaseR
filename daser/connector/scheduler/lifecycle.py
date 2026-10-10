@@ -111,8 +111,12 @@ class RequestLifecycle:
         arrival_readahead: bool = False,
         writeback_low_blocks: int = 0,
         decode_save: bool = False,
+        admit_trace: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
+        # Research switch: requests whose first lookup was traced, or None
+        # when admission tracing is off (see _trace_admit).
+        self._admit_traced: set[str] | None = set() if admit_trace else None
         # Why the last get_num_new_matched_tokens call returned None ("" when
         # it returned a count); read by the scheduler probe.
         self.last_defer_reason = ""
@@ -265,6 +269,7 @@ class RequestLifecycle:
             ``None`` count sets :attr:`last_defer_reason`.
         """
         self.last_defer_reason = ""
+        self._trace_admit("lookup", request.request_id)
         tokens = list(request.prompt_token_ids)
         self._req_tokens[request.request_id] = tokens
         if not getattr(self, "_runtime_config_ready", True):
@@ -582,6 +587,7 @@ class RequestLifecycle:
             num_external_tokens: tokens from DaseR (0 if miss).
         """
         req_id = request.request_id
+        self._trace_admit("alloc", req_id)
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
         getattr(self, "_retry_lookups", {}).pop(req_id, None)
 
@@ -984,6 +990,18 @@ class RequestLifecycle:
         if chunks is not None:
             deadlines.pop(request_id, None)
         return chunks
+
+    def _trace_admit(self, event: str, req_id: str) -> None:
+        """Log ``event`` for ``req_id`` with a monotonic timestamp if tracing.
+
+        ``lookup`` is logged once per request (its first call); allocation
+        retries do not repeat it. The clock matches the replay client's.
+        """
+        traced = getattr(self, "_admit_traced", None)
+        if traced is None or (event == "lookup" and req_id in traced):
+            return
+        traced.add(req_id)
+        logger.info("[ADMIT] %s %s t=%.3f", event, req_id, time.monotonic())
 
     def _lookup_versioned(
         self,
@@ -1708,6 +1726,7 @@ class RequestLifecycle:
             self._discard_pending_request(req_id)
         inflight_loads = getattr(self, "_inflight_loads", {})
         for req_id in getattr(connector_output, "finished_recving", None) or ():
+            self._trace_admit("loaded", req_id)
             landed = inflight_loads.get(req_id)
             if landed is not None:
                 inflight_loads[req_id] = (

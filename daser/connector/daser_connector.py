@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.config import (
+    ADMIT_TRACE_ENV,
     ARRIVAL_READAHEAD_ENV,
     DECODE_SAVE_ENV,
     STORAGE_FORMAT_RAW,
@@ -131,6 +132,7 @@ class DaserConnector(
                     os.environ.get(WRITEBACK_LOW_BLOCKS_ENV, "0") or 0
                 ),
                 decode_save=os.environ.get(DECODE_SAVE_ENV) == "1",
+                admit_trace=os.environ.get(ADMIT_TRACE_ENV) == "1",
             )
             self._request_lifecycle.refresh_runtime_config()
             self._scheduler_probe = SchedulerProbe.from_env()

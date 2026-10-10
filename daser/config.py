@@ -72,6 +72,9 @@ WRITEBACK_LOW_BLOCKS_ENV = "DASER_WRITEBACK_LOW_BLOCKS"
 #: KV blocks a finished request computed past its prompt (the generated
 #: tokens), so a next turn whose prompt replays that output can load it.
 DECODE_SAVE_ENV = "DASER_DECODE_SAVE"
+#: Research switch: ``1`` logs a monotonic timestamp per request at its first
+#: lookup, its block allocation and its load completion (scheduler side).
+ADMIT_TRACE_ENV = "DASER_ADMIT_TRACE"
 #: Research switch: issue L1-to-GPU copies with at least this many
 #: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
 GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
