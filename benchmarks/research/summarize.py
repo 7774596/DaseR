@@ -870,6 +870,59 @@ def concurrency_rows(arm_dirs: list[Path]) -> list[str]:
     return lines
 
 
+def lmcache_rows(arm_dirs: list[Path]) -> list[str]:
+    """Report the LMCache server configuration that was actually in effect.
+
+    Reads ``lmcache_status_after.json`` (written by LMCache arms) so a
+    baseline can be checked against the intended setup: chunk size equal to
+    the vLLM block size, the configured L1 capacity, the L1 eviction
+    watermark, and an attached L2 adapter.
+
+    Args:
+        arm_dirs: Arm directories; arms without the status file are skipped.
+
+    Returns:
+        One line per LMCache arm, tagged ``ANOMALY`` when the chunk size
+        differs from the engine's tokens per block, no L2 adapter is attached,
+        or the server reported itself unhealthy.
+    """
+    lines = []
+    for arm_dir in arm_dirs:
+        path = arm_dir / "lmcache_status_after.json"
+        if not path.is_file():
+            continue
+        status = json.loads(path.read_text())
+        storage = status.get("storage_manager", {})
+        l1 = storage.get("l1_manager", {})
+        eviction = storage.get("l1_eviction_controller", {})
+        adapters = storage.get("l2_adapters", [])
+        blocks = {
+            group.get("tokens_per_block")
+            for meta in status.get("cache_context_meta", {}).values()
+            for group in meta.get("kv_cache_layout", {}).get("kernel_groups", [])
+        }
+        chunk = status.get("chunk_size")
+        problems = []
+        if blocks and blocks != {chunk}:
+            problems.append(f"chunk {chunk} != block {sorted(blocks)}")
+        if not adapters:
+            problems.append("no L2 adapter")
+        if not status.get("is_healthy", False):
+            problems.append("unhealthy")
+        tag = f" ANOMALY: {'; '.join(problems)}" if problems else ""
+        l2 = ",".join(
+            f"{a.get('type')}(odirect={a.get('use_odirect')})" for a in adapters
+        )
+        lines.append(
+            f"  {arm_dir.parent.name}/{arm_dir.name}: chunk={chunk} "
+            f"l1_cfg={l1.get('memory_configured_bytes', 0) / 2**30:.1f}GiB "
+            f"l1_used={l1.get('memory_used_bytes', 0) / 2**30:.1f}GiB "
+            f"l1_objs={l1.get('total_object_count')} "
+            f"wm={eviction.get('trigger_watermark')} l2={l2 or '-'}{tag}"
+        )
+    return lines
+
+
 def live_clock_rows(arm_dirs: list[Path]) -> list[str]:
     """Check that the live-victim arena clock counted one tick per request.
 
@@ -1121,6 +1174,10 @@ def main() -> None:
     print("\n".join(order_rows(arm_dirs)))
     print("measured concurrency (send..completion)")
     print("\n".join(concurrency_rows(arm_dirs)))
+    lmcache = lmcache_rows(arm_dirs)
+    if lmcache:
+        print("LMCache server configuration in effect")
+        print("\n".join(lmcache))
     clocks = live_clock_rows(arm_dirs)
     if clocks:
         print("live-victim arena clock")

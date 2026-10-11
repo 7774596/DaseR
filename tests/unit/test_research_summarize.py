@@ -8,6 +8,7 @@ from benchmarks.research.summarize import (
     arm_row,
     decode_rows,
     live_clock_rows,
+    lmcache_rows,
     load_rows,
     order_rows,
     overlap_bound_rows,
@@ -502,3 +503,42 @@ def test_load_rows_report_ssd_read_contention(tmp_path: Path) -> None:
     )
     (line,) = load_rows([arm_dir])
     assert "ssd[1=10/5.0ms/2.00 8w=4/50.0ms/1.00]" in line
+
+
+def _lmcache_status(chunk: int, adapters: list[dict]) -> dict:
+    return {
+        "is_healthy": True,
+        "chunk_size": chunk,
+        "storage_manager": {
+            "l1_manager": {
+                "memory_configured_bytes": 16 * 2**30,
+                "memory_used_bytes": 2**30,
+                "total_object_count": 7,
+            },
+            "l1_eviction_controller": {"trigger_watermark": 0.45},
+            "l2_adapters": adapters,
+        },
+        "cache_context_meta": {
+            "1": {"kv_cache_layout": {"kernel_groups": [{"tokens_per_block": 128}]}}
+        },
+    }
+
+
+def test_lmcache_rows_report_effective_config(tmp_path: Path) -> None:
+    """LMCache arms report chunk, L1 and L2; mismatches are flagged."""
+    fs = [{"type": "FSL2Adapter", "use_odirect": True}]
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    raw = tmp_path / "raw"
+    for arm_dir in (good, bad, raw):
+        arm_dir.mkdir()
+    (good / "lmcache_status_after.json").write_text(
+        json.dumps(_lmcache_status(128, fs))
+    )
+    (bad / "lmcache_status_after.json").write_text(json.dumps(_lmcache_status(256, [])))
+    lines = lmcache_rows([good, bad, raw])
+    assert len(lines) == 2
+    assert "chunk=128 l1_cfg=16.0GiB l1_used=1.0GiB l1_objs=7 wm=0.45" in lines[0]
+    assert "FSL2Adapter(odirect=True)" in lines[0]
+    assert "ANOMALY" not in lines[0]
+    assert "ANOMALY: chunk 256 != block [128]; no L2 adapter" in lines[1]
