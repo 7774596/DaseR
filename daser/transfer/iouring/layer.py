@@ -3,17 +3,15 @@
 # Standard
 import asyncio
 import bisect
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-import heapq
 import time
 from typing import Any
 
 # First Party
 from daser.logging import init_logger
-from daser.replacement import ReplacementPolicy, SplitResidencyPolicy
+from daser.replacement import ReplacementPolicy
 from daser.replacement.bip import BIPReplacementPolicy
-from daser.replacement.next_use import NextUseReplacementPolicy
 from daser.transfer.base import (
     LeaseIncompleteError,
     PrefetchResult,
@@ -22,7 +20,6 @@ from daser.transfer.base import (
     TransferTier,
 )
 from daser.transfer.iouring import copy_ops
-from daser.transfer.iouring.device_stash import DeviceStash, StashRange
 from daser.transfer.iouring.l1_cache import L1Cache, L1RangeHit
 from daser.transfer.iouring.l2_engine import L2IoEngine
 from daser.transfer.iouring.native import NativeIOUring
@@ -42,24 +39,9 @@ _PACKED_READ_BATCH_BYTES = 128 * 1024 * 1024
 # promotion. Large coalesced extents continue through the splitting single-IO
 # API; neither path reads the holes between immutable packed records.
 _PACKED_READ_BATCH_COUNT = 64
-# Split-residency bypass reads: transient window size and windows in flight
-# (bounds the pinned bounce memory to 4 GiB per grouped load; large windows
-# keep the bypass at a few hundred SSD reads per pass).
-_BYPASS_WINDOW_BYTES = 256 * 1024 * 1024
-_BYPASS_WINDOWS_IN_FLIGHT = 16
-# Offset-class unit for the bypass: misses are split at these aligned
-# boundaries and each unit is admitted or bypassed as a whole, independent of
-# how request spans happen to coalesce.
-_BYPASS_CLASS_BYTES = 256 * 1024 * 1024
 # A readahead not consumed this long after it started lost its load (aborted
 # or trimmed request) and is reclaimed; it outlives a queued request's wait.
 _READAHEAD_LIFETIME_S = 120.0
-#: A device-stash fill waits this long after the last grouped load ended: one
-#: request loads as back-to-back staging-sized calls, so a shorter gap is
-#: still the same request's load and its host-to-device copies.
-_STASH_LOAD_QUIET_S = 0.25
-# Longest an L2 write waits for readahead reads to drain when yielding.
-_WRITE_YIELD_MAX_S = 2.0
 # Held bytes one preclean batch writes before the next idle check.
 _PRECLEAN_BATCH_BYTES = 1 << 30
 #: A promotion reservation still waiting after this long logs the tier state.
@@ -70,50 +52,21 @@ _POOL_RETRY_S = 0.05
 # Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
 # so a scan larger than L1 cannot flush the reused working set.
 _PACKED_L1_BIP_INTERVAL = 32
-# Idle reuse intervals after which next-use replacement treats data as dead.
-_NEXT_USE_OVERDUE = 1.5
 
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
 
 
-def _l1_replacement_policy(
-    bip_enabled: bool,
-    split_fraction: float,
-    l1_bytes: int,
-    split_granularity: int = _DIRECT_IO_ALIGNMENT,
-    next_use_clock: Callable[[], float] | None = None,
-    next_use_region: int = 0,
-) -> ReplacementPolicy[int] | None:
+def _l1_replacement_policy(bip_enabled: bool) -> ReplacementPolicy[int] | None:
     """Select the L1 allocation replacement policy.
 
     Args:
-        bip_enabled: Use BIP when split residency is off.
-        split_fraction: Split-residency protected byte budget as a share of
-            L1; 0 disables it.
-        l1_bytes: L1 capacity in accounted bytes.
-        split_granularity: Bytes per split-residency offset class.
-        next_use_clock: When given, use predicted-next-use replacement on
-            this clock when split residency is off; takes precedence over BIP.
-        next_use_region: L2 bytes per next-use history region; 0 keeps the
-            policy default.
+        bip_enabled: Use BIP instead of the L1 cache's default LRU.
 
     Returns:
         The policy instance, or None for the L1 cache's default LRU.
     """
-    if split_fraction > 0.0:
-        return SplitResidencyPolicy[int](
-            protect_fraction=split_fraction,
-            capacity_bytes=l1_bytes,
-            granularity=split_granularity,
-        )
-    if next_use_clock is not None:
-        return NextUseReplacementPolicy[int](
-            **({"region_bytes": next_use_region} if next_use_region > 0 else {}),
-            overdue_factor=_NEXT_USE_OVERDUE,
-            clock=next_use_clock,
-        )
     if bip_enabled:
         return BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
     return None
@@ -161,10 +114,6 @@ class _RequestLease:
     # (starts, ends, host bases) of ``hits`` for vectorized run lookup;
     # rebuilt lazily and cleared whenever ``hits`` changes.
     run_index: tuple[Any, Any, Any] | None = None
-    # A streaming prefetch is still promoting this lease's L2 misses; loads
-    # wait for coverage instead of failing on unattached ranges.
-    filling: bool = False
-    fill_error: BaseException | None = None
 
 
 @dataclass
@@ -178,10 +127,6 @@ class _Readahead:
     ranges: list[tuple[int, int]]
     pieces: list[tuple[list[tuple[int, int]], asyncio.Future[None]]]
     started: float
-    speculative: bool = False
-    # A speculative readahead a request readahead overlapped: its prediction
-    # came true and it now serves that request.
-    confirmed: bool = False
 
 
 class _ReadaheadStarved(Exception):
@@ -203,46 +148,8 @@ class _LoadPlan:
 
     total: int = 0
     misses: list[dict[str, int]] = field(default_factory=list)
-    bypass: list[dict[str, int]] = field(default_factory=list)
     pending: list[asyncio.Task[None]] = field(default_factory=list)
     copies: list[asyncio.Task[None]] = field(default_factory=list)
-
-
-class _PriorityGate:
-    """Grant a fixed number of slots, lowest priority value first.
-
-    Ties go to the earlier waiter. A waiter cancelled after its grant passes
-    the slot on, so no slot leaks. Event-loop confined.
-    """
-
-    def __init__(self, slots: int) -> None:
-        self._free = slots
-        self._seq = 0
-        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
-
-    async def acquire(self, priority: int) -> None:
-        """Wait for a slot; smaller ``priority`` values are served first."""
-        if self._free > 0 and not self._waiters:
-            self._free -= 1
-            return
-        future = asyncio.get_running_loop().create_future()
-        self._seq += 1
-        heapq.heappush(self._waiters, (priority, self._seq, future))
-        try:
-            await future
-        except asyncio.CancelledError:
-            if future.done() and not future.cancelled():
-                self.release()
-            raise
-
-    def release(self) -> None:
-        """Return a slot, handing it to the best live waiter if any."""
-        while self._waiters:
-            future = heapq.heappop(self._waiters)[2]
-            if not future.done():
-                future.set_result(None)
-                return
-        self._free += 1
 
 
 def _stripe_extents(nbytes: int, stripe_bytes: int) -> list[tuple[int, int]]:
@@ -393,85 +300,6 @@ def _resolve_from_hits(
     return chunks, uncovered
 
 
-def _stream_batches(
-    spans: list[dict[str, int]],
-    pieces: list[tuple[list[tuple[int, int]], asyncio.Future[None]]],
-) -> list[tuple[list[asyncio.Future[None]], list[dict[str, int]]]]:
-    """Split load spans into batches gated by the readahead pieces they need.
-
-    Args:
-        spans: Coalesced load spans with ``target_offset``, ``file_offset``,
-            ``nbytes`` and ``accounted_nbytes``.
-        pieces: In-flight readahead pieces in read order, each its physical
-            ranges and the future completed once they are retained.
-
-    Returns:
-        ``(futures, spans)`` batches ordered by the last piece each waits
-        for, so batches become ready roughly in read order. The batch that
-        needs no in-flight piece comes first with no futures. Every input
-        byte appears in exactly one batch; a span cut at piece boundaries
-        splits its capacity charge over the fragments.
-
-    Async/thread-safety:
-        Pure CPU planning; safe on the server event loop.
-    """
-    intervals = sorted(
-        (start, start + size, index)
-        for index, (ranges, _future) in enumerate(pieces)
-        for start, size in ranges
-    )
-    starts = [start for start, _end, _index in intervals]
-    longest = max((end - start for start, end, _index in intervals), default=0)
-    batches: dict[tuple[int, ...], list[dict[str, int]]] = {}
-    for span in spans:
-        file_offset = span["file_offset"]
-        end = file_offset + span["nbytes"]
-        covering = [
-            (max(start, file_offset), min(stop, end), index)
-            for start, stop, index in intervals[
-                bisect.bisect_left(starts, file_offset - longest) : bisect.bisect_left(
-                    starts, end
-                )
-            ]
-            if stop > file_offset
-        ]
-        cuts = sorted(
-            {file_offset, end}
-            | {cut for start, stop, _ in covering for cut in (start, stop)}
-        )
-        # [key, start, end] runs of bytes waiting on the same piece set.
-        runs: list[list[Any]] = []
-        for left, right in zip(cuts, cuts[1:], strict=False):
-            key = tuple(
-                sorted(
-                    {
-                        index
-                        for start, stop, index in covering
-                        if start < right and left < stop
-                    }
-                )
-            )
-            if runs and runs[-1][0] == key:
-                runs[-1][2] = right
-            else:
-                runs.append([key, left, right])
-        parts = [
-            {
-                "target_offset": span["target_offset"] + left - file_offset,
-                "file_offset": left,
-                "nbytes": right - left,
-                "accounted_nbytes": span["accounted_nbytes"],
-            }
-            for _key, left, right in runs
-        ]
-        if len(parts) > 1:
-            _assign_accounting_charges(parts, span["accounted_nbytes"], span["nbytes"])
-        for (key, _left, _right), part in zip(runs, parts, strict=True):
-            batches.setdefault(key, []).append(part)
-    ordered = sorted(batches.items(), key=lambda item: max(item[0], default=-1))
-    return [([pieces[index][1] for index in key], parts) for key, parts in ordered]
-
-
 def _clip_parts(
     parts: list[tuple[int, int, int, int, int]],
     window_start: int,
@@ -497,23 +325,6 @@ def _clip_parts(
         if start < end:
             clipped.append((target_offset + start - source_offset, start, end - start))
     return clipped
-
-
-def _misses_by_phase(misses: list[dict[str, int]]) -> list[list[dict[str, int]]]:
-    """Group prefetch misses by fill phase, lowest phase first.
-
-    Args:
-        misses: L2 miss entries carrying a ``phase`` key.
-
-    Returns:
-        One list per present phase, in phase order, of the misses without
-        their ``phase`` key; empty when there are no misses.
-    """
-    groups: dict[int, list[dict[str, int]]] = {}
-    for miss in misses:
-        entry = dict(miss)
-        groups.setdefault(int(entry.pop("phase", 0)), []).append(entry)
-    return [groups[phase] for phase in sorted(groups)]
 
 
 def _split_runs_at_slices(
@@ -632,38 +443,6 @@ def _normalize_accounted_ranges(
             continue
         merged.append(span)
     return merged
-
-
-def _split_at_units(miss: dict[str, int], unit: int) -> list[dict[str, int]]:
-    """Cut one miss at ``unit``-aligned file offsets, splitting its charge.
-
-    Args:
-        miss: Miss span with target_offset, file_offset, nbytes and
-            accounted_nbytes.
-        unit: Positive alignment in bytes.
-
-    Returns:
-        Fragments covering the same bytes in order, none crossing a unit
-        boundary; the original miss when it already fits in one unit.
-    """
-    start = int(miss["file_offset"])
-    end = start + int(miss["nbytes"])
-    cuts = list(range((start // unit + 1) * unit, end, unit))
-    if not cuts:
-        return [miss]
-    bounds = [start, *cuts, end]
-    fragments = [
-        {
-            "target_offset": int(miss["target_offset"]) + lo - start,
-            "file_offset": lo,
-            "nbytes": hi - lo,
-        }
-        for lo, hi in zip(bounds, bounds[1:], strict=False)
-    ]
-    _assign_accounting_charges(
-        fragments, int(miss["accounted_nbytes"]), int(miss["nbytes"])
-    )
-    return fragments
 
 
 def _assign_accounting_charges(
@@ -968,16 +747,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             limit into parts of about this many bytes submitted together on
             one ring, so a single request keeps many IOs in flight (0 keeps
             one serial read per extent).
-        l1_split_fraction: Research switch. When in ``(0, 1)``, L1 uses
-            split residency: a protected segment of this share of L1, filled
-            by offset hash and evicted only after all other allocations, so
-            every active prefix keeps a stable L1 share and its loads read
-            memory and SSD concurrently. 0 keeps the BIP/LRU policy selected
-            by ``bip_enabled``.
-        stripe_pipeline: Research switch. With striped L2 reads, copy each
-            stripe part to the load destination as soon as its completion
-            arrives, so host-to-device copies overlap the rest of the read
-            instead of starting after the whole extent.
         readahead_piece_bytes: Research switch. When positive, a lookup that
             hits L2 starts reading the request's external spans into L1 in
             groups of about this many bytes, ``readahead_window`` groups in
@@ -985,47 +754,14 @@ class TieredIOUringTransferLayer(TransferLayer):
             them. The SSD queue depth then no longer depends on how many
             worker staging buffers are in flight. 0 disables readahead.
         readahead_window: Read groups in flight per readahead.
-        readahead_stream: Research switch. A grouped load overlapping
-            in-flight readahead copies each piece's bytes to the destination
-            as soon as that piece is retained, instead of waiting for every
-            overlapping piece before the first copy.
         gather_min_runs: Research switch. When positive, an L1-to-CUDA copy
             with at least this many discontiguous runs is issued as one
             zero-copy gather kernel instead of one ``cudaMemcpyAsync`` per run,
             so small scattered pieces still reach PCIe bandwidth. 0 disables.
-        l1_split_bypass: Research switch, requires ``l1_split_fraction``.
-            Grouped-load L2 misses whose offset class is outside the protected
-            segment are read through transient pinned windows and copied to
-            the destination without entering L1, so SSD traffic for the
-            unprotected share of each prefix cannot evict protected ranges.
-        batch_dst_copies: Research switch. An L1-to-CUDA copy submits all
-            of its runs in one ``cudaMemcpyBatchAsync`` instead of one
-            ``cudaMemcpyAsync`` per run.
-        next_use_replacement: Research switch. L1 evicts the allocation whose
-            reuse-interval prediction of its next use is furthest away
-            (``NextUseReplacementPolicy``) instead of BIP/LRU. Intervals are
-            counted in registered readaheads (one per hitting lookup), not
-            wall time, so cold prefills do not stretch them.
-        skip_pinned_eviction: Research switch. L1 replacement passes over
-            allocations an L2 writer or lease still owns (see ``L1Cache``).
-        readahead_srpt: Research switch. Concurrent readaheads share one
-            window of ``readahead_window`` reads in flight instead of one
-            window each, and a free slot goes to the group whose readahead
-            has the fewest bytes left from that group on, so the shortest
-            request finishes its SSD reads first.
-        l2_write_yield: Research switch. An L2 write waits while any
-            readahead is still reading, at most ``_WRITE_YIELD_MAX_S``, so
-            store writeback does not share the SSD with the next request's
-            load; the written slice stays pinned in L1 meanwhile.
         l2_write_gate: Research switch. L2 writes run on their own executor
             and pause between 16 MiB pieces while any L2 read is in native IO
             (bounded per piece), covering writes already issued when a read
             starts; see ``L2IoEngine``.
-        readahead_tail_bypass: Research switch. A grouped load reads the
-            spans no readahead covers (the tail past the readahead budget)
-            through transient windows straight to the destination while it
-            waits for the covering readaheads, instead of promoting them
-            through L1 after the wait.
         held_preclean_fraction: Research switch (0 disables). Once held
             ranges exceed this fraction of L1, the oldest are written to L2
             while no readahead is reading (one batch at a time) and stay
@@ -1033,13 +769,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             memory without an SSD write.
         readahead_budget_fraction: Share of L1 that readahead leases may
             retain at once (default half).
-        device_stash_bytes: Research switch (0 disables). Size of a GPU
-            buffer that ``fill_device_stash`` fills with a predicted load's
-            stored bytes ahead of time; loads copy those bytes
-            device-to-device instead of host-to-device.
-        readahead_skip_stashed: Research switch. Readaheads skip spans the
-            device stash holds whole, so those bytes take neither SSD reads
-            nor readahead budget.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -1060,33 +789,17 @@ class TieredIOUringTransferLayer(TransferLayer):
         l1_accounting: str = "stored",
         prefetch_lease_budget_bytes: int = 0,
         l2_read_stripe_bytes: int = 0,
-        l1_split_fraction: float = 0.0,
-        stripe_pipeline: bool = False,
         readahead_piece_bytes: int = 0,
         readahead_window: int = 4,
-        readahead_stream: bool = False,
         gather_min_runs: int = 0,
-        l1_split_bypass: bool = False,
-        batch_dst_copies: bool = False,
-        next_use_replacement: bool = False,
-        skip_pinned_eviction: bool = False,
-        readahead_srpt: bool = False,
-        l2_write_yield: bool = False,
         l2_write_gate: bool = False,
-        readahead_tail_bypass: bool = False,
         held_preclean_fraction: float = 0.0,
         readahead_budget_fraction: float = 0.5,
-        device_stash_bytes: int = 0,
-        readahead_skip_stashed: bool = False,
     ) -> None:
         if not 0.0 < readahead_budget_fraction < 1.0:
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
-        if device_stash_bytes < 0:
-            raise ValueError("device_stash_bytes must be >= 0")
         if not 0.0 <= held_preclean_fraction < 1.0:
             raise ValueError("held_preclean_fraction must be in [0, 1)")
-        if l1_split_bypass and l1_split_fraction <= 0.0:
-            raise ValueError("l1_split_bypass requires l1_split_fraction > 0")
         if gather_min_runs < 0:
             raise ValueError("gather_min_runs must be >= 0")
         if readahead_piece_bytes < 0 or readahead_window <= 0:
@@ -1101,8 +814,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        if not 0.0 <= l1_split_fraction < 1.0:
-            raise ValueError("l1_split_fraction must be in [0, 1)")
         if l1_accounting not in ("stored", "raw"):
             raise ValueError("l1_accounting must be 'stored' or 'raw'")
         if not 0 <= prefetch_lease_budget_bytes <= l1_bytes:
@@ -1121,27 +832,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._prefetch_lease_budget = prefetch_lease_budget_bytes
         self._l2_read_stripe = l2_read_stripe_bytes
-        self._stripe_pipeline = bool(stripe_pipeline)
         self._readahead_piece = 0 if skip_l2 else readahead_piece_bytes
         self._readahead_window = readahead_window
         self._readahead_budget = int(l1_bytes * readahead_budget_fraction)
-        self._readahead_stream = bool(readahead_stream)
         self._gather_min_runs = gather_min_runs
-        self._batch_dst_copies = bool(batch_dst_copies)
-        # Logical clock of the next-use policy: registered readaheads.
-        self._lookup_epoch = 0
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
         self._readahead_seq = 0
-        # Shared shortest-remaining-first window, or None for one each.
-        self._readahead_gate = (
-            _PriorityGate(readahead_window) if readahead_srpt else None
-        )
         # Lease ID -> readahead reads in flight, for the contention count.
         self._readahead_reading: dict[str, int] = {}
-        self._l2_write_yield = bool(l2_write_yield)
-        self._readahead_tail_bypass = bool(readahead_tail_bypass) and not skip_l2
         # Running readaheads, and an event set while there are none.
         self._readahead_running = 0
         self._readahead_idle = asyncio.Event()
@@ -1168,77 +868,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._request_leases: dict[str, _RequestLease] = {}
         self._leased_slices: dict[int, tuple[PinnedMemorySlice, int]] = {}
         self._pending_h2d: set[asyncio.Task[None]] = set()
-        self._device_stash = (
-            DeviceStash(device_stash_bytes) if device_stash_bytes else None
-        )
-        self._readahead_skip_stashed = bool(readahead_skip_stashed)
-        # CUDA device of the load destinations, fixed by the first one.
-        self._stash_device: int | None = None
-        # Grouped loads in flight and when the last one ended, so a stash
-        # fill neither shares PCIe with nor unpublishes a running load.
+        # Grouped loads in flight, reported by ``debug_state``.
         self._loads_active = 0
-        self._last_load_end = 0.0
-        # With the bypass, offset classes are whole aligned units so the
-        # class of an L1 entry equals the admission class of its first unit.
-        self._bypass_class = (
-            _BYPASS_CLASS_BYTES if l1_split_bypass else _DIRECT_IO_ALIGNMENT
-        )
-        policy = _l1_replacement_policy(
-            self.bip_enabled,
-            l1_split_fraction,
-            l1_bytes,
-            self._bypass_class,
-            self._lookup_epoch_now if next_use_replacement else None,
-            # History follows the readahead piece, the unit L1 promotes.
-            self._readahead_piece,
-        )
-        # Split policy consulted for L1-bypass admission; None keeps every
-        # L2 miss on the promotion path.
-        self._bypass_policy = (
-            policy
-            if l1_split_bypass and isinstance(policy, SplitResidencyPolicy)
-            else None
-        )
-        # Windows in flight fit in the unprotected share of L1, so bounce
-        # reservations evict probation rather than protected ranges.
-        unprotected = int(l1_bytes * (1.0 - l1_split_fraction))
-        self._bypass_unprotected = unprotected
-        self._bypass_window = max(
-            _DIRECT_IO_ALIGNMENT,
-            min(_BYPASS_WINDOW_BYTES, unprotected // _BYPASS_WINDOWS_IN_FLIGHT)
-            // _DIRECT_IO_ALIGNMENT
-            * _DIRECT_IO_ALIGNMENT,
-        )
-        self._bypass_in_flight = max(
-            1,
-            min(_BYPASS_WINDOWS_IN_FLIGHT, unprotected // self._bypass_window),
-        )
         self._l1 = L1Cache(
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
-            replacement_policy=policy,
-            skip_pinned_eviction=skip_pinned_eviction,
+            replacement_policy=_l1_replacement_policy(self.bip_enabled),
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
         # Signalled under ``_lock`` whenever a lease is dropped.
         self._lease_released = asyncio.Condition(self._lock)
-        # Signalled under ``_lock`` whenever a streaming fill attaches a phase
-        # to its lease or stops filling.
-        self._lease_progress = asyncio.Condition(self._lock)
-        # Background streaming fills, kept referenced until they finish.
-        self._fill_tasks: set[asyncio.Task[None]] = set()
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
-            "prefetch_lease_budget=%d l2_read_stripe=%d l1_split_fraction=%.3f "
-            "stripe_pipeline=%s readahead_piece=%d readahead_window=%d "
-            "readahead_stream=%s "
-            "gather_min_runs=%d l1_split_bypass=%s batch_dst_copies=%s "
-            "next_use_replacement=%s skip_pinned_eviction=%s readahead_srpt=%s "
-            "l2_write_yield=%s l2_write_gate=%s readahead_tail_bypass=%s "
+            "prefetch_lease_budget=%d l2_read_stripe=%d readahead_piece=%d "
+            "readahead_window=%d gather_min_runs=%d l2_write_gate=%s "
             "held_preclean_limit=%d",
             path,
             l1_bytes,
@@ -1250,20 +897,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             self.l1_accounting,
             prefetch_lease_budget_bytes,
             l2_read_stripe_bytes,
-            l1_split_fraction,
-            self._stripe_pipeline,
             self._readahead_piece,
             self._readahead_window,
-            self._readahead_stream,
             self._gather_min_runs,
-            self._bypass_policy is not None,
-            self._batch_dst_copies,
-            next_use_replacement,
-            skip_pinned_eviction,
-            readahead_srpt,
-            self._l2_write_yield,
             l2_write_gate,
-            self._readahead_tail_bypass,
             self._held_preclean_limit,
         )
 
@@ -1352,64 +989,26 @@ class TieredIOUringTransferLayer(TransferLayer):
         # allocation is resolved in a single metadata walk.
         spans = _coalesce_load_spans(spans, self._l1_bytes)
         plan = _LoadPlan()
-        tail_task: asyncio.Task[int] | None = None
         mark = time.perf_counter()
         self._loads_active += 1
         try:
-            if self._readahead_stream and self._readaheads:
-                # Copy each readahead piece's bytes as soon as it is retained,
-                # so host-to-device copies overlap the remaining SSD reads.
-                for futures, batch in _stream_batches(
-                    spans, self._pending_readahead_pieces(spans)
-                ):
-                    if futures:
-                        await asyncio.gather(*futures)
-                    mark = self._add_phase_us("load_readahead_wait_us", mark)
-                    await self._resolve_load_batch(dst, batch, plan)
-                    mark = self._add_phase_us("load_resolve_us", mark)
-            else:
-                waited = spans
-                if self._readahead_tail_bypass and self._readaheads:
-                    waited, tail = self._split_readahead_tail(spans)
-                    if tail:
-                        # Uncovered spans start reading now, beside the wait.
-                        tail_task = asyncio.create_task(
-                            self._load_tail_bypass(dst, tail)
-                        )
-                if self._readaheads:
-                    await self._wait_for_readaheads(waited)
-                mark = self._add_phase_us("load_readahead_wait_us", mark)
-                await self._resolve_load_batch(dst, waited, plan)
-                mark = self._add_phase_us("load_resolve_us", mark)
+            if self._readaheads:
+                await self._wait_for_readaheads(spans)
+            mark = self._add_phase_us("load_readahead_wait_us", mark)
+            await self._resolve_load_batch(dst, spans, plan)
+            mark = self._add_phase_us("load_resolve_us", mark)
             if plan.pending:
                 await asyncio.gather(*plan.pending)
             mark = self._add_phase_us("load_pending_write_us", mark)
-            if plan.bypass:
-                # Both paths write disjoint destination ranges; collect every
-                # outcome so neither is still copying when an error surfaces.
-                results = await asyncio.gather(
-                    self._load_l2_misses_grouped(dst, plan.misses),
-                    self._load_l2_bypass(dst, plan.bypass),
-                    return_exceptions=True,
-                )
-                for result in results:
-                    if isinstance(result, BaseException):
-                        raise result
-            elif plan.misses:
+            if plan.misses:
                 await self._load_l2_misses_grouped(dst, plan.misses)
-            if tail_task is not None:
-                plan.total += await tail_task
             mark = self._add_phase_us("load_l2_us", mark)
         finally:
             try:
-                # The tail reads into ``dst`` too; never return while it runs.
-                if tail_task is not None and not tail_task.done():
-                    await asyncio.gather(tail_task, return_exceptions=True)
                 if plan.copies:
                     await _drain_destination_copies(plan.copies)
             finally:
                 self._loads_active -= 1
-                self._last_load_end = time.perf_counter()
         self._add_phase_us("load_copy_drain_us", mark)
         return plan.total
 
@@ -1827,60 +1426,38 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         spans: list[dict[str, int]],
         lease_id: str | None = None,
-        *,
-        streaming: bool = False,
     ) -> PrefetchResult:
         """Promote L2-missing portions of spans into the pinned L1 tier.
 
         Args:
             spans: Aligned storage spans containing ``file_offset`` and
-                ``nbytes``. An optional integer ``phase`` (default 0) orders
-                the L2 reads: every miss of phase k is read before phase k+1,
-                and spans of different phases never merge into one read.
+                ``nbytes``.
             lease_id: Optional request identifier that blocks overlapping
                 stores and retains promoted slices for the later GPU load.
-            streaming: Return once the lease is admitted and resolved
-                against L1; the L2 misses are then read in the background
-                phase by phase, each phase attached to the lease as it lands.
-                Requires ``lease_id``.
 
         Returns:
-            Requested bytes split between existing L1 data and L2 reads
-            (planned reads when ``streaming``).
+            Requested bytes split between existing L1 data and L2 reads.
 
         Raises:
             NotImplementedError: If the L2 tier is disabled.
-            ValueError: If ``streaming`` is set without ``lease_id``.
 
         Async/thread-safety:
             Metadata is protected by the transfer lock; io_uring reads are
-            awaited through the existing executor-backed read path. A
-            streaming fill runs as a task on the same event loop; a new
-            prefetch for its lease waits until it finished.
+            awaited through the existing executor-backed read path.
         """
         if self._l2 is None:
             raise NotImplementedError("prefetch requires the io_uring L2 tier")
-        if streaming and lease_id is None:
-            raise ValueError("streaming prefetch requires a lease")
 
         accounted_spans = [
             {
                 "file_offset": int(span["file_offset"]),
                 "nbytes": int(span["nbytes"]),
                 "accounted_nbytes": self._accounted_nbytes(span, int(span["nbytes"])),
-                "phase": int(span.get("phase", 0)),
             }
             for span in spans
             if int(span["nbytes"]) > 0
         ]
-        normalized_spans = [
-            {**span, "phase": phase}
-            for phase in sorted({span["phase"] for span in accounted_spans})
-            for span in _normalize_accounted_ranges(
-                [span for span in accounted_spans if span["phase"] == phase],
-                self._l1_bytes,
-            )
-        ]
+        normalized_spans = _normalize_accounted_ranges(accounted_spans, self._l1_bytes)
         requested_ranges = _normalize_ranges(accounted_spans)
         requested_bytes = sum(size for _start, size in requested_ranges)
         if lease_id is not None and requested_bytes > self._l1_bytes:
@@ -1905,11 +1482,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                     # leases whose ranges exceed L1 together could each hold
                     # part of the pool and wait for the other forever. Admit a
                     # lease only once its physical bytes fit beside the others.
-                    # A streaming fill still promoting into this lease would
-                    # attach its reads to the replacement.
-                    await self._lease_progress.wait_for(
-                        lambda: not self._lease_filling_locked(lease_id)
-                    )
                     await self._lease_released.wait_for(
                         lambda: (
                             self._leased_physical_bytes_locked(lease_id)
@@ -1963,7 +1535,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 "file_offset": int(miss["file_offset"]),
                                 "nbytes": int(miss["nbytes"]),
                                 "accounted_nbytes": int(miss["accounted_nbytes"]),
-                                "phase": span["phase"],
                             }
                             in_flight = self._find_pending_promotions_locked(
                                 entry["file_offset"], entry["nbytes"]
@@ -1984,28 +1555,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
             if pending:
                 await asyncio.gather(*set(pending))
-            phase_misses = _misses_by_phase(misses)
             l2_bytes = sum(int(miss["nbytes"]) for miss in misses)
-            if streaming and phase_misses:
-                assert lease_id is not None
-                async with self._lock:
-                    lease = self._request_leases.get(lease_id)
-                    if lease is None:
-                        raise RuntimeError(
-                            f"transfer lease was released during prefetch: {lease_id}"
-                        )
-                    lease.filling = True
-                    self._stats.prefetch_requests += 1
-                    self._stats.prefetch_l1_bytes += l1_bytes
-                    self._stats.prefetch_l2_bytes += l2_bytes
-                task = asyncio.create_task(
-                    self._fill_lease_phases(lease_id, lease, phase_misses)
-                )
-                self._fill_tasks.add(task)
-                task.add_done_callback(self._fill_tasks.discard)
-                return PrefetchResult(requested_bytes, l1_bytes, l2_bytes)
-            for group in phase_misses:
-                await self._load_l2_misses_grouped(None, group, lease_id=lease_id)
+            if misses:
+                await self._load_l2_misses_grouped(None, misses, lease_id=lease_id)
             async with self._lock:
                 if lease_id is not None:
                     self._require_complete_lease_locked(lease_id)
@@ -2027,127 +1579,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         await self._readahead_idle.wait()
 
-    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
-        """Replace the device stash with the L1-resident bytes of ``spans``.
-
-        Spans are taken in order (a load reads its prefix first) until the
-        stash is full; bytes not resident in L1 or in a readahead lease are
-        skipped. A later load on the stash's device copies stashed bytes
-        device-to-device. Stores that overlap a stashed range unpublish it,
-        including stores landing while this fill copies.
-
-        Args:
-            spans: Storage spans with ``file_offset`` and ``nbytes``.
-
-        Returns:
-            Bytes published in the stash; 0 when the stash is disabled or no
-            CUDA load has fixed its device yet.
-
-        Async/thread-safety:
-            Runs on the server event loop. It first waits until no grouped
-            load ran for ``_STASH_LOAD_QUIET_S`` (the current request's load
-            is over), then unpublishes the old ranges and waits for in-flight
-            destination copies (which may read the stash) before overwriting
-            it, then waits for its own host-to-device copy.
-        """
-        if self._device_stash is None or self._stash_device is None:
-            return 0
-        stash = self._device_stash
-        while (
-            self._loads_active
-            or time.perf_counter() - self._last_load_end < _STASH_LOAD_QUIET_S
-        ):
-            await asyncio.sleep(_STASH_LOAD_QUIET_S / 5)
-        async with self._lock:
-            stash.clear()
-            draining = list(self._pending_h2d)
-        if draining:
-            await asyncio.gather(*draining, return_exceptions=True)
-        ranges: list[StashRange] = []
-        copy_future: asyncio.Task[None] | None = None
-        async with self._lock:
-            self._raise_l2_error_locked()
-            target, view = stash.target(self._stash_device)
-            readahead_hits = self._readahead_hits_locked()
-            chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
-            cursor = 0
-            for span in spans:
-                room = stash.capacity_bytes - cursor
-                if room <= 0:
-                    break
-                file_offset = int(span["file_offset"])
-                nbytes = min(int(span["nbytes"]), room)
-                if nbytes <= 0:
-                    continue
-                leased, uncovered = _resolve_from_hits(
-                    readahead_hits, 0, file_offset, nbytes
-                )
-                # (physical offset, grouped-copy chunk) of every resident piece.
-                found = [(file_offset + chunk[0], chunk) for chunk in leased]
-                for _sub_target, sub_offset, sub_nbytes in uncovered:
-                    hits, _misses = self._l1.resolve_subranges(
-                        target_offset=0, file_offset=sub_offset, nbytes=sub_nbytes
-                    )
-                    found.extend(
-                        (
-                            sub_offset + hit.target_offset,
-                            (
-                                hit.target_offset,
-                                hit.data,
-                                hit.source_offset,
-                                hit.nbytes,
-                            ),
-                        )
-                        for hit in hits
-                    )
-                for physical, (_target, data, source_offset, size) in sorted(
-                    found, key=lambda item: item[0]
-                ):
-                    chunks.append((cursor, data, source_offset, size))
-                    ranges.append(StashRange(physical, size, view, cursor))
-                    cursor += size
-            if chunks:
-                stash.begin_fill()
-                copy_future = self._copy_grouped_to_dst(target, chunks)
-        try:
-            if copy_future is not None:
-                await copy_future
-        except BaseException:
-            async with self._lock:
-                stash.publish([])
-            raise
-        async with self._lock:
-            published = stash.publish(ranges)
-            self._stats.device_stash_filled_bytes += published
-        return published
-
-    async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
-        """Drop speculative readaheads that no kept prediction overlaps.
-
-        Args:
-            keep: Span lists of the predictions still expected.
-
-        Returns:
-            Number of speculative readaheads dropped.
-
-        Async/thread-safety:
-            Runs under the transfer lock on the server event loop.
-        """
-        kept = [_normalize_ranges(spans) for spans in keep]
-        async with self._lock:
-            stale = [
-                lease_id
-                for lease_id, item in self._readaheads.items()
-                if item.speculative
-                and not any(_sorted_ranges_overlap(item.ranges, k) for k in kept)
-            ]
-            for lease_id in stale:
-                self._drop_readahead_locked(lease_id, "stale")
-        return len(stale)
-
-    async def start_readahead(
-        self, spans: list[dict[str, int]], *, speculative: bool = False
-    ) -> bool:
+    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
         """Start reading a looked-up request's L2 spans into a retained lease.
 
         Resident bytes are retained at once; L2 misses are grouped into reads
@@ -2156,17 +1588,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         it and copies the retained bytes, falling back to the normal L1/L2
         path for anything the readahead did not cover.
 
-        A request readahead confirms the speculative readaheads it overlaps
-        and releases earlier confirmed ones it does not (their request's load
-        is over). It then drops other speculative readaheads, furthest
-        prediction first, until its own bytes fit the budget; speculative
-        readaheads that leave it room stay.
-
         Args:
             spans: Storage spans with ``file_offset``, ``nbytes`` and optional
                 ``accounted_nbytes``.
-            speculative: The spans belong to a predicted request rather than
-                a looked-up one.
 
         Returns:
             True when a new readahead was registered. False when readahead is
@@ -2209,8 +1633,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if now - item.started > _READAHEAD_LIFETIME_S
             ]:
                 self._drop_readahead_locked(lease_id, "expired")
-            if not speculative:
-                self._make_room_for_request_locked(accounted)
             covered = [rng for item in self._readaheads.values() for rng in item.ranges]
             budget = self._readahead_budget - self._readahead_bytes_locked()
             # Spans arrive in load order: read ahead the leading spans that
@@ -2218,8 +1640,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             # tail goes to the normal load path.
             kept: list[dict[str, int]] = []
             for span in accounted:
-                if self._stashed_locked(span["file_offset"], span["nbytes"]):
-                    continue
                 if not _subtract_ranges(
                     [(span["file_offset"], span["nbytes"])], covered
                 ):
@@ -2233,7 +1653,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             if not ranges:
                 return False
             self._readahead_seq += 1
-            self._lookup_epoch += 1
             lease_id = f"readahead-{self._readahead_seq}"
             self._replace_request_lease_locked(lease_id, ranges, [])
             misses: list[dict[str, Any]] = []
@@ -2267,26 +1686,19 @@ class TieredIOUringTransferLayer(TransferLayer):
                             "accounted_nbytes": int(miss["accounted_nbytes"]),
                         }
                     )
-            bypass = self._take_bypass_readahead(misses)
-            groups = [
-                (group, publish)
-                for selected, publish in ((misses, True), (bypass, False))
-                for group in _group_by_bytes(
-                    _coalesce_load_misses(
-                        selected, self._readahead_piece, preserve_targets=False
-                    ),
-                    self._readahead_piece,
-                )
-            ]
+            groups = _group_by_bytes(
+                _coalesce_load_misses(
+                    misses, self._readahead_piece, preserve_targets=False
+                ),
+                self._readahead_piece,
+            )
             loop = asyncio.get_running_loop()
             readahead = _Readahead(
                 ranges=ranges,
                 pieces=[
-                    (_normalize_ranges(group), loop.create_future())
-                    for group, _publish in groups
+                    (_normalize_ranges(group), loop.create_future()) for group in groups
                 ],
                 started=time.perf_counter(),
-                speculative=speculative,
             )
             self._readaheads[lease_id] = readahead
         if groups:
@@ -2379,15 +1791,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
         copy_future: asyncio.Task[None] | None = None
         async with self._lock:
-            await self._lease_progress.wait_for(
-                lambda: not self._lease_filling_locked(lease_id)
-            )
             self._raise_l2_error_locked()
             lease = self._request_leases.get(lease_id)
             if lease is None:
                 raise KeyError(f"unknown transfer lease: {lease_id}")
-            if lease.fill_error is not None:
-                raise lease.fill_error
             lease.active_loads += 1
             try:
                 for span in spans:
@@ -2467,37 +1874,28 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         targets = numpy.asarray(target_offsets, dtype=numpy.int64)
         async with self._lock:
-            while True:
-                self._raise_l2_error_locked()
-                lease = self._request_leases.get(lease_id)
-                if lease is None:
-                    raise KeyError(f"unknown transfer lease: {lease_id}")
-                if lease.fill_error is not None:
-                    raise lease.fill_error
-                if lease.run_index is None:
-                    hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
-                    starts = numpy.array(
-                        [hit.file_offset for hit in hits], dtype=numpy.int64
-                    )
-                    lease.run_index = (
-                        starts,
-                        starts
-                        + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64),
-                        numpy.array(
-                            [hit.data.ptr_at(hit.source_offset) for hit in hits],
-                            dtype=numpy.uint64,
-                        ),
-                    )
-                starts, ends, bases = lease.run_index
-                try:
-                    split = _split_runs_at_slices(files, targets, sizes, starts, ends)
-                    break
-                except KeyError:
-                    if not lease.filling:
-                        raise
-                # A streaming fill attaches the missing runs phase by phase.
-                await self._lease_progress.wait()
-            files, targets, sizes, index = split
+            self._raise_l2_error_locked()
+            lease = self._request_leases.get(lease_id)
+            if lease is None:
+                raise KeyError(f"unknown transfer lease: {lease_id}")
+            if lease.run_index is None:
+                hits = sorted(lease.hits, key=lambda hit: hit.file_offset)
+                starts = numpy.array(
+                    [hit.file_offset for hit in hits], dtype=numpy.int64
+                )
+                lease.run_index = (
+                    starts,
+                    starts
+                    + numpy.array([hit.nbytes for hit in hits], dtype=numpy.int64),
+                    numpy.array(
+                        [hit.data.ptr_at(hit.source_offset) for hit in hits],
+                        dtype=numpy.uint64,
+                    ),
+                )
+            starts, ends, bases = lease.run_index
+            files, targets, sizes, index = _split_runs_at_slices(
+                files, targets, sizes, starts, ends
+            )
             sources = bases[index] + (files - starts[index]).astype(numpy.uint64)
             # Pin the lease before enqueueing: a partial submission still
             # reads its slices, and the finally below releases the pin only
@@ -2549,21 +1947,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Idempotently release every remaining range for one request."""
         async with self._lock:
             self._release_request_lease_locked(lease_id)
-
-    def persist_held(self, ranges: list[tuple[int, int]]) -> None:
-        """Schedule L2 writes for held ranges; unknown ranges are ignored.
-
-        Args:
-            ranges: ``(file_offset, nbytes)`` keys of held packed spans.
-
-        Async/thread-safety:
-            Must run on the owning event loop. It does not await, so it is
-            atomic with respect to every locked metadata section.
-        """
-        for key in ranges:
-            data = self._pop_held(key)
-            if data is not None:
-                self._persist_locked(key, data)
 
     def discard_held(self, ranges: list[tuple[int, int]]) -> None:
         """Drop held ranges from L1 without writing them to L2.
@@ -2620,7 +2003,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Return in-flight loads, leases, readaheads and writes.
 
         Returns:
-            Counts plus per-lease ``(remaining bytes, active loads, filling)``.
+            Counts plus per-lease ``(remaining bytes, active loads)``.
 
         Async/thread-safety:
             Read from a diagnostic thread without the transfer lock; dicts are
@@ -2633,7 +2016,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                 lease_id: (
                     sum(size for _start, size in lease.remaining),
                     lease.active_loads,
-                    lease.filling,
                 )
                 for lease_id, lease in leases.items()
             },
@@ -2676,8 +2058,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             if not self._l1.contains_slice(pending_buffer):
                 pending_buffer.close()
         self._l1.close()
-        if self._device_stash is not None:
-            self._device_stash.close()
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
         """Return whether a writer, request lease or CUDA copy owns ``data``.
@@ -2979,19 +2359,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             data: Pinned host slice containing the immutable payload.
 
         Async/thread-safety:
-            Metadata locks are never held across this await. With
-            ``l2_write_yield`` the write first waits, bounded, for readahead
-            reads to drain.
+            Metadata locks are never held across this await.
         """
         if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
-        if self._l2_write_yield and not self._readahead_idle.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._readahead_idle.wait(), timeout=_WRITE_YIELD_MAX_S
-                )
-            except asyncio.TimeoutError:
-                pass
         if not self._readahead_idle.is_set():
             self._stats.l2_write_contended_bytes += len(data)
         await loop.run_in_executor(
@@ -3033,107 +2404,13 @@ class TieredIOUringTransferLayer(TransferLayer):
             await self._load_l2_miss_batch(dst, batch, lease_id=lease_id)
             start += len(batch)
 
-    async def _load_l2_bypass(
-        self,
-        dst: Any,
-        misses: list[dict[str, Any]],
-    ) -> None:
-        """Read L2 misses through transient pinned windows that skip L1.
-
-        Each window is reserved untracked from the L1 pool (evicting
-        probation first), read, copied to ``dst`` and closed once the copy
-        completes, so it never becomes a resident allocation. At most
-        windows totalling at most the unprotected L1 share are pinned at a
-        time.
-        """
-        assert self._l2 is not None
-        windows = _coalesce_load_misses(
-            misses, self._bypass_window, preserve_targets=True
-        )
-        gate = asyncio.Semaphore(self._bypass_in_flight)
-
-        async def run(span: dict[str, Any]) -> None:
-            async with gate:
-                await self._load_bypass_window(dst, span)
-
-        results = await asyncio.gather(
-            *(run(span) for span in windows), return_exceptions=True
-        )
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
-    async def _load_bypass_window(self, dst: Any, span: dict[str, Any]) -> None:
-        """Read one coalesced bypass span into a transient slice and copy it."""
-        assert self._l2 is not None
-        loop = asyncio.get_event_loop()
-        start = int(span["file_offset"])
-        while True:
-            async with self._lock:
-                self._raise_l2_error_locked()
-                pinned = self._l1.reserve_untracked(int(span["nbytes"]))
-                if pinned is not None:
-                    # Own the slice like a lease so cleanup elsewhere keeps it.
-                    self._leased_slices[id(pinned)] = (pinned, 1)
-                    break
-                if self._reclaim_idle_readahead_locked():
-                    continue
-                waiter = loop.create_future()
-                self._l1.register_pool_waiter(waiter)
-            await asyncio.wait({waiter}, timeout=_POOL_RETRY_S)
-        read: asyncio.Future[int] | None = None
-        copy_future: asyncio.Task[None] | None = None
-        try:
-            read = loop.run_in_executor(
-                self._l2.executor,
-                self._l2.timed("read", self._read_l2_into),
-                start,
-                pinned,
-                self._next_uring(),
-            )
-            await read
-            parts = span.get("parts") or [span]
-            copy_future = self._copy_grouped_to_dst(
-                dst,
-                [
-                    (
-                        int(part["target_offset"]),
-                        pinned,
-                        int(part["file_offset"]) - start,
-                        int(part["nbytes"]),
-                    )
-                    for part in parts
-                ],
-            )
-            async with self._lock:
-                self._stats.l2_reads += 1
-                self._stats.l1_bypass_bytes += sum(int(p["nbytes"]) for p in parts)
-        finally:
-            # The executor thread may still own the pages after cancellation.
-            if read is not None and not read.done():
-                await asyncio.gather(read, return_exceptions=True)
-            try:
-                if copy_future is not None:
-                    await _drain_destination_copies([copy_future])
-            finally:
-                async with self._lock:
-                    self._release_slice_reference_locked(id(pinned))
-
     async def _load_l2_miss_batch(
         self,
         dst: Any | None,
         misses: list[dict[str, int]],
         lease_id: str | None = None,
-        *,
-        publish: bool = True,
     ) -> None:
-        """Read one bounded L2 miss batch and promote it to L1.
-
-        With ``publish=False`` (requires ``lease_id``) the reads are retained
-        by the lease only and never inserted into L1.
-        """
-        if not publish and lease_id is None:
-            raise ValueError("unpublished L2 reads need a lease to retain them")
+        """Read one bounded L2 miss batch and promote it to L1."""
         loop = asyncio.get_event_loop()
         if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
@@ -3145,14 +2422,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         batch_jobs: list[asyncio.Future[int]] = []
         copy_futures: list[asyncio.Task[None]] = []
         queued: list[tuple[dict[str, int], PinnedMemorySlice, int, int]] = []
-        # Stripe pipeline: per-part completion -> (owning read future, window
-        # relative to the read). Reads in ``pipelined`` copy part by part, and
-        # ``copied`` holds the windows already sent to ``dst``.
-        stripe_parts: dict[asyncio.Future[int], tuple[asyncio.Future[int], int, int]]
-        stripe_parts = {}
-        pipelined: set[asyncio.Future[int]] = set()
-        copied: dict[asyncio.Future[int], list[tuple[int, int]]] = {}
-        retained: list[PinnedMemorySlice] = []
 
         def submit_queued() -> None:
             if not queued:
@@ -3209,7 +2478,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         processed: set[asyncio.Future[int]] = set()
 
         def outstanding() -> set[asyncio.Future[int]]:
-            return (set(future_to_read) | set(stripe_parts)) - processed
+            return set(future_to_read) - processed
 
         mark = time.perf_counter()
         try:
@@ -3258,22 +2527,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                             ]
                         )
                         batch_jobs.extend(parts)
-                        if self._stripe_pipeline and dst is not None:
-                            # Window copies borrow and release the unpublished
-                            # slice; hold one reference for the whole read so the
-                            # first finished DMA cannot close it before promotion.
-                            existing = self._leased_slices.get(id(pinned))
-                            self._leased_slices[id(pinned)] = (
-                                pinned,
-                                1 if existing is None else existing[1] + 1,
-                            )
-                            retained.append(pinned)
-                            pipelined.add(future)
-                            copied[future] = []
-                            for part_future, (offset, size) in zip(
-                                parts, extents, strict=True
-                            ):
-                                stripe_parts[part_future] = (future, offset, size)
                     else:
                         future = loop.run_in_executor(
                             self._l2.executor,
@@ -3295,37 +2548,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                     processed.update(done)
                     for future in done:
                         future.result()
-                        if future in stripe_parts:
-                            owner, offset, size = stripe_parts[future]
-                            if owner in copied:
-                                span, pinned, _promotion_id, _epoch = future_to_read[
-                                    owner
-                                ]
-                                self._copy_stripe_window(
-                                    dst,
-                                    pinned,
-                                    parts_for(span),
-                                    offset,
-                                    size,
-                                    copy_futures,
-                                )
-                                copied[owner].append((offset, size))
-                            continue
                         span, pinned, promotion_id, epoch = future_to_read[future]
                         parts = parts_for(span)
-                        if future in pipelined:
-                            # The extent is complete: copy any stripe windows whose
-                            # completion has not been processed yet, then stop
-                            # pipelining for this read.
-                            done_windows = set(copied.pop(future))
-                            for offset, size in _stripe_extents(
-                                int(span["nbytes"]), self._l2_read_stripe
-                            ):
-                                if (offset, size) not in done_windows:
-                                    self._copy_stripe_window(
-                                        dst, pinned, parts, offset, size, copy_futures
-                                    )
-                        elif dst is not None:
+                        if dst is not None:
                             # One physical read can represent several disjoint
                             # logical records. Submit those records as one grouped
                             # destination copy so the CUDA IPC copy path records
@@ -3361,17 +2586,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                                     file_offset, nbytes, epoch
                                 )
                             ]
-                            if not publish:
-                                assert lease_id is not None
-                                self._attach_unpublished_locked(
-                                    lease_id,
-                                    pinned,
-                                    int(span["file_offset"]),
-                                    parts,
-                                    stale_parts,
-                                )
-                                self._finish_l1_promotion_locked(promotion_id)
-                                continue
                             # A contiguous coalesced extent is one immutable L1
                             # object. Keeping that parent instead of one child
                             # slice per packed record lets later grouped H2D loads
@@ -3486,14 +2700,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                     await _drain_destination_copies(copy_futures)
             finally:
                 async with self._lock:
-                    # Drop the pipelined-read references without closing: the
-                    # residency check below decides which buffers to close.
-                    for pinned in retained:
-                        data, count = self._leased_slices[id(pinned)]
-                        if count > 1:
-                            self._leased_slices[id(pinned)] = (data, count - 1)
-                        else:
-                            del self._leased_slices[id(pinned)]
                     live_buffers = self._l1.resident_slice_ids() | set(
                         self._leased_slices
                     )
@@ -3536,28 +2742,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise RuntimeError("io_uring rings are disabled when skip_l2 is true")
         return self._l2.next_uring()
 
-    def _copy_stripe_window(
-        self,
-        dst: Any,
-        pinned: PinnedMemorySlice,
-        parts: list[tuple[int, int, int, int, int]],
-        window_start: int,
-        window_size: int,
-        copy_futures: list[asyncio.Task[None]],
-    ) -> None:
-        """Copy the record bytes of one completed stripe window to ``dst``."""
-        chunks = [
-            (target_offset, pinned, source_offset, nbytes)
-            for target_offset, source_offset, nbytes in _clip_parts(
-                parts, window_start, window_size
-            )
-        ]
-        if not chunks:
-            return
-        copy_future = self._copy_grouped_to_dst(dst, chunks)
-        if copy_future is not None:
-            copy_futures.append(copy_future)
-
     def _copy_grouped_to_dst(
         self,
         dst: Any,
@@ -3580,9 +2764,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         error: BaseException | None = None
         try:
-            runs = copy_ops.copy_grouped_to_dst(
-                dst, chunks, self._gather_min_runs, self._batch_dst_copies
-            )
+            runs = copy_ops.copy_grouped_to_dst(dst, chunks, self._gather_min_runs)
             self._stats.dst_copies += 1
             self._stats.dst_copy_runs += runs
             self._stats.dst_copy_bytes += sum(chunk[3] for chunk in chunks)
@@ -3978,40 +3160,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             else:
                 self._leased_slices[data_id] = (existing[0], existing[1] + 1)
 
-    def _attach_unpublished_locked(
-        self,
-        lease_id: str,
-        pinned: PinnedMemorySlice,
-        read_offset: int,
-        parts: list[tuple[int, int, int, int, int]],
-        stale_parts: list[tuple[int, int]],
-    ) -> None:
-        """Retain one finished L2 read by a lease without inserting it in L1.
-
-        Parts overwritten by a newer store attach the resident copy instead.
-        """
-        hits: list[L1RangeHit] = []
-        fresh = 0
-        for _target, file_offset, nbytes, source_offset, _charge in parts:
-            if (file_offset, nbytes) in stale_parts:
-                resident, _missing = self._l1.resolve_subranges(
-                    target_offset=0, file_offset=file_offset, nbytes=nbytes
-                )
-                hits.extend(resident)
-                continue
-            hits.append(
-                L1RangeHit(
-                    target_offset=0,
-                    key=(read_offset, len(pinned)),
-                    data=pinned,
-                    source_offset=source_offset,
-                    nbytes=nbytes,
-                )
-            )
-            fresh += nbytes
-        self._attach_l1_hits_to_lease_locked(lease_id, hits)
-        self._stats.l1_bypass_bytes += fresh
-
     def _require_complete_lease_locked(self, lease_id: str) -> None:
         """Raise unless retained slice ranges cover the whole request lease."""
         lease = self._request_leases.get(lease_id)
@@ -4029,58 +3177,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise LeaseIncompleteError(
                 f"prefetch did not retain complete lease: {lease_id}"
             )
-
-    def _lease_filling_locked(self, lease_id: str) -> bool:
-        """Return whether a streaming fill still promotes into a lease."""
-        lease = self._request_leases.get(lease_id)
-        return lease is not None and lease.filling
-
-    async def _fill_lease_phases(
-        self,
-        lease_id: str,
-        lease: _RequestLease,
-        phase_misses: list[list[dict[str, int]]],
-    ) -> None:
-        """Promote a streaming lease's L2 misses one phase at a time.
-
-        Each phase is attached to the lease before the next one is read, so a
-        load waiting for that phase's runs wakes as soon as it lands. A
-        failure is recorded on the lease (waiting loads raise it) and the
-        lease is released.
-
-        Args:
-            lease_id: Request lease receiving the promoted slices.
-            lease: The lease object admitted for this fill.
-            phase_misses: L2 misses grouped by phase, in read order.
-
-        Async/thread-safety:
-            Runs as a task on the owning event loop; metadata updates and the
-            progress notifications happen under the transfer lock.
-        """
-        error: BaseException | None = None
-        try:
-            for group in phase_misses:
-                await self._load_l2_misses_grouped(None, group, lease_id=lease_id)
-                async with self._lock:
-                    self._lease_progress.notify_all()
-            async with self._lock:
-                if self._request_leases.get(lease_id) is lease:
-                    self._require_complete_lease_locked(lease_id)
-        except Exception as exc:  # noqa: BLE001
-            error = exc
-            logger.warning(
-                "[TRANSFER:iouring] streaming fill failed lease=%s: %s",
-                lease_id[:8],
-                exc,
-            )
-        finally:
-            async with self._lock:
-                lease.filling = False
-                if error is not None:
-                    lease.fill_error = error
-                    if self._request_leases.get(lease_id) is lease:
-                        self._release_request_lease_locked(lease_id)
-                self._lease_progress.notify_all()
 
     def _resolve_leased_range_locked(
         self,
@@ -4232,7 +3328,6 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Readahead leases are speculative: an overlapping store drops them
         instead of waiting, so an unconsumed readahead never blocks a writer.
-        The store also unpublishes the device-stash bytes it overwrites.
 
         Args:
             file_offset: Start of the store range.
@@ -4250,8 +3345,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             so callers wait with :meth:`_wait_lease_waiters`.
         """
         end = file_offset + nbytes
-        if self._device_stash is not None:
-            self._device_stash.invalidate(file_offset, nbytes)
         for lease_id in [
             lease_id
             for lease_id in self._readaheads
@@ -4270,11 +3363,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 start < end and file_offset < start + size
                 for start, size in lease.remaining
             )
-            and not (
-                retained_ok
-                and not lease.filling
-                and _lease_retains_range(lease, file_offset, nbytes)
-            )
+            and not (retained_ok and _lease_retains_range(lease, file_offset, nbytes))
         ]
 
     async def _wait_for_overlapping_leases(
@@ -4326,42 +3415,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         return since
 
-    def _take_bypass_readahead(
-        self, misses: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Move bypassed readahead misses out of ``misses`` (in place).
-
-        Returns the leading bypassed fragments that fit half the unprotected
-        L1 share; they are read into lease-only slices that never enter L1.
-        Later bypassed fragments are dropped from the readahead and left to
-        the load path. Returns an empty list when the bypass is off.
-        """
-        if self._bypass_policy is None:
-            return []
-        admitted: list[dict[str, Any]] = []
-        bypass: list[dict[str, Any]] = []
-        budget = self._bypass_unprotected // 2
-        for miss in misses:
-            for fragment in _split_at_units(miss, self._bypass_class):
-                if self._bypass_policy.admits(fragment["file_offset"]):
-                    admitted.append(fragment)
-                elif budget >= int(fragment["nbytes"]):
-                    budget -= int(fragment["nbytes"])
-                    bypass.append(fragment)
-        misses[:] = admitted
-        return bypass
-
     async def _run_readahead(
         self,
         lease_id: str,
         readahead: _Readahead,
-        groups: list[tuple[list[dict[str, Any]], bool]],
+        groups: list[list[dict[str, Any]]],
     ) -> None:
-        """Read readahead groups in order with a bounded number in flight.
-
-        Each group carries whether its reads are published to L1 or retained
-        by the readahead lease only (split-residency bypass).
-        """
+        """Read readahead groups in order with a bounded number in flight."""
         await self._read_readahead_groups(lease_id, readahead, groups)
 
     def _readahead_task_done(self, task: asyncio.Task[None]) -> None:
@@ -4376,38 +3436,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         lease_id: str,
         readahead: _Readahead,
-        groups: list[tuple[list[dict[str, Any]], bool]],
+        groups: list[list[dict[str, Any]]],
     ) -> None:
         """Read the groups of one readahead and log its throughput."""
         window = asyncio.Semaphore(self._readahead_window)
         read_bytes = 0
         failed = 0
         # Physical L2 reads (one per coalesced miss) across all groups.
-        reads = sum(len(group) for group, _ in groups)
-        # Bytes left from each group on: the gate priority of that group.
-        sizes = [sum(int(miss["nbytes"]) for miss in group) for group, _ in groups]
-        remaining = [sum(sizes[index:]) for index in range(len(sizes))]
+        reads = sum(len(group) for group in groups)
 
         async def read(
-            index: int,
-            group: list[dict[str, Any]],
-            publish: bool,
-            future: asyncio.Future[None],
+            group: list[dict[str, Any]], future: asyncio.Future[None]
         ) -> None:
             nonlocal read_bytes, failed
             mark = time.perf_counter()
             try:
                 async with window:
                     self._add_phase_us("load_ra_window_us", mark)
-                    if self._readahead_gate is not None:
-                        await self._readahead_gate.acquire(remaining[index])
-                    try:
-                        read_bytes += await self._read_readahead_group(
-                            lease_id, group, publish
-                        )
-                    finally:
-                        if self._readahead_gate is not None:
-                            self._readahead_gate.release()
+                    read_bytes += await self._read_readahead_group(lease_id, group)
             except Exception as exc:  # noqa: BLE001
                 # A dropped lease or a stale range only costs the readahead:
                 # the waiting load re-resolves through the normal path.
@@ -4419,9 +3465,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         await asyncio.gather(
             *(
-                read(index, group, publish, future)
-                for index, ((group, publish), (_ranges, future)) in enumerate(
-                    zip(groups, readahead.pieces, strict=True)
+                read(group, future)
+                for group, (_ranges, future) in zip(
+                    groups, readahead.pieces, strict=True
                 )
             )
         )
@@ -4439,7 +3485,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
 
     async def _read_readahead_group(
-        self, lease_id: str, group: list[dict[str, Any]], publish: bool
+        self, lease_id: str, group: list[dict[str, Any]]
     ) -> int:
         """Read one readahead group into its lease and count contention.
 
@@ -4453,9 +3499,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         reading[lease_id] = reading.get(lease_id, 0) + 1
         contended = len(reading) > 1
         try:
-            await self._load_l2_miss_batch(
-                None, group, lease_id=lease_id, publish=publish
-            )
+            await self._load_l2_miss_batch(None, group, lease_id=lease_id)
             contended = contended or len(reading) > 1
         finally:
             reading[lease_id] -= 1
@@ -4473,14 +3517,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Resolve load spans against readahead leases and L1, under the lock.
 
         Retained and L1-resident bytes are submitted as one destination copy
-        appended to ``plan.copies``; L1 misses, bypassed fragments and the
-        pending L2 writes they must wait for are appended to ``plan``.
+        appended to ``plan.copies``; L1 misses and the pending L2 writes
+        they must wait for are appended to ``plan``.
         """
         merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         async with self._lock:
             self._raise_l2_error_locked()
             readahead_hits = self._readahead_hits_locked()
-            stash_hits = self._stash_hits_locked(dst)
             for span in spans:
                 target_offset = int(span.get("target_offset", 0))
                 file_offset = int(span["file_offset"])
@@ -4488,25 +3531,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                 accounted_nbytes = self._accounted_nbytes(span, nbytes)
                 self._check_range(file_offset, nbytes)
                 plan.total += nbytes
-                stashed, gaps = _resolve_from_hits(
-                    stash_hits, target_offset, file_offset, nbytes
+                leased, uncovered = _resolve_from_hits(
+                    readahead_hits, target_offset, file_offset, nbytes
                 )
-                if stashed:
-                    self._stats.device_stash_served_bytes += sum(
-                        chunk[3] for chunk in stashed
-                    )
-                    merged_l1.extend(stashed)
-                leased = []
-                uncovered = []
-                for gap_target, gap_offset, gap_nbytes in gaps:
-                    gap_leased, gap_uncovered = _resolve_from_hits(
-                        readahead_hits, gap_target, gap_offset, gap_nbytes
-                    )
-                    if gap_leased:
-                        self._l1.mark_read(gap_offset, gap_nbytes)
-                    leased.extend(gap_leased)
-                    uncovered.extend(gap_uncovered)
                 if leased:
+                    self._l1.mark_read(file_offset, nbytes)
                     self._stats.l1_hits += len(leased)
                     self._stats.readahead_served_bytes += sum(
                         chunk[3] for chunk in leased
@@ -4554,20 +3583,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                             int(miss["nbytes"]),
                         )
                     )
-                    entry = {
-                        "target_offset": int(miss["target_offset"]),
-                        "file_offset": int(miss["file_offset"]),
-                        "nbytes": int(miss["nbytes"]),
-                        "accounted_nbytes": int(miss["accounted_nbytes"]),
-                    }
-                    if self._bypass_policy is None:
-                        plan.misses.append(entry)
-                        continue
-                    for fragment in _split_at_units(entry, self._bypass_class):
-                        if self._bypass_policy.admits(fragment["file_offset"]):
-                            plan.misses.append(fragment)
-                        else:
-                            plan.bypass.append(fragment)
+                    plan.misses.append(
+                        {
+                            "target_offset": int(miss["target_offset"]),
+                            "file_offset": int(miss["file_offset"]),
+                            "nbytes": int(miss["nbytes"]),
+                            "accounted_nbytes": int(miss["accounted_nbytes"]),
+                        }
+                    )
             if merged_l1:
                 copy_future = self._copy_grouped_to_dst(dst, merged_l1)
                 if copy_future is not None:
@@ -4588,69 +3611,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             for piece_ranges, future in readahead.pieces
             if not future.done() and _ranges_overlap(piece_ranges, ranges)
         ]
-
-    def _split_readahead_tail(
-        self, spans: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split load spans into readahead-covered bytes and the uncovered tail.
-
-        Args:
-            spans: Coalesced load spans with destination offsets.
-
-        Returns:
-            ``(covered, tail)`` span fragments: bytes inside any readahead
-            range keep the normal wait-then-resolve path; bytes no readahead
-            covers can be read at once.
-        """
-        ranges = sorted(
-            rng for item in self._readaheads.values() for rng in item.ranges
-        )
-        covered: list[dict[str, Any]] = []
-        tail: list[dict[str, Any]] = []
-        for span in spans:
-            start = int(span["file_offset"])
-            nbytes = int(span["nbytes"])
-            outside = _subtract_ranges([(start, nbytes)], ranges)
-            inside = _subtract_ranges([(start, nbytes)], outside)
-            # Coalesced spans can straddle a readahead edge, so split by bytes;
-            # each fragment carries its share of the L1 accounting charge.
-            accounted = int(span.get("accounted_nbytes", nbytes))
-            for fragments, out in ((inside, covered), (outside, tail)):
-                for frag_start, frag_size in fragments:
-                    out.append(
-                        {
-                            "target_offset": int(span.get("target_offset", 0))
-                            + frag_start
-                            - start,
-                            "file_offset": frag_start,
-                            "nbytes": frag_size,
-                            "accounted_nbytes": accounted * frag_size // nbytes,
-                        }
-                    )
-        return covered, tail
-
-    async def _load_tail_bypass(self, dst: Any, tail: list[dict[str, Any]]) -> int:
-        """Load spans no readahead covers, reading L2 misses around L1.
-
-        L1-resident bytes are copied as usual; misses go through transient
-        windows straight to ``dst`` so they neither wait for the readaheads
-        nor compete with readahead leases for L1 residency.
-
-        Returns:
-            Bytes loaded.
-        """
-        plan = _LoadPlan()
-        try:
-            await self._resolve_load_batch(dst, tail, plan)
-            if plan.pending:
-                await asyncio.gather(*plan.pending)
-            misses = plan.misses + plan.bypass
-            if misses:
-                await self._load_l2_bypass(dst, misses)
-        finally:
-            if plan.copies:
-                await _drain_destination_copies(plan.copies)
-        return plan.total
 
     async def _wait_for_readaheads(self, spans: list[dict[str, Any]]) -> None:
         """Wait for in-flight readahead groups overlapping the load spans."""
@@ -4676,32 +3636,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         return now
 
-    def _stashed_locked(self, file_offset: int, nbytes: int) -> bool:
-        """Return whether readahead should skip a range the stash holds."""
-        return (
-            self._readahead_skip_stashed
-            and self._device_stash is not None
-            and self._device_stash.covers(file_offset, nbytes)
-        )
-
-    def _stash_hits_locked(self, dst: Any) -> tuple[list[int], list[StashRange]]:
-        """Return device-stash ranges usable for ``dst``, sorted by offset.
-
-        Only CUDA destinations on the stash's device read the stash; the
-        first CUDA destination fixes that device for later fills.
-        """
-        if self._device_stash is None:
-            return [], []
-        target = copy_ops.slice_dst(dst, 0, 0)
-        if copy_ops.cuda_array_ptr(target) is None:
-            return [], []
-        device_id = int(target.device.id)
-        if self._stash_device is None:
-            self._stash_device = device_id
-        if device_id != self._stash_device:
-            return [], []
-        return self._device_stash.hits()
-
     def _readahead_hits_locked(self) -> tuple[list[int], list[_LeasedSliceRange]]:
         """Return the retained readahead ranges sorted by physical offset."""
         self._prune_readaheads_locked()
@@ -4722,55 +3656,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             if lease is not None and _ranges_overlap(lease.remaining, removals):
                 self._consume_lease_ranges_locked(lease_id, removals)
         self._prune_readaheads_locked()
-
-    def _lookup_epoch_now(self) -> float:
-        """Return the next-use policy's logical time (readaheads so far)."""
-        return float(self._lookup_epoch)
-
-    def _make_room_for_request_locked(self, accounted: list[dict[str, int]]) -> None:
-        """Drop speculative readaheads a request readahead needs room from.
-
-        Speculative readaheads overlapping the request are its prediction
-        coming true: they become confirmed, so neither this nor
-        ``drop_speculative_except`` drops them while their request loads.
-        Confirmed readaheads this request does not overlap are dropped: with
-        one request scheduled at a time the next request's arrival ends the
-        confirmed one's load, and its remainder would only hold budget.
-        Other speculative readaheads are dropped newest first (the furthest
-        prediction) until the request's uncovered bytes fit the budget.
-        """
-        wanted = _normalize_ranges(accounted)
-        for lease_id, item in list(self._readaheads.items()):
-            if _sorted_ranges_overlap(item.ranges, wanted):
-                if item.speculative:
-                    # The prediction came true: the lease now serves this
-                    # request and later prediction rounds (which exclude it)
-                    # keep it.
-                    item.speculative = False
-                    item.confirmed = True
-            elif item.confirmed:
-                # The next request arrived, so the confirmed request's load
-                # is over; what it left is prefix the GPU cache served.
-                self._drop_readahead_locked(lease_id, "spent")
-        covered = [rng for item in self._readaheads.values() for rng in item.ranges]
-        unstashed = _normalize_ranges(
-            [
-                span
-                for span in accounted
-                if not self._stashed_locked(span["file_offset"], span["nbytes"])
-            ]
-        )
-        need = sum(size for _start, size in _subtract_ranges(unstashed, covered))
-        for lease_id in reversed(
-            [
-                lease_id
-                for lease_id, item in self._readaheads.items()
-                if item.speculative and not _sorted_ranges_overlap(item.ranges, wanted)
-            ]
-        ):
-            if self._readahead_budget - self._readahead_bytes_locked() >= need:
-                return
-            self._drop_readahead_locked(lease_id, "mispredicted")
 
     def _reclaim_idle_readahead_locked(self, exclude: str | None = None) -> bool:
         """Drop the oldest readahead with no read or load in flight.

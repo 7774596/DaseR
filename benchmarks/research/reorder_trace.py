@@ -17,9 +17,6 @@ import argparse
 from collections import Counter
 import json
 import random
-import struct
-
-from daser.server.session_predictor import SessionPredictor
 
 
 def _real_switch_sequence(
@@ -50,28 +47,8 @@ def _real_switch_sequence(
     return seq
 
 
-def _replay_accuracy(order: list[int], depth: int) -> float:
-    """Share of session switches whose session ``SessionPredictor`` predicted."""
-    pred = SessionPredictor()
-    turns: Counter[int] = Counter()
-    prompts: dict[bytes, int] = {}
-    predicted: set[int] = set()
-    hits = switches = 0
-    for index, sid in enumerate(order):
-        if index and turns[sid]:
-            switches += 1
-            hits += sid in predicted
-        tokens = [sid * 1_000_000 + i for i in range(8 * (turns[sid] + 1))]
-        packed = struct.pack(f"{len(tokens)}i", *tokens)
-        turns[sid] += 1
-        prompts[packed] = sid
-        pred.observe(packed, "m")
-        predicted = {prompts[p] for p, _m in pred.predict(depth)}
-    return hits / max(switches, 1)
-
-
 def main() -> None:
-    """Parse arguments, write the reordered trace and print its accuracy."""
+    """Parse arguments and write the reordered trace."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True, help="Input session trace (jsonl).")
     ap.add_argument("--cc-traces", required=True, help="cc-traces traces.jsonl.")
@@ -147,8 +124,6 @@ def main() -> None:
         f"{gaps[len(gaps) // 10]:.1f}/{gaps[len(gaps) // 2]:.1f}/"
         f"{gaps[len(gaps) * 9 // 10]:.1f}/{sum(gaps):.0f}"
     )
-    for depth in (1, 2, 3):
-        print(f"depth={depth} switch_accuracy={_replay_accuracy(order, depth):.3f}")
 
 
 if __name__ == "__main__":

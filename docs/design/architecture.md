@@ -321,16 +321,6 @@ transfer layer，默认开启，与 storage format 无关，保证 raw 和 compr
 LRU 端，每 32 个插入一个到 MRU 端，以抵抗一次性扫描。L2 miss 合并读始终开启：
 物理相邻的记录读在有界范围内合并成一次 io_uring 读。
 
-研究开关 `--l1-split-fraction F`（默认 0 关闭）把 L1 替换换成 split residency
-（`SplitResidencyPolicy`），并覆盖 BIP。循环复用的 agent 会话集合大于 L1 时，
-按 recency 的策略会整会话保留或整会话丢弃：一部分命中全在内存，其余全走 SSD。
-split residency 维护一个占 L1 `F` 份额的 protected 段（按字节记账），按存储偏移的
-稳定哈希准入；其余 allocation 进 LRU probation 段，总是先被逐出。protected 段
-满时，只有最老的 key 已陈旧（两倍容量的插入字节内未访问）才降级它；否则哈希值
-最高的 key 让位，因此 protected 集收敛到每个活跃前缀的最低哈希切片，与到达顺序
-无关。准入阈值在争用时下降、预算有余时上升。效果是每个活跃前缀都在 L1 保留稳定
-份额，一次 load 同时读内存和 SSD。
-
 vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
 `kv_connector_extra_config.storage_format` 可以声明期望的格式；server 返回的
 immutable `runtime_config.storage_format` 是最终真值，两者不一致时 connector

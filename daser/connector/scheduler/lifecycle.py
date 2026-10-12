@@ -186,8 +186,6 @@ class RequestLifecycle:
         # finished_recving.
         self._layerwise_load = layerwise_load
         self._layerwise_request_ids: set[str] = set()
-        self._finish_admission = False
-        self._written_chunks: dict[str, list[str]] = {}
         # In-flight load coalescing: vLLM only publishes externally loaded
         # blocks to its prefix cache after the load lands, so a concurrent
         # request for the same prefix would allocate and load its own copy.
@@ -1277,16 +1275,6 @@ class RequestLifecycle:
         ]
         self._maybe_allocate_pending_store(req_id, pending_store)
 
-    def _report_finish(self, request: "Request") -> None:
-        """Send the finished request's written chunks for L2 admission."""
-        chunk_keys = getattr(self, "_written_chunks", {}).pop(request.request_id, [])
-        if not chunk_keys:
-            return
-        try:
-            self._ipc_sync.finish_request(chunk_keys, int(request.num_output_tokens))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[CONNECTOR] finish_request failed: %s", exc)
-
     def _refresh_runtime_config(self) -> None:
         """Refresh scheduler geometry and reuse policy over owned sync IPC."""
         try:
@@ -1308,7 +1296,6 @@ class RequestLifecycle:
             )
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
-        self._finish_admission = bool(config.get("finish_admission", False))
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))
         if (
             cache_reuse_mode != self._cache_reuse_mode
@@ -1529,7 +1516,6 @@ class RequestLifecycle:
                 continue
             self._writeback_released.add(req_id)
             self._maybe_allocate_pending_store(req_id, pending_store)
-            self._report_finish(request)
             self._writeback_stats["saved"] += 1
         stats = self._writeback_stats
         if released and (stats["saved"] + stats["superseded"]) % 64 < len(released):
@@ -1702,12 +1688,6 @@ class RequestLifecycle:
                 alloc["num_slots"] = len(intent.block_ids)
                 alloc["block_ids"] = intent.block_ids
                 self._pending_stores[intent.req_id] = alloc
-                if getattr(self, "_finish_admission", False):
-                    # Prefix stores use synthetic "<req>:store:<i>" intent IDs;
-                    # the finish hint is keyed by the owning vLLM request.
-                    self._written_chunks.setdefault(req_id, []).append(
-                        alloc["chunk_key"]
-                    )
         pending_store.rolling_key = plan.next_key
         pending_store.rolling_slot_index = plan.next_slot
         if plan.complete:
@@ -1741,7 +1721,6 @@ class RequestLifecycle:
         decode_flush = getattr(self, "_decode_save", False) and self._plan_decode_save(
             request, block_ids
         )
-        self._report_finish(request)
         if decode_flush:
             self._decode_flush.add(request.request_id)
             return True, None

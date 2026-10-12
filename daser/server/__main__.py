@@ -267,15 +267,6 @@ def _parse_args() -> argparse.Namespace:
         "request; must be a multiple of 4 KiB (default 0: one serial read).",
     )
     parser.add_argument(
-        "--l1-split-fraction",
-        type=float,
-        default=0.0,
-        help="Research switch for --transfer-mode=iouring: reserve this share "
-        "of L1 for a protected segment filled by offset hash, so every active "
-        "prefix keeps a stable memory share and loads read memory and SSD "
-        "concurrently (default 0: off, BIP/LRU replacement).",
-    )
-    parser.add_argument(
         "--extra-kv-layers",
         type=int,
         default=0,
@@ -420,7 +411,6 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
         prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
         l2_read_stripe_bytes=int(getattr(args, "l2_read_stripe", 0)),
-        l1_split_fraction=float(getattr(args, "l1_split_fraction", 0.0)),
         extra_kv_layers=int(getattr(args, "extra_kv_layers", 0)),
     )
     slot_size = cfg.resolved_slot_size()

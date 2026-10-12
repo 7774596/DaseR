@@ -50,14 +50,13 @@ def test_delayed_h2d_preserves_unleased_source_during_pool_reuse(
         dst: Any,
         chunks: list[copy_ops.CopyChunk],
         gather_min_runs: int = 0,
-        batch: bool = False,
     ) -> int:
         if isinstance(dst, DeferredDestination):
             dst.chunks.extend(chunks)
             if outcome == "submit_error":
                 raise RuntimeError("partial DMA submission")
             return len(chunks)
-        return original_copy(dst, chunks, gather_min_runs, batch)
+        return original_copy(dst, chunks, gather_min_runs)
 
     def record(dst: DeferredDestination, completion: DeferredDestination) -> None:
         assert dst is completion
@@ -136,10 +135,9 @@ def test_failed_copy_drains_slow_sibling_before_load_returns(
         dst: Any,
         chunks: list[copy_ops.CopyChunk],
         gather_min_runs: int = 0,
-        batch: bool = False,
     ) -> int:
         if not isinstance(dst, DeferredDestination):
-            return original_copy(dst, chunks, gather_min_runs, batch)
+            return original_copy(dst, chunks, gather_min_runs)
         events[-1].chunks.extend(chunks)
         if len(events) == 1:
             raise RuntimeError("first copy submission failed")

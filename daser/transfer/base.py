@@ -33,14 +33,10 @@ class TransferStats:
             another readahead also had a read in flight.
         l2_write_contended_bytes: L2 write bytes submitted while a
             readahead was still reading.
-        device_stash_filled_bytes: bytes published in the device stash.
-        device_stash_served_bytes: load bytes copied from the device stash.
         promotion_wait_l2_write_us: time L2 promotions waited for L1 space
             on a pending L2 write that holds pool memory.
         promotion_wait_promotion_us: same, on another in-flight promotion.
         promotion_wait_pool_us: same, on a pool release.
-        l1_bypass_bytes: L2 load bytes read through transient windows that
-            never entered L1 (split-residency bypass).
         load_readahead_wait_us: grouped-load time spent waiting for in-flight
             readaheads that cover the requested spans.
         load_resolve_us: grouped-load time spent resolving spans against
@@ -84,12 +80,9 @@ class TransferStats:
     readahead_dropped_bytes: int = 0
     readahead_contended_bytes: int = 0
     l2_write_contended_bytes: int = 0
-    device_stash_filled_bytes: int = 0
-    device_stash_served_bytes: int = 0
     promotion_wait_l2_write_us: int = 0
     promotion_wait_promotion_us: int = 0
     promotion_wait_pool_us: int = 0
-    l1_bypass_bytes: int = 0
     load_readahead_wait_us: int = 0
     load_resolve_us: int = 0
     load_pending_write_us: int = 0
@@ -149,7 +142,7 @@ class TransferLayer(ABC):
     #: When True the server coalesces adjacent store spans before dispatch.
     coalesce_store_spans: bool = False
     #: When True, packed store spans carrying ``hold=True`` are published to
-    #: the memory tier only; their SSD write waits for ``persist_held``.
+    #: the memory tier only; their SSD write waits for L1 eviction.
     supports_held_stores: bool = False
 
     @property
@@ -286,19 +279,13 @@ class TransferLayer(ABC):
         self,
         spans: list[dict[str, int]],
         lease_id: str | None = None,
-        *,
-        streaming: bool = False,
     ) -> PrefetchResult:
         """Promote storage spans into an optional host-memory tier.
 
         Args:
-            spans: Storage spans containing ``file_offset`` and ``nbytes``,
-                optionally tagged with a fill ``phase``.
+            spans: Storage spans containing ``file_offset`` and ``nbytes``.
             lease_id: Optional request identifier whose promoted bytes must
                 remain stable until a later load consumes them.
-            streaming: Return once the lease is admitted and resolved and
-                fill its L2 misses in the background in ``phase`` order;
-                requires ``lease_id``.
 
         Returns:
             Byte attribution for the request.
@@ -312,16 +299,12 @@ class TransferLayer(ABC):
         """
         raise NotImplementedError("transfer backend does not support host prefetch")
 
-    async def start_readahead(
-        self, spans: list[dict[str, int]], *, speculative: bool = False
-    ) -> bool:
+    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
         """Begin reading a request's external spans ahead of its load.
 
         Args:
             spans: Storage spans containing ``file_offset``, ``nbytes`` and
                 optional ``accounted_nbytes``, in load order.
-            speculative: The spans belong to a predicted request; a later
-                request readahead may drop them when it does not overlap.
 
         Returns:
             True when background readahead was started; the default backend
@@ -332,34 +315,6 @@ class TransferLayer(ABC):
             the server event loop.
         """
         return False
-
-    async def drop_speculative_except(self, keep: list[list[dict[str, int]]]) -> int:
-        """Drop speculative readaheads that no kept prediction overlaps.
-
-        Args:
-            keep: Span lists of the predictions still expected.
-
-        Returns:
-            Number of speculative readaheads dropped; 0 for backends without
-            readahead.
-        """
-        del keep
-        return 0
-
-    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
-        """Copy a predicted load's stored bytes to the GPU ahead of time.
-
-        Args:
-            spans: Storage spans of the predicted load, in load order.
-
-        Returns:
-            Bytes stashed; 0 for backends without a device stash.
-
-        Async/thread-safety:
-            Implementations run on the server event loop.
-        """
-        del spans
-        return 0
 
     async def wait_readahead_idle(self) -> None:
         """Wait until no readahead is reading.
@@ -506,18 +461,6 @@ class TransferLayer(ABC):
             race with load completion safely.
         """
         return None
-
-    def persist_held(self, ranges: list[tuple[int, int]]) -> None:  # noqa: B027
-        """Schedule SSD writes for held memory-tier ranges.
-
-        Args:
-            ranges: ``(file_offset, nbytes)`` keys returned by a held store.
-                Ranges no longer held are ignored.
-
-        Async/thread-safety:
-            Must be called on the server event loop. Does not await; the
-            writes run in the background and are covered by ``drain``.
-        """
 
     def discard_held(self, ranges: list[tuple[int, int]]) -> None:  # noqa: B027
         """Drop held ranges without writing them to the SSD tier.

@@ -24,20 +24,6 @@ STORAGE_FORMATS = (
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
-#: Research switch for CLOCK second-chance eviction of the packed arena.
-ARENA_SECOND_CHANCE_ENV = "DASER_ARENA_SECOND_CHANCE"
-#: Logical ring headroom under second chance. Spared chunks leave skip holes
-#: behind the hand, so the ring must outlast the byte arena or its FIFO
-#: allocation eviction removes referenced chunks before the hand sees them.
-ARENA_SECOND_CHANCE_SLOT_FACTOR = 2
-#: Research switch for loop-aware eviction of the packed arena: a positive
-#: integer N makes chunks idle for more than N prompts go first (oldest
-#: allocation first), otherwise the newest chunk outside the current prompt.
-ARENA_LIVE_VICTIM_ENV = "DASER_ARENA_LIVE_VICTIM_IDLE"
-#: Logical ring headroom under live-victim eviction. Kept prefixes stay at the
-#: ring tail while churn happens near the head, so the ring must span several
-#: arenas or FIFO slot reuse sweeps the kept prefixes away.
-ARENA_LIVE_VICTIM_SLOT_FACTOR = 16
 #: Research switch for prefix-closed eviction: when FIFO capacity eviction
 #: removes a chunk, also remove its resident descendants, which no lookup can
 #: reach until the chunk is stored again.
@@ -76,16 +62,10 @@ LOAD_UNCHECKED_BOUNDS_ENV = "DASER_LOAD_UNCHECKED_BOUNDS"
 #: Only takes effect together with ``DASER_LOAD_WORD_READS=1`` and
 #: ``DASER_LOAD_VECTOR_STORES=1``.
 LOAD_BRANCHLESS_DECODE_ENV = "DASER_LOAD_BRANCHLESS_DECODE"
-#: Research switch for striped L2 reads: copy each stripe part to the
-#: destination as soon as its completion arrives instead of after the extent.
-STRIPE_PIPELINE_ENV = "DASER_STRIPE_PIPELINE"
 #: Research switch for lookup-triggered L2 readahead: read group size in
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
 LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
-#: Research switch: ``1`` makes a load copy each readahead piece as soon as it
-#: is retained, overlapping host-to-device copies with the remaining reads.
-LOAD_READAHEAD_STREAM_ENV = "DASER_LOAD_READAHEAD_STREAM"
 #: Research switch: ``1`` makes the scheduler connector send a readahead hint
 #: when a request enters vLLM's waiting queue, so its SSD read overlaps the
 #: requests ahead of it instead of starting when it is scheduled.
@@ -115,62 +95,17 @@ LAYERWISE_SLOTS_ENV = "DASER_LAYERWISE_SLOTS"
 #: Research switch: ``1`` times how long the forward stream idles at each
 #: layer's restore and logs the sum per layer-wise load as ``gpu_stall_ms``.
 LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
-#: Research switch: ``1`` submits each request-level L1-to-GPU copy as one
-#: ``cudaMemcpyBatchAsync`` over all its runs instead of one copy per run.
-BATCH_DST_COPY_ENV = "DASER_BATCH_DST_COPY"
-#: Research switch: ``1`` replaces the L1 policy with predicted-next-use
-#: eviction from per-L2-region reuse intervals.
-L1_NEXT_USE_ENV = "DASER_L1_NEXT_USE"
-#: Research switch: ``1`` makes L1 replacement skip allocations an L2 writer
-#: or lease still owns instead of dropping their residency.
-L1_SKIP_PINNED_ENV = "DASER_L1_SKIP_PINNED"
-#: Research switch: ``1`` makes readaheads share one window of reads in
-#: flight, granted to the readahead with the fewest bytes left.
-READAHEAD_SRPT_ENV = "DASER_READAHEAD_SRPT"
-#: Research switch: ``1`` holds L2 writes while a readahead is reading (up to
-#: a bounded delay), so writeback does not share the SSD with the next load.
-L2_WRITE_YIELD_ENV = "DASER_L2_WRITE_YIELD"
 #: Research switch: ``1`` runs L2 writes on their own executor in 16 MiB
 #: pieces that pause (bounded) while any L2 read is in native IO.
 L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
-#: Research switch: ``1`` reads load spans no readahead covers straight to the
-#: destination through transient windows while the load waits for readahead.
-READAHEAD_TAIL_BYPASS_ENV = "DASER_READAHEAD_TAIL_BYPASS"
 #: Research switch: fraction in (0, 1) of L1 that held (not yet written)
 #: ranges may fill before the oldest are written to L2 while no readahead is
 #: reading, so later evictions under a readahead free clean memory instead of
 #: writing to the SSD the readahead reads from.
 HELD_PRECLEAN_FRACTION_ENV = "DASER_HELD_PRECLEAN_FRACTION"
-#: Research switch: ``1`` predicts the agent session that returns next from
-#: the lookup stream and reads its stored prefix ahead after each load, so the
-#: SSD read overlaps the current request's prefill and decode.
-SESSION_PREFETCH_ENV = "DASER_SESSION_PREFETCH"
-#: Research switch: number of upcoming sessions the next-session prefetch
-#: reads ahead (default 1), soonest first, within the readahead budget.
-SESSION_PREFETCH_DEPTH_ENV = "DASER_SESSION_PREFETCH_DEPTH"
-#: Research switch: chance in [0, 1] that each next-session prediction is
-#: kept rather than replaced by a random wrong session (default 1.0).
-SESSION_PREDICT_ACCURACY_ENV = "DASER_SESSION_PREDICT_ACCURACY"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).
 READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
-#: Research switch: bytes of a GPU buffer the next-session prefetch fills
-#: with the soonest predicted session's stored bytes (default 0 = off).
-DEVICE_STASH_BYTES_ENV = "DASER_DEVICE_STASH_BYTES"
-#: Research switch: predicted sessions the device stash holds, soonest first
-#: (default 1).
-DEVICE_STASH_SESSIONS_ENV = "DASER_DEVICE_STASH_SESSIONS"
-#: Research switch: readaheads skip spans the device stash holds whole.
-READAHEAD_SKIP_STASHED_ENV = "DASER_READAHEAD_SKIP_STASHED"
-#: Research switch: byte phases K of a streaming lease prefetch (default 0 =
-#: off). The prefetch replies once the lease is admitted and resolved; L2
-#: misses fill in the background phase by phase (bytes [k/K, (k+1)/K) of
-#: every record), and leased run loads wait until their runs are covered.
-STREAMING_ADMISSION_PHASES_ENV = "DASER_STREAMING_ADMISSION_PHASES"
-#: Research switch for split residency (``--l1-split-fraction``): ``1`` reads
-#: L2 misses outside the protected class through transient pinned windows that
-#: never enter L1, so SSD traffic cannot evict the protected segment.
-L1_SPLIT_BYPASS_ENV = "DASER_L1_SPLIT_BYPASS"
 
 
 @dataclass(frozen=True)
@@ -243,19 +178,6 @@ class ModelGeometry:
             self.local_slot_size_for_block_tokens(block_tokens, tensor_parallel_size)
             * tensor_parallel_size
         )
-
-
-def arena_live_victim_idle() -> int:
-    """Return the live-victim idle threshold in prompts, 0 when disabled.
-
-    Reads ``DASER_ARENA_LIVE_VICTIM_IDLE``; unset, empty or non-positive values
-    disable loop-aware arena eviction.
-
-    Returns:
-        Idle threshold N (> 0) or 0.
-    """
-    value = os.environ.get(ARENA_LIVE_VICTIM_ENV, "")
-    return max(0, int(value)) if value else 0
 
 
 def _dtype_bytes(dtype: object) -> int:
@@ -381,8 +303,6 @@ class DaserConfig:
             in-flight scheduler prefetch leases in iouring mode (0 = no cap).
         l2_read_stripe_bytes: part size for splitting one large iouring L2
             read into concurrently submitted IOs (0 = one serial read).
-        l1_split_fraction: research switch for iouring L1 split residency;
-            protected-segment share of L1 (0 = off).
         extra_kv_layers: attention layers the vLLM worker registers beyond
             the model's own, for example an EAGLE drafter's; they share the
             target layers' KV shape and are stored in every slot.
@@ -406,7 +326,6 @@ class DaserConfig:
     l1_accounting: str = L1_ACCOUNTING_STORED
     prefetch_lease_budget_bytes: int = 0
     l2_read_stripe_bytes: int = 0
-    l1_split_fraction: float = 0.0
     extra_kv_layers: int = 0
 
     def __post_init__(self) -> None:
@@ -419,8 +338,6 @@ class DaserConfig:
             raise ValueError("prefetch_lease_budget_bytes must be non-negative")
         if self.l2_read_stripe_bytes < 0:
             raise ValueError("l2_read_stripe_bytes must be non-negative")
-        if not 0.0 <= self.l1_split_fraction < 1.0:
-            raise ValueError("l1_split_fraction must be in [0, 1)")
         if self.extra_kv_layers < 0:
             raise ValueError("extra_kv_layers must be non-negative")
 
@@ -461,12 +378,7 @@ class DaserConfig:
         packed_size = self.resolved_online_packed_slot_size()
         local_bytes = self.resolved_local_slot_size()
         logical_bytes = physical_slots * local_bytes
-        slots = max(physical_slots, logical_bytes // packed_size)
-        if os.environ.get(ARENA_SECOND_CHANCE_ENV) == "1":
-            slots *= ARENA_SECOND_CHANCE_SLOT_FACTOR
-        elif arena_live_victim_idle():
-            slots *= ARENA_LIVE_VICTIM_SLOT_FACTOR
-        return slots
+        return max(physical_slots, logical_bytes // packed_size)
 
     @property
     def physical_total_slots(self) -> int:
@@ -565,5 +477,4 @@ class DaserConfig:
             "l1_accounting": self.l1_accounting,
             "prefetch_lease_budget_bytes": self.prefetch_lease_budget_bytes,
             "l2_read_stripe_bytes": self.l2_read_stripe_bytes,
-            "l1_split_fraction": self.l1_split_fraction,
         }

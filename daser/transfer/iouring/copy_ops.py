@@ -536,7 +536,7 @@ def coalesce_copy_chunks(chunks: list[CopyChunk]) -> list[CopyChunk]:
 
 
 def copy_grouped_to_cuda_dst(
-    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0, batch: bool = False
+    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
 ) -> int:
     """Copy grouped pinned ranges into a CUDA destination.
 
@@ -546,9 +546,6 @@ def copy_grouped_to_cuda_dst(
         gather_min_runs: Use one zero-copy gather kernel instead of one
             ``cudaMemcpyAsync`` per run when at least this many merged runs
             remain and every run is 16-byte aligned (0 disables).
-        batch: Submit every run in one ``cudaMemcpyBatchAsync`` on the copy
-            engines instead of one ``cudaMemcpyAsync`` per run (needs a
-            private copy stream; gather takes precedence when it applies).
 
     Returns:
         Number of merged runs copied.
@@ -582,12 +579,6 @@ def copy_grouped_to_cuda_dst(
 
             _launch_gather(numpy.array(runs, dtype=numpy.uint64).T, stream_ptr)
             return len(runs)
-        if batch and stream_ptr and len(runs) > 1:
-            import numpy
-
-            table = numpy.array(runs, dtype=numpy.uint64).T
-            _launch_memcpy_batch(table[0], table[1], table[2], stream_ptr)
-            return len(runs)
         for dst_ptr, source_ptr, nbytes in runs:
             runtime.memcpyAsync(
                 dst_ptr, source_ptr, nbytes, runtime.memcpyHostToDevice, stream_ptr
@@ -596,7 +587,7 @@ def copy_grouped_to_cuda_dst(
 
 
 def copy_grouped_to_dst(
-    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0, batch: bool = False
+    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
 ) -> int:
     """Copy source chunks into the destination without staging repacks.
 
@@ -605,7 +596,6 @@ def copy_grouped_to_dst(
         chunks: grouped copy chunks from the L1 tier.
         gather_min_runs: CUDA destinations only; see
             ``copy_grouped_to_cuda_dst``.
-        batch: CUDA destinations only; see ``copy_grouped_to_cuda_dst``.
 
     Returns:
         Number of merged runs copied into a CUDA destination, else 0.
@@ -614,7 +604,7 @@ def copy_grouped_to_dst(
         return 0
     first_target = slice_dst(dst, chunks[0][0], chunks[0][3])
     if cuda_array_ptr(first_target) is not None:
-        return copy_grouped_to_cuda_dst(dst, chunks, gather_min_runs, batch)
+        return copy_grouped_to_cuda_dst(dst, chunks, gather_min_runs)
 
     for target_offset, data, source_offset, nbytes in coalesce_copy_chunks(chunks):
         target = slice_dst(dst, target_offset, nbytes)

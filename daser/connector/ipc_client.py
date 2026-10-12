@@ -528,21 +528,6 @@ class IPCClientSync(_IPCClientBase):
             raise RuntimeError("[IPC] invalid live_allocations response")
         return {str(key) for key in chunk_keys}
 
-    def finish_request(self, chunk_keys: list[str], output_tokens: int) -> None:
-        """Report a finished request's stored chunks for L2 admission.
-
-        Args:
-            chunk_keys: chunks allocated for the request's stores.
-            output_tokens: number of tokens the request generated.
-        """
-        self.call(
-            {
-                "op": "finish_request",
-                "chunk_keys": chunk_keys,
-                "output_tokens": output_tokens,
-            }
-        )
-
     def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from the DaseR index.
 

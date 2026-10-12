@@ -27,9 +27,7 @@ class _StreamDestination:
         return int(self.stream.ptr)
 
 
-def _scattered_copy(
-    piece: int, gather_min_runs: int, batch: bool = False
-) -> tuple[bytes, bytes, int]:
+def _scattered_copy(piece: int, gather_min_runs: int) -> tuple[bytes, bytes, int]:
     """Copy eight scattered pinned pieces to permuted GPU offsets.
 
     Returns the expected bytes, the GPU result and the reported run count.
@@ -54,7 +52,7 @@ def _scattered_copy(
             expected[target : target + nbytes] = view[offset : offset + nbytes]
         dst = cupy.zeros(count * piece, dtype=cupy.uint8)
         target = _StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
-        runs = copy_ops.copy_grouped_to_cuda_dst(target, chunks, gather_min_runs, batch)
+        runs = copy_ops.copy_grouped_to_cuda_dst(target, chunks, gather_min_runs)
         cupy.cuda.Device().synchronize()
         result = cupy.asnumpy(dst).tobytes()
         source.close()
@@ -114,13 +112,5 @@ def test_layer_gather_plan_copies_each_layer_group() -> None:
 def test_unaligned_pieces_fall_back_to_memcpy() -> None:
     """Pieces that are not 16-byte multiples still copy correctly."""
     expected, result, runs = _scattered_copy(4100, 2)
-    assert runs == 8
-    assert result == expected
-
-
-@pytest.mark.parametrize("piece", [4096, 4100])
-def test_batched_scattered_copy_matches_source(piece: int) -> None:
-    """One batched submission of every run lands the same bytes."""
-    expected, result, runs = _scattered_copy(piece, 0, batch=True)
     assert runs == 8
     assert result == expected

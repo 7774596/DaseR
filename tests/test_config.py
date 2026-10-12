@@ -154,50 +154,6 @@ def test_compressed_config_separates_logical_and_physical_capacity(
     assert cfg.runtime_config()["rank_stride_bytes"] == raw_slot * 4
 
 
-def test_second_chance_widens_only_the_logical_ring(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Second chance and live victim add logical headroom, not physical lanes."""
-    model_path = tmp_path / "model"
-    _write_model_config(
-        model_path,
-        {
-            "hidden_size": 1024,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 4,
-            "num_hidden_layers": 28,
-            "torch_dtype": "bfloat16",
-        },
-    )
-    raw_slot = 4 * 128 * 2 * 28 * BLOCK_TOKENS * 2
-
-    def build() -> DaserConfig:
-        return DaserConfig(
-            model_path=str(model_path),
-            storage_format=STORAGE_FORMAT_COMPRESSED_ONLINE,
-            block_tokens=BLOCK_TOKENS,
-            total_store_bytes=raw_slot * 4,
-        )
-
-    monkeypatch.delenv("DASER_ARENA_SECOND_CHANCE", raising=False)
-    base = build()
-    base_slots = base.total_slots
-    base_physical = base.physical_total_slots
-    monkeypatch.setenv("DASER_ARENA_SECOND_CHANCE", "1")
-    widened = build()
-
-    assert widened.total_slots == 2 * base_slots
-    assert widened.physical_total_slots == base_physical
-    assert widened.runtime_config()["rank_stride_bytes"] == raw_slot * 4
-
-    monkeypatch.delenv("DASER_ARENA_SECOND_CHANCE")
-    monkeypatch.setenv("DASER_ARENA_LIVE_VICTIM_IDLE", "8")
-    live = build()
-
-    assert live.total_slots == 16 * base_slots
-    assert live.physical_total_slots == base_physical
-
-
 def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
@@ -240,7 +196,6 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "l1_accounting": "stored",
         "prefetch_lease_budget_bytes": 0,
         "l2_read_stripe_bytes": 0,
-        "l1_split_fraction": 0.0,
     }
 
 

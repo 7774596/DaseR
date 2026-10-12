@@ -13,30 +13,14 @@ from typing import Any
 
 from daser import stalldump
 from daser.config import (
-    BATCH_DST_COPY_ENV,
-    DEVICE_STASH_BYTES_ENV,
-    DEVICE_STASH_SESSIONS_ENV,
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
     HELD_PRECLEAN_FRACTION_ENV,
-    L1_NEXT_USE_ENV,
-    L1_SKIP_PINNED_ENV,
-    L1_SPLIT_BYPASS_ENV,
     L2_WRITE_GATE_ENV,
-    L2_WRITE_YIELD_ENV,
     LOAD_READAHEAD_ENV,
-    LOAD_READAHEAD_STREAM_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
     READAHEAD_BUDGET_FRACTION_ENV,
-    READAHEAD_SKIP_STASHED_ENV,
-    READAHEAD_SRPT_ENV,
-    READAHEAD_TAIL_BYPASS_ENV,
-    SESSION_PREDICT_ACCURACY_ENV,
-    SESSION_PREFETCH_DEPTH_ENV,
-    SESSION_PREFETCH_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STREAMING_ADMISSION_PHASES_ENV,
-    STRIPE_PIPELINE_ENV,
 )
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
@@ -44,17 +28,8 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
-from daser.server.admission import (
-    DEFAULT_DENIED_L1_FRACTION,
-    FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
-    FINISH_ADMIT_GHOST_ENV,
-    FINISH_ADMIT_MIN_OUTPUT_ENV,
-    AdmissionActions,
-    FinishAdmission,
-)
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
-from daser.server.session_predictor import SessionPredictor
 from daser.transfer import LeaseIncompleteError, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -82,11 +57,6 @@ _LOAD_PHASES = (
     "l2_reserve",
     "l2_io",
 )
-
-# Research switch: when set to "1", every storage format retries a lookup that
-# overlaps an in-flight store writer (the online-compressed default). Unset
-# keeps raw lookups on immediate-miss semantics.
-LOOKUP_WAIT_PENDING_ENV = "DASER_LOOKUP_WAIT_PENDING"
 
 
 def _packed_physical_slot(span: dict[str, Any]) -> int:
@@ -306,65 +276,6 @@ def _prefetch_spans_from_chunks(
     return spans
 
 
-def _phase_prefetch_spans(
-    spans: list[dict[str, Any]],
-    *,
-    record_bytes: int,
-    phases: int,
-) -> list[dict[str, int]]:
-    """Split prefetch spans into per-record byte phases for a streaming fill.
-
-    A record stores its layers (layer groups for packed records) in file
-    order, so bytes ``[k/K, (k+1)/K)`` of every record hold roughly the k-th
-    K-th of the layers; tagging them ``phase=k`` lets the fill land layer
-    groups in the order the forward pass consumes them.
-
-    Args:
-        spans: Prefetch spans with ``file_offset``, ``nbytes`` and optional
-            ``accounted_nbytes``. Spans longer than ``record_bytes`` are raw
-            slot runs and are cut into ``record_bytes`` records; shorter
-            spans are one packed record each.
-        record_bytes: Bytes of one raw slot (4 KiB multiple).
-        phases: Number of byte phases K per record.
-
-    Returns:
-        Phase-tagged spans; each record's accounting charge is split across
-        its pieces so every piece is charged at least its bytes.
-    """
-    out: list[dict[str, int]] = []
-    for span in spans:
-        start = int(span["file_offset"])
-        nbytes = int(span["nbytes"])
-        if nbytes <= 0:
-            continue
-        step = record_bytes if nbytes > record_bytes else nbytes
-        for record in range(start, start + nbytes, step):
-            size = min(step, start + nbytes - record)
-            cuts = [
-                size * k // phases // _PACKED_IO_ALIGNMENT * _PACKED_IO_ALIGNMENT
-                for k in range(phases)
-            ]
-            cuts.append(size)
-            charged = "accounted_nbytes" in span and nbytes <= record_bytes
-            extra = int(span["accounted_nbytes"]) - size if charged else 0
-            given = 0
-            for phase in range(phases):
-                lo, hi = cuts[phase], cuts[phase + 1]
-                if hi <= lo:
-                    continue
-                piece: dict[str, int] = {
-                    "file_offset": record + lo,
-                    "nbytes": hi - lo,
-                    "phase": phase,
-                }
-                if charged:
-                    share = extra * hi // size - given
-                    given += share
-                    piece["accounted_nbytes"] = hi - lo + share
-                out.append(piece)
-    return out
-
-
 def _coalesce_transfer_spans(
     spans: list[dict[str, Any]],
     *,
@@ -467,44 +378,20 @@ class IPCServer:
         # Online packed stores publish asynchronously after the worker has
         # released its source snapshot, so a successor lookup can observe the
         # writer key during the short transfer/commit interval. Retry for this
-        # format; raw keeps immediate-miss semantics unless
-        # LOOKUP_WAIT_PENDING_ENV opts it in for a like-for-like comparison.
+        # format; raw keeps immediate-miss semantics.
         self._lookup_wait_pending = (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
-            or os.environ.get(LOOKUP_WAIT_PENDING_ENV) == "1"
         )
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
         # Research switch: L2 readahead group size started by plain lookups.
         self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
-        # Research switch: read the predicted next session's prefix ahead.
-        self._session_predictor = (
-            SessionPredictor(
-                accuracy=float(os.environ.get(SESSION_PREDICT_ACCURACY_ENV, "1") or 1)
-            )
-            if self._readahead_piece and os.environ.get(SESSION_PREFETCH_ENV) == "1"
-            else None
-        )
-        self._session_prefetch_depth = max(
-            1, int(os.environ.get(SESSION_PREFETCH_DEPTH_ENV, "1") or 1)
-        )
-        self._session_prefetch: list[tuple[bytes, str]] = []
-        self._device_stash_bytes = int(os.environ.get(DEVICE_STASH_BYTES_ENV) or 0)
-        self._streaming_phases = max(
-            0, int(os.environ.get(STREAMING_ADMISSION_PHASES_ENV) or 0)
-        )
-        self._device_stash_sessions = max(
-            1, int(os.environ.get(DEVICE_STASH_SESSIONS_ENV, "1") or 1)
-        )
-        self._session_prefetch_task: asyncio.Task[None] | None = None
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
         self._prev_store_lease_wait_us = 0
-        self._prev_l1_bypass_bytes = 0
         self._prev_load_phase_us: dict[str, int] = {}
         self._prev_dst_copy: dict[str, int] = {}
         self._prev_l1_evicted: dict[str, int] = {}
-        self._admission: FinishAdmission | None = None
         # Held L1 ranges per chunk under exclusive tiers; None when disabled.
         self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
         if (
@@ -517,42 +404,16 @@ class IPCServer:
                     chunk_key, core.chunk_manager
                 )
             )
-            # L2 admission and exclusive tiers decide what reaches L2, so a
-            # memory-only store has nothing for them to control.
+            # Exclusive tiers decide what reaches L2, so a memory-only store
+            # has nothing for them to control.
             has_l2 = not bool(self._runtime_config.get("skip_l2", False))
-            min_output = os.environ.get(FINISH_ADMIT_MIN_OUTPUT_ENV, "")
-            if min_output and has_l2:
-                denied_fraction = float(
-                    os.environ.get(
-                        FINISH_ADMIT_DENIED_L1_FRACTION_ENV,
-                        DEFAULT_DENIED_L1_FRACTION,
-                    )
-                )
-                l1_bytes = int(self._runtime_config.get("l1_size_bytes", 0))
-                self._admission = FinishAdmission(
-                    int(min_output),
-                    int(l1_bytes * denied_fraction),
-                    admit_ghosts=os.environ.get(FINISH_ADMIT_GHOST_ENV) == "1",
-                )
-                self._runtime_config["finish_admission"] = True
-                # Held bytes of a removed chunk must never reach L2.
-                core.add_chunk_removal_listener(self._forget_admission)
-            if (
-                os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
-                and has_l2
-                and self._admission is None
-            ):
+            if os.environ.get(EXCLUSIVE_TIERS_ENV) == "1" and has_l2:
                 # Exclusive tiers: every packed record is held in L1 and only
                 # reaches L2 when L1 evicts it; a removed chunk's held bytes
                 # are dropped so L2 never stores a record L1 still owns.
                 self._exclusive_held = {}
                 self._runtime_config["exclusive_tiers"] = True
                 core.add_chunk_removal_listener(self._forget_exclusive)
-        logger.info(
-            "finish admission min_output=%s admit_ghosts=%s",
-            None if self._admission is None else self._admission.min_output_tokens,
-            None if self._admission is None else self._admission.admit_ghosts,
-        )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -586,7 +447,6 @@ class IPCServer:
             "register_load_staging": self._register_load_staging,
             "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
-            "finish_request": self._op_finish_request,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
         }
@@ -784,8 +644,6 @@ class IPCServer:
                 queries=queries,
             )
             await self._core.record_external_prefix_cache(queries=queries, hits=hits)
-            if self._session_predictor is not None and isinstance(tokens, bytes):
-                self._observe_session(tokens, str(msg["model_id"]))
             if self._readahead_piece and chunks and hits > 0:
                 spans = self._external_spans(chunks, num_computed_tokens, hits)
                 if spans:
@@ -936,8 +794,6 @@ class IPCServer:
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
-        if self._session_predictor is not None and isinstance(tokens, bytes):
-            self._observe_session(tokens, str(msg["model_id"]))
         if not chunks or hits <= 0:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
 
@@ -1003,7 +859,6 @@ class IPCServer:
                 raise
             chunks = await self._core.lookup(tokens, model_id)
         chunks = await self._memory_resident_chunks(chunks)
-        await self._mark_admission_hits(chunks)
         return chunks
 
     async def _lookup_now(
@@ -1040,7 +895,6 @@ class IPCServer:
         else:
             chunks = await self._core.lookup(tokens, model_id)
         chunks = await self._memory_resident_chunks(chunks)
-        await self._mark_admission_hits(chunks)
         return chunks
 
     async def _memory_resident_chunks(self, chunks: list[ChunkInfo]) -> list[ChunkInfo]:
@@ -1074,21 +928,6 @@ class IPCServer:
             groups.append(spans)
         resident = await self._ensure_transfer().resident_prefix(groups)
         return ordered[:resident]
-
-    async def _mark_admission_hits(self, chunks: list[ChunkInfo]) -> None:
-        """Report resolved lookup hits to finish-time admission, if enabled.
-
-        Args:
-            chunks: Chunks returned by a resolved lookup.
-        """
-        if self._admission is None:
-            return
-        hit_keys = [
-            key
-            for chunk in chunks
-            for key in self._core.packed_slot_owners(chunk.start_slot, chunk.num_slots)
-        ]
-        await self._apply_admission(self._admission.mark_hit(hit_keys))
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -1183,21 +1022,7 @@ class IPCServer:
             "Host-tier prefetch operations by result.",
         )
         try:
-            if lease_id is None:
-                result = await transfer.prefetch_bytes_grouped(spans)
-            elif self._streaming_phases:
-                record_bytes = int(self._runtime_config.get("slot_size", 0)) // max(
-                    1, int(self._runtime_config.get("tensor_parallel_size", 1))
-                )
-                result = await transfer.prefetch_bytes_grouped(
-                    _phase_prefetch_spans(
-                        spans, record_bytes=record_bytes, phases=self._streaming_phases
-                    ),
-                    lease_id=lease_id,
-                    streaming=True,
-                )
-            else:
-                result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
+            result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
         except LeaseIncompleteError as exc:
             # Expected when the looked-up chunk lost its slots before the
             # prefetch ran; the connector releases the lease and looks again.
@@ -1227,23 +1052,6 @@ class IPCServer:
         loop on it would stall every other client's request past its timeout.
         """
         await self.initialize_transfer()
-        return {"ok": True}
-
-    async def _op_finish_request(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle ``finish_request``: decide L2 admission for a request's chunks.
-
-        Args:
-            msg: IPC request with ``chunk_keys`` and ``output_tokens``.
-
-        Returns:
-            ``{"ok": True}``; a no-op when finish admission is disabled.
-        """
-        if self._admission is not None:
-            actions = self._admission.finish(
-                [str(key) for key in msg.get("chunk_keys", [])],
-                int(msg.get("output_tokens", 0)),
-            )
-            await self._apply_admission(actions)
         return {"ok": True}
 
     async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1451,9 +1259,7 @@ class IPCServer:
                     }
                 )
 
-            holding = (
-                self._admission is not None or self._exclusive_held is not None
-            ) and transfer.supports_held_stores
+            holding = self._exclusive_held is not None and transfer.supports_held_stores
             if holding:
                 live_spans = [
                     {**span, "hold": True, "hold_key": str(span["chunk_key"])}
@@ -1641,7 +1447,6 @@ class IPCServer:
                 nbytes=total,
                 elapsed_s=time.perf_counter() - started_total,
             )
-            self._start_session_prefetch()
             return response
         except BaseException:
             if lease_id is not None:
@@ -1717,7 +1522,6 @@ class IPCServer:
             nbytes=total,
             elapsed_s=elapsed_s,
         )
-        self._start_session_prefetch()
         return {"ok": True, "bytes": total, "transfer_ms": elapsed_s * 1000}
 
     async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1842,12 +1646,12 @@ class IPCServer:
         live_spans: list[dict[str, Any]],
         store_spans: list[dict[str, Any]],
     ) -> None:
-        """Register held ranges per chunk and apply any early decisions.
+        """Register exclusive-tier held ranges per chunk.
 
         A chunk that was evicted while its store was in flight has already
-        been forgotten, so its ranges are discarded instead of held. Under
-        exclusive tiers the ranges stay held until L1 evicts them (written to
-        L2) or the chunk is removed (dropped).
+        been forgotten, so its ranges are discarded instead of held. The
+        ranges stay held until L1 evicts them (written to L2) or the chunk is
+        removed (dropped).
         """
         ranges: dict[str, list[tuple[int, int]]] = {}
         for span in store_spans:
@@ -1858,7 +1662,7 @@ class IPCServer:
         allocations = {
             str(span["chunk_key"]): span for span in live_spans if span.get("hold")
         }
-        actions = AdmissionActions()
+        assert self._exclusive_held is not None
         for chunk_key, held in ranges.items():
             span = allocations[chunk_key]
             if not self._core.is_current_allocation(
@@ -1868,41 +1672,10 @@ class IPCServer:
             ):
                 transfer.discard_held(held)
                 continue
-            if self._admission is None:
-                assert self._exclusive_held is not None
-                self._exclusive_held.setdefault(chunk_key, []).extend(held)
-                continue
-            actions.extend(self._admission.hold(chunk_key, held))
+            self._exclusive_held.setdefault(chunk_key, []).extend(held)
         self._metrics.counter(
-            "daser_admission_chunks_total", "Finish-admission chunk outcomes."
+            "daser_admission_chunks_total", "Exclusive-tier held chunk outcomes."
         ).inc(len(ranges), labels={"outcome": "held"})
-        await self._apply_admission(actions)
-
-    async def _apply_admission(self, actions: AdmissionActions) -> None:
-        """Persist admitted held ranges and evict over-budget denied chunks."""
-        if actions.persist and self._transfer is not None:
-            self._transfer.persist_held(actions.persist)
-        for chunk_key in actions.evict:
-            await self._core.evict_chunk(chunk_key)
-        counter = self._metrics.counter(
-            "daser_admission_chunks_total", "Finish-admission chunk outcomes."
-        )
-        for outcome, count in (
-            ("admitted", actions.admitted),
-            ("rescued", actions.rescued),
-            ("denied", actions.denied),
-            ("evicted", len(actions.evict)),
-            ("ghost", actions.ghost),
-        ):
-            if count:
-                counter.inc(count, labels={"outcome": outcome})
-
-    def _forget_admission(self, chunk_key: str) -> None:
-        """Removal listener: discard a removed chunk's held ranges."""
-        assert self._admission is not None
-        held = self._admission.forget(chunk_key)
-        if held and self._transfer is not None:
-            self._transfer.discard_held(held)
 
     def _forget_exclusive(self, chunk_key: str) -> None:
         """Removal listener: drop a removed chunk's still-held L1 ranges."""
@@ -1998,8 +1771,6 @@ class IPCServer:
             ("dropped", stats.readahead_dropped_bytes),
             ("contended", stats.readahead_contended_bytes),
             ("write_contended", stats.l2_write_contended_bytes),
-            ("stashed", stats.device_stash_filled_bytes),
-            ("stash_served", stats.device_stash_served_bytes),
         ):
             delta = current - self._prev_readahead_bytes.get(outcome, 0)
             if delta > 0:
@@ -2041,13 +1812,6 @@ class IPCServer:
                     "L1-to-destination copy submissions, runs and bytes.",
                 ).inc(delta, labels={"unit": unit})
             self._prev_dst_copy[unit] = current
-        bypass_delta = stats.l1_bypass_bytes - self._prev_l1_bypass_bytes
-        if bypass_delta > 0:
-            self._metrics.counter(
-                "daser_l1_bypass_bytes_total",
-                "L2 load bytes read around L1 by split-residency bypass.",
-            ).inc(bypass_delta)
-        self._prev_l1_bypass_bytes = stats.l1_bypass_bytes
         lease_wait_delta = stats.store_lease_wait_us - self._prev_store_lease_wait_us
         if lease_wait_delta > 0:
             self._metrics.counter(
@@ -2088,7 +1852,7 @@ class IPCServer:
         self._metrics.gauge(
             "daser_l1_bytes_capacity", "L1 memory cache total capacity."
         ).set(l1_capacity)
-        if self._admission is not None or self._exclusive_held is not None:
+        if self._exclusive_held is not None:
             # SSD-resident packed bytes = arena - free - held.
             self._metrics.gauge(
                 "daser_held_bytes", "Held L1 bytes not yet written to L2."
@@ -2145,35 +1909,17 @@ class IPCServer:
                     l2_read_stripe_bytes=int(
                         self._runtime_config.get("l2_read_stripe_bytes", 0)
                     ),
-                    l1_split_fraction=float(
-                        self._runtime_config.get("l1_split_fraction", 0.0)
-                    ),
-                    stripe_pipeline=os.environ.get(STRIPE_PIPELINE_ENV) == "1",
                     readahead_piece_bytes=self._readahead_piece,
                     readahead_window=int(
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
-                    readahead_stream=os.environ.get(LOAD_READAHEAD_STREAM_ENV) == "1",
                     gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
-                    l1_split_bypass=os.environ.get(L1_SPLIT_BYPASS_ENV) == "1",
-                    batch_dst_copies=os.environ.get(BATCH_DST_COPY_ENV) == "1",
-                    next_use_replacement=os.environ.get(L1_NEXT_USE_ENV) == "1",
-                    skip_pinned_eviction=os.environ.get(L1_SKIP_PINNED_ENV) == "1",
-                    readahead_srpt=os.environ.get(READAHEAD_SRPT_ENV) == "1",
-                    l2_write_yield=os.environ.get(L2_WRITE_YIELD_ENV) == "1",
                     l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
-                    readahead_tail_bypass=(
-                        os.environ.get(READAHEAD_TAIL_BYPASS_ENV) == "1"
-                    ),
                     held_preclean_fraction=float(
                         os.environ.get(HELD_PRECLEAN_FRACTION_ENV) or 0.0
                     ),
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
-                    ),
-                    device_stash_bytes=self._device_stash_bytes,
-                    readahead_skip_stashed=(
-                        os.environ.get(READAHEAD_SKIP_STASHED_ENV) == "1"
                     ),
                 )
             else:
@@ -2247,114 +1993,6 @@ class IPCServer:
                 self._runtime_config.get("tensor_parallel_size", 1)
             ),
             rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-        )
-
-    def _observe_session(self, tokens: bytes, model_id: str) -> None:
-        """Feed a scheduler lookup to the session predictor.
-
-        A new request replaces the pending prediction with the session
-        expected after it; the prefetch starts once this request's load
-        finishes, so it does not compete with that load for the SSD.
-        """
-        predictor = self._session_predictor
-        assert predictor is not None
-        before = predictor.predicted_returns
-        if not predictor.observe(tokens, model_id):
-            return
-        returned = predictor.predicted_returns > before
-        if returned:
-            self._session_prefetch_counter().inc(labels={"outcome": "returned"})
-        self._session_prefetch = predictor.predict(self._session_prefetch_depth)
-        logger.info(
-            "[IPC] session request=%d tokens=%d predicted_return=%s next_tokens=%s",
-            predictor.requests,
-            len(tokens) // 4,
-            returned,
-            [len(prompt) // 4 for prompt, _model in self._session_prefetch],
-        )
-
-    def _start_session_prefetch(self) -> None:
-        """Start the pending next-session readaheads in the background."""
-        predictions = self._session_prefetch
-        if not predictions:
-            return
-        running = self._session_prefetch_task
-        if running is not None and not running.done():
-            return
-        self._session_prefetch = []
-        self._session_prefetch_task = asyncio.create_task(
-            self._session_prefetch_readahead(predictions)
-        )
-
-    async def _session_prefetch_readahead(
-        self, predictions: list[tuple[bytes, str]]
-    ) -> None:
-        """Read the predicted sessions' stored prefixes ahead into L1.
-
-        Speculative readaheads of sessions no longer predicted are dropped
-        first. Each prediction then reads after the previous one finished,
-        so the soonest session gets the SSD first and later ones take only
-        the budget left. With a device stash, the bytes of the soonest
-        ``DASER_DEVICE_STASH_SESSIONS`` sessions (default 1) are then copied
-        to the GPU, soonest first, before later predictions read.
-
-        Args:
-            predictions: ``(last prompt, model id)`` per predicted session,
-                soonest first.
-
-        Async/thread-safety:
-            Runs as a background task on the IPC event loop; failures are
-            logged and leave the regular load path unchanged.
-        """
-        counter = self._session_prefetch_counter()
-        transfer = self._ensure_transfer()
-        try:
-            planned = [
-                await self._session_prefix_spans(tokens, model_id)
-                for tokens, model_id in predictions
-            ]
-            await transfer.drop_speculative_except([s for s in planned if s])
-            stash_last = min(self._device_stash_sessions, len(planned)) - 1
-            for index, spans in enumerate(planned):
-                # A grouped load spans several transfer calls fed by the
-                # current request's readahead; read only once that finished.
-                await transfer.wait_readahead_idle()
-                started = bool(spans) and await transfer.start_readahead(
-                    spans, speculative=True
-                )
-                counter.inc(labels={"outcome": "started" if started else "skipped"})
-                stash_spans = [
-                    span for session in planned[: index + 1] for span in session
-                ]
-                if index == stash_last and stash_spans and self._device_stash_bytes:
-                    # The stashed sessions' bytes are in L1 once their
-                    # readaheads finished: copy them to the GPU, soonest
-                    # first, before the next readahead, while the current
-                    # request computes.
-                    await transfer.wait_readahead_idle()
-                    await transfer.fill_device_stash(stash_spans)
-        except Exception:
-            logger.exception("[IPC] session prefetch failed")
-            counter.inc(labels={"outcome": "failed"})
-
-    async def _session_prefix_spans(
-        self, tokens: bytes, model_id: str
-    ) -> list[dict[str, int]]:
-        """Return the physical spans of a session's stored prompt prefix."""
-        chunks = await self._lookup_now(tokens, model_id, defer=False)
-        hits = _external_prefix_hits(
-            chunks or [],
-            num_computed_tokens=0,
-            # The next prompt extends this one, so all of it may hit.
-            queries=len(tokens) // 4 + 1,
-        )
-        return self._external_spans(chunks or [], 0, hits) if hits > 0 else []
-
-    def _session_prefetch_counter(self) -> Any:
-        """Return the counter of next-session prefetch outcomes."""
-        return self._metrics.counter(
-            "daser_session_prefetch_total",
-            "Predicted next-session readaheads by outcome.",
         )
 
     def _online_compressed_prefetch_spans(

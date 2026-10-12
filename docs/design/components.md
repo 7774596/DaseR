@@ -18,7 +18,7 @@
 | `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；当前主路径，编排 L1 pinned-memory + L2 SSD transfer。组合 `L1Cache` + 可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
 | `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；可选兼容 backend，封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
 | `L1Cache` / `L2IoEngine` | DaseR | `daser/transfer/iouring/l1_cache.py`（range-keyed pinned-host LRU 缓存）/ `l2_engine.py`（io_uring positioned I/O）；编排层组合二者，pinned-predicate 单向解耦 |
-| `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，实现为 `LRUReplacementPolicy`（默认）、`BIPReplacementPolicy`（`compressed-online` 的 L1）和研究开关 `SplitResidencyPolicy`（`--l1-split-fraction`） |
+| `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，实现为 `LRUReplacementPolicy`（默认）和 `BIPReplacementPolicy`（`compressed-online` 的 L1） |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
 | `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、op→handler dispatch table |

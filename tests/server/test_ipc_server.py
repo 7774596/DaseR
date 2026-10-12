@@ -25,7 +25,6 @@ from daser.server.ipc.server import (
     _CachedCudaArray,
     _coalesce_transfer_spans,
     _OnlinePackedExtentAllocator,
-    _phase_prefetch_spans,
 )
 from daser.server.metadata_store import MetadataStore
 from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
@@ -77,25 +76,14 @@ def make_core(total_slots: int = 64) -> ServerCore:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("storage_format", "env_value", "expected"),
-    [
-        ("raw", None, False),
-        ("compressed-online", None, True),
-        ("raw", "1", True),
-        ("raw", "0", False),
-    ],
+    ("storage_format", "expected"),
+    [("raw", False), ("compressed-online", True)],
 )
 async def test_ipc_lookup_waits_only_for_online_packed_store(
     storage_format: str,
-    env_value: str | None,
     expected: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Online packed lookup retries in-flight writers; raw only when opted in."""
-    if env_value is None:
-        monkeypatch.delenv("DASER_LOOKUP_WAIT_PENDING", raising=False)
-    else:
-        monkeypatch.setenv("DASER_LOOKUP_WAIT_PENDING", env_value)
+    """Online packed lookup retries in-flight writers; raw lookups do not."""
 
     class LookupCore:
         def add_chunk_removal_listener(self, _listener: Any) -> None:
@@ -822,8 +810,6 @@ async def test_incomplete_prefetch_lease_is_a_recoverable_error(
             self,
             spans: list[dict[str, int]],
             lease_id: str | None = None,
-            *,
-            streaming: bool = False,
         ) -> Any:
             raise LeaseIncompleteError(f"prefetch did not retain lease: {lease_id}")
 
@@ -1788,105 +1774,6 @@ def _l2_write_bytes(registry: MetricsRegistry) -> float:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("output_tokens", "finish_first", "denied_fraction", "l1_slots", "kept", "written"),
-    [
-        (600, False, "0.5", 1, True, 1),
-        (10, False, "0.5", 1, False, 0),
-        (10, True, "0.5", 1, False, 0),
-        (10, False, "1", 2, True, 0),
-        (10, False, "1", 1, True, 1),
-    ],
-)
-async def test_finish_admission_writes_only_admitted_chunks(
-    tmp_path,
-    monkeypatch,
-    output_tokens,
-    finish_first,
-    denied_fraction,
-    l1_slots,
-    kept,
-    written,
-) -> None:
-    """Long outputs reach L2; short outputs reach it only if L1 evicts them.
-
-    A denied fraction of 0.5 of a one-record L1 evicts a denied chunk at
-    once. A fraction of 1.0 keeps it resident without an L2 write while L1
-    has room; when the later store pushes it out of L1 it is written back
-    rather than lost.
-    """
-    monkeypatch.setenv("DASER_FINISH_ADMIT_MIN_OUTPUT", "500")
-    monkeypatch.setenv("DASER_FINISH_ADMIT_DENIED_L1_FRACTION", denied_fraction)
-    registry = MetricsRegistry()
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path,
-        logical_slots=8,
-        arena_slots=4,
-        metrics_registry=registry,
-        l1_slots=l1_slots,
-    )
-    await server.start()
-    try:
-        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
-        assert config["runtime_config"]["finish_admission"] is True
-        finish = {
-            "op": "finish_request",
-            "chunk_keys": ["a"],
-            "output_tokens": output_tokens,
-        }
-        if finish_first:
-            await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": "a",
-                    "token_count": BLOCK_TOKENS,
-                    "model_id": "m",
-                },
-            )
-            core_alloc = core.chunk_manager.store.get("a")
-            assert core_alloc is not None
-            assert "error" not in await _send_recv(socket_path, finish)
-            stored = await _send_recv(
-                socket_path,
-                {
-                    "op": "transfer_store",
-                    "payload": {"data": b"x" * local_slot_size},
-                    "spans": [
-                        {
-                            "source_offset": 0,
-                            "file_offset": 0,
-                            "nbytes": local_slot_size,
-                            "chunk_key": "a",
-                            "start_slot": core_alloc.start_slot,
-                            "num_slots": 1,
-                            "logical_slot_start": 0,
-                            "logical_slot_count": 1,
-                            "packed": True,
-                            "mode": "raw",
-                        }
-                    ],
-                },
-            )
-            assert "error" not in stored
-        else:
-            stored = await _store_online_record(socket_path, "a", local_slot_size)
-            assert "error" not in stored
-            assert "error" not in await _send_recv(socket_path, finish)
-        await server.drain_transfer()
-        # Any later transfer refreshes the tier counters.
-        await _store_online_record(socket_path, "z", local_slot_size)
-        meta = core.chunk_manager.store.get("a")
-        assert (meta is not None) is kept
-        if meta is not None:
-            assert core.packed_slot_owners(meta.start_slot, meta.num_slots) == ["a"]
-        assert _l2_write_bytes(registry) == written * local_slot_size
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     ("arena_slots", "kept", "written"),
     [
         # The arena outlasts L1: the two records L1 evicts are written back.
@@ -2765,24 +2652,12 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l1_accounting": "stored",
             "prefetch_lease_budget_bytes": 0,
             "l2_read_stripe_bytes": 0,
-            "l1_split_fraction": 0.0,
-            "stripe_pipeline": False,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
-            "readahead_stream": False,
             "gather_min_runs": 0,
-            "l1_split_bypass": False,
-            "batch_dst_copies": False,
-            "next_use_replacement": False,
-            "skip_pinned_eviction": False,
-            "readahead_srpt": False,
-            "l2_write_yield": False,
             "l2_write_gate": False,
-            "readahead_tail_bypass": False,
             "held_preclean_fraction": 0.0,
             "readahead_budget_fraction": 0.5,
-            "device_stash_bytes": 0,
-            "readahead_skip_stashed": False,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -2835,24 +2710,12 @@ async def test_bip_setting_is_forwarded(
             "l1_accounting": "stored",
             "prefetch_lease_budget_bytes": 0,
             "l2_read_stripe_bytes": 0,
-            "l1_split_fraction": 0.0,
-            "stripe_pipeline": False,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
-            "readahead_stream": False,
             "gather_min_runs": 0,
-            "l1_split_bypass": False,
-            "batch_dst_copies": False,
-            "next_use_replacement": False,
-            "skip_pinned_eviction": False,
-            "readahead_srpt": False,
-            "l2_write_yield": False,
             "l2_write_gate": False,
-            "readahead_tail_bypass": False,
             "held_preclean_fraction": 0.0,
             "readahead_budget_fraction": 0.5,
-            "device_stash_bytes": 0,
-            "readahead_skip_stashed": False,
         }
     ]
 
@@ -2998,10 +2861,7 @@ class _ReadaheadRecordingTransfer(TransferLayer):
     ) -> int:
         raise AssertionError("readahead hints must not store")
 
-    async def start_readahead(
-        self, spans: list[dict[str, int]], *, speculative: bool = False
-    ) -> bool:
-        del speculative
+    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
         type(self).readaheads.append(spans)
         return True
 
@@ -3073,285 +2933,6 @@ async def test_ipc_readahead_hint_reads_ahead_without_lookup_metrics(
     )
 
 
-class _SessionPrefetchTransfer(_ReadaheadRecordingTransfer):
-    """Readahead recorder that also serves loads without reading."""
-
-    async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-        del dst, file_offset
-        return nbytes
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [True, False])
-async def test_ipc_session_prefetch_reads_the_next_session_after_a_load(
-    tmp_path, monkeypatch, enabled: bool
-) -> None:
-    """After a load the predicted next session's stored prefix is read ahead.
-
-    Sessions A and B alternate. When A returns, B is the session idle the
-    longest, so A's load is followed by a readahead of B's stored block.
-    Without the switch only lookup hits are read ahead.
-    """
-    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
-    if enabled:
-        monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
-    else:
-        monkeypatch.delenv("DASER_SESSION_PREFETCH", raising=False)
-    _ReadaheadRecordingTransfer.readaheads = []
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        _SessionPrefetchTransfer,
-    )
-    registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(
-        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
-    )
-    session_a = [11, 12, 13, 14]
-    session_b = [21, 22, 23, 24]
-    stored = first_rolling_key(session_b)
-
-    async def lookup(tokens: list[int]) -> None:
-        await _send_recv(
-            socket_path,
-            {
-                "op": "lookup",
-                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
-                "model_id": "m",
-                "external_prefix_queries": len(tokens),
-                "num_computed_tokens": 0,
-            },
-        )
-
-    await server.start()
-    try:
-        await _send_recv(
-            socket_path,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": stored,
-                "token_count": len(session_b),
-                "model_id": "m",
-            },
-        )
-        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": stored})
-        await lookup(session_a)
-        await lookup(session_b + [25])
-        # A returns, so B is predicted to return next.
-        await lookup(session_a + [15])
-        await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
-        )
-        for _ in range(100):
-            if "daser_session_prefetch_total" in registry.render_prometheus():
-                break
-            await asyncio.sleep(0.01)
-    finally:
-        await server.stop()
-
-    # B's own lookup hit its stored block; the prefetch reads it once more.
-    assert len(_ReadaheadRecordingTransfer.readaheads) == (2 if enabled else 1)
-    for spans in _ReadaheadRecordingTransfer.readaheads:
-        assert sum(int(span["nbytes"]) for span in spans) == SLOT_SIZE
-    rendered = registry.render_prometheus()
-    assert ('outcome="started"' in rendered) is enabled
-
-
-class _LeasingSessionPrefetchTransfer(_SessionPrefetchTransfer):
-    """Session prefetch stub that also grants all-L1 request leases."""
-
-    async def classify_and_acquire_lease(
-        self, lease_id: str, spans: list[dict[str, int]]
-    ) -> str:
-        del lease_id, spans
-        return "l1"
-
-
-@pytest.mark.asyncio
-async def test_ipc_session_prefetch_observes_leased_lookups(
-    tmp_path, monkeypatch
-) -> None:
-    """Lookups that also take a request lease feed the session predictor.
-
-    The same A, B, A turn order as the plain-lookup case, sent as
-    ``lookup_prefetch``, predicts B after A's load and reads B ahead.
-    """
-    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
-    monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
-    _ReadaheadRecordingTransfer.readaheads = []
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        _LeasingSessionPrefetchTransfer,
-    )
-    registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(
-        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
-    )
-    session_a = [11, 12, 13, 14]
-    session_b = [21, 22, 23, 24]
-    stored = first_rolling_key(session_b)
-
-    async def lookup(tokens: list[int]) -> None:
-        await _send_recv(
-            socket_path,
-            {
-                "op": "lookup_prefetch",
-                "lease_id": f"req-{tokens[0]}-{len(tokens)}",
-                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
-                "model_id": "m",
-                "external_prefix_queries": len(tokens),
-                "num_computed_tokens": 0,
-            },
-        )
-
-    await server.start()
-    try:
-        await _send_recv(
-            socket_path,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": stored,
-                "token_count": len(session_b),
-                "model_id": "m",
-            },
-        )
-        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": stored})
-        await lookup(session_a)
-        await lookup(session_b + [25])
-        # A returns, so B is predicted to return next.
-        await lookup(session_a + [15])
-        await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
-        )
-        for _ in range(100):
-            if "daser_session_prefetch_total" in registry.render_prometheus():
-                break
-            await asyncio.sleep(0.01)
-    finally:
-        await server.stop()
-
-    assert len(_ReadaheadRecordingTransfer.readaheads) == 1
-    assert (
-        sum(int(span["nbytes"]) for span in _ReadaheadRecordingTransfer.readaheads[0])
-        == SLOT_SIZE
-    )
-    assert 'outcome="started"' in registry.render_prometheus()
-
-
-class _StashRecordingTransfer(_SessionPrefetchTransfer):
-    """Session prefetch stub that also records device stash fills."""
-
-    fills: list[list[dict[str, int]]] = []
-
-    async def fill_device_stash(self, spans: list[dict[str, int]]) -> int:
-        type(self).fills.append(spans)
-        return sum(int(span["nbytes"]) for span in spans)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sessions", [1, 2])
-async def test_ipc_device_stash_holds_the_soonest_predicted_sessions(
-    tmp_path, monkeypatch, sessions: int
-) -> None:
-    """The stash fill takes the soonest ``sessions`` predictions, in order.
-
-    Sessions A, B and C take turns; when A returns, B then C are predicted.
-    One fill runs after the stashed predictions were read ahead and holds
-    B's stored block, followed by C's when two sessions are stashed.
-    """
-    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(SLOT_SIZE))
-    monkeypatch.setenv("DASER_SESSION_PREFETCH", "1")
-    monkeypatch.setenv("DASER_SESSION_PREFETCH_DEPTH", "2")
-    monkeypatch.setenv("DASER_DEVICE_STASH_BYTES", str(4 * SLOT_SIZE))
-    monkeypatch.setenv("DASER_DEVICE_STASH_SESSIONS", str(sessions))
-    _ReadaheadRecordingTransfer.readaheads = []
-    _StashRecordingTransfer.fills = []
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        _StashRecordingTransfer,
-    )
-    registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(
-        socket_path, core, make_runtime_config(tmp_path), metrics_registry=registry
-    )
-    session_a = [11, 12, 13, 14]
-    session_b = [21, 22, 23, 24]
-    session_c = [31, 32, 33, 34]
-
-    async def lookup(tokens: list[int]) -> None:
-        await _send_recv(
-            socket_path,
-            {
-                "op": "lookup",
-                "token_bytes": np.asarray(tokens, dtype=np.int32).tobytes(),
-                "model_id": "m",
-                "external_prefix_queries": len(tokens),
-                "num_computed_tokens": 0,
-            },
-        )
-
-    await server.start()
-    try:
-        offsets = []
-        for session in (session_b, session_c):
-            key = first_rolling_key(session)
-            reply = await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": key,
-                    "token_count": len(session),
-                    "model_id": "m",
-                },
-            )
-            offsets.append(int(reply["file_offset"]))
-            await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
-        await lookup(session_a)
-        await lookup(session_b + [25])
-        await lookup(session_c + [35])
-        # A returns, so B (idle longest) and then C are predicted.
-        await lookup(session_a + [15])
-        await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
-        )
-        for _ in range(100):
-            if _StashRecordingTransfer.fills and "daser_session_prefetch_total" in (
-                registry.render_prometheus()
-            ):
-                break
-            await asyncio.sleep(0.01)
-    finally:
-        await server.stop()
-
-    assert [
-        [int(span["file_offset"]) for span in spans]
-        for spans in _StashRecordingTransfer.fills
-    ] == [offsets[:sessions]]
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("compute_tokens_per_s", "expected_front"),
@@ -3418,36 +2999,6 @@ async def test_ipc_split_prefill_reads_only_the_back_part(
     else:
         assert resp["started"] is False
         assert _ReadaheadRecordingTransfer.readaheads == []
-
-
-def test_phase_prefetch_spans_cut_records_into_aligned_phases() -> None:
-    """Raw runs split per slot and packed records keep their charge."""
-    record = 4 * 4096
-    raw = _phase_prefetch_spans(
-        [{"file_offset": 8 * 4096, "nbytes": 2 * record}],
-        record_bytes=record,
-        phases=4,
-    )
-    assert [(s["file_offset"] // 4096, s["nbytes"], s["phase"]) for s in raw] == [
-        (8 + 4 * r + k, 4096, k) for r in range(2) for k in range(4)
-    ]
-    assert all("accounted_nbytes" not in span for span in raw)
-    packed = _phase_prefetch_spans(
-        [{"file_offset": 0, "nbytes": 3 * 4096, "accounted_nbytes": record}],
-        record_bytes=record,
-        phases=2,
-    )
-    assert [(s["file_offset"], s["nbytes"], s["phase"]) for s in packed] == [
-        (0, 4096, 0),
-        (4096, 2 * 4096, 1),
-    ]
-    assert sum(s["accounted_nbytes"] for s in packed) == record
-    assert all(s["accounted_nbytes"] >= s["nbytes"] for s in packed)
-    # A record shorter than K pages yields fewer, non-empty phases.
-    tiny = _phase_prefetch_spans(
-        [{"file_offset": 0, "nbytes": 4096}], record_bytes=record, phases=4
-    )
-    assert [(s["nbytes"], s["phase"]) for s in tiny] == [(4096, 3)]
 
 
 @pytest.mark.asyncio

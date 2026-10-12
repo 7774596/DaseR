@@ -279,41 +279,6 @@ def test_eviction_counters_split_pinned_and_unread_bytes() -> None:
         cache.close()
 
 
-@pytest.mark.parametrize("policy_type", [LRUReplacementPolicy, BIPReplacementPolicy])
-def test_skip_pinned_eviction_keeps_owned_allocations_resident(
-    policy_type: type[ReplacementPolicy[int]],
-) -> None:
-    """With the switch on, replacement evicts the unpinned allocation only."""
-    pinned: set[int] = set()
-    cache = L1Cache(
-        8192,
-        4096,
-        lambda _key, data: id(data) in pinned,
-        policy_type(),
-        skip_pinned_eviction=True,
-    )
-    try:
-        first = cache.reserve_untracked(4096)
-        second = cache.reserve_untracked(4096)
-        assert first is not None and second is not None
-        cache.put((0, 4096), first)
-        cache.put((4096, 4096), second)
-        pinned.add(id(first))
-        third = cache.reserve_untracked(4096)
-        assert third is not None
-        assert cache.contains_slice(first)
-        assert not cache.contains_slice(second)
-        assert cache.eviction_bytes["pinned_bytes"] == 0
-        # Only pinned residents left: nothing to evict, no space to reserve.
-        cache.put((8192, 4096), third)
-        pinned.add(id(third))
-        assert cache.reserve_untracked(4096) is None
-        assert cache.contains_slice(first) and cache.contains_slice(third)
-        pinned.clear()
-    finally:
-        cache.close()
-
-
 def test_mark_read_counts_lease_served_bytes_without_reordering() -> None:
     """Lease-served spans are read for accounting but keep LRU order."""
     cache = L1Cache(8192, 4096, lambda _key, _data: False)

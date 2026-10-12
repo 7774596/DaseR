@@ -51,9 +51,6 @@ ARMS = (
     # load instead of loading their own copy.
     "daser-raw-coalesce",
     "daser-compressed-coalesce",
-    # L1 split residency (--daser-l1-split-fraction) on raw / compressed stores.
-    "daser-raw-split",
-    "daser-compressed-split",
     # Fully leased hits restored layer by layer inside the forward pass, and
     # their PIECEWISE-graph baselines (need prefetch for leases), on packed
     # and raw stores.
@@ -472,12 +469,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DaseR --l2-read-stripe (0 = serial reads; DaseR arms only).",
     )
     parser.add_argument(
-        "--daser-l1-split-fraction",
-        type=float,
-        default=0.6,
-        help="DaseR --l1-split-fraction for the *-split arms only.",
-    )
-    parser.add_argument(
         "--daser-l1-lru",
         action="store_true",
         help="Run DaseR L1 as plain LRU (--no-bip-enabled) instead of BIP.",
@@ -658,9 +649,6 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_l2_read_stripe_bytes=(
             args.daser_l2_read_stripe if arm.startswith("daser") else 0
-        ),
-        daser_l1_split_fraction=(
-            args.daser_l1_split_fraction if arm.endswith("-split") else 0.0
         ),
         daser_extra_kv_layers=_drafter_kv_layers(args.speculative_config),
         daser_l1_lru=args.daser_l1_lru,

@@ -42,10 +42,6 @@ class L1Cache:
             owned by an in-flight L2 write and must not be closed on eviction.
         replacement_policy: Optional policy for physical allocation victims.
             Omission retains LRU; the cache still owns all release barriers.
-        skip_pinned_eviction: Research switch. Replacement passes over
-            allocations a writer or lease still owns (evicting them frees no
-            pool memory and discards bytes about to be reused) and re-tracks
-            them, evicting the first unpinned victim instead.
 
     Async/thread-safety:
         Not internally synchronized. All methods assume the orchestrator's
@@ -59,10 +55,8 @@ class L1Cache:
         alignment: int,
         pinned_predicate: Callable[[tuple[int, int], PinnedMemorySlice], bool],
         replacement_policy: ReplacementPolicy[int] | None = None,
-        skip_pinned_eviction: bool = False,
     ) -> None:
         self._l1_bytes = l1_bytes
-        self._skip_pinned = skip_pinned_eviction
         self._pool = PinnedMemoryPool(l1_bytes, alignment=alignment)
         self._entries: OrderedDict[tuple[int, int], PinnedMemorySlice] = OrderedDict()
         # Writer completion asks about a particular slice, not a byte range.
@@ -521,7 +515,7 @@ class L1Cache:
         allocation = data.allocation_id
         self._allocation_keys.setdefault(allocation, {})[key] = None
         self._charges[key] = charge
-        self._policy.insert_range(allocation, key[0], charge)
+        self._policy.insert(allocation)
         self._used += charge
         self.notify_pool_waiters()
         while self._used > self._l1_bytes:
@@ -531,15 +525,6 @@ class L1Cache:
     def _evict_allocation(self) -> bool:
         """Drop all resident children of the least recently used allocation."""
         allocation = self._policy.evict()
-        if self._skip_pinned:
-            skipped: list[int] = []
-            while allocation is not None and self._allocation_pinned(allocation):
-                skipped.append(allocation)
-                allocation = self._policy.evict()
-            for kept in skipped:
-                self._policy.insert_range(
-                    kept, min(key[0] for key in self._allocation_keys[kept])
-                )
         if allocation is None:
             return False
         for key in tuple(self._allocation_keys[allocation]):
@@ -559,13 +544,6 @@ class L1Cache:
                 # replacement never makes in-flight pool bytes reusable.
                 self.release(key, removed)
         return True
-
-    def _allocation_pinned(self, allocation: int) -> bool:
-        """Return whether a writer or lease owns any child of ``allocation``."""
-        return any(
-            self._is_pinned(key, self._entries[key])
-            for key in self._allocation_keys[allocation]
-        )
 
     def _pop_entry(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
         """Detach one resident from both indexes before releasing its ownership."""
