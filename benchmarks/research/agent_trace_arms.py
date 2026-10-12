@@ -108,6 +108,30 @@ def _wait_pids_exit(pid_file: Path, timeout_s: float = 60.0) -> bool:
     return False
 
 
+def store_disk_usage(store_dir: Path) -> dict[str, int]:
+    """Return the allocated disk bytes under each top-level entry of a store.
+
+    Allocated blocks (not apparent size) show how much of a preallocated or
+    sparse L2 file was actually written, so arms can compare the L2 capacity
+    they really used.
+
+    Args:
+        store_dir: Arm scratch directory holding the service stores.
+
+    Returns:
+        dict[str, int]: Entry name to allocated bytes, plus ``"total"``.
+    """
+    usage: dict[str, int] = {}
+    if store_dir.is_dir():
+        for entry in sorted(store_dir.iterdir()):
+            paths = [entry] if entry.is_file() else entry.rglob("*")
+            usage[entry.name] = sum(
+                p.lstat().st_blocks * 512 for p in paths if p.is_file()
+            )
+    usage["total"] = sum(usage.values())
+    return usage
+
+
 class ArmTerminated(Exception):
     """Raised when SIGTERM/SIGINT arrives while no replay is running."""
 
@@ -993,6 +1017,10 @@ async def run_arm(
             (out_dir / log.name).write_bytes(log.read_bytes())
         stop_from_pid_file(manager.pid_file)
         if _wait_pids_exit(manager.pid_file):
+            # Measured before deletion: the store is gone afterwards.
+            (out_dir / "store_disk_usage.json").write_text(
+                json.dumps(store_disk_usage(manager.store_dir))
+            )
             shutil.rmtree(manager.store_dir, ignore_errors=True)
         else:
             print(f"{arm}: services still alive; kept {manager.store_dir}", flush=True)

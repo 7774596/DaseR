@@ -14,6 +14,7 @@ from benchmarks.research.agent_trace_arms import (
     StopSignals,
     _manager,
     parse_args,
+    store_disk_usage,
 )
 
 
@@ -128,3 +129,22 @@ def test_lmcache_pythonpath_reaches_lmcache_arms(tmp_path: Path) -> None:
     assert [str(p) for p in _manager("lmcache-codec", args).lmcache_pythonpath] == (
         paths
     )
+
+
+def test_store_disk_usage_counts_written_blocks_not_apparent_size(
+    tmp_path: Path,
+) -> None:
+    """A sparse store counts only its written blocks; nested dirs are summed."""
+    with (tmp_path / "daser.store").open("wb") as f:
+        f.truncate(1 << 30)
+        f.write(b"x" * 65536)
+    nested = tmp_path / "lmcache_mp_disk" / "a"
+    nested.mkdir(parents=True)
+    (nested / "obj").write_bytes(b"y" * 8192)
+
+    usage = store_disk_usage(tmp_path)
+
+    assert 65536 <= usage["daser.store"] < 1 << 20
+    assert usage["lmcache_mp_disk"] >= 8192
+    assert usage["total"] == usage["daser.store"] + usage["lmcache_mp_disk"]
+    assert store_disk_usage(tmp_path / "missing") == {"total": 0}
