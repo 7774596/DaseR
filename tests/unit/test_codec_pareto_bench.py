@@ -12,7 +12,10 @@ from benchmarks.research.codec_pareto_bench import (  # noqa: E402
     pareto_front,
     preset_env,
 )
-from daser.config import LOAD_TILE_GROUPS_ENV, LOAD_WORD_READS_ENV  # noqa: E402
+from daser.config import (  # noqa: E402
+    LOAD_BRANCHLESS_DECODE_ENV,
+    LOAD_WORD_READS_ENV,
+)
 
 
 def test_byte_shuffle_splits_low_and_high_bytes_and_inverts() -> None:
@@ -36,10 +39,10 @@ def test_pareto_front_keeps_only_non_dominated_arms() -> None:
 def test_preset_env_clears_other_switches_and_restores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, "9")
+    monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, "1")
     monkeypatch.delenv(LOAD_WORD_READS_ENV, raising=False)
-    with preset_env(DECODE_PRESETS["uc_vec"]):
+    with preset_env(DECODE_PRESETS["uc_vec_g64"]):
         assert os.environ[LOAD_WORD_READS_ENV] == "1"
-        assert LOAD_TILE_GROUPS_ENV not in os.environ
-    assert os.environ[LOAD_TILE_GROUPS_ENV] == "9"
+        assert LOAD_BRANCHLESS_DECODE_ENV not in os.environ
+    assert os.environ[LOAD_BRANCHLESS_DECODE_ENV] == "1"
     assert LOAD_WORD_READS_ENV not in os.environ

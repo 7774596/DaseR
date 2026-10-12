@@ -49,30 +49,28 @@ from daser.ops.compressed_kv import FusedCompressedKVDecoder, FusedOnlineKVPacke
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
 # Load-kernel presets: environment switches read when a decoder is built.
+# Tile groups follow the R199 sweep, where each preset saturates at K=32-64.
 DECODE_PRESETS: dict[str, dict[str, str]] = {
     "byte": {},
-    "word_reg_g32": {
+    "word_reg_g64": {
         LOAD_WORD_READS_ENV: "1",
         LOAD_REGISTER_CODEBOOK_ENV: "1",
+        LOAD_TILE_GROUPS_ENV: "64",
+    },
+    "uc_vec_g64": {
+        LOAD_WORD_READS_ENV: "1",
+        LOAD_REGISTER_CODEBOOK_ENV: "1",
+        LOAD_VECTOR_STORES_ENV: "1",
+        LOAD_UNCHECKED_BOUNDS_ENV: "1",
+        LOAD_TILE_GROUPS_ENV: "64",
+    },
+    "branchless_g32": {
+        LOAD_WORD_READS_ENV: "1",
+        LOAD_REGISTER_CODEBOOK_ENV: "1",
+        LOAD_VECTOR_STORES_ENV: "1",
+        LOAD_UNCHECKED_BOUNDS_ENV: "1",
+        LOAD_BRANCHLESS_DECODE_ENV: "1",
         LOAD_TILE_GROUPS_ENV: "32",
-    },
-    "uc_vec": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_VECTOR_STORES_ENV: "1",
-        LOAD_UNCHECKED_BOUNDS_ENV: "1",
-    },
-    "branchless": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_VECTOR_STORES_ENV: "1",
-        LOAD_UNCHECKED_BOUNDS_ENV: "1",
-        LOAD_BRANCHLESS_DECODE_ENV: "1",
-    },
-    "branchless_g4": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_VECTOR_STORES_ENV: "1",
-        LOAD_UNCHECKED_BOUNDS_ENV: "1",
-        LOAD_BRANCHLESS_DECODE_ENV: "1",
-        LOAD_TILE_GROUPS_ENV: "4",
     },
 }
 _PRESET_KEYS = sorted({key for preset in DECODE_PRESETS.values() for key in preset})
@@ -219,7 +217,8 @@ def _daser_rows(
         torch.cuda.synchronize()
         stored = sum(s.stored_length for s in slots)
         modes = [int(s.mode) for s in slots]
-        offsets = [s.logical_slot * slot_size for s in slots]
+        # Records are packed back to back; their staging offsets are cumulative.
+        offsets = [s.source_offset for s in slots]
         best = float("inf")
         for _ in range(repeats):  # pack_into synchronizes to read lengths
             torch.cuda.synchronize()
@@ -312,15 +311,18 @@ def _nvcomp_rows(
 
                 def decode(
                     codec: Any = codec, encoded: Any = encoded, post: Callable = post
-                ) -> list[torch.Tensor]:
+                ) -> tuple[Any, list[torch.Tensor]]:
+                    # DLPack views do not own nvCOMP buffers: return the
+                    # arrays too so the views stay valid while in use.
                     out = codec.decode(encoded)
-                    return [
+                    return out, [
                         post(torch.from_dlpack(o).view(torch.uint8).reshape(-1))
                         for o in out
                     ]
 
+                _, decoded = decode()
                 exact = all(
-                    torch.equal(d, s) for d, s in zip(decode(), slots, strict=True)
+                    torch.equal(d, s) for d, s in zip(decoded, slots, strict=True)
                 )
                 _emit(
                     rows,
@@ -405,7 +407,7 @@ def main() -> None:
     parser.add_argument(
         "--nvcomp-path",
         default=None,
-        help="directory holding the nvidia.nvcomp package",
+        help="nvidia namespace directory that holds the nvcomp package",
     )
     parser.add_argument(
         "--nvcomp-algorithms", nargs="+", default=["LZ4", "Bitcomp", "ANS", "Zstd"]
