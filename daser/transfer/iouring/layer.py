@@ -491,7 +491,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
-        self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
+        self._l2_write_buffers: dict[int, PinnedMemorySlice] = {}
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
         # L2 byte range of each in-flight promotion, so an overlapping
@@ -763,19 +763,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                         file_offset, nbytes, retained_ok=True
                     )
                     if not waiters:
-                        previous = self._find_pending_l2_locked(file_offset, nbytes)
                         self._record_cache_mutation_locked(file_offset, nbytes)
                         # Pin the buffer as a pending L2 write before publishing:
                         # an over-budget raw charge or a BIP insertion at the
                         # LRU end can evict (and close) it inside put().
-                        task = self._schedule_l2_write_locked(
-                            key,
-                            file_offset,
-                            data,
-                            previous,
-                        )
-                        self._pending_l2[key] = task
-                        self._pending_l2_buffers[key] = data
+                        self._persist_locked(key, data)
                         self._l1.put(key, data, accounted_nbytes=accounting)
                         # Let the newly created task submit its executor work
                         # before a synchronous shutdown can close the
@@ -1056,15 +1048,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     # allocation, and an unpinned child would be closed
                     # before its bytes reach L2.
                     for key, child in children:
-                        previous = self._find_pending_l2_locked(*key)
-                        task = self._schedule_l2_write_locked(
-                            key,
-                            key[0],
-                            child,
-                            previous,
-                        )
-                        self._pending_l2[key] = task
-                        self._pending_l2_buffers[key] = child
+                        self._persist_locked(key, child)
                     self._l1.put_reserved_group(
                         children,
                         accounted_nbytes=accounting,
@@ -1352,11 +1336,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         # Keep every pending buffer alive until ``L2IoEngine.close`` joins the
         # executor, otherwise an asynchronous store can persist bytes from a
         # recycled/cleared slice.  This path is shutdown-only and may block.
-        pending_buffers = list(self._pending_l2_buffers.values())
+        pending_buffers = list(self._l2_write_buffers.values())
         for task in self._pending_l2.values():
             task.cancel()
         self._pending_l2.clear()
-        self._pending_l2_buffers.clear()
+        self._l2_write_buffers.clear()
         if self._l2 is not None:
             self._l2.close()
         for pending_buffer in pending_buffers:
@@ -1366,9 +1350,7 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
         """Return whether a writer, request lease or CUDA copy owns ``data``."""
-        return (
-            self._pending_l2_buffers.get(key) is data or id(data) in self._leased_slices
-        )
+        return id(data) in self._l2_write_buffers or id(data) in self._leased_slices
 
     @property
     def l1_bytes_used(self) -> int:
@@ -1486,6 +1468,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         if written != len(data):
             raise IOError(f"short io_uring write: {written} != {len(data)}")
 
+    def _persist_locked(
+        self, key: tuple[int, int], data: PinnedMemorySlice
+    ) -> asyncio.Task[None]:
+        """Schedule one L2 write for an L1 range and pin its buffer.
+
+        The write waits for earlier pending writes of overlapping ranges and
+        owns ``data`` until it ends, also after a newer write of the same
+        range replaces it in ``_pending_l2``.
+
+        Returns:
+            The write task.
+        """
+        previous = self._find_pending_l2_locked(*key)
+        task = self._schedule_l2_write_locked(key, key[0], data, previous)
+        self._pending_l2[key] = task
+        self._l2_write_buffers[id(data)] = data
+        return task
+
     def _schedule_l2_write_locked(
         self,
         key: tuple[int, int],
@@ -1503,11 +1503,12 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         loop = asyncio.get_event_loop()
         future = asyncio.create_task(self._run_l2_write(loop, file_offset, data))
-        return asyncio.create_task(self._track_l2_write(key, future))
+        return asyncio.create_task(self._track_l2_write(key, data, future))
 
     async def _track_l2_write(
         self,
         key: tuple[int, int],
+        data: PinnedMemorySlice,
         future: asyncio.Future[None],
     ) -> None:
         """Publish completion for an already-submitted L2 write."""
@@ -1522,11 +1523,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise
         finally:
             async with self._lock:
-                if self._pending_l2.get(key) is current:
-                    self._pending_l2.pop(key, None)
-                    pending_buffer = self._pending_l2_buffers.pop(key, None)
-                    if pending_buffer is not None:
-                        self._close_unowned_slice_locked(pending_buffer)
+                self._finish_l2_write_locked(key, data, current)
 
     async def _write_l2_async(
         self,
@@ -1552,11 +1549,19 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise
         finally:
             async with self._lock:
-                if self._pending_l2.get(key) is current:
-                    self._pending_l2.pop(key, None)
-                    pending_buffer = self._pending_l2_buffers.pop(key, None)
-            if pending_buffer is not None:
-                self._close_unowned_slice_locked(pending_buffer)
+                self._finish_l2_write_locked(key, data, current)
+
+    def _finish_l2_write_locked(
+        self,
+        key: tuple[int, int],
+        data: PinnedMemorySlice,
+        task: asyncio.Task[None] | None,
+    ) -> None:
+        """Forget one ended L2 write and free its buffer if nothing owns it."""
+        if self._pending_l2.get(key) is task:
+            del self._pending_l2[key]
+        self._l2_write_buffers.pop(id(data), None)
+        self._close_unowned_slice_locked(data)
 
     async def _run_l2_write(
         self,
@@ -2422,7 +2427,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Close a detached slice after its final writer/lease reference leaves."""
         if self._l1.contains_slice(data):
             return
-        if any(buffer is data for buffer in self._pending_l2_buffers.values()):
+        if id(data) in self._l2_write_buffers:
             return
         if id(data) in self._leased_slices:
             return
