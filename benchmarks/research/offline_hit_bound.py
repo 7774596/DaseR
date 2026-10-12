@@ -5,7 +5,9 @@
 Simulates one inclusive LRU cache over Mooncake 512-token hash blocks with a
 byte capacity, and reports the fraction of prompt tokens served as a reusable
 prefix. Because LRU is a stack algorithm, the hit rate at capacity ``C`` is an
-upper bound for any GPU + L1 + L2 hierarchy whose total capacity is ``C``.
+upper bound for any GPU + L1 + L2 hierarchy of LRU tiers whose total capacity
+is ``C``. ``--policy fifo`` models an insertion-ordered store whose hits do
+not refresh, which cyclic access can favour over LRU.
 ``--policy belady`` instead evicts the block whose next use is farthest
 (deepest prefix position first among ties): a clairvoyant bound for what any
 replacement policy could reach at the same capacity. ``--policy lru-dead``
@@ -52,6 +54,43 @@ def prefix_hit_rate(requests: list, capacity_blocks: int) -> tuple[float, int, i
         for block in request.hash_ids:
             cache[block] = None
             cache.move_to_end(block)
+        if capacity_blocks > 0:
+            while len(cache) > capacity_blocks:
+                cache.popitem(last=False)
+    return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
+
+
+def fifo_prefix_hit_rate(
+    requests: list, capacity_blocks: int
+) -> tuple[float, int, int]:
+    """Replay requests through a FIFO that hits do not refresh.
+
+    Only missing blocks are inserted, so a session's oldest prefix blocks are
+    evicted first even while every request of the session reuses them; this
+    models an insertion-ordered store that evicts its oldest records.
+
+    Args:
+        requests: ``TraceRequest`` rows in arrival order.
+        capacity_blocks: Cache capacity in 512-token blocks (``<=0`` = infinite).
+
+    Returns:
+        ``(hit_rate, hit_tokens, prompt_tokens)`` with the same leading-prefix
+        hit rule as :func:`prefix_hit_rate`.
+    """
+    cache: OrderedDict[int, None] = OrderedDict()
+    hit_tokens = 0
+    prompt_tokens = 0
+    for request in requests:
+        prompt_tokens += request.input_length
+        leading = 0
+        for block in request.hash_ids:
+            if block not in cache:
+                break
+            leading += 1
+        hit_tokens += min(leading * MOONCAKE_BLOCK_TOKENS, request.input_length)
+        for block in request.hash_ids:
+            if block not in cache:
+                cache[block] = None
         if capacity_blocks > 0:
             while len(cache) > capacity_blocks:
                 cache.popitem(last=False)
@@ -182,12 +221,14 @@ def restarted_hit_rate(
 
 _POLICIES = {
     "lru": prefix_hit_rate,
+    "fifo": fifo_prefix_hit_rate,
     "lru-dead": dead_hint_prefix_hit_rate,
     "belady": belady_prefix_hit_rate,
 }
 _POLICY_HELP = (
-    "lru: plain LRU; lru-dead: LRU that evicts blocks a session's prefix "
-    "diverged from first; belady: clairvoyant farthest next use."
+    "lru: plain LRU; fifo: insertion order, hits do not refresh; lru-dead: "
+    "LRU that evicts blocks a session's prefix diverged from first; belady: "
+    "clairvoyant farthest next use."
 )
 
 
