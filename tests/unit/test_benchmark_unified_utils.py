@@ -4253,3 +4253,27 @@ def test_lmcache_codec_options_are_validated(tmp_path: Path, options: dict) -> N
             l2_size_bytes=2 * 1024**3,
             **options,
         )
+
+
+def test_daser_codebooks_reach_compressed_server_only(tmp_path: Path) -> None:
+    """Calibrated codebooks become --compressed-codebooks for compressed stores."""
+    common = {
+        "run_id": "run1",
+        "backend": "daser",
+        "model": "/models/qwen",
+        "store_dir": tmp_path,
+        "gpu_id": "0",
+        "gpu_util": 0.85,
+        "max_num_seqs": 1,
+        "l1_size_bytes": 1024**3,
+        "l2_size_bytes": 2 * 1024**3,
+    }
+    manager = ServerManager(
+        **common, storage_format="compressed-online", daser_codebooks=tmp_path / "b"
+    )
+    cmd = manager._daser_server_command()  # noqa: SLF001
+    assert cmd[cmd.index("--compressed-codebooks") + 1] == str(tmp_path / "b")
+    plain = ServerManager(**common, storage_format="compressed-online")
+    assert "--compressed-codebooks" not in plain._daser_server_command()  # noqa: SLF001
+    with pytest.raises(ValueError, match="compressed-online"):
+        ServerManager(**common, daser_codebooks=tmp_path / "b")

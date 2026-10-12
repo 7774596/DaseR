@@ -429,6 +429,7 @@ class ServerManager:
         daser_extra_kv_layers: int = 0,
         daser_l1_lru: bool = False,
         daser_l1_accounting: str = "stored",
+        daser_codebooks: Path | None = None,
         daser_coalesce_loads: bool = False,
         daser_layerwise_load: bool = False,
         daser_piecewise_cudagraph: bool = False,
@@ -481,6 +482,9 @@ class ServerManager:
             daser_l1_lru: pass ``--no-bip-enabled`` so L1 inserts at the MRU
                 end (plain LRU) instead of BIP.
             daser_l1_accounting: DaseR ``--l1-accounting`` capacity unit.
+            daser_codebooks: calibrated codebook directory passed as DaseR
+                ``--compressed-codebooks``; ``None`` uses the generic
+                codebooks. Only valid with ``compressed-online`` storage.
             daser_coalesce_loads: let the connector hold back requests whose
                 prefix another request is already loading.
             daser_layerwise_load: restore fully leased packed or raw hits
@@ -541,6 +545,8 @@ class ServerManager:
             lmcache_codec_capacity is not None or lmcache_codec_codebooks is not None
         ):
             raise ValueError("LMCache codec options require lmcache_daser_codec")
+        if daser_codebooks is not None and storage_format != "compressed-online":
+            raise ValueError("daser_codebooks require compressed-online storage")
         if lmcache_codec_capacity is not None and not 0 < lmcache_codec_capacity <= 1:
             raise ValueError("lmcache_codec_capacity must be in (0, 1]")
         if extra_vllm_gpu_ids and backend != "daser":
@@ -580,6 +586,7 @@ class ServerManager:
         self.lmcache_codec_capacity = lmcache_codec_capacity
         self.lmcache_codec_codebooks = lmcache_codec_codebooks
         self.daser_l1_accounting = daser_l1_accounting
+        self.daser_codebooks = daser_codebooks
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
         self.daser_piecewise_cudagraph = daser_piecewise_cudagraph
@@ -941,6 +948,8 @@ class ServerManager:
             cmd.append("--no-bip-enabled")
         if self.daser_l1_accounting != "stored":
             cmd.extend(["--l1-accounting", self.daser_l1_accounting])
+        if self.daser_codebooks is not None:
+            cmd.extend(["--compressed-codebooks", str(self.daser_codebooks)])
         if self.trust_remote_code:
             cmd.append("--trust-remote-code")
         return cmd

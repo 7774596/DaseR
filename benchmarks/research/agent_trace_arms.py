@@ -534,10 +534,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stored capacity fraction of a raw chunk (lmcache-codec arm only).",
     )
     parser.add_argument(
-        "--lmcache-codec-codebooks",
+        "--codec-codebooks",
         type=Path,
         default=None,
-        help="Calibrated codebook directory (lmcache-codec arm only).",
+        help="Calibrated codebook directory shared by the daser-compressed* and "
+        "lmcache-codec arms, so both sides run the same codec.",
     )
     parser.add_argument(
         "--vllm-extra-args",
@@ -661,6 +662,9 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
             "compressed-online" if arm.startswith("daser-compressed") else "raw"
         ),
         daser_l1_accounting=("raw" if arm == "daser-compressed-raw-l1" else "stored"),
+        daser_codebooks=(
+            args.codec_codebooks if arm.startswith("daser-compressed") else None
+        ),
         daser_coalesce_loads=arm.endswith("-coalesce"),
         daser_layerwise_load=arm.endswith("-layerwise"),
         daser_piecewise_cudagraph=arm.endswith("-piecewise"),
@@ -689,7 +693,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
             args.lmcache_codec_capacity if arm == "lmcache-codec" else None
         ),
         lmcache_codec_codebooks=(
-            args.lmcache_codec_codebooks if arm == "lmcache-codec" else None
+            args.codec_codebooks if arm == "lmcache-codec" else None
         ),
         extra_vllm_args=tuple(shlex.split(args.vllm_extra_args))
         + _speculative_args(args.speculative_config),
