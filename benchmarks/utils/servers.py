@@ -710,6 +710,9 @@ class ServerManager:
             str(self.lmcache_eviction_watermark),
             "--http-port",
             str(LMCACHE_HTTP_PORT),
+            # Benchmarks read /status; OTel metrics need an exporter that
+            # not every LMCache install ships.
+            "--disable-metrics",
         ]
         if not self.skip_l2:
             scratch = self.store_dir / "lmcache_mp_disk"
