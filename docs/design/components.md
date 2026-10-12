@@ -64,12 +64,14 @@ slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rin
 或恢复 `daser.index`。因此 lookup 和 store 都只对当前进程内的 L1 bytes 有意义；
 L1 淘汰或进程重启后没有 L2 可恢复。
 
-`compressed-online` 下，`ServerCore` 在 store 完成时按物理 slot 记录 packed
-record（mode、file offset、stored length），与 `MetadataStore` 分开保存。lookup
-仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
-展开被命中 slot 的 record。codec metadata 不进入 ring allocator，transfer backend
-也不依赖 server 实现类型。这些 record 只在内存中，因此该模式不保存也不恢复
-`daser.index`。
+`compressed-online` 下，chunk → 物理 record 只由 `ServerCore` 持有的
+`OnlinePackedLayout` 维护：store 先经它放置 packed record（mode、file offset、
+stored length），写完后 `record_store_ranges` 把对应 placement 标为已写；chunk
+离开 metadata store 时由 `ServerCore` 释放其 placement，再通知 removal listener。
+lookup 仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
+展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入 ring
+allocator，transfer backend 也不依赖 server 实现类型。这些 record 只在内存中，
+因此该模式不保存也不恢复 `daser.index`。
 
 ---
 

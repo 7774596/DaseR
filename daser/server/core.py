@@ -21,6 +21,7 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.ghost_admission import GhostAdmission
 from daser.server.metadata_store import ChunkMeta
+from daser.server.packed_layout import OnlinePackedLayout
 
 logger = init_logger(__name__)
 
@@ -266,9 +267,8 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
-        self._packed_slots: dict[int, dict[str, Any]] = {}
-        self._packed_slot_owners: dict[int, str] = {}
-        self._packed_slots_by_owner: dict[str, set[int]] = {}
+        # Online packed records live in one layout; removal reclaims them.
+        self._packed_layout = OnlinePackedLayout()
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
         # Prefix-closed eviction: key -> keys a lookup reaches only through
@@ -321,12 +321,6 @@ class ServerCore:
         Async/thread-safety:
             Run during startup before serving requests.
         """
-        # Packed refs are an in-memory publication artifact, not part of the
-        # persisted chunk index. A restart must begin without reloadable
-        # compressed records until the worker republishes them.
-        self._packed_slots.clear()
-        self._packed_slot_owners.clear()
-        self._packed_slots_by_owner.clear()
         for meta in list(self._cm.store.iter_chunks()):
             await self._ri.insert(meta)
             self._lifecycle.mark_committed(meta.chunk_key)
@@ -868,23 +862,24 @@ class ServerCore:
                 if logical_count != 1:
                     raise ValueError("packed store spans must describe one slot")
                 slot_index = 0 if num_slots == 1 else logical_start
+                # The layout placed this record; a write whose placement was
+                # released meanwhile wrote bytes no lookup may reference.
+                if not self._packed_layout.mark_written(
+                    chunk_key,
+                    start_slot + slot_index,
+                    range_start,
+                    rank_base=tp_rank * rank_stride_bytes,
+                ):
+                    logger.debug(
+                        "[CORE] drop packed record without placement key=%s",
+                        chunk_key[:8],
+                    )
+                    continue
                 complete = self._lifecycle.record_written_slot(
                     chunk_key,
                     tp_rank,
                     slot_index,
                     num_slots,
-                )
-                physical_slot = start_slot + slot_index
-                self._clear_packed_slot(physical_slot)
-                self._packed_slots[physical_slot] = {
-                    "slot_id": physical_slot,
-                    "mode": str(span.get("mode", "compressed")),
-                    "file_offset": range_start,
-                    "stored_length": int(span["nbytes"]),
-                }
-                self._packed_slot_owners[physical_slot] = chunk_key
-                self._packed_slots_by_owner.setdefault(chunk_key, set()).add(
-                    physical_slot
                 )
             else:
                 complete = self._lifecycle.record_written_range(
@@ -903,6 +898,16 @@ class ServerCore:
             await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
         return ready
 
+    @property
+    def packed_layout(self) -> OnlinePackedLayout:
+        """Online packed placement, the one chunk -> physical record index.
+
+        Async/thread-safety:
+            Owned by the server event loop; chunk removal releases placements
+            before removal listeners run.
+        """
+        return self._packed_layout
+
     def packed_slot_refs(
         self, start_slot: int, num_slots: int
     ) -> list[dict[str, int | str]]:
@@ -914,55 +919,17 @@ class ServerCore:
 
         Returns:
             Ordered record metadata, or an empty list until every record has
-            been published by the online store path.
-        """
-        if start_slot < 0 or num_slots <= 0:
-            return []
-        refs = [
-            self._packed_slots.get(start_slot + index) for index in range(num_slots)
-        ]
-        if any(ref is None for ref in refs):
-            return []
-        owners = {
-            self._packed_slot_owners.get(start_slot + index)
-            for index in range(num_slots)
-        }
-        if None in owners:
-            return []
-        for owner in owners:
-            if (
-                owner is None
-                or self._cm.store.get(owner) is None
-                or not self._lifecycle.is_committed(owner)
-            ):
-                self._clear_packed_refs(owner)
-                return []
-        return [dict(ref) for ref in refs if ref is not None]
-
-    def packed_slot_owners(self, start_slot: int, num_slots: int) -> list[str]:
-        """Return the chunks owning online packed records in a slot interval.
-
-        A coalesced prefix match reports only its last key; this recovers
-        every stored chunk it spans.
-
-        Args:
-            start_slot: First logical store slot.
-            num_slots: Number of slots in the interval.
-
-        Returns:
-            Distinct owner chunk keys in slot order; slots without a packed
-            record are skipped.
+            been written and its owner chunk committed.
 
         Async/thread-safety:
-            Reads in-memory state on the server event loop. It performs no
-            blocking I/O.
+            Pure lookup on the server event loop.
         """
-        owners: dict[str, None] = {}
-        for slot in range(start_slot, start_slot + max(0, num_slots)):
-            owner = self._packed_slot_owners.get(slot)
-            if owner is not None:
-                owners[owner] = None
-        return list(owners)
+        records = self._packed_layout.written_records(start_slot, num_slots, self._cm)
+        if records is None:
+            return []
+        if not all(self._lifecycle.is_committed(r.chunk_key) for r in records):
+            return []
+        return [record.to_ref() for record in records]
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.
@@ -1136,7 +1103,7 @@ class ServerCore:
             return False
         if not self.is_current_allocation(chunk_key, start_slot, num_slots):
             return False
-        self._clear_packed_refs(chunk_key)
+        self._packed_layout.clear_written(chunk_key)
         self._lifecycle.discard_owner(chunk_key)
         return True
 
@@ -1336,7 +1303,6 @@ class ServerCore:
         """
         evicted = self._cm.drain_evicted_chunk_keys()
         for chunk_key in evicted:
-            self._clear_packed_refs(chunk_key)
             await self._ri.remove(chunk_key)
             self._lifecycle.mark_evicted(chunk_key)
             self._notify_chunk_removed(chunk_key)
@@ -1393,39 +1359,20 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
-            self._clear_packed_refs(chunk_key)
             self._lifecycle.discard(chunk_key)
             return False
         if doc_id in meta.doc_ids:
             meta.doc_ids.remove(doc_id)
         if meta.doc_ids:
             return False
-        self._clear_packed_refs(chunk_key)
         self._cm.store.remove(chunk_key)
         self._lifecycle.discard(chunk_key)
         self._notify_chunk_removed(chunk_key)
         return True
 
-    def _clear_packed_slot(self, slot_id: int) -> None:
-        """Remove one packed publication before a physical slot is reused."""
-        self._packed_slots.pop(slot_id, None)
-        owner = self._packed_slot_owners.pop(slot_id, None)
-        if owner is not None:
-            slots = self._packed_slots_by_owner.get(owner)
-            if slots is not None:
-                slots.discard(slot_id)
-                if not slots:
-                    del self._packed_slots_by_owner[owner]
-
-    def _clear_packed_refs(self, chunk_key: str | None) -> None:
-        """Remove every packed publication owned by one chunk."""
-        if not chunk_key:
-            return
-        for slot_id in list(self._packed_slots_by_owner.get(chunk_key, ())):
-            self._clear_packed_slot(slot_id)
-
     def _notify_chunk_removed(self, chunk_key: str) -> None:
-        """Tell registered listeners that a chunk left the metadata store."""
+        """Release a removed chunk's packed bytes, then tell listeners."""
+        self._packed_layout.release(chunk_key, self._cm)
         for listener in self._removal_listeners:
             listener(chunk_key)
 
@@ -1440,7 +1387,6 @@ class ServerCore:
             Performs in-memory mutation on the server event loop.
         """
         await self._ri.remove(chunk_key)
-        self._clear_packed_refs(chunk_key)
         meta = self._cm.store.get(chunk_key)
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)

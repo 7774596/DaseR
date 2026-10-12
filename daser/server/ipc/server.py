@@ -29,7 +29,7 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
+from daser.server.packed_layout import PackedArenaFull
 from daser.transfer import LeaseIncompleteError, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -374,7 +374,6 @@ class IPCServer:
         # slots are overwritten; it is intentionally independent of logical
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
-        self._packed_layout = OnlinePackedLayout()
         # Online packed stores publish asynchronously after the worker has
         # released its source snapshot, so a successor lookup can observe the
         # writer key during the short transfer/commit interval. Retry for this
@@ -398,12 +397,6 @@ class IPCServer:
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
         ):
-            # Evicted chunks hand their packed bytes back to the layout.
-            core.add_chunk_removal_listener(
-                lambda chunk_key: self._packed_layout.release(
-                    chunk_key, core.chunk_manager
-                )
-            )
             # Exclusive tiers decide what reaches L2, so a memory-only store
             # has nothing for them to control.
             has_l2 = not bool(self._runtime_config.get("skip_l2", False))
@@ -1199,11 +1192,12 @@ class IPCServer:
                 # chunks (never the ones being stored) until the reported
                 # deficit is freed, then retry placement.
                 rank_base = tp_rank * rank_stride_bytes
+                layout = self._core.packed_layout
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
                 place_started = time.perf_counter()
                 while True:
                     try:
-                        live_spans = self._packed_layout.compact(
+                        live_spans = layout.compact(
                             live_spans,
                             self._core.chunk_manager,
                             local_slot_size=local_slot_size,
@@ -1212,15 +1206,12 @@ class IPCServer:
                         )
                         break
                     except PackedArenaFull as exc:
-                        # Evicted chunks return their bytes through the core's
-                        # removal listener, so free space can be read directly.
+                        # Chunk removal releases placements inside the core,
+                        # so free space can be read directly.
                         target = (
-                            self._packed_layout.free_bytes(rank_base=rank_base)
-                            + exc.deficit_bytes
+                            layout.free_bytes(rank_base=rank_base) + exc.deficit_bytes
                         )
-                        while (
-                            self._packed_layout.free_bytes(rank_base=rank_base) < target
-                        ):
+                        while layout.free_bytes(rank_base=rank_base) < target:
                             evicted = await self._core.evict_oldest_chunk(
                                 protected_keys
                             )
@@ -1237,9 +1228,7 @@ class IPCServer:
                 # Another store may evict these chunks while this one awaits
                 # its IO; keep their bytes from being placed again until the
                 # transfer layer has this write ordered.
-                write_hold = self._packed_layout.begin_writes(
-                    live_spans, rank_base=rank_base
-                )
+                write_hold = layout.begin_writes(live_spans, rank_base=rank_base)
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -1633,7 +1622,7 @@ class IPCServer:
 
     def _end_packed_writes(self, token: int) -> None:
         """End one packed write hold and count bytes freed late by it."""
-        freed = self._packed_layout.end_writes(token)
+        freed = self._core.packed_layout.end_writes(token)
         if freed:
             self._metrics.counter(
                 "daser_packed_deferred_free_bytes_total",
@@ -1860,7 +1849,7 @@ class IPCServer:
             self._metrics.gauge(
                 "daser_packed_arena_free_bytes",
                 "Unreserved bytes of the rank-0 packed arena lane.",
-            ).set(self._packed_layout.free_bytes())
+            ).set(self._core.packed_layout.free_bytes())
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use.
