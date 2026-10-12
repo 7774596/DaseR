@@ -9,7 +9,10 @@ DaseR's strict-lossless online record instead of the raw chunk without
 touching the DaseR kernels: it permutes chunks into a small private ``BLNHC``
 scratch cache, runs ``FusedOnlineKVPacker`` / ``FusedCompressedKVDecoder`` on
 that scratch, and writes records back into the first ``capacity_bytes`` of the
-engine's own staging buffer.
+engine's own staging buffer. Engines whose staging buffer already fuses K
+and V inside each head (``[layers, tokens, heads, 2, head_dim]``, as LMCache
+stages vLLM's ``kv_size == 1`` layouts) pass ``fused_kv=True`` and skip the
+permute.
 
 Host objects must be fixed-size (allocators size them from a layout and
 storage backends verify full-length reads), so every record is padded to one
@@ -121,6 +124,9 @@ class KVMajorChunkCodec:
         max_chunks (int): Largest chunk batch passed to one call.
         codebook_dir (str | Path | None): Calibration artifact directory
             for this model; the model-independent generic palette when None.
+        fused_kv (bool): Chunks hold K and V side by side in each head,
+            ``[layers, tokens, heads, 2, head_dim]``, instead of kv-major.
+            This is DaseR's physical block order, so no permute is needed.
 
     Raises:
         ValueError: If the device is not CUDA, the geometry is unsupported,
@@ -146,6 +152,7 @@ class KVMajorChunkCodec:
         capacity_ratio: float,
         max_chunks: int,
         codebook_dir: str | Path | None = None,
+        fused_kv: bool = False,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("kv-major chunk codec requires a CUDA device")
@@ -162,7 +169,12 @@ class KVMajorChunkCodec:
         )
         self._capacity = chunk_capacity_bytes(self._geometry.slot_size, capacity_ratio)
         self._max_chunks = max_chunks
-        self._kv_major_shape = (2, num_layers, chunk_tokens, num_kv_heads, head_dim)
+        self._fused_kv = fused_kv
+        self._chunk_shape = (
+            (num_layers, chunk_tokens, num_kv_heads, 2, head_dim)
+            if fused_kv
+            else (2, num_layers, chunk_tokens, num_kv_heads, head_dim)
+        )
         codebooks = (
             default_online_codebooks(self._geometry)
             if codebook_dir is None
@@ -219,7 +231,8 @@ class KVMajorChunkCodec:
 
         Args:
             chunks (list[torch.Tensor]): Contiguous CUDA uint8 staging buffers
-                of ``raw_bytes`` each, holding kv-major BF16 chunks. Once
+                of ``raw_bytes`` each, holding BF16 chunks in the codec's chunk
+                layout (kv-major, or fused when ``fused_kv``). Once
                 ``stream`` passes this call, the first ``capacity_bytes`` of
                 each hold its record followed by unspecified padding.
             stream (torch.cuda.Stream): Stream ordered after the producer of
@@ -242,7 +255,7 @@ class KVMajorChunkCodec:
             physical = physical_kv_view(self._encode_scratch)
             with torch.cuda.stream(stream):
                 for index, chunk in enumerate(chunks):
-                    physical[index].copy_(kv_major_to_physical(self._bf16(chunk)))
+                    physical[index].copy_(self._physical_view(chunk))
             records = self._packer.pack_into(
                 staging=self._pack_staging,
                 block_ids=list(range(len(chunks))),
@@ -270,7 +283,7 @@ class KVMajorChunkCodec:
             return [record.stored_length for record in records]
 
     def decode(self, chunks: list[torch.Tensor], stream: torch.cuda.Stream) -> None:
-        """Restore raw kv-major chunks from records at their buffer starts.
+        """Restore raw chunks from records at their buffer starts.
 
         Args:
             chunks (list[torch.Tensor]): Contiguous CUDA uint8 staging buffers
@@ -313,7 +326,7 @@ class KVMajorChunkCodec:
             )
             with torch.cuda.stream(stream):
                 for index, chunk in enumerate(chunks):
-                    self._bf16(chunk).copy_(physical_to_kv_major(physical[index]))
+                    self._physical_view(chunk).copy_(physical[index])
                 self._decode_done = torch.cuda.Event()
                 self._decode_done.record(stream)
             self._decode_events[ring] = self._decode_done
@@ -339,9 +352,10 @@ class KVMajorChunkCodec:
             device=device,
         )
 
-    def _bf16(self, chunk: torch.Tensor) -> torch.Tensor:
-        """View a raw uint8 chunk buffer as its kv-major BF16 tensor."""
-        return chunk.view(torch.bfloat16).view(self._kv_major_shape)
+    def _physical_view(self, chunk: torch.Tensor) -> torch.Tensor:
+        """View a raw uint8 chunk buffer in DaseR's physical block order."""
+        view = chunk.view(torch.bfloat16).view(self._chunk_shape)
+        return view if self._fused_kv else kv_major_to_physical(view)
 
     def _validate(self, chunks: list[torch.Tensor]) -> None:
         """Reject batches that do not match the compiled geometry."""

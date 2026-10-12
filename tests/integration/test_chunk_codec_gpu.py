@@ -5,12 +5,18 @@ import pytest
 import torch
 
 from daser.compression.format import IO_ALIGNMENT
-from daser.ops.chunk_codec import ChunkCapacityError, KVMajorChunkCodec
+from daser.ops.chunk_codec import (
+    ChunkCapacityError,
+    KVMajorChunkCodec,
+    kv_major_to_physical,
+)
 
 _LAYERS, _TOKENS, _HEADS, _HEAD_DIM = 4, 64, 4, 128
 
 
-def _codec(max_chunks: int, capacity_ratio: float = 0.75) -> KVMajorChunkCodec:
+def _codec(
+    max_chunks: int, capacity_ratio: float = 0.75, *, fused_kv: bool = False
+) -> KVMajorChunkCodec:
     return KVMajorChunkCodec(
         num_layers=_LAYERS,
         chunk_tokens=_TOKENS,
@@ -19,6 +25,7 @@ def _codec(max_chunks: int, capacity_ratio: float = 0.75) -> KVMajorChunkCodec:
         device=torch.device("cuda"),
         capacity_ratio=capacity_ratio,
         max_chunks=max_chunks,
+        fused_kv=fused_kv,
     )
 
 
@@ -94,3 +101,35 @@ def test_chunk_codec_rejects_mismatched_buffers() -> None:
         codec.encode([good, good.clone()], stream)
     with pytest.raises(ValueError):
         codec.encode([good[:-IO_ALIGNMENT]], stream)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_chunk_codec_matches_kv_major_records_and_round_trips() -> None:
+    kv_major = _codec(max_chunks=2)
+    fused = _codec(max_chunks=2, fused_kv=True)
+    stream = torch.cuda.Stream()
+    originals = [_chunk(kv_major, seed, compressible=True) for seed in (5, 6)]
+    shape = (2, _LAYERS, _TOKENS, _HEADS, _HEAD_DIM)
+    # The same KV staged K/V-fused per head, as LMCache stages kv_size == 1.
+    fused_originals = [
+        kv_major_to_physical(chunk.view(torch.bfloat16).view(shape))
+        .contiguous()
+        .view(-1)
+        .view(torch.uint8)
+        for chunk in originals
+    ]
+    fused_chunks = [chunk.clone() for chunk in fused_originals]
+    kv_major_chunks = [chunk.clone() for chunk in originals]
+    lengths = fused.encode(fused_chunks, stream)
+    assert kv_major.encode(kv_major_chunks, stream) == lengths
+    # Both layouts produce the same record format: the fused codec restores
+    # records written from the kv-major chunks, and its own.
+    fused.decode(kv_major_chunks, stream)
+    fused.decode(fused_chunks, stream)
+    stream.synchronize()
+    for original, *targets in zip(
+        fused_originals, kv_major_chunks, fused_chunks, strict=True
+    ):
+        for target in targets:
+            assert torch.equal(target, original)
