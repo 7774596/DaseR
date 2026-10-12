@@ -129,6 +129,20 @@ class _Readahead:
     started: float
 
 
+@dataclass
+class _Promotion:
+    """One in-flight L2-to-L1 promotion holding a reserved pinned slice."""
+
+    # L2 byte range read, so an overlapping prefetch waits for these bytes
+    # instead of reading them a second time.
+    key: tuple[int, int]
+    # Cache mutation epoch at reservation; a newer overlapping store makes
+    # the promoted bytes stale.
+    epoch: int
+    # Completed when the promotion ends, waking stores waiting for the pool.
+    done: asyncio.Future[None]
+
+
 class _ReadaheadStarved(Exception):
     """A readahead promotion found the L1 pool exhausted and gave up.
 
@@ -851,21 +865,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         # flight (superseded ones included) keyed by ``id()``.
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._l2_write_buffers: dict[int, PinnedMemorySlice] = {}
-        # L1-only packed ranges waiting for an admission decision. They stay
-        # pinned; leaving L1 before a decision writes them back to L2.
-        self._held: dict[tuple[int, int], PinnedMemorySlice] = {}
-        self._held_bytes = 0
         # Held bytes above which idle time writes the oldest held ranges
         # (0 disables), and the preclean writes still in flight.
         self._held_preclean_limit = (
             0 if skip_l2 else int(l1_bytes * held_preclean_fraction)
         )
         self._preclean_writes: set[asyncio.Task[None]] = set()
-        self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
-        self._pending_l1_promotion_epochs: dict[int, int] = {}
-        # L2 byte range of each in-flight promotion, so an overlapping
-        # prefetch waits for the bytes instead of reading them a second time.
-        self._pending_l1_promotion_ranges: dict[int, tuple[int, int]] = {}
+        # In-flight promotions by reservation identifier (``id()`` of the slice).
+        self._promotions: dict[int, _Promotion] = {}
         self._cache_epoch = 0
         self._cache_mutations: list[tuple[int, int, int]] = []
         self._request_leases: dict[str, _RequestLease] = {}
@@ -878,6 +885,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
             replacement_policy=_l1_replacement_policy(self.bip_enabled),
+            on_held_release=self._persist_evicted_held,
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
@@ -1301,9 +1309,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                             if not task.done()
                         }
                         waiters.update(
-                            future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            promotion.done
+                            for promotion in self._promotions.values()
+                            if not promotion.done.done()
                         )
                         if not waiters:
                             waiter = asyncio.get_event_loop().create_future()
@@ -1386,17 +1394,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                     # publishing: when accounted charges exceed physical
                     # bytes, publication can evict this group's own
                     # allocation, and an unpinned child would be closed
-                    # before its bytes reach L2.
+                    # before its bytes reach L2. Held children are marked
+                    # by put_reserved_group before it evicts anything.
                     for (key, child), hold in zip(children, holds, strict=True):
-                        if hold:
-                            self._pop_held(key)
-                            self._held[key] = child
-                            self._held_bytes += key[1]
-                        else:
+                        if not hold:
                             self._persist_locked(key, child)
                     self._l1.put_reserved_group(
                         children,
                         accounted_nbytes=accounting,
+                        held=holds,
                     )
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
@@ -1954,13 +1960,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             It does not await, so it is atomic with respect to locked sections.
         """
         for key in ranges:
-            data = self._pop_held(key)
-            if data is None:
-                continue
-            if self._l1.get(key) is data:
-                self._l1.drop_overlapping(*key)
-            else:
-                self._close_unowned_slice_locked(data)
+            self._l1.discard_held(key)
 
     async def drain(self) -> None:
         """Wait until all pending L2 writes and destination copies complete.
@@ -2019,9 +2019,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             "pending_l2_writes": sum(
                 not task.done() for task in list(self._pending_l2.values())
             ),
-            "pending_l1_promotions": len(dict(self._pending_l1_promotions)),
+            "pending_l1_promotions": len(dict(self._promotions)),
             "l1_bytes_used": self._l1.bytes_used,
-            "held_bytes": self._held_bytes,
+            "held_bytes": self._l1.held_bytes,
         }
 
     def close(self) -> None:
@@ -2044,9 +2044,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             task.cancel()
         self._pending_l2.clear()
         self._l2_write_buffers.clear()
-        # Held ranges are L1 residents; the L1 close below frees them.
-        self._held.clear()
-        self._held_bytes = 0
         if self._l2 is not None:
             self._l2.close()
         for pending_buffer in pending_buffers:
@@ -2055,23 +2052,20 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1.close()
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
-        """Return whether a writer, request lease or CUDA copy owns ``data``.
-
-        A held range leaving L1 before its admission decision has never been
-        written to L2, so it is written back here and the new writer owns it.
-        """
-        if self._held.get(key) is data:
-            self._pop_held(key)
-            self._stats.held_evict_persists += 1
-            self._persist_locked(key, data)
+        """Return whether an L2 writer or request lease owns ``data``."""
+        del key
         return id(data) in self._l2_write_buffers or id(data) in self._leased_slices
 
-    def _pop_held(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
-        """Remove one held range and return its slice, if still held."""
-        data = self._held.pop(key, None)
-        if data is not None:
-            self._held_bytes -= key[1]
-        return data
+    def _persist_evicted_held(
+        self, key: tuple[int, int], data: PinnedMemorySlice
+    ) -> None:
+        """Write back a held range leaving L1 before it was discarded.
+
+        It has never been written to L2, so the new writer takes ownership of
+        the slice before L1 decides whether to close it.
+        """
+        self._stats.held_evict_persists += 1
+        self._persist_locked(key, data)
 
     def _maybe_preclean_held(self) -> None:
         """Write the oldest held ranges to L2 while no readahead is reading.
@@ -2088,19 +2082,19 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         if (
             not self._held_preclean_limit
-            or self._held_bytes <= self._held_preclean_limit
+            or self._l1.held_bytes <= self._held_preclean_limit
             or self._preclean_writes
             or not self._readahead_idle.is_set()
         ):
             return
         submitted = 0
-        for key in list(self._held):
+        for key in self._l1.held_keys():
             if (
-                self._held_bytes <= self._held_preclean_limit
+                self._l1.held_bytes <= self._held_preclean_limit
                 or submitted >= _PRECLEAN_BATCH_BYTES
             ):
                 break
-            data = self._pop_held(key)
+            data = self._l1.clear_held(key)
             assert data is not None
             task = self._persist_locked(key, data)
             self._preclean_writes.add(task)
@@ -2160,7 +2154,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     @property
     def held_bytes(self) -> int:
         """Return held L1 bytes that have not been written to L2."""
-        return self._held_bytes
+        return self._l1.held_bytes
 
     def _accounted_nbytes(self, span: dict[str, Any], nbytes: int) -> int:
         """Return the configured L1 capacity charge for one physical span.
@@ -2242,11 +2236,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Return waiters of in-flight L2 promotions overlapping a span."""
         end = file_offset + nbytes
         return [
-            self._pending_l1_promotions[promotion_id]
-            for promotion_id, (start, size) in self._pending_l1_promotion_ranges.items()
-            if start < end
-            and file_offset < start + size
-            and not self._pending_l1_promotions[promotion_id].done()
+            promotion.done
+            for promotion in self._promotions.values()
+            if promotion.key[0] < end
+            and file_offset < promotion.key[0] + promotion.key[1]
+            and not promotion.done.done()
         ]
 
     def _read_l2_into(
@@ -2924,9 +2918,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if wait_for is None:
                     wait_for = next(
                         (
-                            future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            promotion.done
+                            for promotion in self._promotions.values()
+                            if not promotion.done.done()
                         ),
                         None,
                     )
@@ -2997,11 +2991,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 if data is not None:
                     promotion_id = id(data)
-                    self._pending_l1_promotions[promotion_id] = (
-                        asyncio.get_event_loop().create_future()
+                    self._promotions[promotion_id] = _Promotion(
+                        key=key,
+                        epoch=self._cache_epoch,
+                        done=asyncio.get_event_loop().create_future(),
                     )
-                    self._pending_l1_promotion_epochs[promotion_id] = self._cache_epoch
-                    self._pending_l1_promotion_ranges[promotion_id] = key
                     pending_writes = self._find_pending_l2_locked(key[0], key[1])
                     return (
                         data,
@@ -3020,11 +3014,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                     cause = "promotion"
                     wait_for = next(
                         (
-                            future
-                            for promotion_id, future in (
-                                self._pending_l1_promotions.items()
-                            )
-                            if promotion_id not in own_promotions and not future.done()
+                            promotion.done
+                            for promotion_id, promotion in self._promotions.items()
+                            if promotion_id not in own_promotions
+                            and not promotion.done.done()
                         ),
                         None,
                     )
@@ -3055,7 +3048,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             waited_s,
                             self._l1.bytes_used,
                             self._l1_bytes,
-                            self._held_bytes,
+                            self._l1.held_bytes,
                             self._readahead_bytes_locked(),
                             len(self._readaheads),
                         )
@@ -3096,13 +3089,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _finish_l1_promotion_locked(self, promotion_id: int) -> None:
         """Release one promotion reservation and wake blocked pool users."""
-        waiter = self._pending_l1_promotions.pop(promotion_id, None)
-        self._pending_l1_promotion_epochs.pop(promotion_id, None)
-        self._pending_l1_promotion_ranges.pop(promotion_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
-        if self._pending_l1_promotion_epochs:
-            oldest_epoch = min(self._pending_l1_promotion_epochs.values())
+        promotion = self._promotions.pop(promotion_id, None)
+        if promotion is not None and not promotion.done.done():
+            promotion.done.set_result(None)
+        if self._promotions:
+            oldest_epoch = min(p.epoch for p in self._promotions.values())
             self._cache_mutations = [
                 mutation
                 for mutation in self._cache_mutations

@@ -303,3 +303,69 @@ def test_mark_read_counts_lease_served_bytes_without_reordering() -> None:
             held.close()
     finally:
         cache.close()
+
+
+def _put_held_group(cache: L1Cache, keys: list[tuple[int, int]]) -> list[object]:
+    """Publish one grouped allocation whose children are all held."""
+    total = sum(size for _start, size in keys)
+    parent = cache.reserve_untracked(total)
+    assert parent is not None
+    children, cursor = [], 0
+    for _start, size in keys:
+        children.append(parent.subslice(cursor, size))
+        cursor += size
+    cache.put_reserved_group(
+        list(zip(keys, children, strict=True)), held=[True] * len(keys)
+    )
+    parent.close()
+    return children
+
+
+def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
+    """Eviction and overwrite of a held range call ``on_held_release`` first.
+
+    The callback pins the slice (as starting its L2 write does), so the slice
+    survives eviction; ``discard_held`` and ``clear_held`` skip the callback.
+    """
+    pinned: set[int] = set()
+    released: list[tuple[int, int]] = []
+
+    def on_held_release(key: tuple[int, int], data: object) -> None:
+        released.append(key)
+        pinned.add(id(data))
+
+    cache = L1Cache(
+        16384,
+        4096,
+        lambda _key, data: id(data) in pinned,
+        on_held_release=on_held_release,
+    )
+    try:
+        _a, b, c = _put_held_group(cache, [(0, 4096), (4096, 4096), (8192, 4096)])
+        assert cache.held_keys() == [(0, 4096), (4096, 4096), (8192, 4096)]
+        assert cache.held_bytes == 3 * 4096
+
+        cache.discard_held((0, 4096))
+        assert released == [] and cache.get((0, 4096)) is None
+        assert cache.clear_held((4096, 4096)) is b
+        assert cache.get((4096, 4096)) is b
+        assert cache.held_keys() == [(8192, 4096)]
+        assert cache.held_bytes == 4096
+
+        # Overwriting the held range hands it over; the cleared one is not.
+        cache.drop_overlapping(4096, 8192)
+        assert released == [(8192, 4096)]
+        assert id(c) in pinned and bytes(c.view()) == bytes(4096)
+        assert cache.held_bytes == 0 and cache.bytes_used == 0
+
+        (d,) = _put_held_group(cache, [(12288, 4096)])
+        # A full-pool reservation evicts it; the callback pins it first.
+        assert cache.reserve_untracked(16384) is None
+        assert released == [(8192, 4096), (12288, 4096)]
+        assert cache.eviction_bytes["pinned_bytes"] == 4096
+        assert cache.held_bytes == 0
+        for data in (c, d):
+            pinned.discard(id(data))
+            cache.release((0, 0), data)
+    finally:
+        cache.close()
