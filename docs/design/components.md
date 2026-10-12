@@ -229,7 +229,10 @@ class TransferLayer(ABC):
   写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
   `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
   pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
-  写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
+  写回调度胶水留在编排层。每个常驻 range 在 `L1Cache` 里只有一条记录（slice 和
+  容量 charge），range/slice/allocation 索引都指向这条记录。编排层只保留按 IO
+  组织的状态：每个 range 最新的 L2 写、按 slice 身份登记的在途写 buffer、每个
+  在途 promotion 一条记录和请求 lease。`--skip-l2` 即「不构造 `L2IoEngine`」
   （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
   适用于需要 L2 文件的可选 backend。
 

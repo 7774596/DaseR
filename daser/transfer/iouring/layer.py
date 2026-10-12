@@ -89,6 +89,20 @@ class _RequestLease:
     release_all: bool = False
 
 
+@dataclass
+class _Promotion:
+    """One in-flight L2-to-L1 promotion holding a reserved pinned slice."""
+
+    # L2 byte range read, so an overlapping prefetch waits for these bytes
+    # instead of reading them a second time.
+    key: tuple[int, int]
+    # Cache mutation epoch at reservation; a newer overlapping store makes
+    # the promoted bytes stale.
+    epoch: int
+    # Completed when the promotion ends, waking stores waiting for the pool.
+    done: asyncio.Future[None]
+
+
 def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     """Return sorted, merged positive physical ranges from transfer spans."""
     ranges = sorted(
@@ -492,11 +506,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._l2_write_buffers: dict[int, PinnedMemorySlice] = {}
-        self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
-        self._pending_l1_promotion_epochs: dict[int, int] = {}
-        # L2 byte range of each in-flight promotion, so an overlapping
-        # prefetch waits for the bytes instead of reading them a second time.
-        self._pending_l1_promotion_ranges: dict[int, tuple[int, int]] = {}
+        # In-flight promotions by reservation identifier (``id()`` of the slice).
+        self._promotions: dict[int, _Promotion] = {}
         self._cache_epoch = 0
         self._cache_mutations: list[tuple[int, int, int]] = []
         self._request_leases: dict[str, _RequestLease] = {}
@@ -963,9 +974,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                             if not task.done()
                         }
                         waiters.update(
-                            future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            promotion.done
+                            for promotion in self._promotions.values()
+                            if not promotion.done.done()
                         )
                         if not waiters:
                             waiter = asyncio.get_event_loop().create_future()
@@ -1437,11 +1448,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Return waiters of in-flight L2 promotions overlapping a span."""
         end = file_offset + nbytes
         return [
-            self._pending_l1_promotions[promotion_id]
-            for promotion_id, (start, size) in self._pending_l1_promotion_ranges.items()
-            if start < end
-            and file_offset < start + size
-            and not self._pending_l1_promotions[promotion_id].done()
+            promotion.done
+            for promotion in self._promotions.values()
+            if promotion.key[0] < end
+            and file_offset < promotion.key[0] + promotion.key[1]
+            and not promotion.done.done()
         ]
 
     def _read_l2_into(
@@ -2104,9 +2115,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if wait_for is None:
                     wait_for = next(
                         (
-                            future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            promotion.done
+                            for promotion in self._promotions.values()
+                            if not promotion.done.done()
                         ),
                         None,
                     )
@@ -2164,11 +2175,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 if data is not None:
                     promotion_id = id(data)
-                    self._pending_l1_promotions[promotion_id] = (
-                        asyncio.get_event_loop().create_future()
+                    self._promotions[promotion_id] = _Promotion(
+                        key=key,
+                        epoch=self._cache_epoch,
+                        done=asyncio.get_event_loop().create_future(),
                     )
-                    self._pending_l1_promotion_epochs[promotion_id] = self._cache_epoch
-                    self._pending_l1_promotion_ranges[promotion_id] = key
                     pending_writes = self._find_pending_l2_locked(key[0], key[1])
                     return (
                         data,
@@ -2185,11 +2196,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if wait_for is None:
                     wait_for = next(
                         (
-                            future
-                            for promotion_id, future in (
-                                self._pending_l1_promotions.items()
-                            )
-                            if promotion_id not in own_promotions and not future.done()
+                            promotion.done
+                            for promotion_id, promotion in self._promotions.items()
+                            if promotion_id not in own_promotions
+                            and not promotion.done.done()
                         ),
                         None,
                     )
@@ -2224,13 +2234,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _finish_l1_promotion_locked(self, promotion_id: int) -> None:
         """Release one promotion reservation and wake blocked pool users."""
-        waiter = self._pending_l1_promotions.pop(promotion_id, None)
-        self._pending_l1_promotion_epochs.pop(promotion_id, None)
-        self._pending_l1_promotion_ranges.pop(promotion_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
-        if self._pending_l1_promotion_epochs:
-            oldest_epoch = min(self._pending_l1_promotion_epochs.values())
+        promotion = self._promotions.pop(promotion_id, None)
+        if promotion is not None and not promotion.done.done():
+            promotion.done.set_result(None)
+        if self._promotions:
+            oldest_epoch = min(p.epoch for p in self._promotions.values())
             self._cache_mutations = [
                 mutation
                 for mutation in self._cache_mutations
