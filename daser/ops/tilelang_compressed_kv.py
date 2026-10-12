@@ -1975,7 +1975,9 @@ def _build_wordparallel_load(
                     # Lane word ``word`` holds plane scalars [8 * word, 8 * word + 8),
                     # which never straddle a head because head_dim % 8 == 0.
                     word = tile * 32 + lane
-                    flat = T.view(dst, (kv_words,), "uint32x4")
+                    # Alias the cache directly: T.view checks the bit count
+                    # as an int32 literal, which a production cache exceeds.
+                    flat = T.Tensor((T.int64(kv_words),), "uint32x4", dst.data)
                     packed = T.view(values, (1,), "uint32x4")
                     for target in range(destination_begin, destination_end):
                         if scalar_start < plane_scalars:

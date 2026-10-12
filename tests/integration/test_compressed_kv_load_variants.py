@@ -463,3 +463,50 @@ def test_branchless_decode_restores_lanes_full_of_raw_escapes(
     monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, "1")
     cache = _restore(staging, [2], [1], geometry, codebooks)
     assert cache[0].view(torch.uint8).cpu().numpy().tobytes() == raw.tobytes()
+
+
+def test_vector_stores_build_and_restore_past_the_int32_bit_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache above 2**31 bits builds and restores its last block exactly."""
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=2 * 2 * 16 * 8 * 128 * 2,
+        block_tokens=16,
+        num_layers=2,
+        num_kv_heads=8,
+        head_dim=128,
+        tile_scalars=256,
+    )
+    # 2100 blocks x 128 KiB is about 275 MB, past 2**31 bits (256 MiB).
+    num_blocks = 2100
+    assert num_blocks * geometry.slot_size * 8 > 2**31
+    codebooks = default_online_codebooks(geometry)
+    raw = _slot(geometry, 81)
+    encoded = encode_slot(raw, slot_id=0, geometry=geometry, codebooks=codebooks)
+    assert encoded.mode is SlotMode.COMPRESSED
+    staging = torch.from_numpy(
+        np.frombuffer(encoded.payload, dtype=np.uint8).copy()
+    ).cuda()
+    monkeypatch.setenv(LOAD_WORD_READS_ENV, "1")
+    monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
+    cache = _cache(num_blocks, geometry)
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=cache,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        ring_depth=1,
+        max_slots_per_buffer=1,
+    )
+    stream = torch.cuda.Stream()
+    last = num_blocks - 1
+    decoder.decode(
+        staging=staging,
+        staging_offsets=[0],
+        block_ids=[last],
+        modes=[1],
+        buffer_index=0,
+        stream=stream,
+    )
+    stream.synchronize()
+    assert cache[last].view(torch.uint8).cpu().numpy().tobytes() == raw
