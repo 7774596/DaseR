@@ -290,7 +290,12 @@ def _nvcomp_rows(
     stream = torch.cuda.current_stream()
     slots = [torch.from_numpy(s.reshape(-1).view(np.uint8)).cuda() for s in raw]
     total = raw.nbytes
-    options = {"Cascaded": {"data_type": "<u2"}, "Bitcomp": {"data_type": "<u2"}}
+    # BF16-aware modes; ANS with "<f2" is nvCOMP's best ratio on KV (R194).
+    options = {
+        "Cascaded": {"data_type": "<u2"},
+        "Bitcomp": {"data_type": "<u2"},
+        "ANS": {"data_type": "<f2"},
+    }
     for algorithm in algorithms:
         for shuffled in (False, True):
             arm = f"nvcomp_{'shuf_' if shuffled else ''}{algorithm}"
