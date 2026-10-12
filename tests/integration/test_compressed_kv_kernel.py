@@ -724,7 +724,7 @@ def test_deep_models_agree_with_the_reference_on_multi_page_headers(
         record = host[slot.source_offset : slot.source_offset + slot.stored_length]
         header = SlotHeader.parse(
             record.tobytes(),
-            geometry=geometry,
+            expected_geometry=geometry,
             expected_slot_id=index,
             expected_codebook_hash=digest_bytes(codebooks),
         )
@@ -736,6 +736,8 @@ def test_deep_models_agree_with_the_reference_on_multi_page_headers(
                 slot_id=index,
                 geometry=geometry,
                 codebooks=codebooks,
+                # The GPU packer leaves raw_hash unset.
+                verify_hash=False,
             )
             == raw_slots[index]
         )

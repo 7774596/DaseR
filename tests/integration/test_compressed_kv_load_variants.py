@@ -276,13 +276,15 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     branchless: str,
 ) -> None:
     """128-bit stores restore v2, raw and v1 records, a partial tile and fanout."""
-    # 3 tokens x 1 head x 128 = 384 scalars: the second tile is half empty.
+    # 3 tokens x 5 heads x 128 = 1920 scalars: the eighth tile is half
+    # empty. Eight layers keep the slot 4 KiB aligned and large enough that
+    # both records stay compressed instead of falling back to raw.
     geometry = CompressedStoreGeometry(
         num_slots=3,
-        slot_size=3 * 2 * 3 * 1 * 128 * 2,
+        slot_size=8 * 2 * 3 * 5 * 128 * 2,
         block_tokens=3,
-        num_layers=3,
-        num_kv_heads=1,
+        num_layers=8,
+        num_kv_heads=5,
         head_dim=128,
         tile_scalars=256,
     )
@@ -296,6 +298,8 @@ def test_vector_stores_restore_byte_exact_with_fanout(
         prefix_group_tiles=PREFIX_GROUP_TILES,
     )
     per_tile = encode_slot(raws[2], slot_id=2, geometry=geometry, codebooks=codebooks)
+    assert grouped.mode is SlotMode.COMPRESSED
+    assert per_tile.mode is SlotMode.COMPRESSED
     blob = b"\x03" + grouped.payload + raws[1] + per_tile.payload
     blob += b"\x00" * ((-len(blob)) % 4)
     offsets = [1, 1 + len(grouped.payload), 1 + len(grouped.payload) + len(raws[1])]

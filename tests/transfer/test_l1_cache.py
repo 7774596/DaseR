@@ -342,6 +342,8 @@ def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
     )
     try:
         _a, b, c = _put_held_group(cache, [(0, 4096), (4096, 4096), (8192, 4096)])
+        # Pool pages are reused uninitialized; give c known bytes.
+        c.view()[:] = b"c" * 4096
         assert cache.held_keys() == [(0, 4096), (4096, 4096), (8192, 4096)]
         assert cache.held_bytes == 3 * 4096
 
@@ -355,7 +357,7 @@ def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
         # Overwriting the held range hands it over; the cleared one is not.
         cache.drop_overlapping(4096, 8192)
         assert released == [(8192, 4096)]
-        assert id(c) in pinned and bytes(c.view()) == bytes(4096)
+        assert id(c) in pinned and bytes(c.view()) == b"c" * 4096
         assert cache.held_bytes == 0 and cache.bytes_used == 0
 
         (d,) = _put_held_group(cache, [(12288, 4096)])
