@@ -42,6 +42,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help=(
+            "Enable vLLM batch-invariant execution for exact-output comparisons; "
+            "may change performance."
+        ),
+    )
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
@@ -124,6 +132,7 @@ async def main_async(args: argparse.Namespace) -> None:
         skip_l2=args.skip_l2,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
+        batch_invariant=args.batch_invariant,
         daser_prefetch_max_requests=prefetch_max_requests,
         storage_format=args.storage_format,
         online_pack_batch_slots=args.online_pack_batch_slots,

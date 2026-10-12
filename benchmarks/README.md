@@ -179,10 +179,23 @@ pass. Raw vLLM bench JSON is saved beside each backend's `results.json` as
 `vllm_bench_baseline.json`, `vllm_bench_cold.json`, and
 `vllm_bench_warm.json`.
 
-Generation defaults are deterministic across backends: `--gen-temperature`
+Generation defaults use greedy sampling across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
 to `42`. The end-to-end entry point uses those defaults unless you call
-`bench_load.py` directly with different values.
+`bench_load.py` directly with different values. These sampling settings do not
+guarantee identical text across different batch shapes or CUDA graph policies.
+For exact-output diagnostics, add `--batch-invariant` to `run_bench.py` or
+`bench_start_servers.py`. It enables vLLM's existing `VLLM_BATCH_INVARIANT=1`
+before engine startup for every selected backend. An inherited value of `1`
+also enables the mode, and explicit opt-in overrides an inherited `0`.
+
+The effective mode is stored as `batch_invariant` in `manifest.json` and the
+manifest embedded in `results.json`. Keep this mode consistent across compared
+arms: it can change kernel selection and performance. The flag is off by
+default, and omitting it preserves the normal performance configuration when
+the environment variable is unset or zero. It is a numerical-control option,
+not a guarantee that arbitrary cache bugs or stochastic sampling will produce
+matching outputs. See [the original-branch diagnostic record](../docs/optimizations/6_benchmark_determinism.md).
 
 ## Dataset Modes
 

@@ -157,6 +157,7 @@ class BenchmarkManifest:
         endpoints: Named service endpoints.
         log_dir: Log directory.
         pid_file: JSON file containing subprocess PIDs.
+        batch_invariant: Effective vLLM batch-invariant execution mode.
         block_size: vLLM KV block size in tokens.
         prefetch_enabled: Whether scheduler prefetch is effectively enabled.
         prefetch_max_requests: Effective scheduler prefetch worker limit.
@@ -184,6 +185,7 @@ class BenchmarkManifest:
     prefetch_max_requests: int = 0
     storage_format: str = "raw"
     online_pack_batch_slots: int | None = None
+    batch_invariant: bool = False
 
     def write(self, path: str | Path) -> None:
         """Write manifest JSON atomically enough for local benchmark use."""
@@ -246,6 +248,7 @@ class ServerManager:
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
+        batch_invariant: bool = False,
     ) -> None:
         """Initialize the service manager.
 
@@ -276,6 +279,9 @@ class ServerManager:
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
+            batch_invariant: Opt into vLLM batch-invariant execution. An inherited
+                VLLM_BATCH_INVARIANT=1 also enables it; explicit opt-in takes
+                precedence over an inherited zero without mutating the parent.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -307,6 +313,9 @@ class ServerManager:
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
+        self.batch_invariant = (
+            batch_invariant or os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1"
+        )
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -364,6 +373,7 @@ class ServerManager:
             prefetch_max_requests=self.daser_prefetch_max_requests,
             storage_format=self.storage_format,
             online_pack_batch_slots=self.online_pack_batch_slots,
+            batch_invariant=self.batch_invariant,
         )
 
     async def start_lmcache_mp_server(self) -> None:
@@ -570,10 +580,15 @@ class ServerManager:
         kv_transfer_config: dict[str, Any] | None,
         extra_env: dict[str, str] | None = None,
     ) -> None:
+        # Set the engine process environment before vLLM imports and kernel
+        # selection. Apply this consistently to all benchmark backends, and
+        # keep it separate from DaseR connector configuration.
+        engine_env = dict(extra_env or {})
+        engine_env["VLLM_BATCH_INVARIANT"] = "1" if self.batch_invariant else "0"
         proc = self._start(
             self.vllm_command(kv_transfer_config),
             log_name,
-            extra_env=extra_env,
+            extra_env=engine_env,
         )
         await self._wait_healthy(self.vllm_url, "/health", self.startup_timeout, proc)
 

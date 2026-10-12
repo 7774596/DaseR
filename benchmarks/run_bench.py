@@ -69,6 +69,8 @@ class RunBenchArgs:
         gpu_util: vLLM GPU memory utilization.
         max_num_seqs: vLLM maximum sequence concurrency.
         max_num_batched_tokens: Optional vLLM scheduler token budget.
+        batch_invariant: Opt into vLLM batch-invariant execution for correctness
+            comparisons; may change throughput.
         max_model_len: Optional explicit vLLM maximum model length; 0 lets
             vLLM infer the model default.
         block_size: vLLM KV block size in tokens.
@@ -115,6 +117,7 @@ class RunBenchArgs:
     max_model_len: int = 0
     tensor_parallel_size: int = 1
     trust_remote_code: bool = False
+    batch_invariant: bool = False
     block_size: int = BLOCK_TOKENS
     max_inflight: int = 32
     gen_max_tokens: int = 128
@@ -196,6 +199,14 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help=(
+            "Enable vLLM batch-invariant execution for exact-output comparisons; "
+            "may change performance."
+        ),
+    )
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--gen-max-tokens", type=int, default=128)
@@ -274,6 +285,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
+        batch_invariant=args.batch_invariant,
         block_size=args.block_size,
         max_inflight=args.max_inflight,
         gen_max_tokens=args.gen_max_tokens,
@@ -621,6 +633,8 @@ def _start_command(
         "--l2-size",
         str(derived_l2),
     ]
+    if args.batch_invariant:
+        command.append("--batch-invariant")
     if args.max_model_len > 0:
         command.extend(["--max-model-len", str(args.max_model_len)])
     if backend_run.backend == "daser":
