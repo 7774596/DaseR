@@ -352,7 +352,20 @@ def _splitzip_rows(
     encoded = codec.encode(data)
     exact = torch.equal(codec.decode(encoded).view(torch.int16), data)
     stream = torch.cuda.current_stream()
+    kv = torch.empty_like(data)
+
+    def decode_into_kv() -> None:
+        # SplitZip decodes to a fresh contiguous tensor; restoring it needs at
+        # least one more pass into the KV buffer, which DaseR's restore fuses.
+        kv.copy_(codec.decode(encoded).view(torch.int16))
+
     return [
+        {
+            "arm": "splitzip_then_copy",
+            "ratio": encoded.compressed_bytes / raw.nbytes,
+            "dec_gbs": raw.nbytes / _best_ms(decode_into_kv, stream, repeats) / 1e6,
+            "exact": exact,
+        },
         {
             "arm": "splitzip",
             "ratio": encoded.compressed_bytes / raw.nbytes,
@@ -363,7 +376,7 @@ def _splitzip_rows(
             / _best_ms(lambda: codec.decode(encoded), stream, repeats)
             / 1e6,
             "exact": exact,
-        }
+        },
     ]
 
 
@@ -449,9 +462,10 @@ def main() -> None:
                 evaluate, args.nvcomp_path, args.nvcomp_algorithms, args.repeats
             )
         if args.splitzip_path:
-            rows += _splitzip_rows(
+            for row in _splitzip_rows(
                 evaluate, slots[:ncal], args.splitzip_path, args.repeats
-            )
+            ):
+                _emit(rows, row)
     if args.cpu_zstd_level is not None:
         for row in _cpu_zstd_rows(evaluate, args.cpu_zstd_level):
             _emit(rows, row)
