@@ -195,7 +195,7 @@ arms: it can change kernel selection and performance. The flag is off by
 default, and omitting it preserves the normal performance configuration when
 the environment variable is unset or zero. It is a numerical-control option,
 not a guarantee that arbitrary cache bugs or stochastic sampling will produce
-matching outputs. See [the original-branch diagnostic record](../docs/optimizations/6_benchmark_determinism.md).
+matching outputs.
 
 ## Dataset Modes
 
