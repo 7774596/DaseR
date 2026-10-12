@@ -1225,6 +1225,7 @@ class IPCServer:
                     rank_base=tp_rank * rank_stride_bytes,
                 )
                 place_ms = (time.perf_counter() - place_started) * 1000
+                self._record_packed_ratios(live_spans, local_slot_size)
                 # Another store may evict these chunks while this one awaits
                 # its IO; keep their bytes from being placed again until the
                 # transfer layer has this write ordered.
@@ -1619,6 +1620,31 @@ class IPCServer:
             elapsed_s * 1000,
             throughput_gbps,
         )
+
+    def _record_packed_ratios(
+        self, spans: list[dict[str, Any]], local_slot_size: int
+    ) -> None:
+        """Observe each placed packed record's size relative to a raw slot.
+
+        Args:
+            spans: Spans returned by packed placement for one store.
+            local_slot_size: Bytes of one raw rank-local slot.
+
+        Async/thread-safety:
+            Call on the server event loop. A retried store observes its
+            records again.
+        """
+        histogram = self._metrics.histogram(
+            "daser_packed_record_ratio",
+            "Stored bytes of each placed packed record over one raw slot, by mode.",
+            buckets=tuple(i / 100 for i in range(50, 101, 2)),
+        )
+        for span in spans:
+            if span.get("packed", False):
+                histogram.observe(
+                    int(span["nbytes"]) / local_slot_size,
+                    labels={"mode": str(span.get("mode", "compressed"))},
+                )
 
     def _end_packed_writes(self, token: int) -> None:
         """End one packed write hold and count bytes freed late by it."""

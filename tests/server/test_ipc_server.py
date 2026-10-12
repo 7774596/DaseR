@@ -1703,7 +1703,11 @@ def _online_arena_server(
 
 
 async def _store_online_record(
-    socket_path: str, chunk_key: str, nbytes: int, fill: bytes = b"x"
+    socket_path: str,
+    chunk_key: str,
+    nbytes: int,
+    fill: bytes = b"x",
+    mode: str = "raw",
 ) -> dict[str, Any]:
     """Allocate one single-slot chunk and store one ``fill`` record for it."""
     allocation = await _send_recv(
@@ -1731,11 +1735,40 @@ async def _store_online_record(
                     "logical_slot_start": 0,
                     "logical_slot_count": 1,
                     "packed": True,
-                    "mode": "raw",
+                    "mode": mode,
                 }
             ],
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_online_store_observes_packed_record_ratios(tmp_path) -> None:
+    """Each placed packed record is observed as stored bytes over a raw slot."""
+    registry = MetricsRegistry()
+    _core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path, logical_slots=8, arena_slots=4, metrics_registry=registry
+    )
+    await server.start()
+    try:
+        stored = await _store_online_record(
+            socket_path, "a", local_slot_size * 3 // 4, mode="compressed"
+        )
+        assert "error" not in stored
+        assert "error" not in await _store_online_record(
+            socket_path, "b", local_slot_size
+        )
+        await server.drain_transfer()
+        lines = set(registry.render_prometheus().splitlines())
+        name = "daser_packed_record_ratio"
+        assert f'{name}_bucket{{mode="compressed",le="0.74"}} 0' in lines
+        assert f'{name}_bucket{{mode="compressed",le="0.76"}} 1' in lines
+        assert f'{name}_sum{{mode="compressed"}} 0.75' in lines
+        assert f'{name}_bucket{{mode="raw",le="0.98"}} 0' in lines
+        assert f'{name}_count{{mode="raw"}} 1' in lines
+    finally:
+        await server.drain_transfer()
+        await server.stop()
 
 
 @pytest.mark.asyncio
