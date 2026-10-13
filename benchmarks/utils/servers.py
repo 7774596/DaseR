@@ -514,8 +514,8 @@ class ServerManager:
             lmcache_daser_codec: enable the DaseR lossless chunk codec of a
                 codec-patched LMCache checkout (``LMCACHE_DASER_CODEC=1``).
             lmcache_codec_capacity: stored capacity class as a fraction of the
-                raw chunk (``LMCACHE_DASER_CODEC_CAPACITY``); ``None`` keeps
-                the LMCache-side default.
+                raw chunk (``LMCACHE_DASER_CODEC_CAPACITY``); ``None`` stores
+                variable-length records.
             lmcache_codec_codebooks: calibrated codebook directory for the
                 codec; ``None`` uses the generic codebooks.
             online_pack_batch_slots: Optional compressed-online codec batch

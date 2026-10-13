@@ -15,7 +15,7 @@ _LAYERS, _TOKENS, _HEADS, _HEAD_DIM = 4, 64, 4, 128
 
 
 def _codec(
-    max_chunks: int, capacity_ratio: float = 0.75, *, fused_kv: bool = False
+    max_chunks: int, capacity_ratio: float | None = 0.75, *, fused_kv: bool = False
 ) -> KVMajorChunkCodec:
     return KVMajorChunkCodec(
         num_layers=_LAYERS,
@@ -56,10 +56,54 @@ def test_chunk_codec_round_trips_through_capacity_records(batch: int) -> None:
     restored = [torch.full_like(chunk, 0xA5) for chunk in originals]
     for target, record in zip(restored, records, strict=True):
         target[: codec.capacity_bytes].copy_(record)
-    codec.decode(restored, stream)
+    codec.decode(restored, lengths, stream)
     stream.synchronize()
     for target, original in zip(restored, originals, strict=True):
         assert torch.equal(target, original)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_variable_chunk_codec_round_trips_stored_prefixes() -> None:
+    codec = _codec(max_chunks=3, capacity_ratio=None)
+    assert not codec.fixed_capacity
+    assert codec.capacity_bytes == codec.raw_bytes
+    stream = torch.cuda.Stream()
+    originals = [
+        _chunk(codec, 1, compressible=True),
+        _chunk(codec, 2, compressible=False),
+        _chunk(codec, 3, compressible=True),
+    ]
+    chunks = [chunk.clone() for chunk in originals]
+    lengths = codec.encode(chunks, stream)
+    # Compressible chunks store an aligned record; the noise chunk stays raw.
+    assert lengths[1] == codec.raw_bytes
+    for length in (lengths[0], lengths[2]):
+        assert length < codec.raw_bytes * 0.75
+        assert length % IO_ALIGNMENT == 0
+    # Engines keep exactly the stored prefix of each buffer.
+    restored = [torch.full_like(chunk, 0xA5) for chunk in originals]
+    for target, chunk, length in zip(restored, chunks, lengths, strict=True):
+        target[:length].copy_(chunk[:length])
+    codec.decode(restored, lengths, stream)
+    stream.synchronize()
+    for target, original in zip(restored, originals, strict=True):
+        assert torch.equal(target, original)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_variable_chunk_codec_skips_all_raw_batches() -> None:
+    codec = _codec(max_chunks=2, capacity_ratio=None)
+    stream = torch.cuda.Stream()
+    originals = [_chunk(codec, seed, compressible=False) for seed in (7, 8)]
+    chunks = [chunk.clone() for chunk in originals]
+    lengths = codec.encode(chunks, stream)
+    assert lengths == [codec.raw_bytes] * 2
+    codec.decode(chunks, lengths, stream)
+    stream.synchronize()
+    for chunk, original in zip(chunks, originals, strict=True):
+        assert torch.equal(chunk, original)
 
 
 @pytest.mark.integration
@@ -69,10 +113,11 @@ def test_chunk_codec_decode_reuses_rings_across_batches() -> None:
     stream = torch.cuda.Stream()
     originals = [_chunk(codec, seed, compressible=True) for seed in range(6)]
     encoded = [chunk.clone() for chunk in originals]
+    lengths: list[int] = []
     for start in range(0, 6, 2):
-        codec.encode(encoded[start : start + 2], stream)
+        lengths += codec.encode(encoded[start : start + 2], stream)
     for start in range(0, 6, 2):
-        codec.decode(encoded[start : start + 2], stream)
+        codec.decode(encoded[start : start + 2], lengths[start : start + 2], stream)
     stream.synchronize()
     for target, original in zip(encoded, originals, strict=True):
         assert torch.equal(target, original)
@@ -101,6 +146,10 @@ def test_chunk_codec_rejects_mismatched_buffers() -> None:
         codec.encode([good, good.clone()], stream)
     with pytest.raises(ValueError):
         codec.encode([good[:-IO_ALIGNMENT]], stream)
+    with pytest.raises(ValueError):
+        codec.decode([good], [codec.capacity_bytes + IO_ALIGNMENT], stream)
+    with pytest.raises(ValueError):
+        codec.decode([good], [], stream)
 
 
 @pytest.mark.integration
@@ -125,8 +174,8 @@ def test_fused_chunk_codec_matches_kv_major_records_and_round_trips() -> None:
     assert kv_major.encode(kv_major_chunks, stream) == lengths
     # Both layouts produce the same record format: the fused codec restores
     # records written from the kv-major chunks, and its own.
-    fused.decode(kv_major_chunks, stream)
-    fused.decode(fused_chunks, stream)
+    fused.decode(kv_major_chunks, lengths, stream)
+    fused.decode(fused_chunks, lengths, stream)
     stream.synchronize()
     for original, *targets in zip(
         fused_originals, kv_major_chunks, fused_chunks, strict=True

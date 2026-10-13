@@ -531,7 +531,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--lmcache-codec-capacity",
         type=float,
         default=None,
-        help="Stored capacity fraction of a raw chunk (lmcache-codec arm only).",
+        help="Fixed stored capacity fraction of a raw chunk (lmcache-codec arm "
+        "only); unset stores variable-length records.",
     )
     parser.add_argument(
         "--codec-codebooks",

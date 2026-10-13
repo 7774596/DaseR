@@ -14,11 +14,14 @@ and V inside each head (``[layers, tokens, heads, 2, head_dim]``, as LMCache
 stages vLLM's ``kv_size == 1`` layouts) pass ``fused_kv=True`` and skip the
 permute.
 
-Host objects must be fixed-size (allocators size them from a layout and
-storage backends verify full-length reads), so every record is padded to one
-capacity class ``align4K(raw * capacity_ratio)``. A chunk whose record does
-not fit raises ``ChunkCapacityError``; callers fail the store closed instead
-of storing a raw fallback that the capacity class cannot hold.
+Records are variable-length by default: each chunk stores its own 4 KiB
+aligned record, and a chunk whose record would not be smaller than raw keeps
+its raw bytes, so a stored length equal to ``raw_bytes`` marks a raw chunk.
+Engines then size each host object from the length ``encode`` returns.
+Engines that can only allocate one object size pass ``capacity_ratio`` to pad
+every record to the capacity class ``align4K(raw * capacity_ratio)``; a chunk
+that does not fit raises ``ChunkCapacityError`` and callers fail the store
+closed, because the class cannot hold a raw fallback.
 """
 
 from __future__ import annotations
@@ -120,8 +123,9 @@ class KVMajorChunkCodec:
         num_kv_heads (int): KV heads per layer on this rank.
         head_dim (int): Scalars per head.
         device (torch.device): CUDA device holding the engine staging buffers.
-        capacity_ratio (float): Capacity class as a fraction of raw bytes.
         max_chunks (int): Largest chunk batch passed to one call.
+        capacity_ratio (float | None): Fixed capacity class as a fraction of
+            raw bytes; None stores variable-length records.
         codebook_dir (str | Path | None): Calibration artifact directory
             for this model; the model-independent generic palette when None.
         fused_kv (bool): Chunks hold K and V side by side in each head,
@@ -149,8 +153,8 @@ class KVMajorChunkCodec:
         num_kv_heads: int,
         head_dim: int,
         device: torch.device,
-        capacity_ratio: float,
         max_chunks: int,
+        capacity_ratio: float | None = None,
         codebook_dir: str | Path | None = None,
         fused_kv: bool = False,
     ) -> None:
@@ -167,7 +171,13 @@ class KVMajorChunkCodec:
             head_dim=head_dim,
             tile_scalars=ONLINE_TILE_SCALARS,
         )
-        self._capacity = chunk_capacity_bytes(self._geometry.slot_size, capacity_ratio)
+        self._fixed_capacity = capacity_ratio is not None
+        # Variable records are bounded by raw: anything larger stays raw.
+        self._capacity = (
+            chunk_capacity_bytes(self._geometry.slot_size, capacity_ratio)
+            if capacity_ratio is not None
+            else self._geometry.slot_size
+        )
         self._max_chunks = max_chunks
         self._fused_kv = fused_kv
         self._chunk_shape = (
@@ -221,8 +231,17 @@ class KVMajorChunkCodec:
 
     @property
     def capacity_bytes(self) -> int:
-        """Return the fixed record capacity callers allocate per chunk."""
+        """Return the largest stored length of one chunk.
+
+        The fixed capacity class when ``capacity_ratio`` was given (every
+        stored length then equals it), otherwise ``raw_bytes``.
+        """
         return self._capacity
+
+    @property
+    def fixed_capacity(self) -> bool:
+        """Return whether every record is padded to ``capacity_bytes``."""
+        return self._fixed_capacity
 
     def encode(
         self, chunks: list[torch.Tensor], stream: torch.cuda.Stream
@@ -239,17 +258,21 @@ class KVMajorChunkCodec:
                 ``chunks``; consumers of the records must also use it.
 
         Returns:
-            Stored record length of each chunk.
+            Stored length of each chunk: the 4 KiB aligned record length,
+            ``raw_bytes`` for a chunk kept raw, or ``capacity_bytes`` for
+            every chunk under a fixed capacity class. Engines copy and later
+            restore exactly this prefix of each buffer.
 
         Raises:
             ValueError: If buffers do not match the codec geometry.
-            ChunkCapacityError: If a record exceeds ``capacity_bytes``. The
-                chunks' contents are then unspecified.
+            ChunkCapacityError: Under a fixed capacity class, if a record
+                does not fit it. The chunks' contents are then unspecified.
 
         Async/thread-safety:
             Synchronizes ``stream`` to read record lengths.
         """
         self._validate(chunks)
+        raw = self._geometry.slot_size
         with self._encode_lock:
             self._order_after(self._encode_done, stream)
             physical = physical_kv_view(self._encode_scratch)
@@ -260,47 +283,73 @@ class KVMajorChunkCodec:
                 staging=self._pack_staging,
                 block_ids=list(range(len(chunks))),
                 logical_slots=list(range(len(chunks))),
-                slot_stride=self._geometry.slot_size,
+                slot_stride=raw,
                 stream=stream,
             )
+            lengths: list[int] = []
             for record in records:
-                if (
-                    record.mode is not SlotMode.COMPRESSED
-                    or record.stored_length > self._capacity
+                compressed = (
+                    record.mode is SlotMode.COMPRESSED and record.stored_length < raw
+                )
+                if self._fixed_capacity and (
+                    not compressed or record.stored_length > self._capacity
                 ):
                     raise ChunkCapacityError(
                         f"chunk record needs {record.stored_length} bytes "
                         f"(mode {record.mode.name}), capacity is {self._capacity}"
                     )
+                lengths.append(record.stored_length if compressed else raw)
             with torch.cuda.stream(stream):
-                for chunk, record in zip(chunks, records, strict=True):
-                    start = record.source_offset
-                    chunk[: record.stored_length].copy_(
-                        self._pack_staging[start : start + record.stored_length]
-                    )
+                for chunk, record, length in zip(chunks, records, lengths, strict=True):
+                    # A raw chunk already holds its stored bytes.
+                    if length < raw:
+                        start = record.source_offset
+                        chunk[:length].copy_(self._pack_staging[start : start + length])
                 self._encode_done = torch.cuda.Event()
                 self._encode_done.record(stream)
-            return [record.stored_length for record in records]
+            if self._fixed_capacity:
+                return [self._capacity] * len(chunks)
+            return lengths
 
-    def decode(self, chunks: list[torch.Tensor], stream: torch.cuda.Stream) -> None:
+    def decode(
+        self,
+        chunks: list[torch.Tensor],
+        lengths: list[int],
+        stream: torch.cuda.Stream,
+    ) -> None:
         """Restore raw chunks from records at their buffer starts.
 
         Args:
             chunks (list[torch.Tensor]): Contiguous CUDA uint8 staging buffers
-                of ``raw_bytes`` each whose first ``capacity_bytes`` hold a
-                record written by ``encode``. They are overwritten in place.
+                of ``raw_bytes`` each whose first ``lengths[i]`` bytes hold
+                what ``encode`` stored. They are overwritten in place.
+            lengths (list[int]): Stored length of each chunk as returned by
+                ``encode``; ``raw_bytes`` marks a chunk kept raw, which is
+                left untouched.
             stream (torch.cuda.Stream): Stream ordered after the copies that
                 filled ``chunks``.
 
         Raises:
-            ValueError: If buffers do not match the codec geometry or a
-                record header is malformed.
+            ValueError: If buffers do not match the codec geometry, a length
+                is out of range, or a record header is malformed.
 
         Async/thread-safety:
             Enqueues work on ``stream`` without synchronizing it; the chunks
             are valid once ``stream`` reaches this point.
         """
         self._validate(chunks)
+        if len(lengths) != len(chunks) or any(
+            not 0 < length <= self._capacity for length in lengths
+        ):
+            raise ValueError("kv-major chunk stored lengths are out of range")
+        raw = self._geometry.slot_size
+        compressed = [
+            index
+            for index, length in enumerate(lengths)
+            if length < raw or self._fixed_capacity
+        ]
+        if not compressed:
+            return
         with self._decode_lock:
             ring = self._next_ring
             self._next_ring = (ring + 1) % _DECODE_RING_DEPTH
@@ -312,21 +361,23 @@ class KVMajorChunkCodec:
             capacity = self._capacity
             physical = physical_kv_view(self._decode_scratch)
             with torch.cuda.stream(stream):
-                for index, chunk in enumerate(chunks):
-                    self._decode_staging[
-                        index * capacity : (index + 1) * capacity
-                    ].copy_(chunk[:capacity])
+                for index in compressed:
+                    length = lengths[index]
+                    start = index * capacity
+                    self._decode_staging[start : start + length].copy_(
+                        chunks[index][:length]
+                    )
             self._decoder.decode(
                 staging=self._decode_staging,
-                staging_offsets=[index * capacity for index in range(len(chunks))],
-                block_ids=list(range(len(chunks))),
-                modes=[int(SlotMode.COMPRESSED)] * len(chunks),
+                staging_offsets=[index * capacity for index in compressed],
+                block_ids=compressed,
+                modes=[int(SlotMode.COMPRESSED)] * len(compressed),
                 buffer_index=ring,
                 stream=stream,
             )
             with torch.cuda.stream(stream):
-                for index, chunk in enumerate(chunks):
-                    self._physical_view(chunk).copy_(physical[index])
+                for index in compressed:
+                    self._physical_view(chunks[index]).copy_(physical[index])
                 self._decode_done = torch.cuda.Event()
                 self._decode_done.record(stream)
             self._decode_events[ring] = self._decode_done
