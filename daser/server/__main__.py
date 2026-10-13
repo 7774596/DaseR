@@ -26,7 +26,6 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
-    EXCLUSIVE_TIERS_ENV,
     L1_ACCOUNTING_MODES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
@@ -385,19 +384,19 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     )
     total_store_bytes = l1_size if skip_l2 else int(args.l2_size)
     storage_format = str(getattr(args, "storage_format", STORAGE_FORMAT_RAW))
-    if (
-        os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
-        and storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
-        and not skip_l2
-    ):
-        # Write-back L1 records never occupy SSD bytes, so the packed arena
-        # addresses L1 + L2 while live SSD bytes stay within --l2-size.
+    l2_budget = 0
+    if storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE and not skip_l2:
+        # Records kept by L1 alone hold arena addresses but no SSD budget, so
+        # the packed arena addresses L1 + L2 while live SSD bytes stay within
+        # --l2-size (docs/design/tier-residency.md).
+        l2_budget = total_store_bytes
         total_store_bytes += l1_size
     cfg = DaserConfig(
         model_path=model_path,
         vllm_model_id=model_id,
         store_dir=args.store_dir,
         total_store_bytes=total_store_bytes,
+        l2_budget_bytes=l2_budget,
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         block_tokens=int(args.block_tokens),
@@ -424,7 +423,11 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         cfg.l1_size_bytes = cfg.l2_size_bytes
     if cfg.transfer_mode == "iouring" and cfg.l1_size_bytes <= 0:
         raise ValueError("--l1-size must be positive for iouring transfer")
-    if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
+    if (
+        not skip_l2
+        and cfg.l1_size_bytes
+        and cfg.l1_size_bytes > (cfg.l2_budget_bytes or cfg.l2_size_bytes)
+    ):
         raise ValueError("--l1-size must not exceed --l2-size")
     if cfg.prefetch_lease_budget_bytes > cfg.l1_size_bytes:
         raise ValueError("--prefetch-lease-budget must not exceed --l1-size")

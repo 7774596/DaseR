@@ -268,7 +268,10 @@ class ServerCore:
         self._lookup_requests = 0
         self._lookup_hits = 0
         # Online packed records live in one layout; removal reclaims them.
-        self._packed_layout = OnlinePackedLayout()
+        # The memory-tier hooks are attached once the transfer layer exists.
+        self._packed_layout = OnlinePackedLayout(on_held_drop=self._discard_held)
+        self._hold_resident: Callable[[int, int], bool] | None = None
+        self._discard_held_range: Callable[[int, int], None] | None = None
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
         # Prefix-closed eviction: key -> keys a lookup reaches only through
@@ -1118,36 +1121,76 @@ class ServerCore:
         """
         await self._remove_chunk(chunk_key, reason="explicit")
 
-    async def evict_oldest_chunk(self, protected_keys: set[str]) -> ChunkMeta | None:
-        """Evict a chunk to relieve physical byte pressure.
+    def attach_l1_tier(
+        self,
+        hold_resident: Callable[[int, int], bool],
+        discard_held: Callable[[int, int], None],
+    ) -> None:
+        """Let packed reclaim keep L1-resident records indexed.
 
-        Compressed-online stores over-provision logical slots, so the packed
-        arena can fill before the ring runs out of slots. By default this
-        advances the ring tail past skip blocks and evicts the first chunk
-        found (FIFO), using the same cleanup as automatic ring eviction.
+        Args:
+            hold_resident: ``TransferLayer.hold_resident``; marks a whole
+                resident record held and returns whether it did.
+            discard_held: ``TransferLayer.discard_held``; drops the L1 copy of
+                a held record whose placement is released.
+
+        Async/thread-safety:
+            Call once before the first packed store. Both callables run
+            synchronously on the server event loop.
+        """
+        self._hold_resident = hold_resident
+        self._discard_held_range = discard_held
+
+    async def reclaim_packed(
+        self,
+        protected_keys: set[str],
+        *,
+        rank_base: int = 0,
+        free_address: bool = False,
+    ) -> bool:
+        """Reclaim the oldest packed record of a lane's L2 FIFO.
+
+        The record leaves the L2 budget: when the attached memory tier holds
+        it whole it stays indexed as an L1-only record, otherwise its chunk is
+        removed. With ``free_address`` (the arena has no room) the record's
+        chunk is always removed, and the longest-held chunk once no charged
+        record is left. See ``docs/design/tier-residency.md``.
 
         Args:
             protected_keys: Chunk keys that must stay resident, e.g. the
                 chunks being placed by the current store call.
+            rank_base: Start of the rank lane to reclaim from.
+            free_address: Free arena bytes instead of L2 budget.
 
         Returns:
-            Metadata of the evicted chunk, or None when the ring is empty or
-            only protected chunks remain in reach.
+            Whether a record was reclaimed; False when only protected records
+            remain.
 
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        store = self._cm.store
-        while len(store):
-            entry = store.get_slot_entry(self._cm.tail_slot)
-            meta = store.get(entry.chunk_key) if entry.kind == "chunk" else None
-            if meta is not None and meta.chunk_key in protected_keys:
-                return None
-            self._cm.evict_oldest()
-            if meta is not None:
-                await self._drain_ring_evictions(frozenset(protected_keys))
-                return meta
-        return None
+        layout = self._packed_layout
+        victim = layout.oldest_charged(protected_keys, rank_base=rank_base)
+        if free_address and victim is None:
+            victim = layout.oldest_held(protected_keys, rank_base=rank_base)
+        if victim is None:
+            return False
+        held = (
+            not free_address
+            and self._hold_resident is not None
+            and self._hold_resident(victim.file_offset, victim.stored_length)
+        )
+        self._metrics.counter(
+            "daser_packed_reclaims_total",
+            "Packed records reclaimed, by whether L1 kept them indexed.",
+        ).inc(labels={"outcome": "held" if held else "removed"})
+        if held:
+            layout.hold(victim.file_offset)
+            return True
+        await self._remove_chunk(victim.chunk_key, reason="capacity")
+        if self._prefix_closed:
+            await self._remove_orphans([victim.chunk_key], frozenset(protected_keys))
+        return True
 
     async def register_document(
         self,
@@ -1369,6 +1412,11 @@ class ServerCore:
         self._lifecycle.discard(chunk_key)
         self._notify_chunk_removed(chunk_key)
         return True
+
+    def _discard_held(self, file_offset: int, nbytes: int) -> None:
+        """Drop the L1 copy of a released held placement."""
+        if self._discard_held_range is not None:
+            self._discard_held_range(file_offset, nbytes)
 
     def _notify_chunk_removed(self, chunk_key: str) -> None:
         """Release a removed chunk's packed bytes, then tell listeners."""

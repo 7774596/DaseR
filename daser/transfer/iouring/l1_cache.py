@@ -42,9 +42,11 @@ class _Resident:
     charge: int
     # Served by a load since insertion, for the unread-eviction counter.
     read: bool = False
-    # Exclusive-tier range not yet written to L2: leaving L1 hands it to
-    # ``on_held_release`` unless ``discard_held`` dropped it first.
+    # The server keeps this range's record indexed only while it is in L1:
+    # leaving L1 hands it to ``on_held_release`` unless ``discard_held``
+    # dropped it first. ``dirty`` additionally means L2 has no copy yet.
     held: bool = False
+    dirty: bool = False
 
 
 class L1Cache:
@@ -57,9 +59,10 @@ class L1Cache:
             owned by an in-flight L2 write and must not be closed on eviction.
         replacement_policy: Optional policy for physical allocation victims.
             Omission retains LRU; the cache still owns all release barriers.
-        on_held_release: Called with ``(key, slice)`` when a held range leaves
-            L1 by eviction or overwrite, before the pinned check, so the
-            orchestrator can start its L2 write and pin the slice.
+        on_held_release: Called with ``(key, slice, dirty)`` when a held
+            range leaves L1 by eviction or overwrite, before the pinned check,
+            so the orchestrator can start the L2 write of a dirty range and
+            pin its slice.
 
     Async/thread-safety:
         Not internally synchronized. All methods assume the orchestrator's
@@ -74,7 +77,7 @@ class L1Cache:
         pinned_predicate: Callable[[tuple[int, int], PinnedMemorySlice], bool],
         replacement_policy: ReplacementPolicy[int] | None = None,
         on_held_release: (
-            Callable[[tuple[int, int], PinnedMemorySlice], None] | None
+            Callable[[tuple[int, int], PinnedMemorySlice, bool], None] | None
         ) = None,
     ) -> None:
         self._l1_bytes = l1_bytes
@@ -100,9 +103,6 @@ class L1Cache:
         self._pool_waiters: list[object] = []
         self._is_pinned = pinned_predicate
         self._on_held_release = on_held_release
-        # Held keys in hold order (oldest first) and their physical bytes.
-        self._held: dict[tuple[int, int], None] = {}
-        self._held_bytes = 0
         self._evicted = {"bytes": 0, "pinned_bytes": 0, "unread_bytes": 0}
 
     @property
@@ -121,15 +121,6 @@ class L1Cache:
             without a hit since insertion).
         """
         return dict(self._evicted)
-
-    @property
-    def held_bytes(self) -> int:
-        """Return physical bytes of held ranges not yet written to L2."""
-        return self._held_bytes
-
-    def held_keys(self) -> list[tuple[int, int]]:
-        """Return held range keys, oldest hold first."""
-        return list(self._held)
 
     def get(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
         """Return the resident slice for ``key`` or None."""
@@ -430,10 +421,11 @@ class L1Cache:
                 grouped allocation.
             accounted_nbytes: Optional per-entry capacity charges in the same
                 order as ``entries``. Omission charges physical slice lengths.
-            held: Optional per-entry flags marking ranges held in L1 until
-                ``discard_held`` or until they leave L1 (``on_held_release``).
-                Every entry is marked before any capacity eviction runs, so a
-                held entry evicted by its own group is still handed over.
+            held: Optional per-entry flags marking dirty held ranges (not
+                yet in L2) kept until ``discard_held`` or until they leave L1
+                (``on_held_release``). Every entry is marked before any
+                capacity eviction runs, so a held entry evicted by its own
+                group is still handed over.
 
         Thread-safety:
             Must be called while the transfer layer metadata lock is held.
@@ -465,23 +457,32 @@ class L1Cache:
         data.close()
         self.notify_pool_waiters()
 
-    def clear_held(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
-        """Keep a held range resident but stop treating it as held.
+    def hold_clean(self, key: tuple[int, int]) -> bool:
+        """Mark a range already in L2 as held, isolating it as its own entry.
 
-        The caller takes over persistence, for example by writing the slice
-        to L2 now; leaving L1 later no longer calls ``on_held_release``.
+        When ``key`` lies inside a larger resident entry, that entry is split
+        into zero-copy child slices of the same allocation, so replacement
+        recency is unchanged and the original charge is conserved exactly.
 
         Args:
-            key: Held range key.
+            key: ``(file_offset, nbytes)`` of one record.
 
         Returns:
-            The range's slice, or None when ``key`` is not held.
+            Whether ``key`` is now a held entry. False when the range is not
+            covered by a single unheld resident entry.
         """
-        resident = self._entries.get(key)
-        if resident is None or not resident.held:
-            return None
-        self._unhold(key, resident)
-        return resident.data
+        hit = self.find(key[0])
+        if hit is None:
+            return False
+        container, data, offset = hit
+        resident = self._entries[container]
+        if resident.held or offset + key[1] > container[1]:
+            return False
+        if container != key:
+            self._split(container, resident, key)
+            resident = self._entries[key]
+        resident.held = True
+        return True
 
     def discard_held(self, key: tuple[int, int]) -> None:
         """Drop a held range from L1 without handing it to ``on_held_release``.
@@ -489,7 +490,9 @@ class L1Cache:
         Args:
             key: Held range key; a key that is not held is ignored.
         """
-        if self.clear_held(key) is not None:
+        resident = self._entries.get(key)
+        if resident is not None and resident.held:
+            resident.held = False
             self.drop_overlapping(*key)
 
     def register_pool_waiter(self, waiter: object) -> None:
@@ -576,10 +579,7 @@ class L1Cache:
             raise ValueError(
                 f"invalid L1 accounting charge {charge} for physical slice {len(data)}"
             )
-        self._entries[key] = _Resident(data=data, charge=charge, held=held)
-        if held:
-            self._held[key] = None
-            self._held_bytes += key[1]
+        self._entries[key] = _Resident(data=data, charge=charge, held=held, dirty=held)
         self._slice_ids.add(id(data))
         self._insert_index(key)
         allocation = data.allocation_id
@@ -620,20 +620,56 @@ class L1Cache:
             Whether the slice stays open because it is still pinned.
         """
         if removed.held:
-            self._unhold(key, removed)
+            removed.held = False
             if self._on_held_release is not None:
-                self._on_held_release(key, removed.data)
+                self._on_held_release(key, removed.data, removed.dirty)
         pinned = self._is_pinned(key, removed.data)
         if not pinned:
             removed.data.close()
             self.notify_pool_waiters()
         return pinned
 
-    def _unhold(self, key: tuple[int, int], resident: _Resident) -> None:
-        """Clear one resident's held flag and its held-bytes accounting."""
-        resident.held = False
-        del self._held[key]
-        self._held_bytes -= key[1]
+    def _split(
+        self, container: tuple[int, int], resident: _Resident, key: tuple[int, int]
+    ) -> None:
+        """Replace ``container`` by child entries so ``key`` stands alone.
+
+        Children share the allocation, so its replacement position and pool
+        ownership are unchanged; side pieces take a floor share of the charge
+        and ``key`` the remainder, keeping the total and ``charge >= length``.
+        """
+        start, size = container
+        end = start + size
+        pieces = [
+            piece
+            for piece in (
+                (start, key[0] - start),
+                key,
+                (key[0] + key[1], end - key[0] - key[1]),
+            )
+            if piece[1] > 0
+        ]
+        allocation = resident.data.allocation_id
+        keys = self._allocation_keys[allocation]
+        del self._entries[container]
+        del keys[container]
+        self._slice_ids.remove(id(resident.data))
+        self._remove_index(container)
+        remaining = resident.charge
+        for piece in pieces:
+            child = resident.data.subslice(piece[0] - start, piece[1])
+            charge = 0 if piece == key else resident.charge * piece[1] // size
+            remaining -= charge
+            self._entries[piece] = _Resident(
+                data=child, charge=charge, read=resident.read
+            )
+            self._slice_ids.add(id(child))
+            self._insert_index(piece)
+            keys[piece] = None
+        self._entries[key].charge = remaining
+        # The container slice is detached; its owner (a lease or L2 write)
+        # closes it later, otherwise nothing references it now.
+        self.release(container, resident.data)
 
     def _pop_entry(self, key: tuple[int, int]) -> _Resident | None:
         """Detach one resident from every index and release its capacity."""

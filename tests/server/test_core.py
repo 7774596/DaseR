@@ -974,29 +974,103 @@ async def test_online_lookup_waits_for_pending_gap_block() -> None:
     assert sum(chunk.token_count for chunk in chunks) == 2 * BLOCK_TOKENS
 
 
+def _place_record(core: ServerCore, key: str) -> dict:
+    """Place one 4 KiB packed record for a committed single-slot chunk."""
+    meta = core.chunk_manager.store.get(key)
+    assert meta is not None
+    (span,) = place_packed(
+        core,
+        [
+            {
+                "chunk_key": key,
+                "file_offset": meta.start_slot * PACKED_LANE_SLOT,
+                "nbytes": 4096,
+                "start_slot": meta.start_slot,
+                "num_slots": 1,
+                "logical_slot_start": meta.start_slot,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+            }
+        ],
+    )
+    return span
+
+
 async def _committed_blocks(core: ServerCore, count: int) -> list[list[int]]:
-    """Allocate and commit ``count`` single-block chunks with distinct tokens."""
+    """Commit ``count`` single-block chunks with one packed record each."""
     blocks = [[10 * i + j for j in range(BLOCK_TOKENS)] for i in range(count)]
     for tokens in blocks:
         key = first_rolling_key(tokens)
         await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
         await core.commit_chunk(key)
+        _place_record(core, key)
     return blocks
 
 
 @pytest.mark.asyncio
-async def test_evict_oldest_chunk_is_fifo_despite_hits() -> None:
-    """Capacity eviction removes the oldest chunk even after a lookup hit."""
+async def test_reclaim_packed_is_fifo_despite_hits() -> None:
+    """Without an L1 tier, reclaim removes the oldest record even after a hit."""
     core = make_core()
     blocks = await _committed_blocks(core, 3)
     assert len(await core.lookup(blocks[0], "m")) == 1
 
-    evicted = await core.evict_oldest_chunk(set())
+    assert await core.reclaim_packed(set())
 
-    assert evicted is not None
-    assert evicted.chunk_key == first_rolling_key(blocks[0])
     assert await core.lookup(blocks[0], "m") == []
     assert len(await core.lookup(blocks[1], "m")) == 1
+    assert core.packed_layout.charged_bytes() == 2 * 4096
+
+
+@pytest.mark.asyncio
+async def test_reclaim_packed_keeps_l1_resident_victim_indexed() -> None:
+    """An L2 FIFO victim held by L1 stays indexed and leaves only the budget."""
+    core = make_core()
+    resident: set[int] = set()
+    discarded: list[tuple[int, int]] = []
+    core.attach_l1_tier(
+        lambda offset, nbytes: offset in resident,
+        lambda offset, nbytes: discarded.append((offset, nbytes)),
+    )
+    blocks = await _committed_blocks(core, 3)
+    first = core.packed_layout.oldest_charged(set())
+    assert first is not None
+    resident.add(first.file_offset)
+
+    assert await core.reclaim_packed(set())
+    assert len(await core.lookup(blocks[0], "m")) == 1
+    assert core.packed_layout.is_held(first.file_offset, 4096)
+    assert core.packed_layout.charged_bytes() == 2 * 4096
+    assert core.packed_layout.held_bytes == 4096
+
+    # The next victim is not resident, so its chunk leaves the index.
+    assert await core.reclaim_packed(set())
+    assert await core.lookup(blocks[1], "m") == []
+    assert discarded == []
+
+    # Removing a held chunk drops its L1 copy before the bytes are reused.
+    await core.evict_chunk(first.chunk_key)
+    assert discarded == [(first.file_offset, 4096)]
+    assert core.packed_layout.held_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_reclaim_packed_frees_arena_from_held_records_last() -> None:
+    """Arena reclaim removes charged records first, then the longest-held."""
+    core = make_core()
+    core.attach_l1_tier(lambda offset, nbytes: True, lambda offset, nbytes: None)
+    blocks = await _committed_blocks(core, 2)
+    assert await core.reclaim_packed(set())  # holds blocks[0]
+
+    assert await core.reclaim_packed(set(), free_address=True)
+    assert len(await core.lookup(blocks[0], "m")) == 1
+    assert await core.lookup(blocks[1], "m") == []
+
+    protected = {first_rolling_key(blocks[0])}
+    assert not await core.reclaim_packed(protected, free_address=True)
+    assert await core.reclaim_packed(set(), free_address=True)
+    assert await core.lookup(blocks[0], "m") == []
+    assert not await core.reclaim_packed(set())
 
 
 async def _committed_chain(
@@ -1009,6 +1083,7 @@ async def _committed_chain(
     for key in keys:
         await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
         await core.commit_chunk(key)
+        _place_record(core, key)
     assert len(await core.lookup(tokens, "m")) == 1
     return tokens, keys
 
@@ -1027,9 +1102,9 @@ async def test_prefix_closed_eviction_removes_unreachable_descendants(
     tokens, keys = await _committed_chain(core, 3)
     other = await _committed_blocks(core, 1)
 
-    evicted = await core.evict_oldest_chunk(set())
+    assert await core.reclaim_packed(set())
 
-    assert evicted is not None and evicted.chunk_key == keys[0]
+    assert core.chunk_manager.store.get(keys[0]) is None
     assert await core.lookup(tokens, "m") == []
     resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
     assert resident == [not closed, not closed]
@@ -1057,8 +1132,8 @@ async def test_prefix_closed_eviction_bounds_learned_edges(
     # 40 prompts learn 120 edges; a prune keeps the 2 cached edges plus at
     # most one generation of fresh ones (2 * 8 slots each).
     assert gauge and float(gauge[0].split()[1]) <= 2 + 2 * 2 * 8
-    evicted = await core.evict_oldest_chunk(set())
-    assert evicted is not None and evicted.chunk_key == keys[0]
+    assert await core.reclaim_packed(set())
+    assert core.chunk_manager.store.get(keys[0]) is None
     resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
     assert resident == [False, False]
 
@@ -1076,9 +1151,10 @@ async def test_prefix_closed_eviction_keeps_pending_and_protected(
         await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
     for key in (keys[0], keys[1], keys[3]):
         await core.commit_chunk(key)
+        _place_record(core, key)
     await core.lookup(tokens, "m")
 
-    await core.evict_oldest_chunk({keys[1]})
+    assert await core.reclaim_packed({keys[1]})
 
     resident = [core.chunk_manager.store.get(key) is not None for key in keys]
     assert resident == [False, True, True, True]

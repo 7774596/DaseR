@@ -15,7 +15,6 @@ from daser import stalldump
 from daser.config import (
     EXCLUSIVE_TIERS_ENV,
     GATHER_MIN_RUNS_ENV,
-    HELD_PRECLEAN_FRACTION_ENV,
     L2_WRITE_GATE_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
@@ -44,7 +43,6 @@ _PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
 
 
 _CUDA_IPC_CACHE_LIMIT = 16
-_PACKED_IO_ALIGNMENT = 4096
 # Grouped-load phases exported as daser_load_phase_seconds_total{phase}; each
 # maps to a TransferStats load_<phase>_us counter.
 _LOAD_PHASES = (
@@ -57,107 +55,6 @@ _LOAD_PHASES = (
     "l2_reserve",
     "l2_io",
 )
-
-
-def _packed_physical_slot(span: dict[str, Any]) -> int:
-    """Return the DaseR ring slot represented by one packed span.
-
-    Prefix reuse allocates one physical slot per synthetic ``:store:<index>``
-    request, while chunk reuse allocates a multi-slot physical range whose
-    prompt-relative offset is carried by ``logical_slot_start``.  The packed
-    metadata index must use the physical ring slot in both cases.
-    """
-    logical_slot = int(span.get("logical_slot_start", -1))
-    start_slot = int(span.get("start_slot", -1))
-    num_slots = int(span.get("num_slots", 0))
-    if logical_slot < 0:
-        raise ValueError("packed span is missing logical slot metadata")
-    if start_slot < 0 or num_slots <= 0:
-        # Keep the allocator usable for minimal unit-test spans that predate
-        # allocation metadata; production transfers always provide both.
-        return logical_slot
-    offset = 0 if num_slots == 1 else logical_slot
-    if offset < 0 or offset >= num_slots:
-        raise ValueError("packed span logical slot is outside its allocation")
-    return start_slot + offset
-
-
-class _OnlinePackedExtentAllocator:
-    """Validate online packed extents inside the physical L2 lane.
-
-    The worker still supplies raw allocation metadata for stale-write checks,
-    while ``OnlinePackedLayout`` owns variable-length placement. This class
-    validates the resulting physical ranges and rejects overlap before the
-    transfer layer sees them.
-    """
-
-    def assign(
-        self,
-        spans: list[dict[str, Any]],
-        capacity: int,
-        *,
-        local_slot_size: int,
-        rank_base: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Validate and preserve physical ranges for packed spans.
-
-        Args:
-            spans: Live transfer spans in source-buffer order.
-            capacity: Exclusive byte limit of the L2 store.
-            local_slot_size: Raw byte envelope for one rank-local slot.
-            rank_base: Byte offset of the current tensor-parallel rank lane.
-
-        Returns:
-            Copies of ``spans`` with validated packed ``file_offset`` values.
-
-        Raises:
-            ValueError: If packed span metadata or capacity is invalid.
-            MemoryError: If a packed span exceeds the L2 capacity.
-
-        Async/thread-safety:
-            Pure event-loop bookkeeping with no blocking or suspension.
-        """
-        if capacity <= 0 or local_slot_size <= 0 or rank_base < 0:
-            raise ValueError("invalid packed extent geometry")
-        assigned: list[dict[str, Any]] = []
-        seen_slots: set[int] = set()
-        ranges: list[tuple[int, int]] = []
-        for span in spans:
-            updated = dict(span)
-            if not bool(span.get("packed", False)):
-                assigned.append(updated)
-                continue
-            nbytes = int(span["nbytes"])
-            logical_count = int(span.get("logical_slot_count", 0))
-            logical_slot = int(span.get("logical_slot_start", -1))
-            if nbytes <= 0 or nbytes % _PACKED_IO_ALIGNMENT:
-                raise ValueError("online packed span must be positive and aligned")
-            if logical_count != 1 or logical_slot < 0:
-                raise ValueError("packed span must describe one logical slot")
-            physical_slot = _packed_physical_slot(span)
-            if physical_slot in seen_slots:
-                raise ValueError("packed transfer repeats a logical slot")
-            seen_slots.add(physical_slot)
-
-            offset = int(span.get("file_offset", -1))
-            allocation_slots = int(span.get("num_slots", 0))
-            if offset < rank_base or offset % _PACKED_IO_ALIGNMENT:
-                raise ValueError("online packed span file offset is invalid")
-            if allocation_slots <= 0:
-                raise ValueError("packed span allocation metadata is invalid")
-            if offset + nbytes > capacity:
-                raise MemoryError(
-                    "online packed store capacity exhausted: "
-                    f"need [{offset}, {offset + nbytes}), capacity={capacity}"
-                )
-            ranges.append((offset, offset + nbytes))
-            updated["file_offset"] = offset
-            assigned.append(updated)
-        ordered_ranges = sorted(ranges)
-        for index, (start, _end) in enumerate(ordered_ranges):
-            if index and start < ordered_ranges[index - 1][1]:
-                raise ValueError("online packed transfer contains overlapping ranges")
-        return assigned
 
 
 def _external_prefix_hits(
@@ -283,8 +180,7 @@ def _coalesce_transfer_spans(
 ) -> list[dict[str, Any]]:
     """Merge adjacent transfer spans without changing byte contents.
 
-    Spans are merged only when they share ``hold_key``, so every held range
-    belongs to exactly one chunk.
+    Held spans are never merged: each held L1 range is one packed record.
 
     Args:
         spans: transfer spans with source_offset, file_offset, and nbytes.
@@ -305,7 +201,6 @@ def _coalesce_transfer_spans(
             "packed": bool(span.get("packed", False)),
             "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
             "hold": bool(span.get("hold", False)),
-            "hold_key": str(span.get("hold_key", "")),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -323,7 +218,8 @@ def _coalesce_transfer_spans(
             span["source_offset"] == prev_source_end
             and span["file_offset"] == prev_file_end
             and span["packed"] == prev["packed"]
-            and span["hold_key"] == prev["hold_key"]
+            and not span["hold"]
+            and not prev["hold"]
             and (
                 not span["packed"]
                 or max_packed_bytes is None
@@ -368,12 +264,6 @@ class IPCServer:
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
-        # Compressed-online records are assigned physical extents after the
-        # worker has discovered their actual lengths.  The allocator is owned
-        # by this server event loop and recycles extents when ring logical
-        # slots are overwritten; it is intentionally independent of logical
-        # ring-slot allocation.
-        self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         # Online packed stores publish asynchronously after the worker has
         # released its source snapshot, so a successor lookup can observe the
         # writer key during the short transfer/commit interval. Retry for this
@@ -391,22 +281,19 @@ class IPCServer:
         self._prev_load_phase_us: dict[str, int] = {}
         self._prev_dst_copy: dict[str, int] = {}
         self._prev_l1_evicted: dict[str, int] = {}
-        # Held L1 ranges per chunk under exclusive tiers; None when disabled.
-        self._exclusive_held: dict[str, list[tuple[int, int]]] | None = None
-        if (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
-            # Exclusive tiers decide what reaches L2, so a memory-only store
-            # has nothing for them to control.
-            has_l2 = not bool(self._runtime_config.get("skip_l2", False))
-            if os.environ.get(EXCLUSIVE_TIERS_ENV) == "1" and has_l2:
-                # Exclusive tiers: every packed record is held in L1 and only
-                # reaches L2 when L1 evicts it; a removed chunk's held bytes
-                # are dropped so L2 never stores a record L1 still owns.
-                self._exclusive_held = {}
-                self._runtime_config["exclusive_tiers"] = True
-                core.add_chunk_removal_listener(self._forget_exclusive)
+        # Packed records are tiered across L1 and an L2 budget when both
+        # tiers exist; see docs/design/tier-residency.md. Exclusive tiers
+        # store new records in L1 only. Tiers attach with the transfer layer.
+        self._packed_tiers = self._runtime_config.get(
+            "storage_format"
+        ) == STORAGE_FORMAT_COMPRESSED_ONLINE and not bool(
+            self._runtime_config.get("skip_l2", False)
+        )
+        self._exclusive_tiers = (
+            self._packed_tiers and os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
+        )
+        if self._exclusive_tiers:
+            self._runtime_config["exclusive_tiers"] = True
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -1089,11 +976,13 @@ class IPCServer:
         backend = str(self._runtime_config.get("transfer_mode", "gds"))
         transfer = self._ensure_transfer()
         total = 0
-        held_spans: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
+        layout = self._core.packed_layout
+        hold = self._exclusive_tiers and transfer.supports_held_stores
+        held_ranges: list[tuple[int, int]] = []
         stored_chunk_keys: list[str] = []
         accepted_spans: list[dict[str, Any]] = []
         place_ms = 0.0
-        place_evictions = 0
+        reclaims = 0
         tp_rank = int(msg.get("tp_rank", 0))
         tp_size = int(msg.get("tp_size", 1))
         # The worker may export a compact view whose reported length ends at
@@ -1188,11 +1077,10 @@ class IPCServer:
                     self._runtime_config.get("rank_stride_bytes", 0)
                 )
                 # Logical slots are over-provisioned for compressed records,
-                # so the physical arena can fill first. Reclaim FIFO-oldest
-                # chunks (never the ones being stored) until the reported
+                # so the physical arena can fill first. Remove the oldest
+                # records (never the ones being stored) until the reported
                 # deficit is freed, then retry placement.
                 rank_base = tp_rank * rank_stride_bytes
-                layout = self._core.packed_layout
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
                 place_started = time.perf_counter()
                 while True:
@@ -1203,6 +1091,7 @@ class IPCServer:
                             local_slot_size=local_slot_size,
                             rank_base=rank_base,
                             arena_size=rank_stride_bytes or capacity // max(1, tp_size),
+                            hold=hold,
                         )
                         break
                     except PackedArenaFull as exc:
@@ -1212,18 +1101,21 @@ class IPCServer:
                             layout.free_bytes(rank_base=rank_base) + exc.deficit_bytes
                         )
                         while layout.free_bytes(rank_base=rank_base) < target:
-                            evicted = await self._core.evict_oldest_chunk(
-                                protected_keys
-                            )
-                            if evicted is None:
+                            if not await self._core.reclaim_packed(
+                                protected_keys, rank_base=rank_base, free_address=True
+                            ):
                                 raise
-                            place_evictions += 1
-                live_spans = self._packed_extent_allocator.assign(
-                    live_spans,
-                    capacity,
-                    local_slot_size=local_slot_size,
-                    rank_base=tp_rank * rank_stride_bytes,
-                )
+                            reclaims += 1
+                # Keep L2 within its budget; L1-resident victims stay indexed.
+                l2_budget = int(self._runtime_config.get("l2_budget_bytes", 0))
+                while (
+                    l2_budget
+                    and layout.charged_bytes(rank_base=rank_base) > l2_budget
+                    and await self._core.reclaim_packed(
+                        protected_keys, rank_base=rank_base
+                    )
+                ):
+                    reclaims += 1
                 place_ms = (time.perf_counter() - place_started) * 1000
                 self._record_packed_ratios(live_spans, local_slot_size)
                 # Another store may evict these chunks while this one awaits
@@ -1249,13 +1141,20 @@ class IPCServer:
                     }
                 )
 
-            holding = self._exclusive_held is not None and transfer.supports_held_stores
-            if holding:
+            if hold:
+                # Only records placed held go to L1 alone; a retried record
+                # that L1 already released stays charged.
                 live_spans = [
-                    {**span, "hold": True, "hold_key": str(span["chunk_key"])}
-                    if span.get("packed", False) and span.get("chunk_key")
+                    {**span, "hold": True}
+                    if span.get("packed", False)
+                    and layout.is_held(int(span["file_offset"]), int(span["nbytes"]))
                     else span
                     for span in live_spans
+                ]
+                held_ranges = [
+                    (int(span["file_offset"]), int(span["nbytes"]))
+                    for span in live_spans
+                    if span.get("hold")
                 ]
             if transfer.coalesce_store_spans:
                 store_spans = _coalesce_transfer_spans(
@@ -1273,62 +1172,54 @@ class IPCServer:
                 store_spans = live_spans
             io_started = time.perf_counter()
             total = await transfer.store_bytes_grouped(buffer, store_spans)
-            if holding:
-                held_spans = (live_spans, store_spans)
             logger.info(
                 "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d "
-                "place_ms=%.1f evictions=%d io_ms=%.1f total_ms=%.1f",
+                "place_ms=%.1f reclaims=%d io_ms=%.1f total_ms=%.1f",
                 len(live_spans),
                 sum(bool(span.get("packed", False)) for span in live_spans),
                 len(store_spans),
                 sum(int(span["nbytes"]) for span in store_spans),
                 place_ms,
-                place_evictions,
+                reclaims,
                 (time.perf_counter() - io_started) * 1000,
                 (time.perf_counter() - started) * 1000,
             )
         finally:
-            # A held range is registered only after record_store_ranges, so
-            # its bytes stay reserved until then: freed earlier, a later
-            # record placed there would share the held range's L1 key.
-            if write_hold is not None and held_spans is None:
+            # A record removed while its held store was in flight was dropped
+            # before its L1 entry existed. Discard that entry while the write
+            # hold still keeps its offset from being placed again.
+            for file_offset, nbytes in held_ranges:
+                if not layout.is_held(file_offset, nbytes):
+                    transfer.discard_held(file_offset, nbytes)
+            if write_hold is not None:
                 self._end_packed_writes(write_hold)
             if (
                 isinstance(buffer, _UncachedCudaArray)
                 and "store_staging_buffer_index" not in payload
             ):
                 buffer.close()
-        try:
-            if accepted_spans:
-                configured_tp_size = int(
-                    self._runtime_config.get("tensor_parallel_size", tp_size)
+        if accepted_spans:
+            configured_tp_size = int(
+                self._runtime_config.get("tensor_parallel_size", tp_size)
+            )
+            if configured_tp_size != tp_size:
+                raise ValueError(
+                    f"transfer TP size {tp_size} != configured {configured_tp_size}"
                 )
-                if configured_tp_size != tp_size:
-                    raise ValueError(
-                        f"transfer TP size {tp_size} != configured {configured_tp_size}"
-                    )
-                slot_size = int(self._runtime_config.get("slot_size", 0))
-                local_slot_size = int(
-                    self._runtime_config.get(
-                        "local_slot_size", slot_size // max(1, tp_size)
-                    )
+            slot_size = int(self._runtime_config.get("slot_size", 0))
+            local_slot_size = int(
+                self._runtime_config.get(
+                    "local_slot_size", slot_size // max(1, tp_size)
                 )
-                rank_stride_bytes = int(
-                    self._runtime_config.get("rank_stride_bytes", 0)
-                )
-                await self._core.record_store_ranges(
-                    accepted_spans,
-                    tp_rank=tp_rank,
-                    tp_size=tp_size,
-                    local_slot_size=local_slot_size,
-                    rank_stride_bytes=rank_stride_bytes,
-                )
-            if held_spans is not None:
-                # After record_store_ranges: an early deny may evict the chunk.
-                await self._record_held_spans(transfer, *held_spans)
-        finally:
-            if write_hold is not None and held_spans is not None:
-                self._end_packed_writes(write_hold)
+            )
+            rank_stride_bytes = int(self._runtime_config.get("rank_stride_bytes", 0))
+            await self._core.record_store_ranges(
+                accepted_spans,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                local_slot_size=local_slot_size,
+                rank_stride_bytes=rank_stride_bytes,
+            )
         self._record_transfer_metrics(
             op="store",
             backend=backend,
@@ -1655,50 +1546,6 @@ class IPCServer:
                 "Packed bytes freed when a store finished after its chunk left.",
             ).inc(freed)
 
-    async def _record_held_spans(
-        self,
-        transfer: TransferLayer,
-        live_spans: list[dict[str, Any]],
-        store_spans: list[dict[str, Any]],
-    ) -> None:
-        """Register exclusive-tier held ranges per chunk.
-
-        A chunk that was evicted while its store was in flight has already
-        been forgotten, so its ranges are discarded instead of held. The
-        ranges stay held until L1 evicts them (written to L2) or the chunk is
-        removed (dropped).
-        """
-        ranges: dict[str, list[tuple[int, int]]] = {}
-        for span in store_spans:
-            if span.get("hold"):
-                ranges.setdefault(str(span["hold_key"]), []).append(
-                    (int(span["file_offset"]), int(span["nbytes"]))
-                )
-        allocations = {
-            str(span["chunk_key"]): span for span in live_spans if span.get("hold")
-        }
-        assert self._exclusive_held is not None
-        for chunk_key, held in ranges.items():
-            span = allocations[chunk_key]
-            if not self._core.is_current_allocation(
-                chunk_key=chunk_key,
-                start_slot=int(span.get("start_slot", -1)),
-                num_slots=int(span.get("num_slots", 0)),
-            ):
-                transfer.discard_held(held)
-                continue
-            self._exclusive_held.setdefault(chunk_key, []).extend(held)
-        self._metrics.counter(
-            "daser_admission_chunks_total", "Exclusive-tier held chunk outcomes."
-        ).inc(len(ranges), labels={"outcome": "held"})
-
-    def _forget_exclusive(self, chunk_key: str) -> None:
-        """Removal listener: drop a removed chunk's still-held L1 ranges."""
-        assert self._exclusive_held is not None
-        held = self._exclusive_held.pop(chunk_key, None)
-        if held and self._transfer is not None:
-            self._transfer.discard_held(held)
-
     def _record_tier_metrics(self) -> None:
         """Publish L1 cache metrics and the cumulative L2 read counter."""
         transfer = self._transfer
@@ -1719,19 +1566,10 @@ class IPCServer:
         )
         if held_evicts > 0:
             self._metrics.counter(
-                "daser_admission_ranges_total",
-                "Finish-admission held-range outcomes.",
-            ).inc(held_evicts, labels={"outcome": "l1_evicted"})
+                "daser_held_writebacks_total",
+                "Exclusive-tier records written to L2 when L1 evicted them.",
+            ).inc(held_evicts)
         self._prev_held_evict_persists = stats.held_evict_persists
-        precleaned = stats.held_preclean_bytes - getattr(
-            self, "_prev_held_preclean_bytes", 0
-        )
-        if precleaned > 0:
-            self._metrics.counter(
-                "daser_held_preclean_bytes_total",
-                "Held bytes written to L2 ahead of eviction while idle.",
-            ).inc(precleaned)
-        self._prev_held_preclean_bytes = stats.held_preclean_bytes
         timing = getattr(transfer, "l2_timing_us", None) or {}
         prev_timing = getattr(self, "_prev_l2_timing_us", {})
         for key, current in timing.items():
@@ -1867,11 +1705,16 @@ class IPCServer:
         self._metrics.gauge(
             "daser_l1_bytes_capacity", "L1 memory cache total capacity."
         ).set(l1_capacity)
-        if self._exclusive_held is not None:
-            # SSD-resident packed bytes = arena - free - held.
+        if self._packed_tiers:
+            layout = self._core.packed_layout
             self._metrics.gauge(
-                "daser_held_bytes", "Held L1 bytes not yet written to L2."
-            ).set(transfer.held_bytes)
+                "daser_packed_l2_charged_bytes",
+                "Rank-0 packed bytes counted against the L2 budget.",
+            ).set(layout.charged_bytes())
+            self._metrics.gauge(
+                "daser_packed_l1_held_bytes",
+                "Packed bytes indexed only through L1 residency.",
+            ).set(layout.held_bytes)
             self._metrics.gauge(
                 "daser_packed_arena_free_bytes",
                 "Unreserved bytes of the rank-0 packed arena lane.",
@@ -1930,16 +1773,28 @@ class IPCServer:
                     ),
                     gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
                     l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
-                    held_preclean_fraction=float(
-                        os.environ.get(HELD_PRECLEAN_FRACTION_ENV) or 0.0
-                    ),
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
                     ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
+            if self._packed_tiers and self._transfer.supports_held_stores:
+                self._core.attach_l1_tier(
+                    self._transfer.hold_resident, self._transfer.discard_held
+                )
+                self._transfer.set_held_release_listener(self._on_held_release)
         return self._transfer
+
+    def _on_held_release(self, file_offset: int, nbytes: int) -> None:
+        """Return a held record that left L1 to the L2 FIFO.
+
+        Exclusive tiers enter it as newest (it was just demoted); inclusive
+        tiers as oldest, so the next reclaim drops it as LMCache would.
+        """
+        self._core.packed_layout.charge_held(
+            file_offset, nbytes, newest=self._exclusive_tiers
+        )
 
     def _chunk_payloads(self, chunks: list[ChunkInfo]) -> list[dict[str, Any]]:
         """Serialize lookup chunks and attach published online packed slot refs."""

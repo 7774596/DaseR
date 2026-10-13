@@ -290,16 +290,19 @@ system，之后不做运行时切换：
 `iouring + prefix + TP=1 + BF16 + block_tokens=128`；不满足条件时
 启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
 与 `--skip-l2` 同开时 packed arena 只寻址 L1（`--l1-size`），压缩后的 record
-只驻留 pinned memory，容量收益直接作用于 memory-only 缓存；L2 准入和独占
-L1/L2 研究开关在这种模式下不生效。
+只驻留 pinned memory，容量收益直接作用于 memory-only 缓存；L2 准入和
+inclusive/exclusive 策略在这种模式下不生效。
 
 store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
 record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，默认使用模型无关的
-generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。每个 allocation 仍按 raw
-slot envelope 预留 `slot_offset = slot_id * slot_size`，因此 `ChunkManager`、
-`MetadataStore`、ring wrap 和淘汰语义不变；packed record 在所属 allocation 内部
-紧凑排列，相邻 slot 合并成一个 DMA span。L1 只为实际写入的字节分配 pinned
-memory，这是容量收益的来源。
+generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。`ChunkManager` 的逻辑 ring
+按最小 packed 长度超额供给 slot，只负责 slot 身份和元数据；server 在 L1+L2
+大小的 packed arena 中为每个 record 分配稳定地址，相邻 record 合并成一个 DMA
+span。L1 只为实际写入的字节分配 pinned memory，这是容量收益的来源。L2 FIFO
+只回收 L2 预算（`--l2-size`），整段驻留在 L1 的 record 保留在索引中，因此 SSD
+的 FIFO 不会淘汰 L1 的热数据；inclusive（默认，write-through）与 exclusive
+（`DASER_EXCLUSIVE_TIERS=1`，L1 淘汰时才写 SSD）只在 store 策略上不同，见
+[packed arena 与 L1/L2 驻留](tier-residency.md)。
 
 server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、
 stored length），lookup 命中后把有序 record 以 `compressed_slots` 附在 load
@@ -311,7 +314,7 @@ io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker 在固定 C
 KV blocks，不物化完整 decoded staging；`raw` mode slot 走既有 restore。prefix
 mode 的 `pos_offset` 必须为 0，decoder 暂不融合 RoPE。
 
-packed record 引用只存在于 server 内存，且会覆盖 raw envelope 的内容，所以该
+packed record 引用只存在于 server 内存，且不按 raw slot 寻址，所以该
 模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
 snapshot，避免之后的 raw 重启把 packed bytes 当作 raw 读。
 

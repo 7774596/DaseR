@@ -309,3 +309,64 @@ def test_written_records_follow_the_current_placement() -> None:
     assert [r.chunk_key for r in layout.written_records(slot, 1, manager) or []] == [
         "new"
     ]
+
+
+def _placed_records(
+    layout: OnlinePackedLayout, manager: ChunkManager, keys: str, *, hold: bool
+) -> list[int]:
+    """Place one 4 KiB record per key in its own call; return their offsets."""
+    return [
+        layout.compact(
+            [allocate(manager, key, 4096)], manager, local_slot_size=SLOT, hold=hold
+        )[0]["file_offset"]
+        for key in keys
+    ]
+
+
+def test_hold_and_recharge_follow_the_l2_fifo_policy() -> None:
+    """Holding leaves the L2 budget; recharge enters as oldest or newest."""
+    manager = ChunkManager(8, MetadataStore(8))
+    layout = OnlinePackedLayout()
+    a, b, c = _placed_records(layout, manager, "abc", hold=False)
+    assert layout.charged_bytes() == 3 * 4096
+    assert layout.oldest_charged(set()).chunk_key == "a"
+    assert layout.oldest_charged({"a"}).chunk_key == "b"
+
+    layout.hold(a)
+    layout.hold(b)
+    with pytest.raises(ValueError, match="charged"):
+        layout.hold(a)
+    assert layout.is_held(a, 4096) and not layout.is_held(c, 4096)
+    assert layout.charged_bytes() == 4096 and layout.held_bytes == 2 * 4096
+    assert layout.oldest_held(set()).chunk_key == "a"
+
+    # Inclusive re-charge goes to the FIFO head, exclusive to its tail.
+    assert layout.charge_held(a, 4096, newest=False)
+    assert layout.charge_held(b, 4096, newest=True)
+    assert not layout.charge_held(b, 4096, newest=True)
+    assert not layout.charge_held(c + 1, 4096, newest=True)
+    order = []
+    while (victim := layout.oldest_charged(set(order))) is not None:
+        order.append(victim.chunk_key)
+    assert order == ["a", "c", "b"]
+    assert layout.charged_bytes() == 3 * 4096 and layout.held_bytes == 0
+
+
+def test_dropping_a_held_placement_discards_it_before_reuse() -> None:
+    """Held records report their range on release, charged ones do not."""
+    dropped: list[tuple[int, int]] = []
+    manager = ChunkManager(2, MetadataStore(2))
+    layout = OnlinePackedLayout(on_held_drop=lambda *key: dropped.append(key))
+    (held,) = _placed_records(layout, manager, "h", hold=True)
+    (charged,) = _placed_records(layout, manager, "c", hold=False)
+    assert layout.held_bytes == 4096 and layout.charged_bytes() == 4096
+
+    # The ring wraps over both records; only the held one is discarded.
+    allocate(manager, "n", 4096)
+    allocate(manager, "m", 4096)
+    for key in manager.drain_evicted_chunk_keys():
+        layout.release(key, manager)
+    assert dropped == [(held, 4096)]
+    assert not layout.is_held(held, 4096)
+    assert layout.held_bytes == 0 and layout.charged_bytes() == 0
+    assert charged != held

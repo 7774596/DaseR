@@ -3,7 +3,7 @@
 # Standard
 import asyncio
 import bisect
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import time
 from typing import Any
@@ -42,8 +42,6 @@ _PACKED_READ_BATCH_COUNT = 64
 # A readahead not consumed this long after it started lost its load (aborted
 # or trimmed request) and is reclaimed; it outlives a queued request's wait.
 _READAHEAD_LIFETIME_S = 120.0
-# Held bytes one preclean batch writes before the next idle check.
-_PRECLEAN_BATCH_BYTES = 1 << 30
 #: A promotion reservation still waiting after this long logs the tier state.
 _STUCK_WAIT_LOG_S = 30.0
 #: Re-check interval for reservations waiting on an exhausted pool: readahead
@@ -776,11 +774,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             and pause between 16 MiB pieces while any L2 read is in native IO
             (bounded per piece), covering writes already issued when a read
             starts; see ``L2IoEngine``.
-        held_preclean_fraction: Research switch (0 disables). Once held
-            ranges exceed this fraction of L1, the oldest are written to L2
-            while no readahead is reading (one batch at a time) and stay
-            resident as clean copies, so evictions during a readahead free
-            memory without an SSD write.
         readahead_budget_fraction: Share of L1 that readahead leases may
             retain at once (default half).
 
@@ -807,13 +800,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         readahead_window: int = 4,
         gather_min_runs: int = 0,
         l2_write_gate: bool = False,
-        held_preclean_fraction: float = 0.0,
         readahead_budget_fraction: float = 0.5,
     ) -> None:
         if not 0.0 < readahead_budget_fraction < 1.0:
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
-        if not 0.0 <= held_preclean_fraction < 1.0:
-            raise ValueError("held_preclean_fraction must be in [0, 1)")
         if gather_min_runs < 0:
             raise ValueError("gather_min_runs must be >= 0")
         if readahead_piece_bytes < 0 or readahead_window <= 0:
@@ -865,12 +855,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         # flight (superseded ones included) keyed by ``id()``.
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._l2_write_buffers: dict[int, PinnedMemorySlice] = {}
-        # Held bytes above which idle time writes the oldest held ranges
-        # (0 disables), and the preclean writes still in flight.
-        self._held_preclean_limit = (
-            0 if skip_l2 else int(l1_bytes * held_preclean_fraction)
-        )
-        self._preclean_writes: set[asyncio.Task[None]] = set()
+        self._held_release_listener: Callable[[int, int], None] | None = None
         # In-flight promotions by reservation identifier (``id()`` of the slice).
         self._promotions: dict[int, _Promotion] = {}
         self._cache_epoch = 0
@@ -885,7 +870,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
             replacement_policy=_l1_replacement_policy(self.bip_enabled),
-            on_held_release=self._persist_evicted_held,
+            on_held_release=self._release_held,
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
@@ -896,8 +881,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
             "prefetch_lease_budget=%d l2_read_stripe=%d readahead_piece=%d "
-            "readahead_window=%d gather_min_runs=%d l2_write_gate=%s "
-            "held_preclean_limit=%d",
+            "readahead_window=%d gather_min_runs=%d l2_write_gate=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -912,7 +896,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._readahead_window,
             self._gather_min_runs,
             l2_write_gate,
-            self._held_preclean_limit,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1407,7 +1390,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
                     data.close()
-                    self._maybe_preclean_held()
                     # Ensure every scheduled write has entered the executor
                     # before callers can close the layer synchronously.
                     await asyncio.sleep(0)
@@ -1949,18 +1931,28 @@ class TieredIOUringTransferLayer(TransferLayer):
         async with self._lock:
             self._release_request_lease_locked(lease_id)
 
-    def discard_held(self, ranges: list[tuple[int, int]]) -> None:
-        """Drop held ranges from L1 without writing them to L2.
+    def hold_resident(self, file_offset: int, nbytes: int) -> bool:
+        """Mark a record's resident L1 range held; see ``TransferLayer``.
 
-        Args:
-            ranges: ``(file_offset, nbytes)`` keys of held packed spans.
+        Async/thread-safety:
+            Must run on the owning event loop. It does not await, so it is
+            atomic with respect to locked sections; a split keeps every byte
+            resident and its owners unchanged.
+        """
+        return self._l1.hold_clean((file_offset, nbytes))
+
+    def set_held_release_listener(self, listener: Callable[[int, int], None]) -> None:
+        """Register the held-release callback; see ``TransferLayer``."""
+        self._held_release_listener = listener
+
+    def discard_held(self, file_offset: int, nbytes: int) -> None:
+        """Drop a held L1 range without writing it to L2.
 
         Async/thread-safety:
             Must run on the owning event loop before the file range is reused.
             It does not await, so it is atomic with respect to locked sections.
         """
-        for key in ranges:
-            self._l1.discard_held(key)
+        self._l1.discard_held((file_offset, nbytes))
 
     async def drain(self) -> None:
         """Wait until all pending L2 writes and destination copies complete.
@@ -2021,7 +2013,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             ),
             "pending_l1_promotions": len(dict(self._promotions)),
             "l1_bytes_used": self._l1.bytes_used,
-            "held_bytes": self._l1.held_bytes,
         }
 
     def close(self) -> None:
@@ -2056,57 +2047,19 @@ class TieredIOUringTransferLayer(TransferLayer):
         del key
         return id(data) in self._l2_write_buffers or id(data) in self._leased_slices
 
-    def _persist_evicted_held(
-        self, key: tuple[int, int], data: PinnedMemorySlice
+    def _release_held(
+        self, key: tuple[int, int], data: PinnedMemorySlice, dirty: bool
     ) -> None:
-        """Write back a held range leaving L1 before it was discarded.
+        """Hand a held range leaving L1 back to the server.
 
-        It has never been written to L2, so the new writer takes ownership of
-        the slice before L1 decides whether to close it.
+        A dirty range has never been written to L2, so its writer takes
+        ownership of the slice before L1 decides whether to close it.
         """
-        self._stats.held_evict_persists += 1
-        self._persist_locked(key, data)
-
-    def _maybe_preclean_held(self) -> None:
-        """Write the oldest held ranges to L2 while no readahead is reading.
-
-        Runs only with ``held_preclean_fraction`` set, no readahead running and
-        no earlier preclean batch in flight. Writes oldest-held-first until
-        held bytes fall to the limit or one batch (``_PRECLEAN_BATCH_BYTES``)
-        is submitted; the ranges stay resident in L1 and, once written, leave
-        it later without an SSD write. Each finished batch re-checks.
-
-        Async/thread-safety:
-            Must run on the owning event loop. It does not await, so it is
-            atomic with respect to every locked metadata section.
-        """
-        if (
-            not self._held_preclean_limit
-            or self._l1.held_bytes <= self._held_preclean_limit
-            or self._preclean_writes
-            or not self._readahead_idle.is_set()
-        ):
-            return
-        submitted = 0
-        for key in self._l1.held_keys():
-            if (
-                self._l1.held_bytes <= self._held_preclean_limit
-                or submitted >= _PRECLEAN_BATCH_BYTES
-            ):
-                break
-            data = self._l1.clear_held(key)
-            assert data is not None
-            task = self._persist_locked(key, data)
-            self._preclean_writes.add(task)
-            task.add_done_callback(self._preclean_write_done)
-            submitted += key[1]
-        self._stats.held_preclean_bytes += submitted
-
-    def _preclean_write_done(self, task: asyncio.Task[None]) -> None:
-        """Forget a finished preclean write and start the next batch."""
-        self._preclean_writes.discard(task)
-        if not self._preclean_writes:
-            self._maybe_preclean_held()
+        if dirty:
+            self._stats.held_evict_persists += 1
+            self._persist_locked(key, data)
+        if self._held_release_listener is not None:
+            self._held_release_listener(*key)
 
     def _persist_locked(
         self, key: tuple[int, int], data: PinnedMemorySlice
@@ -2150,11 +2103,6 @@ class TieredIOUringTransferLayer(TransferLayer):
     def l1_bytes_used(self) -> int:
         """Return resident L1 memory-tier bytes."""
         return self._l1.bytes_used
-
-    @property
-    def held_bytes(self) -> int:
-        """Return held L1 bytes that have not been written to L2."""
-        return self._l1.held_bytes
 
     def _accounted_nbytes(self, span: dict[str, Any], nbytes: int) -> int:
         """Return the configured L1 capacity charge for one physical span.
@@ -3042,13 +2990,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         # Diagnostic for promotion stalls that never wake.
                         logger.warning(
                             "[TRANSFER:iouring] promotion of %d bytes waiting "
-                            "%.0f s on pool: l1_used=%d/%d held=%d "
+                            "%.0f s on pool: l1_used=%d/%d "
                             "readahead_retained=%d readaheads=%d",
                             nbytes,
                             waited_s,
                             self._l1.bytes_used,
                             self._l1_bytes,
-                            self._l1.held_bytes,
                             self._readahead_bytes_locked(),
                             len(self._readaheads),
                         )
@@ -3428,7 +3375,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readahead_running -= 1
         if not self._readahead_running:
             self._readahead_idle.set()
-            self._maybe_preclean_held()
 
     async def _read_readahead_groups(
         self,

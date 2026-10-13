@@ -325,13 +325,13 @@ def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
     """Eviction and overwrite of a held range call ``on_held_release`` first.
 
     The callback pins the slice (as starting its L2 write does), so the slice
-    survives eviction; ``discard_held`` and ``clear_held`` skip the callback.
+    survives eviction; ``discard_held`` skips the callback.
     """
     pinned: set[int] = set()
-    released: list[tuple[int, int]] = []
+    released: list[tuple[tuple[int, int], bool]] = []
 
-    def on_held_release(key: tuple[int, int], data: object) -> None:
-        released.append(key)
+    def on_held_release(key: tuple[int, int], data: object, dirty: bool) -> None:
+        released.append((key, dirty))
         pinned.add(id(data))
 
     cache = L1Cache(
@@ -344,30 +344,58 @@ def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
         _a, b, c = _put_held_group(cache, [(0, 4096), (4096, 4096), (8192, 4096)])
         # Pool pages are reused uninitialized; give c known bytes.
         c.view()[:] = b"c" * 4096
-        assert cache.held_keys() == [(0, 4096), (4096, 4096), (8192, 4096)]
-        assert cache.held_bytes == 3 * 4096
 
         cache.discard_held((0, 4096))
         assert released == [] and cache.get((0, 4096)) is None
-        assert cache.clear_held((4096, 4096)) is b
         assert cache.get((4096, 4096)) is b
-        assert cache.held_keys() == [(8192, 4096)]
-        assert cache.held_bytes == 4096
 
-        # Overwriting the held range hands it over; the cleared one is not.
+        # Overwriting held ranges hands each one over as dirty.
         cache.drop_overlapping(4096, 8192)
-        assert released == [(8192, 4096)]
+        assert released == [((4096, 4096), True), ((8192, 4096), True)]
         assert id(c) in pinned and bytes(c.view()) == b"c" * 4096
-        assert cache.held_bytes == 0 and cache.bytes_used == 0
+        assert cache.bytes_used == 0
 
         (d,) = _put_held_group(cache, [(12288, 4096)])
         # A full-pool reservation evicts it; the callback pins it first.
         assert cache.reserve_untracked(16384) is None
-        assert released == [(8192, 4096), (12288, 4096)]
+        assert released[-1] == ((12288, 4096), True)
         assert cache.eviction_bytes["pinned_bytes"] == 4096
-        assert cache.held_bytes == 0
-        for data in (c, d):
+        for data in (b, c, d):
             pinned.discard(id(data))
             cache.release((0, 0), data)
+    finally:
+        cache.close()
+
+
+def test_hold_clean_splits_a_resident_entry_without_changing_its_charge() -> None:
+    """``hold_clean`` isolates one record of an entry; it leaves L1 as clean."""
+    released: list[tuple[tuple[int, int], bool]] = []
+    cache = L1Cache(
+        16384,
+        4096,
+        lambda _key, _data: False,
+        on_held_release=lambda key, _data, dirty: released.append((key, dirty)),
+    )
+    try:
+        parent = cache.reserve_untracked(12288)
+        assert parent is not None
+        parent.view()[:] = b"a" * 4096 + b"b" * 4096 + b"c" * 4096
+        cache.put_reserved_group([((0, 12288), parent)], held=[False])
+        used = cache.bytes_used
+
+        assert not cache.hold_clean((8192, 8192))  # not covered by one entry
+        assert cache.hold_clean((4096, 4096))
+        assert not cache.hold_clean((4096, 4096))  # already held
+        assert cache.bytes_used == used
+        held = cache.get((4096, 4096))
+        assert held is not None and bytes(held.view()) == b"b" * 4096
+        side = cache.get((8192, 4096))
+        assert side is not None and bytes(side.view()) == b"c" * 4096
+
+        # Evicting the allocation releases the held child once, as clean.
+        whole = cache.reserve_untracked(16384)
+        assert whole is not None
+        assert released == [((4096, 4096), False)]
+        whole.close()
     finally:
         cache.close()

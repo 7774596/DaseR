@@ -2,6 +2,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,10 +19,8 @@ class TransferStats:
         l2_reads: number of reads issued to the SSD tier.
         l2_writes: number of writes issued to the SSD tier.
         l2_write_bytes: bytes written to the SSD tier.
-        held_evict_persists: held ranges written to L2 because they left the
-            memory tier before an admission decision arrived.
-        held_preclean_bytes: held bytes written to L2 ahead of eviction while
-            no readahead was reading (they stay resident, now clean).
+        held_evict_persists: dirty held ranges written to L2 because they
+            left the memory tier (exclusive tiers).
         prefetch_requests: number of host-tier prefetch operations.
         prefetch_l1_bytes: requested bytes already resident in L1.
         prefetch_l2_bytes: requested bytes read from L2.
@@ -71,7 +70,6 @@ class TransferStats:
     l2_writes: int = 0
     l2_write_bytes: int = 0
     held_evict_persists: int = 0
-    held_preclean_bytes: int = 0
     prefetch_requests: int = 0
     prefetch_l1_bytes: int = 0
     prefetch_l2_bytes: int = 0
@@ -141,8 +139,9 @@ class TransferLayer(ABC):
 
     #: When True the server coalesces adjacent store spans before dispatch.
     coalesce_store_spans: bool = False
-    #: When True, packed store spans carrying ``hold=True`` are published to
-    #: the memory tier only; their SSD write waits for L1 eviction.
+    #: When True the backend has a memory tier that can hold records: packed
+    #: store spans carrying ``hold=True`` are published to it only (their SSD
+    #: write waits for eviction) and ``hold_resident`` can keep L2 records.
     supports_held_stores: bool = False
 
     @property
@@ -165,15 +164,6 @@ class TransferLayer(ABC):
             memory tier.
         """
         return int(getattr(self, "_l1_used", 0))
-
-    @property
-    def held_bytes(self) -> int:
-        """Return held memory-tier bytes that have not been written to L2.
-
-        Returns:
-            Held bytes, or 0 for backends without held stores.
-        """
-        return 0
 
     def debug_state(self) -> dict[str, Any]:
         """Return a small snapshot of in-flight work for stall diagnostics.
@@ -462,12 +452,47 @@ class TransferLayer(ABC):
         """
         return None
 
-    def discard_held(self, ranges: list[tuple[int, int]]) -> None:  # noqa: B027
-        """Drop held ranges without writing them to the SSD tier.
+    def hold_resident(self, file_offset: int, nbytes: int) -> bool:
+        """Keep a record's memory-tier copy as the only copy the server needs.
+
+        The range must already be written (or being written) to L2. On
+        success it stays in the memory tier until replacement evicts it, then
+        the held-release listener is called.
 
         Args:
-            ranges: ``(file_offset, nbytes)`` keys returned by a held store.
-                Ranges no longer held are ignored.
+            file_offset: Start of one packed record.
+            nbytes: Record length.
+
+        Returns:
+            Whether the whole record was resident and is now held; always
+            False for backends without a memory tier.
+
+        Async/thread-safety:
+            Call on the server event loop. Does not await.
+        """
+        del file_offset, nbytes
+        return False
+
+    def set_held_release_listener(  # noqa: B027
+        self, listener: Callable[[int, int], None]
+    ) -> None:
+        """Register the callback for held ranges leaving the memory tier.
+
+        Args:
+            listener: Called with ``(file_offset, nbytes)`` after a held range
+                was evicted; a dirty range already has its L2 write ordered.
+
+        Async/thread-safety:
+            The listener runs synchronously on the server event loop inside
+            transfer bookkeeping and must not await or call the transfer.
+        """
+
+    def discard_held(self, file_offset: int, nbytes: int) -> None:  # noqa: B027
+        """Drop a held range without writing it to the SSD tier.
+
+        Args:
+            file_offset: Start of the held range.
+            nbytes: Range length. A range no longer held is ignored.
 
         Async/thread-safety:
             Must be called on the server event loop before the file range is

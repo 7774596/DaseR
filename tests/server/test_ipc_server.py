@@ -24,7 +24,6 @@ from daser.server.ipc import IPCServer
 from daser.server.ipc.server import (
     _CachedCudaArray,
     _coalesce_transfer_spans,
-    _OnlinePackedExtentAllocator,
 )
 from daser.server.metadata_store import MetadataStore
 from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
@@ -191,151 +190,29 @@ def test_coalesce_transfer_spans_preserves_accounting_charge() -> None:
             "accounted_nbytes": 32,
             "packed": True,
             "hold": False,
-            "hold_key": "",
         }
     ]
 
 
-def test_coalesce_transfer_spans_keeps_held_chunks_apart() -> None:
-    """Adjacent held records of different chunks stay separate transfer keys."""
+def test_coalesce_transfer_spans_keeps_held_records_apart() -> None:
+    """Held records stay one transfer key each; unheld neighbours still merge."""
     spans = [
         {
             "source_offset": index * 4,
             "file_offset": index * 4,
             "nbytes": 4,
             "packed": True,
-            "hold": True,
-            "hold_key": key,
+            "hold": hold,
         }
-        for index, key in enumerate(("a", "a", "b"))
+        for index, hold in enumerate((True, True, False, False))
     ]
 
     merged = _coalesce_transfer_spans(spans)
-    assert [(span["hold_key"], span["nbytes"]) for span in merged] == [
-        ("a", 8),
-        ("b", 4),
+    assert [(span["hold"], span["nbytes"]) for span in merged] == [
+        (True, 4),
+        (True, 4),
+        (False, 8),
     ]
-
-
-def test_online_packed_extent_allocator_accepts_global_packed_offsets() -> None:
-    """Packed records may span raw allocations while remaining in L2."""
-    allocator = _OnlinePackedExtentAllocator()
-    slot_size = 4096 * 4
-    first = allocator.assign(
-        [
-            {
-                "source_offset": 0,
-                "file_offset": slot_size * 4,
-                "start_slot": 4,
-                "num_slots": 1,
-                "logical_slot_start": 4,
-                "logical_slot_count": 1,
-                "nbytes": 4096 * 4,
-                "packed": True,
-            },
-            {
-                "source_offset": 4096 * 4,
-                "file_offset": slot_size * 5,
-                "start_slot": 5,
-                "num_slots": 1,
-                "logical_slot_start": 5,
-                "logical_slot_count": 1,
-                "nbytes": 4096 * 2,
-                "packed": True,
-            },
-        ],
-        capacity=slot_size * 8,
-        local_slot_size=slot_size,
-    )
-    assert [span["file_offset"] for span in first] == [slot_size * 4, slot_size * 5]
-
-    second = allocator.assign(
-        [
-            {
-                "source_offset": 0,
-                "file_offset": slot_size * 4,
-                "start_slot": 4,
-                "num_slots": 1,
-                "logical_slot_start": 4,
-                "logical_slot_count": 1,
-                "nbytes": 4096 * 2,
-                "packed": True,
-            },
-            {
-                "source_offset": 4096 * 2,
-                "file_offset": slot_size * 6,
-                "start_slot": 6,
-                "num_slots": 1,
-                "logical_slot_start": 6,
-                "logical_slot_count": 1,
-                "nbytes": 4096 * 2,
-                "packed": True,
-            },
-        ],
-        capacity=slot_size * 8,
-        local_slot_size=slot_size,
-    )
-    assert [span["file_offset"] for span in second] == [slot_size * 4, slot_size * 6]
-
-
-def test_online_packed_extent_allocator_handles_exact_capacity_rewrites() -> None:
-    """Slot rewrites do not fail because a global arena became fragmented."""
-    allocator = _OnlinePackedExtentAllocator()
-    slot_size = 4096 * 4
-    capacity = slot_size * 3
-
-    def spans(length: int) -> list[dict[str, int | bool]]:
-        return [
-            {
-                "source_offset": index * slot_size,
-                "file_offset": index * slot_size,
-                "start_slot": index,
-                "num_slots": 1,
-                "logical_slot_start": index,
-                "logical_slot_count": 1,
-                "nbytes": length,
-                "packed": True,
-            }
-            for index in range(3)
-        ]
-
-    allocator.assign(spans(slot_size), capacity, local_slot_size=slot_size)
-    allocator.assign(spans(slot_size - 4096), capacity, local_slot_size=slot_size)
-    restored = allocator.assign(spans(slot_size), capacity, local_slot_size=slot_size)
-
-    assert [span["file_offset"] for span in restored] == [0, slot_size, 2 * slot_size]
-
-
-def test_online_packed_extent_allocator_rejects_overlapping_ranges() -> None:
-    """Malformed packed offsets cannot overlap a neighboring record."""
-    allocator = _OnlinePackedExtentAllocator()
-    with pytest.raises(ValueError, match="overlapping ranges"):
-        allocator.assign(
-            [
-                {
-                    "source_offset": 0,
-                    "file_offset": 4096 * 4,
-                    "start_slot": 0,
-                    "num_slots": 1,
-                    "logical_slot_start": 0,
-                    "logical_slot_count": 1,
-                    "nbytes": 4096 * 2,
-                    "packed": True,
-                },
-                {
-                    "source_offset": 4096 * 2,
-                    "file_offset": 4096 * 5,
-                    "start_slot": 1,
-                    "num_slots": 1,
-                    "logical_slot_start": 1,
-                    "logical_slot_count": 1,
-                    "nbytes": 4096 * 2,
-                    "packed": True,
-                },
-            ],
-            capacity=4096 * 8,
-            local_slot_size=4096 * 4,
-        )
 
 
 async def _send_recv(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1670,10 +1547,13 @@ def _online_arena_server(
     metrics_registry: MetricsRegistry | None = None,
     l1_slots: int = 1,
     skip_l2: bool = False,
+    bip_enabled: bool = True,
 ) -> tuple[ServerCore, IPCServer, str, int]:
     """Build a compressed-online server whose arena is smaller than its ring.
 
-    With ``skip_l2`` the arena addresses L1 only, as ``--skip-l2`` configures.
+    ``arena_slots`` is the L2 budget; as ``--l2-size`` configures, the arena
+    addresses that budget plus L1. With ``skip_l2`` the arena addresses L1
+    only and has no budget.
     """
     local_slot_size = 4 * SLOT_SIZE
     core = ServerCore(
@@ -1687,15 +1567,18 @@ def _online_arena_server(
         **make_runtime_config(tmp_path),
         "slot_size": local_slot_size,
         "storage_format": "compressed-online",
-        "bip_enabled": True,
+        "bip_enabled": bip_enabled,
         "l1_size_bytes": l1_slots * local_slot_size,
-        "l2_size_bytes": arena_slots * local_slot_size,
+        "l2_size_bytes": (arena_slots + l1_slots) * local_slot_size,
+        "l2_budget_bytes": arena_slots * local_slot_size,
     }
     if skip_l2:
         config.update(
             skip_l2=True,
             store_path="",
             l1_size_bytes=arena_slots * local_slot_size,
+            l2_size_bytes=arena_slots * local_slot_size,
+            l2_budget_bytes=0,
         )
     socket_path = str(tmp_path / "arena.sock")
     server = IPCServer(socket_path, core, config, metrics_registry=metrics_registry)
@@ -1805,63 +1688,64 @@ def _l2_write_bytes(registry: MetricsRegistry) -> float:
     return _metric_value(registry, "daser_l2_write_bytes_total")
 
 
+async def _store_records(socket_path: str, keys: str, nbytes: int) -> None:
+    """Store one raw record per key, one store call each."""
+    for key in keys:
+        assert "error" not in await _store_online_record(socket_path, key, nbytes)
+
+
+async def _refresh_tier_metrics(server: IPCServer, socket_path: str) -> None:
+    """Drain pending IO, then publish tier metrics with an empty store."""
+    await server.drain_transfer()
+    empty = {"op": "transfer_store", "payload": {"data": b""}, "spans": []}
+    assert "error" not in await _send_recv(socket_path, empty)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("arena_slots", "kept", "written"),
-    [
-        # The arena outlasts L1: the two records L1 evicts are written back.
-        (4, ["a", "b", "c", "d"], 2),
-        # The arena evicts records L1 still holds: they never reach L2.
-        (2, ["c", "d"], 0),
-    ],
-)
-async def test_exclusive_tiers_write_records_only_when_l1_evicts_them(
-    tmp_path, monkeypatch, arena_slots, kept, written
-) -> None:
-    """Exclusive tiers keep new records in L1 and write only L1 evictions."""
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+async def test_inclusive_tiers_keep_l2_victims_resident_in_l1(tmp_path) -> None:
+    """An L2 FIFO victim still held by L1 stays indexed; it leaves only L2."""
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
         logical_slots=8,
-        arena_slots=arena_slots,
+        arena_slots=2,
         metrics_registry=registry,
-        l1_slots=2,
+        l1_slots=4,
+        bip_enabled=False,
     )
     await server.start()
     try:
-        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
-        assert config["runtime_config"]["exclusive_tiers"] is True
-        for key in ("a", "b", "c"):
-            assert "error" not in await _store_online_record(
-                socket_path, key, local_slot_size
-            )
-        await server.drain_transfer()
-        # The last store also refreshes the tier metrics.
-        assert "error" not in await _store_online_record(
-            socket_path, "d", local_slot_size
-        )
-        await server.drain_transfer()
+        await _store_records(socket_path, "abcd", local_slot_size)
+        await _refresh_tier_metrics(server, socket_path)
         present = [k for k in "abcd" if core.chunk_manager.store.get(k) is not None]
-        assert present == kept
-        assert _l2_write_bytes(registry) == written * local_slot_size
-        assert _metric_value(registry, "daser_held_bytes") == 2 * local_slot_size
+        assert present == list("abcd")
+        # Write-through: every record reached L2 once.
+        assert _l2_write_bytes(registry) == 4 * local_slot_size
+        assert core.packed_layout.charged_bytes() == 2 * local_slot_size
+        assert core.packed_layout.held_bytes == 2 * local_slot_size
     finally:
         await server.drain_transfer()
         await server.stop()
 
 
 @pytest.mark.asyncio
-async def test_exclusive_store_evicted_before_registration_keeps_its_successor(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("exclusive", "kept", "written"),
+    [
+        # Inclusive: the L1 victim "a" re-enters L2 as oldest and goes first.
+        (False, "bcd", 4),
+        # Exclusive: only L1 evictions are written, as newest; L1+L2 all stay.
+        (True, "abcd", 2),
+    ],
+)
+async def test_tier_policy_decides_writes_and_recharge_order(
+    tmp_path, monkeypatch, exclusive, kept, written
 ) -> None:
-    """A held store evicted before it registers keeps the record reusing its bytes.
-
-    Store "a" is paused after its write, before its held range is registered.
-    Stores "b" and "c" then evict "z" and "a" from the two-record arena.
-    Whatever survives must load back its own bytes.
-    """
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    """Exclusive tiers write records once L1 evicts them; inclusive write through."""
+    if exclusive:
+        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    else:
+        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1869,6 +1753,43 @@ async def test_exclusive_store_evicted_before_registration_keeps_its_successor(
         arena_slots=2,
         metrics_registry=registry,
         l1_slots=2,
+        bip_enabled=False,
+    )
+    await server.start()
+    try:
+        config = await _send_recv(socket_path, {"op": "get_runtime_config"})
+        assert config["runtime_config"].get("exclusive_tiers", False) is exclusive
+        await _store_records(socket_path, "abcd", local_slot_size)
+        await _refresh_tier_metrics(server, socket_path)
+        present = "".join(k for k in "abcd" if core.chunk_manager.store.get(k))
+        assert present == kept
+        assert _l2_write_bytes(registry) == written * local_slot_size
+        assert _metric_value(registry, "daser_packed_l1_held_bytes") == (
+            core.packed_layout.held_bytes
+        )
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_exclusive_store_removed_mid_write_keeps_its_successor(
+    tmp_path, monkeypatch
+) -> None:
+    """A held store removed mid-write keeps the record reusing its bytes.
+
+    Store "a" is paused after its write, before it records its ranges.
+    Stores "b" and "c" then reclaim "z" and "a" from the two-record arena.
+    Whatever survives must load back its own bytes.
+    """
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    registry = MetricsRegistry()
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path,
+        logical_slots=8,
+        arena_slots=1,
+        metrics_registry=registry,
+        l1_slots=1,
     )
     entered, gate = asyncio.Event(), asyncio.Event()
     record_store_ranges = core.record_store_ranges
@@ -1914,10 +1835,8 @@ async def test_exclusive_store_evicted_before_registration_keeps_its_successor(
                 },
             )
             assert load["data"] == key.encode() * local_slot_size
-        assert (
-            _metric_value(registry, "daser_packed_deferred_free_bytes_total")
-            == local_slot_size
-        )
+        # Each survivor's L1 copy is its own; no held entry of "a" aliases it.
+        assert core.packed_layout.held_bytes <= local_slot_size
     finally:
         gate.set()
         await server.drain_transfer()
@@ -1975,14 +1894,14 @@ async def test_memory_only_online_store_keeps_packed_records_in_l1(
 
 @pytest.mark.asyncio
 async def test_online_store_never_evicts_chunks_in_the_same_batch(tmp_path) -> None:
-    """A batch larger than the arena fails instead of evicting its own records."""
+    """A batch larger than the L1+L2 arena fails instead of evicting itself."""
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path, logical_slots=8, arena_slots=1
     )
     await server.start()
     try:
         spans = []
-        for i, key in enumerate(("a", "b")):
+        for i, key in enumerate("abc"):
             allocation = await _send_recv(
                 socket_path,
                 {
@@ -2010,13 +1929,12 @@ async def test_online_store_never_evicts_chunks_in_the_same_batch(tmp_path) -> N
             socket_path,
             {
                 "op": "transfer_store",
-                "payload": {"data": b"x" * (2 * local_slot_size)},
+                "payload": {"data": b"x" * (3 * local_slot_size)},
                 "spans": spans,
             },
         )
         assert "packed arena exhausted" in response["error"]
-        assert core.chunk_manager.store.get("a") is not None
-        assert core.chunk_manager.store.get("b") is not None
+        assert all(core.chunk_manager.store.get(key) is not None for key in "abc")
     finally:
         await server.drain_transfer()
         await server.stop()
@@ -2689,7 +2607,6 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "readahead_window": 4,
             "gather_min_runs": 0,
             "l2_write_gate": False,
-            "held_preclean_fraction": 0.0,
             "readahead_budget_fraction": 0.5,
         }
     ]
@@ -2708,6 +2625,8 @@ async def test_bip_setting_is_forwarded(
     init_kwargs: list[dict[str, Any]] = []
 
     class FakeTransfer:
+        supports_held_stores = False
+
         def __init__(self, **kwargs: Any) -> None:
             init_kwargs.append(kwargs)
 
@@ -2747,7 +2666,6 @@ async def test_bip_setting_is_forwarded(
             "readahead_window": 4,
             "gather_min_runs": 0,
             "l2_write_gate": False,
-            "held_preclean_fraction": 0.0,
             "readahead_budget_fraction": 0.5,
         }
     ]

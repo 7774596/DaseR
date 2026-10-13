@@ -28,9 +28,9 @@ L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
 #: removes a chunk, also remove its resident descendants, which no lookup can
 #: reach until the chunk is stored again.
 PREFIX_CLOSED_EVICTION_ENV = "DASER_PREFIX_CLOSED_EVICTION"
-#: Research switch for exclusive L1/L2 tiers under compressed-online storage.
-#: New packed records live only in L1 and reach L2 when L1 evicts them, so the
-#: packed arena spans L1 + L2 while L2 holds only records that left L1.
+#: Exclusive L1/L2 tiers under compressed-online storage: new packed records
+#: live only in L1 and reach L2 when L1 evicts them (default inclusive). See
+#: docs/design/tier-residency.md.
 EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: Research control for compressed-online storage: ``1`` makes the worker
 #: store every packed record through the raw fallback, so the packed layout
@@ -98,11 +98,6 @@ LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
 #: Research switch: ``1`` runs L2 writes on their own executor in 16 MiB
 #: pieces that pause (bounded) while any L2 read is in native IO.
 L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
-#: Research switch: fraction in (0, 1) of L1 that held (not yet written)
-#: ranges may fill before the oldest are written to L2 while no readahead is
-#: reading, so later evictions under a readahead free clean memory instead of
-#: writing to the SSD the readahead reads from.
-HELD_PRECLEAN_FRACTION_ENV = "DASER_HELD_PRECLEAN_FRACTION"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).
 READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
@@ -283,7 +278,11 @@ class DaserConfig:
         model_path: HuggingFace model path used by vLLM and tokenizer loading.
         vllm_model_id: model identifier served by vLLM's OpenAI API.
         store_dir: directory containing DaseR data files.
-        total_store_bytes: total KV store capacity.
+        total_store_bytes: total KV store capacity. Compressed-online with
+            an L2 tier addresses ``l2_budget_bytes`` plus L1 here, because
+            records kept by L1 alone hold arena addresses but no SSD budget.
+        l2_budget_bytes: live packed SSD bytes allowed by compressed-online
+            tiering (0 = no budget beyond the arena).
         total_slots: number of fixed-size slots in the ring buffer.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
         log_level: log level string passed to init_logger.
@@ -312,6 +311,7 @@ class DaserConfig:
     vllm_model_id: str = ""
     store_dir: str = "/mnt/xfs/daser"
     total_store_bytes: int = 10 * 1024 * 1024 * 1024
+    l2_budget_bytes: int = 0
     ipc_socket_path: str = "/tmp/daser.sock"
     log_level: str = "INFO"
 
@@ -471,6 +471,7 @@ class DaserConfig:
             "l2_size_bytes": self.l2_size_bytes,
             "total_slots": self.total_slots,
             "total_store_bytes": self.l2_size_bytes,
+            "l2_budget_bytes": self.l2_budget_bytes,
             "skip_l2": self.skip_l2,
             "storage_format": self.storage_format,
             "bip_enabled": self.bip_enabled,
