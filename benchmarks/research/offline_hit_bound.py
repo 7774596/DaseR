@@ -67,7 +67,10 @@ def fifo_prefix_hit_rate(
 
     Only missing blocks are inserted, so a session's oldest prefix blocks are
     evicted first even while every request of the session reuses them; this
-    models an insertion-ordered store that evicts its oldest records.
+    models an insertion-ordered store that evicts its oldest records. Each
+    insertion evicts immediately, as a store allocating one block at a time
+    does: a resident block later in the same prompt can be evicted before the
+    replay reaches it and is then written again as the newest block.
 
     Args:
         requests: ``TraceRequest`` rows in arrival order.
@@ -89,10 +92,10 @@ def fifo_prefix_hit_rate(
             leading += 1
         hit_tokens += min(leading * MOONCAKE_BLOCK_TOKENS, request.input_length)
         for block in request.hash_ids:
-            if block not in cache:
-                cache[block] = None
-        if capacity_blocks > 0:
-            while len(cache) > capacity_blocks:
+            if block in cache:
+                continue
+            cache[block] = None
+            if capacity_blocks > 0 and len(cache) > capacity_blocks:
                 cache.popitem(last=False)
     return hit_tokens / max(prompt_tokens, 1), hit_tokens, prompt_tokens
 

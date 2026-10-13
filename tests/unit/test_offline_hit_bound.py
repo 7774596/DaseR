@@ -105,3 +105,25 @@ def test_fifo_evicts_a_reused_head_that_lru_keeps() -> None:
 
     assert lru == 0.5
     assert fifo == 0.25
+
+
+def test_fifo_rewrites_resident_blocks_its_own_insertions_evict() -> None:
+    """Each insertion evicts at once, so a resident later block is rewritten."""
+    rows = [(1, 2, 3), (4,), (1, 2, 3), (1, 2, 3)]
+    requests = [
+        TraceRequest(
+            index=i,
+            timestamp_ms=i,
+            input_length=len(ids) * 512,
+            output_length=1,
+            hash_ids=ids,
+        )
+        for i, ids in enumerate(rows)
+    ]
+
+    # Replaying (1, 2, 3) over [2, 3, 4] evicts 2 and 3 before reaching them,
+    # so the store ends as [1, 2, 3] and the last request hits all 3 blocks.
+    fifo, hits, _ = fifo_prefix_hit_rate(requests, capacity_blocks=3)
+
+    assert hits == 3 * 512
+    assert fifo == 0.3
