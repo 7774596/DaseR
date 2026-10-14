@@ -300,8 +300,8 @@ generic codebook；可复现的离线 model-bound calibration artifact 可显式
 大小的 packed arena 中为每个 record 分配稳定地址，相邻 record 合并成一个 DMA
 span。L1 只为实际写入的字节分配 pinned memory，这是容量收益的来源。L2 FIFO
 只回收 L2 预算（`--l2-size`），整段驻留在 L1 的 record 保留在索引中，因此 SSD
-的 FIFO 不会淘汰 L1 的热数据；exclusive（默认，L1 淘汰时才写 SSD）与
-inclusive（`DASER_EXCLUSIVE_TIERS=0`，write-through）只在 store 策略上不同，见
+的 FIFO 不会淘汰 L1 的热数据；inclusive（默认，write-through）与
+exclusive（`DASER_EXCLUSIVE_TIERS=1`，L1 淘汰时才写 SSD）只在 store 策略上不同，见
 [packed arena 与 L1/L2 驻留](tier-residency.md)。
 
 server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、

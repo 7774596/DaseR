@@ -284,15 +284,16 @@ class IPCServer:
         self._prev_dst_copy: dict[str, int] = {}
         self._prev_l1_evicted: dict[str, int] = {}
         # Packed records are tiered across L1 and an L2 budget when both
-        # tiers exist; see docs/design/tier-residency.md. Exclusive tiers
-        # store new records in L1 only. Tiers attach with the transfer layer.
+        # tiers exist; see docs/design/tier-residency.md. Inclusive tiers
+        # write through by default; opt-in exclusive tiers store new records
+        # in L1 only. Tiers attach with the transfer layer.
         self._packed_tiers = self._runtime_config.get(
             "storage_format"
         ) == STORAGE_FORMAT_COMPRESSED_ONLINE and not bool(
             self._runtime_config.get("skip_l2", False)
         )
         self._exclusive_tiers = (
-            self._packed_tiers and os.environ.get(EXCLUSIVE_TIERS_ENV) != "0"
+            self._packed_tiers and os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
         )
         if self._exclusive_tiers:
             self._runtime_config["exclusive_tiers"] = True

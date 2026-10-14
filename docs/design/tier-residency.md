@@ -63,9 +63,9 @@ L1 按自身 LRU/BIP 淘汰。held 条目离开 L1 时：
 
 两者只在 store 策略上不同：
 
-- inclusive（`DASER_EXCLUSIVE_TIERS=0`）：record 写入 L1 并立即异步写 SSD，放置即 charged。
+- inclusive（默认）：record 写入 L1 并立即异步写 SSD，放置即 charged。
   L1 与 L2 内容可以重叠；行为对应 LMCache 的 L1/L2 write-through。
-- exclusive（默认）：新 record 以 held-dirty 放置，只写
+- exclusive（`DASER_EXCLUSIVE_TIERS=1`，消融用）：新 record 以 held-dirty 放置，只写
   L1、不计 L2 预算；L1 淘汰时才写 SSD 并进入 FIFO 头。L1 中驻留的数据不占
   L2 预算，两层合计容量接近 `L1 + L2`。
 
@@ -75,6 +75,11 @@ L1 按自身 LRU/BIP 淘汰。held 条目离开 L1 时：
 | 新 record 状态 | charged | held-dirty |
 | L2 FIFO 淘汰的 L1 驻留 record | 转 held-clean，保留在索引中 | 同左 |
 | held 条目被 L1 淘汰 | 回 FIFO 尾 | 写回（若 dirty）后回 FIFO 头 |
+
+默认取 inclusive：L2 FIFO 淘汰的 L1 驻留 record 已经转 held 保留在索引中，
+inclusive 下两层合计容量同样接近 `L1 + L2`，exclusive 不再多出容量。exclusive
+反而把写 SSD 推到 L1 淘汰时，正好落在新 record 需要 L1 空间的关键路径上，
+热 record 每次被 L1 淘汰都要重写，SSD 写入更多且与 load 读争带宽。
 
 `--skip-l2` 下没有 L2 预算，arena 只寻址 L1，lookup 仍只返回 L1 驻留的前缀；
 GDS backend 没有 L1，`hold_resident` 总是失败，退化为纯 L2 FIFO。

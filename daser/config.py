@@ -29,8 +29,9 @@ L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
 #: is stored again (default on; ``0`` keeps orphans for the ablation).
 PREFIX_CLOSED_EVICTION_ENV = "DASER_PREFIX_CLOSED_EVICTION"
 #: Exclusive L1/L2 tiers under compressed-online storage: new packed records
-#: live only in L1 and reach L2 when L1 evicts them (default on; ``0`` keeps
-#: inclusive tiers). See docs/design/tier-residency.md.
+#: live only in L1 and reach L2 when L1 evicts them (``1`` opts in for the
+#: ablation; the default is inclusive write-through tiers). See
+#: docs/design/tier-residency.md.
 EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: Research control for compressed-online storage: ``1`` makes the worker
 #: store every packed record through the raw fallback, so the packed layout

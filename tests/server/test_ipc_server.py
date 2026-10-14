@@ -1660,7 +1660,7 @@ async def test_online_store_evicts_oldest_when_packed_arena_is_full(
     tmp_path, monkeypatch
 ) -> None:
     """Raw-size records overflow an over-provisioned ring; FIFO eviction frees bytes."""
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
+    monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path, logical_slots=8, arena_slots=2
     )
@@ -1710,7 +1710,7 @@ async def test_inclusive_tiers_keep_l2_victims_resident_in_l1(
     tmp_path, monkeypatch
 ) -> None:
     """An L2 FIFO victim still held by L1 stays indexed; it leaves only L2."""
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
+    monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1750,9 +1750,9 @@ async def test_tier_policy_decides_writes_and_recharge_order(
 ) -> None:
     """Exclusive tiers write records once L1 evicts them; inclusive write through."""
     if exclusive:
-        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
+        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
     else:
-        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
+        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1789,7 +1789,7 @@ async def test_exclusive_store_removed_mid_write_keeps_its_successor(
     Stores "b" and "c" then reclaim "z" and "a" from the two-record arena.
     Whatever survives must load back its own bytes.
     """
-    monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,

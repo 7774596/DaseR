@@ -994,9 +994,9 @@ def test_compressed_arena_addresses_l2_budget_plus_l1(
 ) -> None:
     """Both tier policies size the arena as L1 + L2 and budget L2 at --l2-size."""
     if exclusive:
-        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
+        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
     else:
-        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
+        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     args = _compressed_args(tmp_path)
     config = _build_daser_config(args)
 
