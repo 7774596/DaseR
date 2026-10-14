@@ -62,6 +62,12 @@ LOAD_UNCHECKED_BOUNDS_ENV = "DASER_LOAD_UNCHECKED_BOUNDS"
 #: Only takes effect together with ``DASER_LOAD_WORD_READS=1`` and
 #: ``DASER_LOAD_VECTOR_STORES=1``.
 LOAD_BRANCHLESS_DECODE_ENV = "DASER_LOAD_BRANCHLESS_DECODE"
+
+#: Research switch: ``1`` makes each coarsened CTA of the 256-scalar compressed
+#: load kernel fetch the next tile group's scan-independent record words while
+#: it decodes the current group. Only takes effect together with
+#: ``DASER_LOAD_WORD_READS=1``.
+LOAD_PIPELINED_GROUPS_ENV = "DASER_LOAD_PIPELINED_GROUPS"
 #: Research switch for lookup-triggered L2 readahead: read group size in
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"

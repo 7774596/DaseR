@@ -14,6 +14,7 @@ from daser.compression import (
 from daser.compression.format import PREFIX_GROUP_TILES, SlotHeader
 from daser.config import (
     LOAD_BRANCHLESS_DECODE_ENV,
+    LOAD_PIPELINED_GROUPS_ENV,
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
     LOAD_UNCHECKED_BOUNDS_ENV,
@@ -163,10 +164,12 @@ def test_word_reads_reject_misaligned_staging(monkeypatch: pytest.MonkeyPatch) -
         _restore(staging, [0], [1], geometry, codebooks)
 
 
-@pytest.mark.parametrize("word_reads", ["0", "1"])
-@pytest.mark.parametrize("groups", [2, 3, 5])
+@pytest.mark.parametrize(
+    ("word_reads", "pipelined"), [("0", "0"), ("1", "0"), ("1", "1")]
+)
+@pytest.mark.parametrize("groups", [1, 2, 3, 5])
 def test_tile_groups_restore_byte_exact(
-    monkeypatch: pytest.MonkeyPatch, groups: int, word_reads: str
+    monkeypatch: pytest.MonkeyPatch, groups: int, word_reads: str, pipelined: str
 ) -> None:
     """Coarsened CTAs, including groups past the last tile, restore exactly."""
     geometry = _geometry()
@@ -180,6 +183,7 @@ def test_tile_groups_restore_byte_exact(
     staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
     monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
     monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, str(groups))
+    monkeypatch.setenv(LOAD_PIPELINED_GROUPS_ENV, pipelined)
     cache = _restore(staging, offsets, [1, 0, 1], geometry, codebooks)
     for block, raw in enumerate(raws):
         assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
@@ -224,11 +228,21 @@ def test_tile_groups_reject_non_positive(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.parametrize(
-    ("word_reads", "groups", "register"),
-    [("0", "1", "0"), ("1", "1", "0"), ("1", "3", "1"), ("0", "2", "1")],
+    ("word_reads", "groups", "register", "pipelined"),
+    [
+        ("0", "1", "0", "0"),
+        ("1", "1", "0", "0"),
+        ("1", "3", "1", "0"),
+        ("0", "2", "1", "0"),
+        ("1", "3", "1", "1"),
+    ],
 )
 def test_grouped_prefix_records_restore_beside_version_one(
-    monkeypatch: pytest.MonkeyPatch, word_reads: str, groups: str, register: str
+    monkeypatch: pytest.MonkeyPatch,
+    word_reads: str,
+    groups: str,
+    register: str,
+    pipelined: str,
 ) -> None:
     """Version-2 group prefixes decode exactly next to v1 and raw records."""
     geometry = _geometry()
@@ -250,21 +264,24 @@ def test_grouped_prefix_records_restore_beside_version_one(
     monkeypatch.setenv(LOAD_WORD_READS_ENV, word_reads)
     monkeypatch.setenv(LOAD_TILE_GROUPS_ENV, groups)
     monkeypatch.setenv(LOAD_REGISTER_CODEBOOK_ENV, register)
+    monkeypatch.setenv(LOAD_PIPELINED_GROUPS_ENV, pipelined)
     cache = _restore(staging, offsets, [1, 0, 1], geometry, codebooks)
     for block, raw in enumerate(raws):
         assert cache[block].view(torch.uint8).cpu().numpy().tobytes() == raw
 
 
 @pytest.mark.parametrize(
-    ("word_reads", "groups", "register", "unchecked", "branchless"),
+    ("word_reads", "groups", "register", "unchecked", "branchless", "pipelined"),
     [
-        ("0", "1", "0", "0", "0"),
-        ("1", "1", "1", "0", "0"),
-        ("1", "2", "1", "0", "0"),
-        ("1", "1", "1", "1", "0"),
-        ("1", "2", "0", "1", "0"),
-        ("1", "1", "0", "0", "1"),
-        ("1", "2", "0", "1", "1"),
+        ("0", "1", "0", "0", "0", "0"),
+        ("1", "1", "1", "0", "0", "0"),
+        ("1", "2", "1", "0", "0", "0"),
+        ("1", "1", "1", "1", "0", "0"),
+        ("1", "2", "0", "1", "0", "0"),
+        ("1", "1", "0", "0", "1", "0"),
+        ("1", "2", "0", "1", "1", "0"),
+        ("1", "2", "1", "1", "0", "1"),
+        ("1", "3", "0", "1", "1", "1"),
     ],
 )
 def test_vector_stores_restore_byte_exact_with_fanout(
@@ -274,6 +291,7 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     register: str,
     unchecked: str,
     branchless: str,
+    pipelined: str,
 ) -> None:
     """128-bit stores restore v2, raw and v1 records, a partial tile and fanout."""
     # 3 tokens x 5 heads x 128 = 1920 scalars: the eighth tile is half
@@ -310,6 +328,7 @@ def test_vector_stores_restore_byte_exact_with_fanout(
     monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
     monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
     monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, branchless)
+    monkeypatch.setenv(LOAD_PIPELINED_GROUPS_ENV, pipelined)
     cache = _cache(5, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=cache,
@@ -350,11 +369,16 @@ def test_vector_stores_reject_head_dims_not_divisible_by_eight(
 
 
 @pytest.mark.parametrize(
-    ("unchecked", "branchless"), [("0", "0"), ("1", "0"), ("1", "1")]
+    ("unchecked", "branchless", "pipelined"),
+    [("0", "0", "0"), ("1", "0", "0"), ("1", "1", "0"), ("1", "0", "1")],
 )
 @pytest.mark.parametrize("region", ["header", "prefix", "payload"])
 def test_corrupt_records_only_change_their_own_destination(
-    monkeypatch: pytest.MonkeyPatch, unchecked: str, branchless: str, region: str
+    monkeypatch: pytest.MonkeyPatch,
+    unchecked: str,
+    branchless: str,
+    pipelined: str,
+    region: str,
 ) -> None:
     """Bit flips in a record never fault or write outside its destination."""
     geometry = CompressedStoreGeometry(
@@ -387,6 +411,7 @@ def test_corrupt_records_only_change_their_own_destination(
     monkeypatch.setenv(LOAD_VECTOR_STORES_ENV, "1")
     monkeypatch.setenv(LOAD_UNCHECKED_BOUNDS_ENV, unchecked)
     monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, branchless)
+    monkeypatch.setenv(LOAD_PIPELINED_GROUPS_ENV, pipelined)
     cache = _cache(3, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=cache,

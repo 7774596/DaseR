@@ -23,6 +23,7 @@ from daser.compression.format import (
 )
 from daser.config import (
     LOAD_BRANCHLESS_DECODE_ENV,
+    LOAD_PIPELINED_GROUPS_ENV,
     LOAD_REGISTER_CODEBOOK_ENV,
     LOAD_TILE_GROUPS_ENV,
     LOAD_UNCHECKED_BOUNDS_ENV,
@@ -124,7 +125,8 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
     Returns:
         ``compile_load_kernel`` keyword arguments ``word_reads``,
         ``tile_groups``, ``register_codebook``, ``vector_stores``,
-        ``unchecked_bounds`` and ``branchless_decode``. The
+        ``unchecked_bounds``, ``branchless_decode`` and
+        ``pipelined_groups``. The
         switches only apply to the 256-scalar word-parallel decoder; other
         tile sizes get defaults.
 
@@ -139,6 +141,7 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
             "vector_stores": False,
             "unchecked_bounds": False,
             "branchless_decode": False,
+            "pipelined_groups": False,
         }
     groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
     if groups < 1:
@@ -155,6 +158,8 @@ def _load_variant(tile_scalars: int) -> dict[str, Any]:
         "branchless_decode": word_reads
         and vector_stores
         and os.environ.get(LOAD_BRANCHLESS_DECODE_ENV) == "1",
+        "pipelined_groups": word_reads
+        and os.environ.get(LOAD_PIPELINED_GROUPS_ENV) == "1",
     }
 
 

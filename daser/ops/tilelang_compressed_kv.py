@@ -254,6 +254,7 @@ def compile_load_kernel(
     vector_stores: bool = False,
     unchecked_bounds: bool = False,
     branchless_decode: bool = False,
+    pipelined_groups: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -287,6 +288,10 @@ def compile_load_kernel(
             instead of per-scalar branches. Requires ``word_reads`` and
             ``vector_stores``, and codebooks packed by
             ``pack_branchless_codebooks``.
+        pipelined_groups: Research variant of the 256-scalar word-parallel
+            decoder that fetches the next tile group's scan-independent
+            record words while decoding the current group. Requires
+            ``word_reads``.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -324,6 +329,7 @@ def compile_load_kernel(
         vector_stores,
         unchecked_bounds,
         branchless_decode,
+        pipelined_groups,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
@@ -337,6 +343,7 @@ def compile_load_kernel(
         or vector_stores
         or unchecked_bounds
         or branchless_decode
+        or pipelined_groups
     )
     if research and tile_scalars != 256:
         raise ValueError(
@@ -351,6 +358,7 @@ def compile_load_kernel(
             "vector_stores": vector_stores,
             "unchecked_bounds": unchecked_bounds,
             "branchless_decode": branchless_decode,
+            "pipelined_groups": pipelined_groups,
         }
         if tile_scalars == 256
         else {}
@@ -1459,6 +1467,7 @@ def _build_wordparallel_load(
     vector_stores: bool = False,
     unchecked_bounds: bool = False,
     branchless_decode: bool = False,
+    pipelined_groups: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1506,9 +1515,19 @@ def _build_wordparallel_load(
     selects one; running counters replace the per-scalar prefix popcounts.
     Two more permutes per output word interleave four low and four high
     bytes. Requires ``word_reads`` and ``vector_stores``.
+
+    ``pipelined_groups`` targets the latency chain of a coarsened CTA. Each
+    group otherwise issues its primary word, then (after a warp scan and a
+    barrier) its tile prefixes, then its secondary word and raw bytes, so a
+    CTA keeps few loads in flight. The five words that do not depend on the
+    scans (primary, two low words, two tile prefixes) are instead fetched one
+    group ahead into registers, overlapping the next group's loads with the
+    current group's dependent reads. Requires ``word_reads``.
     """
     if vector_stores and head_dim % 8:
         raise ValueError("vector stores require a head dimension divisible by 8")
+    if pipelined_groups and not word_reads:
+        raise ValueError("pipelined groups require word reads")
     if unchecked_bounds and not word_reads:
         raise ValueError("unchecked bounds require word reads")
     if branchless_decode and not (word_reads and vector_stores):
@@ -1533,6 +1552,47 @@ def _build_wordparallel_load(
     kv_shape = _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim)
     rows = kv_shape[2]
     kv_words = num_blocks * num_planes * plane_scalars // 8
+    prefix_groups = (tiles_per_plane + _PREFIX_GROUP_TILES - 1) // _PREFIX_GROUP_TILES
+
+    @T.macro
+    def fetch_group(words, word_base, lead, last, descriptor, grouped, tile, lane, out):
+        # Scan-independent words of one lane in ``tile``: primary symbols, low
+        # bytes [0, 4) and [4, 8), and the tile's escape and raw prefixes.
+        # Reads past the plane are clamped by ``_record_word`` and unused.
+        scalar_start = tile * 256 + lane * 8
+        prefix_entry = T.if_then_else(grouped, tile // 8, tile)
+        prefix_entries = T.if_then_else(grouped, prefix_groups, tiles_per_plane)
+        out[0] = _record_word(
+            words,
+            word_base,
+            lead,
+            descriptor[1] + T.cast(scalar_start * 3 // 8, T.uint32),
+            last,
+        )
+        out[1] = _record_word(
+            words, word_base, lead, descriptor[0] + T.cast(scalar_start, T.uint32), last
+        )
+        out[2] = _record_word(
+            words,
+            word_base,
+            lead,
+            descriptor[0] + T.cast(scalar_start + 4, T.uint32),
+            last,
+        )
+        out[3] = _record_word(
+            words,
+            word_base,
+            lead,
+            descriptor[2] + T.cast(prefix_entry * 4, T.uint32),
+            last,
+        )
+        out[4] = _record_word(
+            words,
+            word_base,
+            lead,
+            descriptor[2] + T.cast((prefix_entries + 1 + prefix_entry) * 4, T.uint32),
+            last,
+        )
 
     @T.macro
     def body(
@@ -1619,12 +1679,45 @@ def _build_wordparallel_load(
                         )
                         << (entry * 8)
                     )
+            if pipelined_groups:
+                # ``ahead`` holds the next group's scan-independent words,
+                # ``current`` the words of the group being decoded.
+                ahead = T.alloc_local((5,), "uint32")
+                current = T.alloc_local((5,), "uint32")
+                if mode != 0:
+                    fetch_group(
+                        words,
+                        word_base,
+                        word_lead,
+                        word_last,
+                        descriptor,
+                        grouped,
+                        bz * tile_groups * 8 + tx // 32,
+                        lane,
+                        ahead,
+                    )
             # Coarsened CTAs reuse one descriptor read for tile_groups
             # consecutive eight-tile groups of the same plane.
             for group in T.serial(tile_groups):
                 tile = (bz * tile_groups + group) * 8 + tx // 32
                 scalar_start = tile * 256 + lane * 8
                 valid = T.min(T.max(plane_scalars - scalar_start, 0), 8)
+                if pipelined_groups:
+                    if mode != 0:
+                        for entry in T.unroll(5):
+                            current[entry] = ahead[entry]
+                        if group + 1 < tile_groups:
+                            fetch_group(
+                                words,
+                                word_base,
+                                word_lead,
+                                word_last,
+                                descriptor,
+                                grouped,
+                                tile + 8,
+                                lane,
+                                ahead,
+                            )
                 if mode == 0:
                     for i in T.unroll(8):
                         raw_address = (
@@ -1642,7 +1735,11 @@ def _build_wordparallel_load(
                     high_words[1] = 0
                     primary_word = T.alloc_var(T.uint32, init=0)
                     primary_address = slot_base + descriptor[1] + scalar_start * 3 // 8
-                    if word_reads:
+                    if pipelined_groups:
+                        primary_word = current[0] & (
+                            (T.cast(1, T.uint32) << (valid * 3)) - 1
+                        )
+                    elif word_reads:
                         if valid > 0:
                             primary_word = _record_word(
                                 words,
@@ -1702,7 +1799,11 @@ def _build_wordparallel_load(
                     raw_prefix = T.alloc_var(T.uint32, init=0)
                     # All lanes, including an inactive final warp, participate
                     # in the warp scans. Only real tiles may read prefix tables.
-                    if word_reads:
+                    if pipelined_groups:
+                        if tile < tiles_per_plane:
+                            prefix = current[3]
+                            raw_prefix = current[4]
+                    elif word_reads:
                         if tile < tiles_per_plane:
                             prefix = _record_word(
                                 words,
@@ -1820,7 +1921,12 @@ def _build_wordparallel_load(
                     low_address = slot_base + descriptor[0] + scalar_start
                     low_first = T.alloc_var(T.uint32, init=0)
                     low_second = T.alloc_var(T.uint32, init=0)
-                    if word_reads:
+                    if pipelined_groups:
+                        if valid > 0:
+                            low_first = current[1]
+                        if valid > 4:
+                            low_second = current[2]
+                    elif word_reads:
                         if valid > 0:
                             low_first = _record_word(
                                 words,
