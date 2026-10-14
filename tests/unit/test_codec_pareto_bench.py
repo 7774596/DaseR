@@ -1,20 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
-
 import pytest
 import torch
 
 pytest.importorskip("daser.ops.tilelang_compressed_kv")
 from benchmarks.research.codec_pareto_bench import (  # noqa: E402
-    DECODE_PRESETS,
     byte_shuffle,
     byte_unshuffle,
     pareto_front,
-    preset_env,
-)
-from daser.config import (  # noqa: E402
-    LOAD_BRANCHLESS_DECODE_ENV,
-    LOAD_WORD_READS_ENV,
 )
 
 
@@ -34,15 +26,3 @@ def test_pareto_front_keeps_only_non_dominated_arms() -> None:
         {"arm": "failed", "error": "unsupported"},
     ]
     assert pareto_front(rows) == ["memcpy", "fast", "dense"]
-
-
-def test_preset_env_clears_other_switches_and_restores(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(LOAD_BRANCHLESS_DECODE_ENV, "1")
-    monkeypatch.delenv(LOAD_WORD_READS_ENV, raising=False)
-    with preset_env(DECODE_PRESETS["uc_vec_g64"]):
-        assert os.environ[LOAD_WORD_READS_ENV] == "1"
-        assert LOAD_BRANCHLESS_DECODE_ENV not in os.environ
-    assert os.environ[LOAD_BRANCHLESS_DECODE_ENV] == "1"
-    assert LOAD_WORD_READS_ENV not in os.environ

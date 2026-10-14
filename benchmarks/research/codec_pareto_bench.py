@@ -8,7 +8,7 @@ measures, on the remaining slots of the same card:
 
 - the raw device-to-device copy bound;
 - DaseR online encode (``FusedOnlineKVPacker.pack_into``) and decode
-  (``FusedCompressedKVDecoder``) for each load-kernel preset and record format;
+  (``FusedCompressedKVDecoder``) for each record format;
 - optionally nvCOMP algorithms with and without a BF16 byte shuffle, the
   shuffle and unshuffle kernels included in the timed region;
 - optionally the SplitZip GPU codec, calibrated on the same slots as DaseR;
@@ -21,12 +21,11 @@ and the Pareto front (lowest ratio for a given decode throughput) is marked.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import sys
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -37,43 +36,8 @@ from daser.compression.format import (
     ONLINE_TILE_SCALARS,
     CompressedStoreGeometry,
 )
-from daser.config import (
-    LOAD_BRANCHLESS_DECODE_ENV,
-    LOAD_REGISTER_CODEBOOK_ENV,
-    LOAD_TILE_GROUPS_ENV,
-    LOAD_UNCHECKED_BOUNDS_ENV,
-    LOAD_VECTOR_STORES_ENV,
-    LOAD_WORD_READS_ENV,
-)
 from daser.ops.compressed_kv import FusedCompressedKVDecoder, FusedOnlineKVPacker
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
-
-# Load-kernel presets: environment switches read when a decoder is built.
-# Tile groups follow the R199 sweep, where each preset saturates at K=32-64.
-DECODE_PRESETS: dict[str, dict[str, str]] = {
-    "byte": {},
-    "word_reg_g64": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_REGISTER_CODEBOOK_ENV: "1",
-        LOAD_TILE_GROUPS_ENV: "64",
-    },
-    "uc_vec_g64": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_REGISTER_CODEBOOK_ENV: "1",
-        LOAD_VECTOR_STORES_ENV: "1",
-        LOAD_UNCHECKED_BOUNDS_ENV: "1",
-        LOAD_TILE_GROUPS_ENV: "64",
-    },
-    "branchless_g32": {
-        LOAD_WORD_READS_ENV: "1",
-        LOAD_REGISTER_CODEBOOK_ENV: "1",
-        LOAD_VECTOR_STORES_ENV: "1",
-        LOAD_UNCHECKED_BOUNDS_ENV: "1",
-        LOAD_BRANCHLESS_DECODE_ENV: "1",
-        LOAD_TILE_GROUPS_ENV: "32",
-    },
-}
-_PRESET_KEYS = sorted({key for preset in DECODE_PRESETS.values() for key in preset})
 
 
 def byte_shuffle(data: torch.Tensor) -> torch.Tensor:
@@ -122,30 +86,6 @@ def pareto_front(rows: list[dict[str, Any]]) -> list[str]:
     return front
 
 
-@contextlib.contextmanager
-def preset_env(preset: dict[str, str]) -> Iterator[None]:
-    """Apply one decode preset to the environment, clearing the other switches.
-
-    Args:
-        preset (dict[str, str]): Environment overrides for the preset.
-
-    Yields:
-        None while the preset is active; the previous values are restored.
-    """
-    saved = {key: os.environ.get(key) for key in _PRESET_KEYS}
-    for key in _PRESET_KEYS:
-        os.environ.pop(key, None)
-    os.environ.update(preset)
-    try:
-        yield
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
 def _best_ms(fn: Callable[[], Any], stream: torch.cuda.Stream, repeats: int) -> float:
     """Return the best event-timed milliseconds of ``fn`` on ``stream``."""
     start, end = (
@@ -180,9 +120,9 @@ def _memcpy_row(raw: np.ndarray, repeats: int) -> dict[str, Any]:
 
 
 def _daser_rows(
-    raw: np.ndarray, books: bytes, formats: list[str], presets: list[str], repeats: int
+    raw: np.ndarray, books: bytes, formats: list[str], repeats: int
 ) -> list[dict[str, Any]]:
-    """Encode and decode the evaluation slots with every format and preset."""
+    """Encode and decode the evaluation slots with every record format."""
     rows: list[dict[str, Any]] = []
     n, layers, _, tokens, heads, dim = raw.shape
     slot_size = raw[0].nbytes
@@ -234,45 +174,43 @@ def _daser_rows(
                 "enc_gbs": total / best / 1e9,
             },
         )
-        for name in presets:
-            with preset_env(DECODE_PRESETS[name]):
-                decoder = FusedCompressedKVDecoder(
-                    kv_cache=kv_cache,
-                    codebooks=books,
-                    tile_scalars=ONLINE_TILE_SCALARS,
-                    ring_depth=1,
-                    max_slots_per_buffer=n,
-                )
+        decoder = FusedCompressedKVDecoder(
+            kv_cache=kv_cache,
+            codebooks=books,
+            tile_scalars=ONLINE_TILE_SCALARS,
+            ring_depth=1,
+            max_slots_per_buffer=n,
+        )
 
-            def decode(
-                decoder: FusedCompressedKVDecoder = decoder,
-                offsets: list[int] = offsets,
-                modes: list[int] = modes,
-            ) -> int:
-                plan = decoder.prepare(
-                    staging=staging,
-                    staging_offsets=offsets,
-                    block_ids=blocks,
-                    modes=modes,
-                    buffer_index=0,
-                    stream=stream,
-                )
-                return plan.submit() if plan is not None else 0
-
-            kv_cache.zero_()
-            decode()
-            torch.cuda.synchronize()
-            exact = torch.equal(kv_cache.view(torch.int16), source)
-            ms = _best_ms(decode, stream, repeats)
-            _emit(
-                rows,
-                {
-                    "arm": f"daser_{fmt}_{name}",
-                    "ratio": stored / total,
-                    "dec_gbs": total / ms / 1e6,
-                    "exact": exact,
-                },
+        def decode(
+            decoder: FusedCompressedKVDecoder = decoder,
+            offsets: list[int] = offsets,
+            modes: list[int] = modes,
+        ) -> int:
+            plan = decoder.prepare(
+                staging=staging,
+                staging_offsets=offsets,
+                block_ids=blocks,
+                modes=modes,
+                buffer_index=0,
+                stream=stream,
             )
+            return plan.submit() if plan is not None else 0
+
+        kv_cache.zero_()
+        decode()
+        torch.cuda.synchronize()
+        exact = torch.equal(kv_cache.view(torch.int16), source)
+        ms = _best_ms(decode, stream, repeats)
+        _emit(
+            rows,
+            {
+                "arm": f"daser_{fmt}_decode",
+                "ratio": stored / total,
+                "dec_gbs": total / ms / 1e6,
+                "exact": exact,
+            },
+        )
     os.environ.pop(GROUP_PREFIX_ENV, None)
     return rows
 
@@ -418,9 +356,6 @@ def main() -> None:
     parser.add_argument("--model-id", default="captured")
     parser.add_argument("--calibration-slots", type=int, default=8)
     parser.add_argument("--formats", nargs="+", default=["v1", "v2"])
-    parser.add_argument(
-        "--presets", nargs="+", default=list(DECODE_PRESETS), choices=DECODE_PRESETS
-    )
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument(
         "--nvcomp-path",
@@ -461,7 +396,7 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     with torch.inference_mode():
         _emit(rows, _memcpy_row(evaluate, args.repeats))
-        rows += _daser_rows(evaluate, books, args.formats, args.presets, args.repeats)
+        rows += _daser_rows(evaluate, books, args.formats, args.repeats)
         if args.nvcomp_path:
             rows += _nvcomp_rows(
                 evaluate, args.nvcomp_path, args.nvcomp_algorithms, args.repeats

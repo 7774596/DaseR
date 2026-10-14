@@ -36,38 +36,6 @@ EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: store every packed record through the raw fallback, so the packed layout
 #: and exclusive tiers can be measured without compression.
 PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
-#: Research switch: ``1`` compiles the 256-scalar compressed load kernel with
-#: ``uint32`` word reads of the packed record fields instead of byte loads.
-LOAD_WORD_READS_ENV = "DASER_LOAD_WORD_READS"
-
-#: Research switch: a positive integer ``K`` makes each 256-scalar compressed
-#: load CTA decode ``K`` consecutive eight-tile groups of one plane (unset = 1).
-LOAD_TILE_GROUPS_ENV = "DASER_LOAD_TILE_GROUPS"
-
-#: Research switch: ``1`` makes the 256-scalar compressed load kernel keep the
-#: plane codebook in registers and select escape bytes without memory reads.
-LOAD_REGISTER_CODEBOOK_ENV = "DASER_LOAD_REGISTER_CODEBOOK"
-
-#: Research switch: ``1`` makes the 256-scalar compressed load kernel write
-#: each lane's eight decoded scalars with one 128-bit store.
-LOAD_VECTOR_STORES_ENV = "DASER_LOAD_VECTOR_STORES"
-
-#: Research switch: ``1`` compiles the 256-scalar compressed load kernel without
-#: TileLang's per-access bounds guards (staging reads are clamped explicitly).
-#: Only takes effect together with ``DASER_LOAD_WORD_READS=1``.
-LOAD_UNCHECKED_BOUNDS_ENV = "DASER_LOAD_UNCHECKED_BOUNDS"
-
-#: Research switch: ``1`` makes the 256-scalar compressed load kernel resolve
-#: high bytes with byte permutes and selects instead of per-scalar branches.
-#: Only takes effect together with ``DASER_LOAD_WORD_READS=1`` and
-#: ``DASER_LOAD_VECTOR_STORES=1``.
-LOAD_BRANCHLESS_DECODE_ENV = "DASER_LOAD_BRANCHLESS_DECODE"
-
-#: Research switch: ``1`` makes each coarsened CTA of the 256-scalar compressed
-#: load kernel fetch the next tile group's scan-independent record words while
-#: it decodes the current group. Only takes effect together with
-#: ``DASER_LOAD_WORD_READS=1``.
-LOAD_PIPELINED_GROUPS_ENV = "DASER_LOAD_PIPELINED_GROUPS"
 #: Research switch for lookup-triggered L2 readahead: read group size in
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"

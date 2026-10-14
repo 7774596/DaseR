@@ -21,16 +21,7 @@ from daser.compression.format import (
     prefix_table_bytes,
     slot_header_bytes,
 )
-from daser.config import (
-    LOAD_BRANCHLESS_DECODE_ENV,
-    LOAD_PIPELINED_GROUPS_ENV,
-    LOAD_REGISTER_CODEBOOK_ENV,
-    LOAD_TILE_GROUPS_ENV,
-    LOAD_UNCHECKED_BOUNDS_ENV,
-    LOAD_VECTOR_STORES_ENV,
-    LOAD_WORD_READS_ENV,
-    PACKED_FORCE_RAW_ENV,
-)
+from daser.config import PACKED_FORCE_RAW_ENV
 from daser.logging import init_logger
 from daser.ops.kv_layout import physical_kv_view
 
@@ -116,53 +107,6 @@ def _fixed_single_read_geometry(
     return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
 
 
-def _load_variant(tile_scalars: int) -> dict[str, Any]:
-    """Return the research load-kernel variant selected by the environment.
-
-    Args:
-        tile_scalars (int): Codec tile size of the decoded records.
-
-    Returns:
-        ``compile_load_kernel`` keyword arguments ``word_reads``,
-        ``tile_groups``, ``register_codebook``, ``vector_stores``,
-        ``unchecked_bounds``, ``branchless_decode`` and
-        ``pipelined_groups``. The
-        switches only apply to the 256-scalar word-parallel decoder; other
-        tile sizes get defaults.
-
-    Raises:
-        ValueError: If ``DASER_LOAD_TILE_GROUPS`` is not a positive integer.
-    """
-    if tile_scalars != 256:
-        return {
-            "word_reads": False,
-            "tile_groups": 1,
-            "register_codebook": False,
-            "vector_stores": False,
-            "unchecked_bounds": False,
-            "branchless_decode": False,
-            "pipelined_groups": False,
-        }
-    groups = int(os.environ.get(LOAD_TILE_GROUPS_ENV, "1"))
-    if groups < 1:
-        raise ValueError(f"{LOAD_TILE_GROUPS_ENV} must be a positive integer")
-    word_reads = os.environ.get(LOAD_WORD_READS_ENV) == "1"
-    vector_stores = os.environ.get(LOAD_VECTOR_STORES_ENV) == "1"
-    return {
-        "word_reads": word_reads,
-        "tile_groups": groups,
-        "register_codebook": os.environ.get(LOAD_REGISTER_CODEBOOK_ENV) == "1",
-        "vector_stores": vector_stores,
-        "unchecked_bounds": word_reads
-        and os.environ.get(LOAD_UNCHECKED_BOUNDS_ENV) == "1",
-        "branchless_decode": word_reads
-        and vector_stores
-        and os.environ.get(LOAD_BRANCHLESS_DECODE_ENV) == "1",
-        "pipelined_groups": word_reads
-        and os.environ.get(LOAD_PIPELINED_GROUPS_ENV) == "1",
-    }
-
-
 def warm_fused_online_kv_packer(
     kv_cache: torch.Tensor, max_slots_per_buffer: int, tile_scalars: int = 1024
 ) -> None:
@@ -193,9 +137,10 @@ def _warm_tilelang_codec(
     path can therefore trigger TileLang JIT compilation.
     """
     from daser.ops.tilelang_compressed_kv import (
-        BRANCHLESS_CODEBOOK_BYTES,
         compile_load_kernel,
         compile_store_kernels,
+        load_reads_words,
+        pack_load_codebooks,
     )
 
     if kv_cache.device.type != "cuda" or kv_cache.dtype is not torch.bfloat16:
@@ -217,7 +162,6 @@ def _warm_tilelang_codec(
         tile_scalars=tile_scalars,
         prefix_group_tiles=prefix_group_tiles,
     )
-    variant = _load_variant(tile_scalars)
     loads = tuple(
         compile_load_kernel(
             num_blocks=num_blocks,
@@ -227,7 +171,6 @@ def _warm_tilelang_codec(
             tile_scalars=tile_scalars,
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
-            **variant,
         )
         for fanout in (False, True)
     )
@@ -324,7 +267,15 @@ def _warm_tilelang_codec(
             block_tokens,
             int(kv_cache[0].nbytes),
         )
-        words = (output.view(torch.int32),) if variant["word_reads"] else ()
+        words = (output.view(torch.int32),) if load_reads_words(tile_scalars) else ()
+        codebooks = torch.from_numpy(
+            np.frombuffer(
+                pack_load_codebooks(
+                    bytes(num_planes * CODEBOOK_ENTRIES), num_planes, tile_scalars
+                ),
+                dtype=np.uint8,
+            ).copy()
+        ).to(device)
         for load in loads:
             load(
                 output,
@@ -336,16 +287,7 @@ def _warm_tilelang_codec(
                 # source/destination counts remain runtime inputs. The live
                 # cache block is restored after synchronized warmup.
                 torch.ones(1, dtype=torch.int32, device=device),
-                torch.zeros(
-                    num_planes
-                    * (
-                        BRANCHLESS_CODEBOOK_BYTES
-                        if variant["branchless_decode"]
-                        else CODEBOOK_ENTRIES
-                    ),
-                    dtype=torch.uint8,
-                    device=device,
-                ),
+                codebooks,
                 bits,
                 0,
                 num_planes,
@@ -864,8 +806,8 @@ class PreparedKVRestore:
         stream: Stream on which metadata was uploaded and kernels will launch.
         plane_range: ``(first, count)`` layer/K-or-V planes to decode; the
             default ``None`` decodes every plane.
-        word_reads: Whether ``kernel`` is the word-read variant, which also
-            takes the staging bytes as an int32 word view.
+        word_reads: Whether ``kernel`` also takes the staging bytes as an
+            int32 word view (see ``load_reads_words``).
 
     Async/thread-safety:
         The load thread exclusively owns this plan and its metadata ring. The
@@ -1033,29 +975,30 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed codebooks do not match KV layer geometry")
         from daser.ops.tilelang_compressed_kv import (
             compile_load_kernel,
-            pack_branchless_codebooks,
+            load_reads_words,
+            pack_load_codebooks,
         )
 
-        variant = _load_variant(tile_scalars)
-        self._word_reads = variant["word_reads"]
+        head_dim = int(kv_cache.shape[5])
+        self._word_reads = load_reads_words(tile_scalars)
         self._kv_bits = _kv_bits(kv_cache)
         self._kernels = tuple(
             compile_load_kernel(
                 num_blocks=self._num_blocks,
                 num_planes=self._num_planes,
                 plane_scalars=self._plane_scalars,
-                head_dim=int(kv_cache.shape[5]),
+                head_dim=head_dim,
                 tile_scalars=self._tile_scalars,
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,
-                **variant,
             )
             for fanout in (False, True)
         )
-        if variant["branchless_decode"]:
-            codebooks = pack_branchless_codebooks(codebooks, self._num_planes)
         self._codebooks = torch.from_numpy(
-            np.frombuffer(codebooks, dtype=np.uint8).copy()
+            np.frombuffer(
+                pack_load_codebooks(codebooks, self._num_planes, tile_scalars),
+                dtype=np.uint8,
+            ).copy()
         ).to(kv_cache.device)
         self._rings = tuple(
             self._allocate_metadata(kv_cache.device, max_slots_per_buffer)

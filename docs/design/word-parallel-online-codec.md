@@ -59,11 +59,17 @@ directly in the vLLM KV cache. The fixed geometry permits vector stores where
 aligned. Multiple destinations reuse the same decoded values; they do not
 require an intermediate raw payload.
 
-Research switches select load-kernel variants for the 256-scalar decoder;
-all default off. `DASER_LOAD_UNCHECKED_BOUNDS=1` (with word reads) compiles
-the kernel without TileLang's per-access bounds guards. Containment of a
-corrupt record (media bit flip, torn write or packer bug) then rests on
-three properties instead of the guards:
+The 256-scalar decoder has a single implementation. One warp decodes a tile
+and one lane eight scalars. A CTA reads the plane descriptor once and decodes
+32 consecutive groups of eight tiles, prefetching the next group's primary
+word, two low-byte words and two prefix entries while the current group
+decodes. Record fields are read as clamped 32-bit words. A lane writes its
+eight scalars as one 128-bit store when the head dimension is divisible by
+eight, and one scalar at a time otherwise.
+
+The kernel compiles without TileLang's per-access bounds guards. Containment
+of a corrupt record (media bit flip, torn write or packer bug) rests on three
+properties instead of the guards:
 
 - Every global write address derives from host-validated metadata only:
   destination block IDs, the plane range and grid indices. Record bytes
@@ -71,25 +77,26 @@ three properties instead of the guards:
 - Every read addressed by record bytes (descriptor offsets, prefixes, ranks)
   is clamped to `[0, staging extent)`: word reads take unsigned 32-bit
   offsets from the record's first word (a corrupt negative rank wraps high)
-  and clamp both aligned word indices to the last staging word, and the raw escape byte read is clamped explicitly (or, with
-  branchless decode, read through the clamped word path).
+  and clamp both aligned word indices to the last staging word.
 - Header, descriptor, codebook and metadata reads use offsets the host has
   already range-checked against the staging tensor.
 
 A corrupt record therefore restores wrong scalars into its own destination
 blocks and nothing else. A GPU fuzz test flips bits in descriptors, prefix
-tables and payload with and without the switch and checks for CUDA faults and
-writes to neighbouring blocks.
+tables and payload and checks for CUDA faults and writes to neighbouring
+blocks.
 
-`DASER_LOAD_BRANCHLESS_DECODE=1` (with word reads and vector stores) removes
-the per-scalar escape branches, which diverge in most warps because escapes
-are scattered across lanes. Codebooks are repacked to 16 bytes per plane
-(primary entries in bytes 0-6, secondary in 8-14) so each level is one PRMT
-byte pair. Each lane loads its raw escape bytes, fewer than eight, as one
-eight-byte window; per scalar it computes the primary, secondary and raw
-candidates with three PRMTs and selects one, advancing a secondary cursor and
-a raw rank instead of recomputing prefix popcounts. Two PRMTs per output word
-interleave low and high bytes before the 128-bit store.
+Decoding is branchless: per-scalar escape branches would diverge in most
+warps because escapes are scattered across lanes. Codebooks are repacked to
+16 bytes per plane (primary entries in bytes 0-6, secondary in 8-14) so each
+level is one PRMT byte pair. Each lane loads its raw escape bytes, fewer than
+eight, as one eight-byte window; per scalar it computes the primary, secondary
+and raw candidates with three PRMTs and selects one, advancing a secondary
+cursor and a raw rank instead of recomputing prefix popcounts. Two PRMTs per
+output word interleave low and high bytes before the 128-bit store. On
+Qwen3-8B 512-tile planes this restores about 657 GB/s of raw-equivalent bytes
+on one GPU, against about 620 GB/s for the same kernel with branches and no
+prefetch.
 
 The codec does not detect corruption. GPU-packed records carry no digest of
 the raw bytes (the CPU reference stores a SHA-256 that only its own decoder
@@ -98,7 +105,7 @@ were written.
 
 All buffer budgets, stream ownership, staging leases and transfer/commit
 boundaries remain unchanged. Completion still covers every destination write.
-Both decoder variants and the store bundle compile and execute during startup;
+Both decoder variants (singleton and fanout) and the store bundle compile and execute during startup;
 request slot count and destination fanout do not trigger JIT compilation.
 
 ## Validation
