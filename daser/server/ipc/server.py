@@ -305,7 +305,6 @@ class IPCServer:
             "lookup": self._op_lookup,
             "index_epoch": self._op_index_epoch,
             "lookup_prefetch": self._op_lookup_prefetch,
-            "readahead_hint": self._op_readahead_hint,
             "split_prefill": self._op_split_prefill,
             "estimate_reuse": self._op_estimate_reuse,
             "prefill_holes": self._op_prefill_holes,
@@ -538,43 +537,6 @@ class IPCServer:
             still describes chunks that are all present in the index.
         """
         return {"index_epoch": self._core.index_epoch}
-
-    async def _op_readahead_hint(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Start L2 readahead for a request that has not been scheduled yet.
-
-        The scheduler sends this when a request enters vLLM's waiting queue,
-        so its external prefix is read from SSD while earlier requests run.
-        The later scheduling lookup then finds the bytes retained or in
-        flight. Unlike ``lookup`` it records no prefix-cache counters and
-        never waits for pending writers.
-
-        Args:
-            msg: ``token_bytes`` (or ``tokens``), ``model_id``,
-                ``external_prefix_queries`` and ``num_computed_tokens``.
-
-        Returns:
-            ``{"started": bool}``: whether a new readahead was registered.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop; readahead reads run in the
-            background after the reply.
-        """
-        if not self._readahead_piece:
-            return {"started": False}
-        chunks = await self._lookup_now(
-            self._lookup_tokens(msg), msg["model_id"], defer=False
-        )
-        num_computed_tokens = int(msg.get("num_computed_tokens", 0))
-        hits = _external_prefix_hits(
-            chunks,
-            num_computed_tokens=num_computed_tokens,
-            queries=int(msg.get("external_prefix_queries", 0)),
-        )
-        spans = (
-            self._external_spans(chunks, num_computed_tokens, hits) if hits > 0 else []
-        )
-        started = bool(spans) and await self._ensure_transfer().start_readahead(spans)
-        return {"started": started}
 
     async def _op_split_prefill(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Plan a bidirectional prefill: compute the front, read the back.

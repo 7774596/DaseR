@@ -40,18 +40,6 @@ PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
 #: bytes (0 or unset disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
 LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
-#: Research switch: ``1`` makes the scheduler connector send a readahead hint
-#: when a request enters vLLM's waiting queue, so its SSD read overlaps the
-#: requests ahead of it instead of starting when it is scheduled.
-ARRIVAL_READAHEAD_ENV = "DASER_ARRIVAL_READAHEAD"
-#: Research switch: positive block count makes the scheduler connector hold a
-#: finished request's vLLM blocks and write its prompt KV to DaseR only when
-#: free GPU blocks fall below this count (write-back instead of write-through).
-WRITEBACK_LOW_BLOCKS_ENV = "DASER_WRITEBACK_LOW_BLOCKS"
-#: Research switch: ``1`` makes the scheduler connector also store the full
-#: KV blocks a finished request computed past its prompt (the generated
-#: tokens), so a next turn whose prompt replays that output can load it.
-DECODE_SAVE_ENV = "DASER_DECODE_SAVE"
 #: Research switch: ``1`` logs a monotonic timestamp per request at its first
 #: lookup, its block allocation and its load completion (scheduler side).
 ADMIT_TRACE_ENV = "DASER_ADMIT_TRACE"

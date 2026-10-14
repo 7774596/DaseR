@@ -19,11 +19,8 @@ if TYPE_CHECKING:
 # First Party
 from daser.config import (
     ADMIT_TRACE_ENV,
-    ARRIVAL_READAHEAD_ENV,
-    DECODE_SAVE_ENV,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
-    WRITEBACK_LOW_BLOCKS_ENV,
 )
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
@@ -127,11 +124,6 @@ class DaserConnector(
                 storage_format=storage_format,
                 coalesce_loads=bool(extra.get("coalesce_loads", False)),
                 layerwise_load=bool(extra.get("layerwise_load", False)),
-                arrival_readahead=os.environ.get(ARRIVAL_READAHEAD_ENV) == "1",
-                writeback_low_blocks=int(
-                    os.environ.get(WRITEBACK_LOW_BLOCKS_ENV, "0") or 0
-                ),
-                decode_save=os.environ.get(DECODE_SAVE_ENV) == "1",
                 admit_trace=os.environ.get(ADMIT_TRACE_ENV) == "1",
             )
             self._request_lifecycle.refresh_runtime_config()

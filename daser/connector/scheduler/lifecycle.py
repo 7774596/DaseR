@@ -108,9 +108,6 @@ class RequestLifecycle:
         storage_format: str | None = None,
         coalesce_loads: bool = False,
         layerwise_load: bool = False,
-        arrival_readahead: bool = False,
-        writeback_low_blocks: int = 0,
-        decode_save: bool = False,
         admit_trace: bool = False,
     ) -> None:
         self._ipc_sync = ipc_client
@@ -124,37 +121,11 @@ class RequestLifecycle:
         # Why the last get_num_new_matched_tokens call returned None ("" when
         # it returned a count); read by the scheduler probe.
         self.last_defer_reason = ""
-        self._arrival_readahead = arrival_readahead
         # Last lookup per request kept for vLLM's allocation retries:
         # (num_computed_tokens, prefix length, index epoch, chunks).
         self._retry_lookups: dict[str, tuple[int, int, int, list[dict[str, Any]]]] = {}
         # Server index epoch already read in this scheduler step, if any.
         self._step_epoch: int | None = None
-        # Research switch: write-back stores. A finished request keeps its
-        # vLLM blocks (and so its GPU prefix-cache residency) until free
-        # blocks fall below this watermark; only then is its prompt KV
-        # allocated in DaseR and saved, oldest finish first. A release whose
-        # last prompt block is still shared with a live request writes
-        # nothing: that request's own store covers the same prefix later.
-        self._writeback_low_blocks = max(0, writeback_low_blocks)
-        self._writeback_held: dict[str, tuple[Request, list[int]]] = {}
-        self._writeback_released: set[str] = set()
-        self._writeback_stats = {"held": 0, "saved": 0, "superseded": 0}
-        # Research switch: at finish, store the full blocks computed past the
-        # prompt (generated tokens) as rolling-prefix slots that continue the
-        # prompt's, held like a write-back release until the worker has them.
-        # Skipped while the prompt store is still unallocated (its rolling
-        # key is not known yet) and under write-back, which owns finish holds.
-        self._decode_save = decode_save
-        # Finished requests whose decode stores are published this step.
-        self._decode_flush: set[str] = set()
-        self._decode_stats = {
-            "saved": 0,
-            "blocks": 0,
-            "tail_blocks": 0,
-            "skipped": 0,
-        }
-        self._gpu_block_pool: Any = None
         self._block_tokens = block_tokens
         self._slot_size = slot_size
         self._model_id = model_id
@@ -208,51 +179,6 @@ class RequestLifecycle:
                 "inflight_loads": dict(self._inflight_loads),
                 "now": time.monotonic(),
             },
-        )
-
-    def on_new_request(self, request: "Request") -> None:
-        """Start SSD readahead for a request entering vLLM's waiting queue.
-
-        With ``arrival_readahead`` the block-aligned prompt is sent as a
-        readahead hint, so the server reads the request's external prefix
-        while earlier requests run; the scheduling lookup later finds those
-        bytes retained or in flight. When the GPU block pool is bound, the
-        hint starts after the prompt's GPU prefix-cache hit, so the readahead
-        budget is spent only on blocks vLLM would load externally. The hint
-        is best effort: failures are logged and the request is scheduled
-        normally.
-
-        Args:
-            request: vLLM Request with prompt_token_ids.
-
-        Thread-safety:
-            Runs on the scheduler thread through its synchronous IPC client.
-        """
-        if not self._arrival_readahead:
-            return
-        tokens = list(request.prompt_token_ids)
-        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
-        local = (self._gpu_cached_tokens(request) // self._block_tokens) * (
-            self._block_tokens
-        )
-        if aligned == 0 or local >= aligned:
-            return
-        try:
-            started = self._ipc_sync.readahead_hint(
-                tokens[:aligned], self._model_id, len(tokens), local
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[CONNECTOR] readahead hint failed req=%s: %s",
-                request.request_id[:8],
-                exc,
-            )
-            return
-        logger.debug(
-            "[CONNECTOR] readahead hint req=%s gpu_tokens=%d started=%s",
-            request.request_id[:8],
-            local,
-            started,
         )
 
     def get_num_new_matched_tokens(
@@ -707,10 +633,6 @@ class RequestLifecycle:
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
-        meta.writeback_req_ids = self._release_writeback_holds()
-        decode_flush: set[str] = getattr(self, "_decode_flush", set())
-        self._decode_flush = set()
-        meta.writeback_req_ids |= decode_flush
 
         for req_id, chunks in list(self._pending_loads.items()):
             if req_id in getattr(self, "_layerwise_request_ids", set()):
@@ -751,15 +673,11 @@ class RequestLifecycle:
                 if slot_index is not None
                 else int(alloc["token_count"])
             )
-            # Released write-back holds are finished, so every planned block
-            # is already computed although the request is no longer scheduled.
-            should_store = "block_ids" in alloc and (
-                base_req_id in meta.writeback_req_ids
-                or (
-                    base_req_id in scheduled_ids
-                    and scheduled_tokens > 0
-                    and computed_tokens >= required_tokens
-                )
+            should_store = (
+                "block_ids" in alloc
+                and base_req_id in scheduled_ids
+                and scheduled_tokens > 0
+                and computed_tokens >= required_tokens
             )
             if should_store:
                 logical_slot_start = _store_slot_index(req_id)
@@ -781,15 +699,6 @@ class RequestLifecycle:
             pending_async_saves = self._pending_async_save_ids()
             for req_id in meta.reqs_to_store:
                 pending_async_saves.add(_base_req_id(req_id))
-        if decode_flush:
-            stored = {_base_req_id(req_id) for req_id in meta.reqs_to_store}
-            for req_id in decode_flush - stored:
-                # Every decode slot was dropped (already stored or evicted).
-                # A prompt save still pending reports the request itself;
-                # reporting it unsaved now would free blocks under that save.
-                if req_id in self._pending_async_save_ids():
-                    meta.writeback_req_ids.discard(req_id)
-
         if logger.isEnabledFor(logging.DEBUG):
             for req_id, load_spec in meta.reqs_to_load.items():
                 logger.debug(
@@ -820,19 +729,6 @@ class RequestLifecycle:
             IPC during connector initialization or recovery, never worker IO.
         """
         self._refresh_runtime_config()
-
-    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
-        """Bind vLLM's GPU block pool for write-back and arrival readahead.
-
-        Args:
-            gpu_block_pool: vLLM ``BlockPool``; only ``get_num_free_blocks``,
-                ``get_cached_block``, ``hash_block_size`` and per-block
-                ``ref_cnt`` are read.
-
-        Thread-safety:
-            Called once on the scheduler thread after the cache manager exists.
-        """
-        self._gpu_block_pool = gpu_block_pool
 
     def _drop_preempted_pending_state(
         self,
@@ -1443,167 +1339,6 @@ class RequestLifecycle:
         getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
         had_prefetch = self._cancel_prefetch_future(req_id)
         self._release_transfer_lease(req_id, force=had_prefetch)
-        getattr(self, "_writeback_held", {}).pop(req_id, None)
-        getattr(self, "_writeback_released", set()).discard(req_id)
-
-    def _writeback_enabled(self) -> bool:
-        """Return whether write-back stores are active for this scheduler."""
-        return (
-            getattr(self, "_writeback_low_blocks", 0) > 0
-            and getattr(self, "_gpu_block_pool", None) is not None
-        )
-
-    def _gpu_cached_tokens(self, request: "Request") -> int:
-        """Return the prompt prefix length vLLM's GPU prefix cache holds now.
-
-        Walks ``request.block_hashes`` in order and stops at the first hash
-        the bound block pool does not hold for KV cache group 0. Returns 0
-        when no pool is bound. Blocks may still be evicted before the request
-        is scheduled; the scheduling lookup covers whatever is lost.
-        """
-        pool = getattr(self, "_gpu_block_pool", None)
-        if pool is None:
-            return 0
-        cached = 0
-        for block_hash in getattr(request, "block_hashes", ()):
-            if pool.get_cached_block(block_hash, [0]) is None:
-                break
-            cached += 1
-        return cached * int(pool.hash_block_size)
-
-    def _release_writeback_holds(self) -> set[str]:
-        """Release held finished requests until free blocks reach the watermark.
-
-        Oldest finishes go first, which matches vLLM's own LRU order for
-        freed blocks. A release whose last prompt block is still referenced by
-        a live request is superseded and writes nothing; otherwise its pending
-        store is allocated now and published this step.
-
-        Returns:
-            Released base request IDs. The worker reports each one as finished
-            sending, which makes vLLM free the held blocks.
-
-        Async/thread-safety:
-            Runs on the scheduler thread inside ``build_connector_meta`` and
-            performs synchronous control-plane allocation IPC.
-        """
-        if not self._writeback_enabled() or not self._writeback_held:
-            return set()
-        pool = self._gpu_block_pool
-        deficit = self._writeback_low_blocks - int(pool.get_num_free_blocks())
-        released: set[str] = set()
-        while deficit > 0 and self._writeback_held:
-            req_id, (request, block_ids) = next(iter(self._writeback_held.items()))
-            del self._writeback_held[req_id]
-            released.add(req_id)
-            # Only blocks this hold owns alone return to the free queue.
-            deficit -= sum(1 for bid in block_ids if pool.blocks[bid].ref_cnt == 1)
-            pending_store = self._pending_alloc.get(req_id)
-            if pending_store is None:
-                continue
-            store_slots = math.ceil(pending_store.token_count / self._block_tokens)
-            store_blocks = pending_store.block_ids[:store_slots]
-            if (
-                len(store_blocks) < store_slots
-                or int(request.num_computed_tokens) < pending_store.token_count
-            ):
-                # Aborted before its prompt was computed: nothing to save.
-                self._pending_alloc.pop(req_id, None)
-                continue
-            if pool.blocks[store_blocks[-1]].ref_cnt > 1:
-                self._pending_alloc.pop(req_id, None)
-                self._writeback_stats["superseded"] += 1
-                continue
-            self._writeback_released.add(req_id)
-            self._maybe_allocate_pending_store(req_id, pending_store)
-            self._writeback_stats["saved"] += 1
-        stats = self._writeback_stats
-        if released and (stats["saved"] + stats["superseded"]) % 64 < len(released):
-            logger.info(
-                "[CONNECTOR] write-back: held=%d saved=%d superseded=%d waiting=%d",
-                stats["held"],
-                stats["saved"],
-                stats["superseded"],
-                len(self._writeback_held),
-            )
-        return released
-
-    def _plan_decode_save(self, request: "Request", block_ids: list[int]) -> bool:
-        """Allocate stores for the full blocks a finished request decoded.
-
-        The stores continue the prompt's rolling-prefix slots over prompt plus
-        generated tokens, so a later prompt that replays this output matches
-        them. Only blocks past the prompt's last full block are new; the
-        first may mix the prompt's sub-block tail with generated tokens.
-
-        Args:
-            request: Finished vLLM request.
-            block_ids: The request's blocks covering its computed tokens.
-
-        Returns:
-            True when decode stores were allocated; the caller then holds the
-            blocks until the worker reports the request finished sending.
-
-        Async/thread-safety:
-            Runs on the scheduler thread inside ``request_finished`` and
-            performs synchronous control-plane allocation IPC.
-        """
-        req_id = request.request_id
-        prompt_tokens = list(request.prompt_token_ids)
-        prompt_slots = len(prompt_tokens) // self._block_tokens
-        # Tokens still in flight under async scheduling have no KV yet.
-        computed = int(request.num_computed_tokens) - int(
-            getattr(request, "num_in_flight_tokens", 0) or 0
-        )
-        slots = min(computed // self._block_tokens, len(block_ids))
-        if slots <= prompt_slots:
-            return False
-        if _get_kv_transfer_flag(request, "daser_skip_save"):
-            return False
-        if self._writeback_enabled() or req_id in self._pending_alloc:
-            # Write-back owns finish holds; an unallocated prompt store has no
-            # rolling key to continue from yet.
-            self._decode_stats["skipped"] += 1
-            return False
-        tokens = (prompt_tokens + list(request.output_token_ids))[
-            : slots * self._block_tokens
-        ]
-        pending_store = self._reuse_strategy().extend_store(
-            slots * self._block_tokens, prompt_slots
-        )
-        if pending_store is None:
-            return False
-        pending_store.block_ids = list(block_ids[:slots])
-        self._req_tokens[req_id] = tokens
-        self._pending_alloc[req_id] = pending_store
-        before = {
-            store_id
-            for store_id in self._pending_stores
-            if _matches_request_or_store_id(store_id, req_id)
-        }
-        self._maybe_allocate_pending_store(req_id, pending_store)
-        self._pending_alloc.pop(req_id, None)
-        new_stores = [
-            store_id
-            for store_id in self._pending_stores
-            if _matches_request_or_store_id(store_id, req_id) and store_id not in before
-        ]
-        if not new_stores:
-            self._req_tokens[req_id] = prompt_tokens
-            return False
-        stats = self._decode_stats
-        stats["saved"] += 1
-        stats["blocks"] += len(new_stores)
-        stats["tail_blocks"] += int(len(prompt_tokens) % self._block_tokens > 0)
-        if stats["saved"] % 64 == 1:
-            logger.info(
-                "[CONNECTOR] decode save: saved=%d blocks=%d tail_blocks=%d skipped=%d",
-                stats["saved"],
-                stats["blocks"],
-                stats["tail_blocks"],
-                stats["skipped"],
-            )
-        return True
 
     def _pending_async_save_ids(self) -> set[str]:
         """Return request IDs whose worker-side saves are still pending.
@@ -1630,10 +1365,6 @@ class RequestLifecycle:
             req_id: vLLM request ID being tracked.
             pending_store: store tracker for the request.
         """
-        if self._writeback_enabled() and req_id not in self._writeback_released:
-            # Write-back allocates only when the held blocks are released, so
-            # DaseR never stores a prefix that is still GPU-resident.
-            return
         requested_tokens = pending_store.token_count
         strategy = self._reuse_strategy()
         if not strategy.ready_to_allocate(pending_store):
@@ -1706,24 +1437,13 @@ class RequestLifecycle:
             block_ids: block IDs being freed.
 
         Returns:
-            (True, None) when DaseR is still storing this request's KV blocks
-            or holds them for a write-back store, otherwise (False, None).
+            (True, None) when DaseR is still storing this request's KV blocks,
+            otherwise (False, None).
         """
         self._defer_deadlines().pop(request.request_id, None)
         getattr(self, "_inflight_loads", {}).pop(request.request_id, None)
         getattr(self, "_coalesce_followers", {}).pop(request.request_id, None)
         getattr(self, "_follower_digests", {}).pop(request.request_id, None)
-        if self._writeback_enabled() and request.request_id in self._pending_alloc:
-            # The finish hint carries the chunks written at release time.
-            self._writeback_held[request.request_id] = (request, list(block_ids))
-            self._writeback_stats["held"] += 1
-            return True, None
-        decode_flush = getattr(self, "_decode_save", False) and self._plan_decode_save(
-            request, block_ids
-        )
-        if decode_flush:
-            self._decode_flush.add(request.request_id)
-            return True, None
         if request.request_id in self._pending_async_save_ids():
             return True, None
         self._req_tokens.pop(request.request_id, None)
