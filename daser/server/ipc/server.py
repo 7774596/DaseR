@@ -307,9 +307,6 @@ class IPCServer:
             "lookup": self._op_lookup,
             "index_epoch": self._op_index_epoch,
             "lookup_prefetch": self._op_lookup_prefetch,
-            "split_prefill": self._op_split_prefill,
-            "estimate_reuse": self._op_estimate_reuse,
-            "prefill_holes": self._op_prefill_holes,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
             "alloc_chunk": self._op_alloc_chunk,
@@ -539,93 +536,6 @@ class IPCServer:
             still describes chunks that are all present in the index.
         """
         return {"index_epoch": self._core.index_epoch}
-
-    async def _op_split_prefill(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Plan a bidirectional prefill: compute the front, read the back.
-
-        The external hit is split at a block boundary ``x`` so that computing
-        tokens ``[0, x)`` on the GPU takes as long as reading the stored bytes
-        of ``[x, hits)``; readahead for the back part starts before replying.
-        Compression shrinks the back part's bytes and so moves ``x`` forward.
-        Records no prefix-cache counters and never waits for pending writers.
-
-        Args:
-            msg: ``token_bytes`` (or ``tokens``), ``model_id``,
-                ``external_prefix_queries``, ``compute_tokens_per_s`` and
-                ``load_bytes_per_s``.
-
-        Returns:
-            ``{"compute_tokens": int, "hit_tokens": int, "started": bool}``;
-            ``compute_tokens`` is 0 when no split is worthwhile.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop; readahead reads run in the
-            background after the reply.
-        """
-        empty = {"compute_tokens": 0, "hit_tokens": 0, "started": False}
-        chunks = await self._lookup_now(
-            self._lookup_tokens(msg), msg["model_id"], defer=False
-        )
-        hits = _external_prefix_hits(
-            chunks,
-            num_computed_tokens=0,
-            queries=int(msg.get("external_prefix_queries", 0)),
-        )
-        block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        if hits <= 0 or block_tokens <= 0:
-            return empty
-        spans = self._external_spans(chunks, 0, hits)
-        bytes_per_token = sum(int(span["nbytes"]) for span in spans) / hits
-        compute_s = 1.0 / float(msg["compute_tokens_per_s"])
-        load_s = bytes_per_token / float(msg["load_bytes_per_s"])
-        # Balance x * compute_s == (hits - x) * load_s.
-        split = int(hits * load_s / (compute_s + load_s))
-        split = (split // block_tokens) * block_tokens
-        if split <= 0 or split >= hits:
-            return {**empty, "hit_tokens": hits}
-        back = self._external_spans(chunks, split, hits - split)
-        started = bool(back) and await self._ensure_transfer().start_readahead(back)
-        return {"compute_tokens": split, "hit_tokens": hits, "started": started}
-
-    async def _op_estimate_reuse(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Estimate a prompt's reusable prefix without serving a lookup.
-
-        Args:
-            msg: ``token_bytes`` (or ``tokens``) and ``model_id``.
-
-        Returns:
-            ``{"reusable_tokens": int}``, counting committed chunks and chunks
-            still being written; no lookup counters, replacement state or
-            reads are touched.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop without sleeping.
-        """
-        reusable = await self._core.estimate_reusable_tokens(
-            self._lookup_tokens(msg), msg["model_id"]
-        )
-        return {"reusable_tokens": int(reusable)}
-
-    async def _op_prefill_holes(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Report missing block runs that hide stored blocks behind them.
-
-        Args:
-            msg: ``token_bytes`` (or ``tokens``), ``model_id`` and
-                ``min_tail_tokens``.
-
-        Returns:
-            ``{"holes": [[start, end], ...]}`` token spans in prompt order; no
-            lookup counters, replacement state or reads are touched.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop without sleeping.
-        """
-        holes = self._core.prefill_holes(
-            self._lookup_tokens(msg),
-            msg["model_id"],
-            int(msg.get("min_tail_tokens", 0)),
-        )
-        return {"holes": [[start, end] for start, end in holes]}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""

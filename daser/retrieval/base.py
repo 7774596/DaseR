@@ -57,59 +57,6 @@ class RetrievalIndex(ABC):
         """
         ...
 
-    async def reusable_tokens(
-        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
-    ) -> int:
-        """Estimate prompt tokens reusable from the start of ``tokens``.
-
-        The default counts tokens covered contiguously by :meth:`lookup` and
-        ignores ``pending_keys``; indexes whose keys name prompt blocks should
-        also count blocks a writer is still publishing.
-
-        Args:
-            tokens: full prompt token IDs.
-            model_id: model identifier used for cache isolation.
-            pending_keys: keys of chunks whose store writer has not committed.
-
-        Returns:
-            Contiguous reusable token count from the prompt start.
-
-        Async/thread-safety:
-            Pure in-memory planning on the server event loop.  Implementations
-            must not perform blocking I/O or mutate index state.
-        """
-        del pending_keys
-        covered = 0
-        for match in await self.lookup(tokens, model_id):
-            if match.target_token_start > covered:
-                break
-            covered = max(covered, match.target_token_start + match.meta.token_count)
-        return covered
-
-    def resident_blocks(
-        self, tokens: TokenSequence, model_id: str, pending_keys: set[str]
-    ) -> list[bool]:
-        """Report, per full prompt block, whether its key is held.
-
-        Unlike :meth:`reusable_tokens` this keeps scanning past a missing
-        block, so callers can see stored blocks behind a gap.
-
-        Args:
-            tokens: full prompt token IDs.
-            model_id: committed blocks must belong to this model.
-            pending_keys: keys of chunks whose store writer has not committed.
-
-        Returns:
-            One flag per full block in prompt order, or an empty list when
-            the index has no fixed per-block keys.
-
-        Async/thread-safety:
-            Pure in-memory planning on the server event loop.  Implementations
-            must not perform blocking I/O or mutate index state.
-        """
-        del tokens, model_id, pending_keys
-        return []
-
     def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return keys that this index could match for ``tokens``.
 
