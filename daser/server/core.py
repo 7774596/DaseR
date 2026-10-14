@@ -2,7 +2,6 @@
 
 # Standard
 import asyncio
-from collections import OrderedDict
 from dataclasses import dataclass
 import math
 import os
@@ -19,7 +18,6 @@ from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_lifecycle import ChunkLifecycle
 from daser.server.chunk_manager import ChunkManager
 from daser.server.doc_registry import DocEntry, DocRegistry
-from daser.server.ghost_admission import GhostAdmission
 from daser.server.metadata_store import ChunkMeta
 from daser.server.packed_layout import OnlinePackedLayout
 
@@ -46,10 +44,6 @@ _PUBLISH_BUCKETS = (
     20.0,
     60.0,
 )
-
-# Distinct recent prompts remembered so adaptive ghost admission feeds each
-# prompt to its shadow caches once despite repeated scheduler polls.
-_GHOST_PROMPT_MEMORY = 4096
 
 
 @dataclass(frozen=True)
@@ -107,9 +101,7 @@ class Allocation:
         pos_offset: position offset assigned by the position encoder.
         token_count: number of tokens covered by this allocation.
         skipped: True when the connector should not write KV: the chunk is
-            already committed or owned by another writer, or ghost admission
-            declined its first store (then no slots are allocated and
-            ``start_slot`` and ``file_offset`` are -1).
+            already committed or owned by another writer.
     """
 
     chunk_key: str
@@ -285,10 +277,6 @@ class ServerCore:
         self._chain_edges = 0
         self._chain_fresh: set[str] = set()
         self._chain_limit = 2 * chunk_manager.total_slots
-        self._ghost_admission = GhostAdmission.from_env(chunk_manager.total_slots)
-        # Schedulers poll waiting prompts every step, interleaved, so the
-        # shadow caches see each distinct prompt once.
-        self._ghost_prompts: OrderedDict[int, None] = OrderedDict()
         self._record_capacity_metrics()
 
     @property
@@ -442,13 +430,6 @@ class ServerCore:
         chunks = [self._chunk_info(match) for match in matches]
         if self._prefix_closed:
             self._learn_chain(tokens)
-        if self._ghost_admission is not None and self._ghost_admission.adaptive:
-            prompt = hash(tokens if isinstance(tokens, bytes) else tuple(tokens))
-            if prompt not in self._ghost_prompts:
-                self._ghost_prompts[prompt] = None
-                if len(self._ghost_prompts) > _GHOST_PROMPT_MEMORY:
-                    self._ghost_prompts.popitem(last=False)
-                self._ghost_admission.observe(self._ri.chain_keys(tokens))
         self._metrics.counter(
             "daser_cache_lookup_total",
             "Cache lookup requests by result.",
@@ -595,11 +576,6 @@ class ServerCore:
             token_count = int(chunk["token_count"])
             num_slots = self._slots_for(token_count)
             should_write = not self._has_store_owner(chunk_key, token_count, model_id)
-            if should_write and not self._admit_store(chunk_key):
-                allocations.append(
-                    self._declined_allocation(chunk_key, token_count, num_slots)
-                )
-                continue
             meta = await self._alloc_or_get_chunk(
                 chunk_key=chunk_key,
                 token_count=token_count,
@@ -644,11 +620,6 @@ class ServerCore:
             return MatchAndAllocResult(chunks=[], alloc=None)
         num_slots = self._slots_for(aligned)
         should_write = not self._has_store_owner(chunk_key, aligned, model_id)
-        if should_write and not self._admit_store(chunk_key):
-            return MatchAndAllocResult(
-                chunks=[],
-                alloc=self._declined_allocation(chunk_key, aligned, num_slots),
-            )
         meta = await self._alloc_or_get_chunk(
             chunk_key=chunk_key,
             token_count=aligned,
@@ -1577,39 +1548,6 @@ class ServerCore:
             model_id=meta.model_id,
             file_offset=meta.start_slot * self._slot_size,
             target_token_start=match.target_token_start,
-        )
-
-    def _admit_store(self, chunk_key: str) -> bool:
-        """Return whether ghost admission lets the first writer store a key.
-
-        Args:
-            chunk_key: key with no store owner yet.
-
-        Returns:
-            True when ghost admission is disabled, the key is already
-            allocated, or the filter admits it.
-        """
-        if self._ghost_admission is None or self._cm.store.get(chunk_key) is not None:
-            return True
-        admitted = self._ghost_admission.admit(chunk_key)
-        self._metrics.counter(
-            "daser_ghost_admission_total",
-            "First stores of unallocated keys by ghost admission result.",
-        ).inc(labels={"result": "admitted" if admitted else "declined"})
-        return admitted
-
-    def _declined_allocation(
-        self, chunk_key: str, token_count: int, num_slots: int
-    ) -> Allocation:
-        """Return the skipped allocation of a store ghost admission declined."""
-        return Allocation(
-            chunk_key=chunk_key,
-            start_slot=-1,
-            num_slots=num_slots,
-            file_offset=-1,
-            pos_offset=0,
-            token_count=token_count,
-            skipped=True,
         )
 
     def _allocation(
