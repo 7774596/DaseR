@@ -1095,9 +1095,9 @@ async def test_prefix_closed_eviction_removes_unreachable_descendants(
 ) -> None:
     """Evicting a prefix head also frees the blocks only it led to."""
     if closed:
-        monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
-    else:
         monkeypatch.delenv("DASER_PREFIX_CLOSED_EVICTION", raising=False)
+    else:
+        monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "0")
     core = make_core()
     tokens, keys = await _committed_chain(core, 3)
     other = await _committed_blocks(core, 1)
@@ -1112,11 +1112,8 @@ async def test_prefix_closed_eviction_removes_unreachable_descendants(
 
 
 @pytest.mark.asyncio
-async def test_prefix_closed_eviction_bounds_learned_edges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_prefix_closed_eviction_bounds_learned_edges() -> None:
     """Lookups of never-stored prompts do not grow the edge map forever."""
-    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
     registry = MetricsRegistry()
     core = make_instrumented_core(registry, total_slots=8)
     tokens, keys = await _committed_chain(core, 3)
@@ -1139,11 +1136,8 @@ async def test_prefix_closed_eviction_bounds_learned_edges(
 
 
 @pytest.mark.asyncio
-async def test_prefix_closed_eviction_keeps_pending_and_protected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_prefix_closed_eviction_keeps_pending_and_protected() -> None:
     """Uncommitted or protected descendants survive, and so does what follows."""
-    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
     core = make_core()
     tokens = list(range(4 * BLOCK_TOKENS))
     keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
@@ -1161,11 +1155,8 @@ async def test_prefix_closed_eviction_keeps_pending_and_protected(
 
 
 @pytest.mark.asyncio
-async def test_prefix_closed_eviction_follows_ring_wrap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_prefix_closed_eviction_follows_ring_wrap() -> None:
     """Ring allocation that evicts a head also frees its descendants."""
-    monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "1")
     core = make_core(total_slots=4)
     _, keys = await _committed_chain(core, 3)
     fresh = await _committed_blocks(core, 2)

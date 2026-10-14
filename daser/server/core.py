@@ -267,11 +267,11 @@ class ServerCore:
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
         # Prefix-closed eviction: key -> keys a lookup reaches only through
-        # it, learned from looked-up prompts (research switch only). Edges to
+        # it, learned from looked-up prompts (on unless the switch is 0). Edges to
         # children that are neither stored, pending nor learned since the last
         # prune are dropped periodically, so it stays proportional to the
         # cache instead of to every prompt ever seen.
-        self._prefix_closed = os.environ.get(PREFIX_CLOSED_EVICTION_ENV) == "1"
+        self._prefix_closed = os.environ.get(PREFIX_CLOSED_EVICTION_ENV) != "0"
         self._chain_children: dict[str, set[str]] = {}
         self._chain_prompt: int | None = None
         self._chain_edges = 0

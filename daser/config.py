@@ -24,9 +24,9 @@ STORAGE_FORMATS = (
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
-#: Research switch for prefix-closed eviction: when FIFO capacity eviction
-#: removes a chunk, also remove its resident descendants, which no lookup can
-#: reach until the chunk is stored again.
+#: Prefix-closed eviction: when FIFO capacity eviction removes a chunk, also
+#: remove its resident descendants, which no lookup can reach until the chunk
+#: is stored again (default on; ``0`` keeps orphans for the ablation).
 PREFIX_CLOSED_EVICTION_ENV = "DASER_PREFIX_CLOSED_EVICTION"
 #: Exclusive L1/L2 tiers under compressed-online storage: new packed records
 #: live only in L1 and reach L2 when L1 evicts them (default on; ``0`` keeps
