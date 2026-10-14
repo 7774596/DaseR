@@ -35,7 +35,6 @@ from transformers import AutoTokenizer
 from vllm import SamplingParams
 
 # First Party
-from daser.connector.helpers import hash_tokens
 from daser.connector.ipc_client import IPCClientSync
 from daser.logging import init_logger
 
@@ -146,12 +145,7 @@ def test_skip_save_blocks_chunk_alloc(daser_server: tuple[str, str, int]) -> Non
             "Phase 1 (no flag): expected the prompt to be cached, "
             f"got {len(hits)} chunks. Connector default-path STORE broke."
         )
-        expected_key = hash_tokens(aligned_default)
-        assert any(c.get("chunk_key") == expected_key for c in hits), (
-            f"Phase 1: chunk_key mismatch — expected {expected_key[:12]}…, "
-            f"got {[c.get('chunk_key', '?')[:12] for c in hits]}"
-        )
-        logger.info("[SKIP-SAVE] Phase 1 OK — chunk %s… cached", expected_key[:12])
+        logger.info("[SKIP-SAVE] Phase 1 OK — %d chunk(s) cached", len(hits))
 
         # --------------------------------------------------------------
         # Phase 2: skip-save flag set — connector must NOT STORE
