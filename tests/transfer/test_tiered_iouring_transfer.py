@@ -2,7 +2,6 @@
 
 # Standard
 import asyncio
-import itertools
 import os
 import threading
 import time
@@ -1680,9 +1679,9 @@ def test_iouring_striped_read_copies_records_across_part_boundaries(
     copies: list[int] = []
     original_copy = layer_module.copy_ops.copy_grouped_to_dst
 
-    def counting_copy(dst, chunks, gather_min_runs=0) -> int:
+    def counting_copy(dst, chunks) -> int:
         copies.append(len(chunks))
-        return original_copy(dst, chunks, gather_min_runs)
+        return original_copy(dst, chunks)
 
     monkeypatch.setattr(layer_module.copy_ops, "copy_grouped_to_dst", counting_copy)
     blocks = 6
@@ -2357,10 +2356,7 @@ def test_iouring_rejects_l2_overflow(tmp_path) -> None:
         layer.close()
 
 
-@pytest.mark.parametrize("gather_min_runs", [0, 2])
-def test_iouring_leased_runs_copy_subranges_of_every_record(
-    tmp_path, gather_min_runs: int
-) -> None:
+def test_iouring_leased_runs_copy_subranges_of_every_record(tmp_path) -> None:
     """Vectorized leased runs land each record's subrange at its target."""
     cupy = pytest.importorskip("cupy")
     np = pytest.importorskip("numpy")
@@ -2374,7 +2370,6 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
             l1_bytes=records * record,
             l2_bytes=0,
             skip_l2=True,
-            gather_min_runs=gather_min_runs,
         )
         payloads = [
             bytearray((np.arange(record) * (i + 3) % 251).astype(np.uint8).tobytes())
@@ -2396,15 +2391,13 @@ def test_iouring_leased_runs_copy_subranges_of_every_record(
             # Stream zero exercises the batch fallback; a private stream the
             # real cudaMemcpyBatchAsync submission.
             streamed = StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
-            for target, copy_mode in itertools.product(
-                (dst, streamed), ("gather", "memcpy", "batch")
-            ):
+            for target in (dst, streamed):
                 dst.fill(0)
                 # The zero fill runs on the legacy stream, which a non-blocking
                 # copy stream does not wait for: finish it before loading.
                 cupy.cuda.Device().synchronize()
                 copied = await layer.load_leased_runs(
-                    target, files, targets, sizes, "runs", copy_mode=copy_mode
+                    target, files, targets, sizes, "runs"
                 )
                 streamed.stream.synchronize()
                 assert copied == records * size

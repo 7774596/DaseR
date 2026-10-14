@@ -2605,7 +2605,6 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l2_read_stripe_bytes": 0,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
-            "gather_min_runs": 0,
             "l2_write_gate": False,
             "readahead_budget_fraction": 0.5,
         }
@@ -2664,7 +2663,6 @@ async def test_bip_setting_is_forwarded(
             "l2_read_stripe_bytes": 0,
             "readahead_piece_bytes": 0,
             "readahead_window": 4,
-            "gather_min_runs": 0,
             "l2_write_gate": False,
             "readahead_budget_fraction": 0.5,
         }
@@ -2697,8 +2695,6 @@ class _RunsTransfer(TransferLayer):
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
-        *,
-        copy_mode: str = "gather",
     ) -> int:
         self.calls.append(
             (
@@ -2707,7 +2703,6 @@ class _RunsTransfer(TransferLayer):
                 list(target_offsets),
                 list(nbytes),
                 lease_id,
-                copy_mode,
             )
         )
         return int(sum(nbytes))
@@ -2744,21 +2739,11 @@ async def test_transfer_load_runs_decodes_run_table_into_registered_buffer(
             "runs": runs.tobytes(),
         }
     )
-    await server._transfer_load_runs(  # noqa: SLF001
-        {
-            "payload": {"load_staging_buffer_index": 1, "producer_pid": 7},
-            "lease_id": "req",
-            "runs": runs.tobytes(),
-            "copy_mode": "batch",
-        }
-    )
 
     assert response["ok"] is True
     assert response["bytes"] == 1536
-    # Gather stays the default; a request can pick copy-engine runs.
     assert transfer.calls == [
-        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", "gather"),
-        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req", "batch"),
+        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req"),
     ]
 
 

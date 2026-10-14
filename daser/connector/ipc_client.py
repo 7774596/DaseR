@@ -831,8 +831,6 @@ class IPCClientAsync(_IPCClientBase):
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
-        *,
-        copy_mode: str = "gather",
     ) -> dict[str, Any]:
         """Copy leased runs into a registered fixed CUDA staging buffer.
 
@@ -844,8 +842,6 @@ class IPCClientAsync(_IPCClientBase):
             nbytes: Run lengths.
             lease_id: Request lease from ``lookup_prefetch`` retaining every
                 run in L1.
-            copy_mode: ``gather`` (server gather kernel), ``memcpy`` or
-                ``batch`` (copy-engine runs).
 
         Returns:
             Server response with ``bytes`` and ``transfer_ms`` after the
@@ -873,7 +869,6 @@ class IPCClientAsync(_IPCClientBase):
                 },
                 "lease_id": lease_id,
                 "runs": runs.tobytes(),
-                "copy_mode": copy_mode,
             }
         )
 

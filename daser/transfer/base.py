@@ -392,8 +392,6 @@ class TransferLayer(ABC):
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
-        *,
-        copy_mode: str = "gather",
     ) -> int:
         """Copy many small runs retained by a request lease in one call.
 
@@ -403,8 +401,6 @@ class TransferLayer(ABC):
             target_offsets: ``int64`` array of destination offsets.
             nbytes: ``int64`` array of run lengths.
             lease_id: Request lease retaining every run.
-            copy_mode: ``gather`` (configured gather kernel), ``memcpy``
-                or ``batch`` (copy-engine runs).
 
         Returns:
             Bytes copied, after the copies completed on the device.

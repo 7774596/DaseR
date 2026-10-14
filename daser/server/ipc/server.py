@@ -14,7 +14,6 @@ from typing import Any
 from daser import stalldump
 from daser.config import (
     EXCLUSIVE_TIERS_ENV,
-    GATHER_MIN_RUNS_ENV,
     L2_WRITE_GATE_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
@@ -1320,8 +1319,7 @@ class IPCServer:
 
         Args:
             msg: IPC request with ``payload`` (registered staging buffer),
-                ``lease_id``, ``runs`` bytes and optional ``copy_mode``
-                (``gather`` default, ``memcpy`` or ``batch``).
+                ``lease_id`` and ``runs`` bytes.
 
         Returns:
             ``{"ok": True, "bytes": n, "transfer_ms": ms}`` once the copies
@@ -1355,7 +1353,6 @@ class IPCServer:
             runs[1],
             runs[2],
             lease_id,
-            copy_mode=str(msg.get("copy_mode", "gather")),
         )
         elapsed_s = time.perf_counter() - started
         self._record_transfer_metrics(
@@ -1733,7 +1730,6 @@ class IPCServer:
                     readahead_window=int(
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
-                    gather_min_runs=int(os.environ.get(GATHER_MIN_RUNS_ENV) or 0),
                     l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5

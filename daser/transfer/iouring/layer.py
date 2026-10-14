@@ -766,10 +766,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             them. The SSD queue depth then no longer depends on how many
             worker staging buffers are in flight. 0 disables readahead.
         readahead_window: Read groups in flight per readahead.
-        gather_min_runs: Research switch. When positive, an L1-to-CUDA copy
-            with at least this many discontiguous runs is issued as one
-            zero-copy gather kernel instead of one ``cudaMemcpyAsync`` per run,
-            so small scattered pieces still reach PCIe bandwidth. 0 disables.
         l2_write_gate: Research switch. L2 writes run on their own executor
             and pause between 16 MiB pieces while any L2 read is in native IO
             (bounded per piece), covering writes already issued when a read
@@ -798,14 +794,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_read_stripe_bytes: int = 0,
         readahead_piece_bytes: int = 0,
         readahead_window: int = 4,
-        gather_min_runs: int = 0,
         l2_write_gate: bool = False,
         readahead_budget_fraction: float = 0.5,
     ) -> None:
         if not 0.0 < readahead_budget_fraction < 1.0:
             raise ValueError("readahead_budget_fraction must be in (0, 1)")
-        if gather_min_runs < 0:
-            raise ValueError("gather_min_runs must be >= 0")
         if readahead_piece_bytes < 0 or readahead_window <= 0:
             raise ValueError(
                 "readahead_piece_bytes must be >= 0 and readahead_window > 0"
@@ -839,7 +832,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._readahead_piece = 0 if skip_l2 else readahead_piece_bytes
         self._readahead_window = readahead_window
         self._readahead_budget = int(l1_bytes * readahead_budget_fraction)
-        self._gather_min_runs = gather_min_runs
         # Lease ID -> readahead; insertion order is age for budget reclaim.
         self._readaheads: dict[str, _Readahead] = {}
         self._readahead_tasks: set[asyncio.Task[None]] = set()
@@ -881,7 +873,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s "
             "prefetch_lease_budget=%d l2_read_stripe=%d readahead_piece=%d "
-            "readahead_window=%d gather_min_runs=%d l2_write_gate=%s",
+            "readahead_window=%d l2_write_gate=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -894,7 +886,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             l2_read_stripe_bytes,
             self._readahead_piece,
             self._readahead_window,
-            self._gather_min_runs,
             l2_write_gate,
         )
 
@@ -1813,8 +1804,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
-        *,
-        copy_mode: str = "gather",
     ) -> int:
         """Copy many leased L1 runs with one vectorized resolution.
 
@@ -1830,11 +1819,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             file_offsets: ``int64`` array of physical run starts.
             target_offsets: ``int64`` array of destination offsets.
             nbytes: ``int64`` array of run lengths.
-            lease_id: Request lease retaining every run.
-            copy_mode: ``gather`` uses the configured gather kernel;
-                ``memcpy`` and ``batch`` keep the copies on the copy engines,
-                so they do not compete with a concurrent forward pass for
-                SMs.
+            lease_id: Request lease retaining every run. The copies run on
+                the copy engines, so they do not compete with a concurrent
+                forward pass for SMs.
 
         Returns:
             Bytes copied, after the copies completed on the device.
@@ -1890,8 +1877,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                     targets,
                     sources,
                     sizes,
-                    self._gather_min_runs,
-                    copy_mode,
                 )
             except BaseException:
                 lease.active_loads -= 1
@@ -2713,7 +2698,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         error: BaseException | None = None
         try:
-            runs = copy_ops.copy_grouped_to_dst(dst, chunks, self._gather_min_runs)
+            runs = copy_ops.copy_grouped_to_dst(dst, chunks)
             self._stats.dst_copies += 1
             self._stats.dst_copy_runs += runs
             self._stats.dst_copy_bytes += sum(chunk[3] for chunk in chunks)

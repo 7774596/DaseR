@@ -18,42 +18,6 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 #: One grouped copy chunk: (target_offset, source_slice, source_offset, nbytes).
 CopyChunk = tuple[int, PinnedMemorySlice, int, int]
 
-#: Zero-copy gather: each thread block copies whole pieces with 16-byte loads
-#: straight from pinned host memory, so small scattered pieces reach PCIe
-#: bandwidth where one cudaMemcpyAsync per piece is launch-bound.
-_GATHER_SOURCE = r"""
-extern "C" __global__ void daser_gather16(
-    const unsigned long long* src, const unsigned long long* dst,
-    const unsigned long long* nbytes, int count) {
-  for (int piece = blockIdx.x; piece < count; piece += gridDim.x) {
-    const uint4* s = (const uint4*)src[piece];
-    uint4* d = (uint4*)dst[piece];
-    unsigned long long n = nbytes[piece] / 16;
-    for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
-  }
-}
-"""
-#: Layer-group gather: the same copy, but every record contributes the range
-#: at one shared offset, so the per-request record table is uploaded once and
-#: each layer group launches with scalar offsets only.
-_LAYER_GATHER_SOURCE = r"""
-extern "C" __global__ void daser_layer_gather16(
-    const unsigned long long* src, const unsigned long long* dst,
-    unsigned long long src_offset, unsigned long long dst_offset,
-    unsigned long long nbytes, int count) {
-  unsigned long long n = nbytes / 16;
-  for (int rec = blockIdx.x; rec < count; rec += gridDim.x) {
-    const uint4* s = (const uint4*)(src[rec] + src_offset);
-    uint4* d = (uint4*)(dst[rec] + dst_offset);
-    for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
-  }
-}
-"""
-_GATHER_BLOCKS = 1056
-_GATHER_THREADS = 512
-_gather_kernel: Any = None
-_layer_gather_kernel: Any = None
-
 
 def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, int]]:
     """Return ``(dst_ptr, src_ptr, nbytes)`` runs with adjacent chunks merged."""
@@ -93,11 +57,6 @@ def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, 
     return runs
 
 
-#: Per-run copy modes for ``copy_pointer_runs_to_cuda_dst``.
-COPY_MODE_GATHER = "gather"
-COPY_MODE_MEMCPY = "memcpy"
-COPY_MODE_BATCH = "batch"
-COPY_MODES = (COPY_MODE_GATHER, COPY_MODE_MEMCPY, COPY_MODE_BATCH)
 #: ``cudaMemcpySrcAccessOrderStream``: sources are read in stream order.
 _SRC_ACCESS_ORDER_STREAM = 1
 
@@ -174,129 +133,17 @@ def _launch_memcpy_batch(
         )
 
 
-def _launch_gather(meta: Any, stream_ptr: int) -> None:
-    """Queue one zero-copy gather kernel for 16-byte-aligned runs.
-
-    ``meta`` is a ``(3, runs)`` uint64 array of destination pointers, source
-    pointers and lengths. Must run under the destination's
-    ``cupy.cuda.Device`` context.
-    """
-    global _gather_kernel
-    import cupy
-    import numpy
-
-    if _gather_kernel is None:
-        _gather_kernel = cupy.RawKernel(_GATHER_SOURCE, "daser_gather16")
-    count = int(meta.shape[1])
-    stream = cupy.cuda.ExternalStream(stream_ptr)
-    with stream:
-        device_meta = cupy.asarray(numpy.ascontiguousarray(meta, dtype=numpy.uint64))
-        _gather_kernel(
-            (min(_GATHER_BLOCKS, count),),
-            (_GATHER_THREADS,),
-            (
-                device_meta[1],
-                device_meta[0],
-                device_meta[2],
-                numpy.int32(count),
-            ),
-        )
-
-
-class LayerGatherPlan:
-    """Per-request record table for layer-group copies into a CUDA buffer.
-
-    Record ``i`` starts at host address ``src_ptrs[i]`` (pinned, mapped) and
-    its packed destination block starts at ``dst_ptrs[i]``. The table is
-    uploaded once; each ``copy`` then moves ``[src_offset, src_offset +
-    nbytes)`` of every record to ``dst_offset`` of its destination block with
-    one kernel launch and no per-record host work.
-
-    Args:
-        src_ptrs: Host pointers of the record starts.
-        dst_ptrs: Device pointers of the destination blocks.
-        stream_ptr: CUDA stream the copies are queued on.
-        device_id: CUDA device owning the destination.
-
-    Async/thread-safety:
-        Not thread-safe. The caller keeps the source slices and destination
-        alive until the stream passes the last ``copy``; the table itself is
-        a stream-ordered allocation held by this object.
-    """
-
-    def __init__(
-        self,
-        src_ptrs: list[int],
-        dst_ptrs: list[int],
-        stream_ptr: int,
-        device_id: int,
-    ) -> None:
-        if len(src_ptrs) != len(dst_ptrs) or not src_ptrs:
-            raise ValueError("src_ptrs and dst_ptrs must be equal and nonempty")
-        if any((s | d) % 16 for s, d in zip(src_ptrs, dst_ptrs, strict=True)):
-            raise ValueError("record pointers must be 16-byte aligned")
-        global _layer_gather_kernel
-        import cupy
-        import numpy
-
-        self._count = len(src_ptrs)
-        self._stream_ptr = stream_ptr
-        self._device_id = device_id
-        with cupy.cuda.Device(device_id):
-            if _layer_gather_kernel is None:
-                _layer_gather_kernel = cupy.RawKernel(
-                    _LAYER_GATHER_SOURCE, "daser_layer_gather16"
-                )
-            with cupy.cuda.ExternalStream(stream_ptr):
-                self._src = cupy.asarray(numpy.array(src_ptrs, dtype=numpy.uint64))
-                self._dst = cupy.asarray(numpy.array(dst_ptrs, dtype=numpy.uint64))
-
-    @property
-    def count(self) -> int:
-        """Return the number of records in the plan."""
-        return self._count
-
-    def copy(self, src_offset: int, dst_offset: int, nbytes: int) -> None:
-        """Queue one layer-group copy from every record.
-
-        Args:
-            src_offset: Byte offset of the range inside each record.
-            dst_offset: Byte offset inside each destination block.
-            nbytes: Range length; offsets and length must be 16-byte multiples.
-
-        Returns:
-            None. The copy is queued on the plan's stream.
-        """
-        if (src_offset | dst_offset | nbytes) % 16:
-            raise ValueError("layer gather offsets and length must be 16-aligned")
-        import cupy
-        import numpy
-
-        with cupy.cuda.Device(self._device_id):
-            with cupy.cuda.ExternalStream(self._stream_ptr):
-                _layer_gather_kernel(
-                    (min(_GATHER_BLOCKS, self._count),),
-                    (_GATHER_THREADS,),
-                    (
-                        self._src,
-                        self._dst,
-                        numpy.uint64(src_offset),
-                        numpy.uint64(dst_offset),
-                        numpy.uint64(nbytes),
-                        numpy.int32(self._count),
-                    ),
-                )
-
-
 def copy_pointer_runs_to_cuda_dst(
     dst: Any,
     target_offsets: Any,
     source_ptrs: Any,
     nbytes: Any,
-    gather_min_runs: int = 0,
-    copy_mode: str = COPY_MODE_GATHER,
 ) -> Any:
     """Queue host-pointer runs into a flat CUDA byte destination.
+
+    Every run goes to the copy engines in one ``cudaMemcpyBatchAsync``, or
+    one ``cudaMemcpyAsync`` per run on the legacy default stream, which batch
+    copies do not accept.
 
     Args:
         dst: Flat CuPy-like byte destination, optionally exposing
@@ -304,15 +151,9 @@ def copy_pointer_runs_to_cuda_dst(
         target_offsets: ``int64`` array of destination byte offsets.
         source_ptrs: ``uint64`` array of pinned, device-mapped host pointers.
         nbytes: ``int64`` array of run lengths.
-        gather_min_runs: Use one zero-copy gather launch when at least this
-            many runs are given and all are 16-byte aligned (0 disables).
-        copy_mode: ``gather`` applies ``gather_min_runs``; ``memcpy`` issues
-            one copy-engine ``cudaMemcpyAsync`` per run; ``batch`` submits
-            every run in one copy-engine ``cudaMemcpyBatchAsync`` (falls back
-            to ``memcpy`` on the legacy default stream).
 
     Raises:
-        ValueError: If the runs are malformed or the copy mode is unknown.
+        ValueError: If the runs are malformed.
 
     Returns:
         A CUDA event recorded on the destination stream after the copies.
@@ -331,8 +172,6 @@ def copy_pointer_runs_to_cuda_dst(
     sizes = numpy.asarray(nbytes, dtype=numpy.int64)
     if not (len(targets) == len(sources) == len(sizes)) or not len(targets):
         raise ValueError("pointer runs must be nonempty and of equal length")
-    if copy_mode not in COPY_MODES:
-        raise ValueError(f"unknown copy mode: {copy_mode}")
     end = int((targets + sizes).max())
     whole = slice_dst(dst, 0, end)
     base_ptr = cuda_array_ptr(whole)
@@ -341,21 +180,7 @@ def copy_pointer_runs_to_cuda_dst(
     dst_ptrs = targets.astype(numpy.uint64) + numpy.uint64(base_ptr)
     stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
     with cupy.cuda.Device(int(whole.device.id)):
-        aligned = not (
-            numpy.bitwise_or.reduce(dst_ptrs | sources | sizes.astype(numpy.uint64))
-            % 16
-        )
-        if (
-            copy_mode == COPY_MODE_GATHER
-            and gather_min_runs
-            and len(sizes) >= gather_min_runs
-            and aligned
-        ):
-            _launch_gather(
-                numpy.stack([dst_ptrs, sources, sizes.astype(numpy.uint64)]),
-                stream_ptr,
-            )
-        elif copy_mode == COPY_MODE_BATCH and stream_ptr:
+        if stream_ptr:
             _launch_memcpy_batch(dst_ptrs, sources, sizes, stream_ptr)
         else:
             for d, s, n in zip(
@@ -535,24 +360,18 @@ def coalesce_copy_chunks(chunks: list[CopyChunk]) -> list[CopyChunk]:
     return merged
 
 
-def copy_grouped_to_cuda_dst(
-    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
-) -> int:
+def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> int:
     """Copy grouped pinned ranges into a CUDA destination.
 
     Args:
         dst: CuPy ndarray destination.
         chunks: grouped copy chunks from the L1 tier.
-        gather_min_runs: Use one zero-copy gather kernel instead of one
-            ``cudaMemcpyAsync`` per run when at least this many merged runs
-            remain and every run is 16-byte aligned (0 disables).
 
     Returns:
         Number of merged runs copied.
 
     Async/thread-safety:
-        Work is queued on the destination's copy stream. Gather metadata is a
-        stream-ordered CuPy allocation, so it stays valid until the kernel runs.
+        Work is queued on the destination's copy stream.
     """
     import cupy
     from cupy.cuda import runtime
@@ -560,8 +379,7 @@ def copy_grouped_to_cuda_dst(
     runs = _merge_cuda_runs(dst, chunks)
     stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
     device_id = int(slice_dst(dst, 0, 0).device.id)
-    # Device-resident sources (the device stash) copy device-to-device; the
-    # gather kernel and batch attributes assume pinned host sources.
+    # Device-resident sources (the device stash) copy device-to-device.
     on_device = any(getattr(chunk[1], "on_device", False) for chunk in chunks)
     with cupy.cuda.Device(device_id):
         if on_device:
@@ -570,15 +388,6 @@ def copy_grouped_to_cuda_dst(
                     dst_ptr, source_ptr, nbytes, runtime.memcpyDefault, stream_ptr
                 )
             return len(runs)
-        if (
-            gather_min_runs
-            and len(runs) >= gather_min_runs
-            and all(not (d | s | n) % 16 for d, s, n in runs)
-        ):
-            import numpy
-
-            _launch_gather(numpy.array(runs, dtype=numpy.uint64).T, stream_ptr)
-            return len(runs)
         for dst_ptr, source_ptr, nbytes in runs:
             runtime.memcpyAsync(
                 dst_ptr, source_ptr, nbytes, runtime.memcpyHostToDevice, stream_ptr
@@ -586,16 +395,12 @@ def copy_grouped_to_cuda_dst(
     return len(runs)
 
 
-def copy_grouped_to_dst(
-    dst: Any, chunks: list[CopyChunk], gather_min_runs: int = 0
-) -> int:
+def copy_grouped_to_dst(dst: Any, chunks: list[CopyChunk]) -> int:
     """Copy source chunks into the destination without staging repacks.
 
     Args:
         dst: writable buffer or CuPy ndarray destination.
         chunks: grouped copy chunks from the L1 tier.
-        gather_min_runs: CUDA destinations only; see
-            ``copy_grouped_to_cuda_dst``.
 
     Returns:
         Number of merged runs copied into a CUDA destination, else 0.
@@ -604,7 +409,7 @@ def copy_grouped_to_dst(
         return 0
     first_target = slice_dst(dst, chunks[0][0], chunks[0][3])
     if cuda_array_ptr(first_target) is not None:
-        return copy_grouped_to_cuda_dst(dst, chunks, gather_min_runs)
+        return copy_grouped_to_cuda_dst(dst, chunks)
 
     for target_offset, data, source_offset, nbytes in coalesce_copy_chunks(chunks):
         target = slice_dst(dst, target_offset, nbytes)

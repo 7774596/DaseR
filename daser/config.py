@@ -43,17 +43,6 @@ LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
 #: Research switch: ``1`` logs a monotonic timestamp per request at its first
 #: lookup, its block allocation and its load completion (scheduler side).
 ADMIT_TRACE_ENV = "DASER_ADMIT_TRACE"
-#: Research switch: issue L1-to-GPU copies with at least this many
-#: discontiguous runs as one zero-copy gather kernel (0 or unset disables).
-GATHER_MIN_RUNS_ENV = "DASER_GATHER_MIN_RUNS"
-#: Research switch: layer-wise ``transfer_load_runs`` copy mode, ``gather``
-#: (SM gather kernel, default), ``memcpy`` or ``batch`` (copy engines). The
-#: copies run while the forward pass occupies the SMs.
-LAYERWISE_COPY_ENV = "DASER_LAYERWISE_COPY"
-#: Research switch: layer-wise restore slots per staging buffer (default 1).
-#: More slots let later layers' transfers run while earlier layers restore;
-#: a request gets as many as its per-layer bytes fit.
-LAYERWISE_SLOTS_ENV = "DASER_LAYERWISE_SLOTS"
 #: Research switch: ``1`` times how long the forward stream idles at each
 #: layer's restore and logs the sum per layer-wise load as ``gpu_stall_ms``.
 LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
