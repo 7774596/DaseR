@@ -61,6 +61,9 @@ class RequestResult:
     #: is the request's engine steps, so completion_tokens / token_events is
     #: its mean speculative acceptance length (tokens per step).
     token_events: int = 0
+    #: Client-observed gaps between consecutive token events in ms (per-step
+    #: inter-token latency; ``token_events - 1`` entries).
+    token_gaps_ms: list[float] = field(default_factory=list)
     #: Generated token IDs in stream order (from ``return_token_ids``).
     generated_token_ids: list[int] = field(default_factory=list)
 
@@ -631,6 +634,8 @@ async def vllm_completion_stream(
     first_nonempty_text = False
     queue_ms = 0.0
     token_events = 0
+    token_gaps_ms: list[float] = []
+    last_token_at: float | None = None
     generated: list[int] = []
     try:
         async with sem:
@@ -665,6 +670,10 @@ async def vllm_completion_stream(
                         token_events += has_token
                         if has_token:
                             generated.extend(int(token) for token in token_ids)
+                            now = time.perf_counter()
+                            if last_token_at is not None:
+                                token_gaps_ms.append((now - last_token_at) * 1000)
+                            last_token_at = now
                         if first_token_at is None and (fragment or has_token):
                             first_token_at = time.perf_counter()
                             if on_first_token is not None:
@@ -730,6 +739,7 @@ async def vllm_completion_stream(
         sent_at_s=t0,
         first_token_at_s=first_token_at,
         token_events=token_events,
+        token_gaps_ms=token_gaps_ms,
         generated_token_ids=generated,
     )
 

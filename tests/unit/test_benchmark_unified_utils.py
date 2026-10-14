@@ -4179,6 +4179,9 @@ async def test_vllm_stream_counts_token_events_per_step() -> None:
 
     assert result.completion_tokens == 4
     assert result.token_events == 2
+    # One gap between the two token events; the empty chunk adds none.
+    assert len(result.token_gaps_ms) == 1
+    assert result.token_gaps_ms[0] >= 0.0
 
 
 def test_lmcache_server_runs_the_cli_module_of_the_configured_checkout(

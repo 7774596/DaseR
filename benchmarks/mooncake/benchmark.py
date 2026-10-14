@@ -937,6 +937,11 @@ def summarise(
         for result in successful
         if result.get("tpot_ms") is not None
     ]
+    # Per-step inter-token gaps pooled over requests; a request's mean
+    # (TPOT) hides the few decode steps that overlap a store encode.
+    token_gaps = [
+        float(gap) for result in successful for gap in result.get("token_gaps_ms", [])
+    ]
     instances: dict[str, int] = {}
     for result in successful:
         key = str(result.get("instance", 0))
@@ -961,6 +966,7 @@ def summarise(
         "arrival_to_first_token_ms": _latency_summary(arrival_ttfts),
         "arrival_to_completion_ms": _latency_summary(arrival_latencies),
         "tpot_ms": _latency_summary(tpots),
+        "itl_ms": _latency_summary(token_gaps),
         "requests_per_instance": instances,
         "prefix_cache": _prefix_cache_summary(prefix_cache_metrics or {}),
     }

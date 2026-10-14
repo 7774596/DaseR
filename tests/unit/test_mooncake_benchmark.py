@@ -176,9 +176,11 @@ def test_context_selection_and_summary_report_skipped_token_mass() -> None:
                 "client_queue_ms": 1,
                 "arrival_to_first_token_ms": 12,
                 "arrival_to_completion_ms": 22,
+                "token_gaps_ms": [1.0, 3.0],
             },
             {
                 "error": "failed",
+                "token_gaps_ms": [100.0],
                 "ttft_ms": 0,
                 "latency_ms": 0,
                 "client_queue_ms": 0,
@@ -202,6 +204,8 @@ def test_context_selection_and_summary_report_skipped_token_mass() -> None:
     assert summary["failed_requests"] == 1
     assert summary["ttft_ms"]["p99"] == 10
     assert summary["arrival_to_first_token_ms"]["p99"] == 12
+    # Inter-token gaps pool successful requests only.
+    assert summary["itl_ms"]["mean"] == 2.0
     assert summary["prefix_cache"]["local_hit_rate"] == 0.6
 
 
