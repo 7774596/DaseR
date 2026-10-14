@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 # First Party
+from daser.config import DEFAULT_LOAD_READAHEAD_BYTES
 from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
 from daser.metrics import MetricsRegistry
 from daser.position.fixed_offset import FixedOffsetEncoder
@@ -1655,8 +1656,11 @@ async def test_online_store_observes_packed_record_ratios(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_online_store_evicts_oldest_when_packed_arena_is_full(tmp_path) -> None:
+async def test_online_store_evicts_oldest_when_packed_arena_is_full(
+    tmp_path, monkeypatch
+) -> None:
     """Raw-size records overflow an over-provisioned ring; FIFO eviction frees bytes."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path, logical_slots=8, arena_slots=2
     )
@@ -1702,8 +1706,11 @@ async def _refresh_tier_metrics(server: IPCServer, socket_path: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_inclusive_tiers_keep_l2_victims_resident_in_l1(tmp_path) -> None:
+async def test_inclusive_tiers_keep_l2_victims_resident_in_l1(
+    tmp_path, monkeypatch
+) -> None:
     """An L2 FIFO victim still held by L1 stays indexed; it leaves only L2."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1743,9 +1750,9 @@ async def test_tier_policy_decides_writes_and_recharge_order(
 ) -> None:
     """Exclusive tiers write records once L1 evicts them; inclusive write through."""
     if exclusive:
-        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
-    else:
         monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
+    else:
+        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "0")
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1782,7 +1789,7 @@ async def test_exclusive_store_removed_mid_write_keeps_its_successor(
     Stores "b" and "c" then reclaim "z" and "a" from the two-record arena.
     Whatever survives must load back its own bytes.
     """
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -1848,7 +1855,7 @@ async def test_memory_only_online_store_keeps_packed_records_in_l1(
     tmp_path, monkeypatch
 ) -> None:
     """Without L2 the packed arena spans L1: records load back, none reach SSD."""
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
     registry = MetricsRegistry()
     core, server, socket_path, local_slot_size = _online_arena_server(
         tmp_path,
@@ -2603,9 +2610,9 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l1_accounting": "stored",
             "prefetch_lease_budget_bytes": 0,
             "l2_read_stripe_bytes": 0,
-            "readahead_piece_bytes": 0,
+            "readahead_piece_bytes": DEFAULT_LOAD_READAHEAD_BYTES,
             "readahead_window": 4,
-            "l2_write_gate": False,
+            "l2_write_gate": True,
             "readahead_budget_fraction": 0.5,
         }
     ]
@@ -2661,9 +2668,9 @@ async def test_bip_setting_is_forwarded(
             "l1_accounting": "stored",
             "prefetch_lease_budget_bytes": 0,
             "l2_read_stripe_bytes": 0,
-            "readahead_piece_bytes": 0,
+            "readahead_piece_bytes": DEFAULT_LOAD_READAHEAD_BYTES,
             "readahead_window": 4,
-            "l2_write_gate": False,
+            "l2_write_gate": True,
             "readahead_budget_fraction": 0.5,
         }
     ]

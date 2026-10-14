@@ -29,16 +29,17 @@ L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
 #: reach until the chunk is stored again.
 PREFIX_CLOSED_EVICTION_ENV = "DASER_PREFIX_CLOSED_EVICTION"
 #: Exclusive L1/L2 tiers under compressed-online storage: new packed records
-#: live only in L1 and reach L2 when L1 evicts them (default inclusive). See
-#: docs/design/tier-residency.md.
+#: live only in L1 and reach L2 when L1 evicts them (default on; ``0`` keeps
+#: inclusive tiers). See docs/design/tier-residency.md.
 EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: Research control for compressed-online storage: ``1`` makes the worker
 #: store every packed record through the raw fallback, so the packed layout
 #: and exclusive tiers can be measured without compression.
 PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
-#: Research switch for lookup-triggered L2 readahead: read group size in
-#: bytes (0 or unset disables), and the number of groups kept in flight.
+#: Lookup-triggered L2 readahead: read group size in bytes (default 1 GiB,
+#: ``0`` disables), and the number of groups kept in flight.
 LOAD_READAHEAD_ENV = "DASER_LOAD_READAHEAD"
+DEFAULT_LOAD_READAHEAD_BYTES = 1024 * 1024 * 1024
 LOAD_READAHEAD_WINDOW_ENV = "DASER_LOAD_READAHEAD_WINDOW"
 #: Research switch: ``1`` logs a monotonic timestamp per request at its first
 #: lookup, its block allocation and its load completion (scheduler side).
@@ -46,8 +47,8 @@ ADMIT_TRACE_ENV = "DASER_ADMIT_TRACE"
 #: Research switch: ``1`` times how long the forward stream idles at each
 #: layer's restore and logs the sum per layer-wise load as ``gpu_stall_ms``.
 LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
-#: Research switch: ``1`` runs L2 writes on their own executor in 16 MiB
-#: pieces that pause (bounded) while any L2 read is in native IO.
+#: L2 writes run on their own executor in 16 MiB pieces that pause (bounded)
+#: while any L2 read is in native IO (default on; ``0`` disables).
 L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).

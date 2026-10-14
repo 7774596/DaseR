@@ -63,9 +63,9 @@ L1 按自身 LRU/BIP 淘汰。held 条目离开 L1 时：
 
 两者只在 store 策略上不同：
 
-- inclusive（默认）：record 写入 L1 并立即异步写 SSD，放置即 charged。
+- inclusive（`DASER_EXCLUSIVE_TIERS=0`）：record 写入 L1 并立即异步写 SSD，放置即 charged。
   L1 与 L2 内容可以重叠；行为对应 LMCache 的 L1/L2 write-through。
-- exclusive（`DASER_EXCLUSIVE_TIERS=1`）：新 record 以 held-dirty 放置，只写
+- exclusive（默认）：新 record 以 held-dirty 放置，只写
   L1、不计 L2 预算；L1 淘汰时才写 SSD 并进入 FIFO 头。L1 中驻留的数据不占
   L2 预算，两层合计容量接近 `L1 + L2`。
 

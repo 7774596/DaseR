@@ -13,6 +13,7 @@ from typing import Any
 
 from daser import stalldump
 from daser.config import (
+    DEFAULT_LOAD_READAHEAD_BYTES,
     EXCLUSIVE_TIERS_ENV,
     L2_WRITE_GATE_ENV,
     LOAD_READAHEAD_ENV,
@@ -272,8 +273,10 @@ class IPCServer:
             == STORAGE_FORMAT_COMPRESSED_ONLINE
         )
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
-        # Research switch: L2 readahead group size started by plain lookups.
-        self._readahead_piece = int(os.environ.get(LOAD_READAHEAD_ENV, "0") or 0)
+        # L2 readahead group size started by plain lookups (0 disables).
+        self._readahead_piece = int(
+            os.environ.get(LOAD_READAHEAD_ENV) or DEFAULT_LOAD_READAHEAD_BYTES
+        )
         self._prev_readahead_bytes: dict[str, int] = {}
         self._prev_promotion_wait_us: dict[str, int] = {}
         self._prev_store_lease_wait_us = 0
@@ -289,7 +292,7 @@ class IPCServer:
             self._runtime_config.get("skip_l2", False)
         )
         self._exclusive_tiers = (
-            self._packed_tiers and os.environ.get(EXCLUSIVE_TIERS_ENV) == "1"
+            self._packed_tiers and os.environ.get(EXCLUSIVE_TIERS_ENV) != "0"
         )
         if self._exclusive_tiers:
             self._runtime_config["exclusive_tiers"] = True
@@ -1730,7 +1733,7 @@ class IPCServer:
                     readahead_window=int(
                         os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
                     ),
-                    l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) == "1",
+                    l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) != "0",
                     readahead_budget_fraction=float(
                         os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
                     ),
