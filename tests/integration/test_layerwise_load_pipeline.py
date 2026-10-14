@@ -14,7 +14,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import IO_ALIGNMENT
+from daser.compression.format import IO_ALIGNMENT, ONLINE_TILE_SCALARS
 from daser.config import LAYERWISE_GPU_STALL_ENV
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker import load as load_module
@@ -31,7 +31,7 @@ pytestmark = [
 
 # More layers than the two lanes, so lanes get refilled.
 _LAYERS = 8
-_TILE_SCALARS = 1024
+_TILE_SCALARS = ONLINE_TILE_SCALARS
 
 
 def _geometry() -> CompressedStoreGeometry:

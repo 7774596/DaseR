@@ -24,7 +24,7 @@ from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 _LAYERS = 4
 
 
-def _geometry(tile_scalars: int) -> CompressedStoreGeometry:
+def _geometry() -> CompressedStoreGeometry:
     return CompressedStoreGeometry(
         num_slots=3,
         slot_size=_LAYERS * 2 * 128 * 4 * 128 * 2,
@@ -32,7 +32,6 @@ def _geometry(tile_scalars: int) -> CompressedStoreGeometry:
         num_layers=_LAYERS,
         num_kv_heads=4,
         head_dim=128,
-        tile_scalars=tile_scalars,
     )
 
 
@@ -64,14 +63,11 @@ def _kv_cache(num_blocks: int, geometry: CompressedStoreGeometry) -> torch.Tenso
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("tile_scalars", [256, 1024])
 @pytest.mark.parametrize("group_layers", [1, 2])
-def test_layer_groups_restore_like_whole_records(
-    tile_scalars: int, group_layers: int
-) -> None:
+def test_layer_groups_restore_like_whole_records(group_layers: int) -> None:
     """Restoring every layer group from layer-major staging equals one full
     record-major restore, and a group touches only its own layers."""
-    geometry = _geometry(tile_scalars)
+    geometry = _geometry()
     codebooks = default_online_codebooks(geometry)
     encoded = [
         encode_slot(
@@ -92,14 +88,14 @@ def test_layer_groups_restore_like_whole_records(
         reference = FusedCompressedKVDecoder(
             kv_cache=expected,
             codebooks=codebooks,
-            tile_scalars=tile_scalars,
+            tile_scalars=geometry.tile_scalars,
             ring_depth=1,
             max_slots_per_buffer=3,
         )
         decoder = FusedCompressedKVDecoder(
             kv_cache=actual,
             codebooks=codebooks,
-            tile_scalars=tile_scalars,
+            tile_scalars=geometry.tile_scalars,
             ring_depth=1,
             max_slots_per_buffer=3,
         )
@@ -144,10 +140,9 @@ def test_layer_groups_restore_like_whole_records(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("tile_scalars", [256, 1024])
-def test_one_prepare_restores_groups_from_separate_staging(tile_scalars: int) -> None:
+def test_one_prepare_restores_groups_from_separate_staging() -> None:
     """One prepared plan decodes each group from its own staging buffer."""
-    geometry = _geometry(tile_scalars)
+    geometry = _geometry()
     codebooks = default_online_codebooks(geometry)
     payloads = [
         encode_slot(
@@ -167,7 +162,7 @@ def test_one_prepare_restores_groups_from_separate_staging(tile_scalars: int) ->
             FusedCompressedKVDecoder(
                 kv_cache=cache,
                 codebooks=codebooks,
-                tile_scalars=tile_scalars,
+                tile_scalars=geometry.tile_scalars,
                 ring_depth=1,
                 max_slots_per_buffer=3,
             )
@@ -222,13 +217,13 @@ def test_one_prepare_restores_groups_from_separate_staging(tile_scalars: int) ->
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_partial_plane_range_rejects_raw_records() -> None:
     """Raw fallback records cannot be restored one plane group at a time."""
-    geometry = _geometry(1024)
+    geometry = _geometry()
     codebooks = default_online_codebooks(geometry)
     with torch.inference_mode():
         decoder = FusedCompressedKVDecoder(
             kv_cache=_kv_cache(1, geometry),
             codebooks=codebooks,
-            tile_scalars=1024,
+            tile_scalars=geometry.tile_scalars,
             ring_depth=1,
             max_slots_per_buffer=1,
         )

@@ -23,7 +23,6 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import ONLINE_TILE_SCALARS
 from daser.compression.layer_major import (
     plan_layer_group,
     plan_layer_groups,
@@ -136,7 +135,6 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-tokens", type=int, default=128)
-    parser.add_argument("--tile-scalars", type=int, default=ONLINE_TILE_SCALARS)
     parser.add_argument("--groups", type=int, nargs="+", default=[1, 2, 4, 12, 36])
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
@@ -149,7 +147,6 @@ def main() -> None:
         num_layers=args.layers,
         num_kv_heads=args.heads,
         head_dim=args.head_dim,
-        tile_scalars=args.tile_scalars,
     )
     codebooks = default_online_codebooks(geometry)
     unique = [_record(geometry, seed, codebooks) for seed in range(4)]
@@ -176,7 +173,7 @@ def main() -> None:
         decoder = FusedCompressedKVDecoder(
             kv_cache=kv_cache,
             codebooks=codebooks,
-            tile_scalars=args.tile_scalars,
+            tile_scalars=geometry.tile_scalars,
             ring_depth=1,
             max_slots_per_buffer=args.records,
         )
@@ -193,7 +190,7 @@ def main() -> None:
     print(
         f"records={args.records} record_mb={record_bytes / args.records / 1e6:.2f} "
         f"ratio={record_bytes / (args.records * slot_size):.3f} "
-        f"tile={args.tile_scalars}"
+        f"tile={geometry.tile_scalars}"
     )
     print(
         f"record-major all planes: host {host:.2f} ms gpu {gpu:.2f} ms "

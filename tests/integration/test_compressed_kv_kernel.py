@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -73,9 +72,8 @@ def _slot(geometry: CompressedStoreGeometry, seed: int) -> bytes:
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("tile_scalars", [512, 1024, 2048])
-def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> None:
-    geometry = replace(_geometry(), tile_scalars=tile_scalars)
+def test_fused_decoder_restores_mixed_slots_byte_exact() -> None:
+    geometry = _geometry()
     raw_compressed = _slot(geometry, 1)
     raw_fallback = _slot(geometry, 2)
     codebooks = default_online_codebooks(geometry)
@@ -127,29 +125,24 @@ def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> Non
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("gpu_packed", [False, True])
-@pytest.mark.parametrize("tile_scalars", [256, 1024])
 @pytest.mark.parametrize("prepared", [False, True])
 def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
     monkeypatch: pytest.MonkeyPatch,
     gpu_packed: bool,
-    tile_scalars: int,
     prepared: bool,
 ) -> None:
     """Interleaved aliases restore exact KV to distinct targets without new JIT."""
     import tilelang
 
-    geometry = replace(_geometry(), tile_scalars=tile_scalars)
-    if tile_scalars == 256:
-        # Leave a partial tile and fewer than four tiles in the final CTA.
-        geometry = CompressedStoreGeometry(
-            num_slots=2,
-            slot_size=8 * 2 * 128 * 61 * 2,
-            block_tokens=128,
-            num_layers=8,
-            num_kv_heads=1,
-            head_dim=61,
-            tile_scalars=tile_scalars,
-        )
+    # Leave a partial tile and fewer than four tiles in the final CTA.
+    geometry = CompressedStoreGeometry(
+        num_slots=2,
+        slot_size=8 * 2 * 128 * 61 * 2,
+        block_tokens=128,
+        num_layers=8,
+        num_kv_heads=1,
+        head_dim=61,
+    )
     packed_raw, fallback_raw = _slot(geometry, 51), _slot(geometry, 52)
     codebooks = default_online_codebooks(geometry)
     if gpu_packed:
@@ -167,7 +160,7 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
             .cuda()
         )
         source = _kv_cache(1, geometry, source)
-        warm_fused_online_kv_packer(source, 1, tile_scalars=tile_scalars)
+        warm_fused_online_kv_packer(source, 1)
         packer = FusedOnlineKVPacker(
             kv_cache=source,
             codebooks=codebooks,
@@ -285,24 +278,12 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    ("tile_scalars", "escape_pattern"),
-    [
-        (256, "sparse"),
-        (256, "secondary"),
-        (256, "clustered_raw"),
-        (512, "sparse"),
-        (513, "sparse"),
-        (1024, "sparse"),
-        (2048, "sparse"),
-    ],
-)
+@pytest.mark.parametrize("escape_pattern", ["sparse", "secondary", "clustered_raw"])
 def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
-    tile_scalars: int,
     escape_pattern: str,
 ) -> None:
     """Preserve escapes and raw slots across aligned and partial tile words."""
-    geometry = replace(_geometry(), tile_scalars=tile_scalars)
+    geometry = _geometry()
     if escape_pattern != "sparse":
         # A full escape stream exercises the final allocated scratch word.
         # Thirty-one tiles leave one inactive warp and a partial tail tile.
@@ -313,7 +294,6 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
             num_layers=8,
             num_kv_heads=1,
             head_dim=61,
-            tile_scalars=tile_scalars,
         )
     raw_compressed = _slot(geometry, 21)
     raw_fallback_array = np.frombuffer(_slot(geometry, 22), dtype=np.uint8).copy()
@@ -499,12 +479,8 @@ def test_online_packer_force_raw_stores_every_record_raw_byte_exact(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    ("tile_scalars", "num_layers", "head_dim"),
-    [(256, 2, 127), (1024, 2, 127), (256, 18, 129)],
-)
+@pytest.mark.parametrize(("num_layers", "head_dim"), [(2, 127), (18, 129)])
 def test_online_packer_handles_production_batch_geometry_and_partial_tail(
-    tile_scalars: int,
     num_layers: int,
     head_dim: int,
 ) -> None:
@@ -523,7 +499,6 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
         num_layers=num_layers,
         num_kv_heads=4,
         head_dim=head_dim,
-        tile_scalars=tile_scalars,
     )
     source_block_ids = [1 + ((index * 17) % 95) for index in range(48)]
     assert len(set(source_block_ids)) == len(source_block_ids)

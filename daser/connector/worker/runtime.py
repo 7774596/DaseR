@@ -570,7 +570,7 @@ class WorkerRuntime:
         codebooks = config.get("compressed_codebooks", b"")
         if not isinstance(codebooks, bytes):
             raise ValueError("compressed codebooks must be a byte payload")
-        tile_scalars = int(config.get("compressed_tile_scalars", 1024))
+        tile_scalars = int(config.get("compressed_tile_scalars", ONLINE_TILE_SCALARS))
         if getattr(self, "_compression_configured", False):
             if self._storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
                 return

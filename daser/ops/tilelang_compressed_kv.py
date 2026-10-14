@@ -28,25 +28,24 @@ import tilelang
 import tilelang.language as T
 from tilelang.transform import PassConfigKey
 
-from daser.compression.format import IO_ALIGNMENT, slot_header_bytes
+from daser.compression.format import (
+    IO_ALIGNMENT,
+    ONLINE_TILE_SCALARS,
+    slot_header_bytes,
+)
 
 _COUNT_THREADS = 256
 _COUNT_WARPS = _COUNT_THREADS // 32
-# Compact assigns one warp to each 1024-scalar tile.
+# Compact assigns one warp to each tile.
 _COMPACT_THREADS = 256
 _COMPACT_WARPS = _COMPACT_THREADS // 32
-# Decode uses fewer threads because each escape ballot is warp-local.  Four
-# warps cover one tile through multiple scalar groups while reducing block-wide
-# barrier and register overhead on the load critical path.
-_LOAD_THREADS = 64
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48
 _CODEBOOK_ENTRIES = 15
-# The word-parallel decoder pads each seven-entry codebook level to eight
+# The decoder pads each seven-entry codebook level to eight
 # bytes so a level fits one PRMT byte pair (see ``pack_load_codebooks``).
 _PACKED_CODEBOOK_BYTES = 16
-_WORD_PARALLEL_TILE_SCALARS = 256
-# Eight-tile groups decoded per word-parallel CTA; 32 measured fastest
+# Eight-tile groups decoded per load CTA; 32 measured fastest
 # against 16 and 64 on Qwen3-8B planes (512 tiles).
 _LOAD_TILE_GROUPS = 32
 _ESCAPE_PACKED_FLAG = 0x80
@@ -77,6 +76,22 @@ def _validate_head_dim(num_planes: int, plane_scalars: int, head_dim: int) -> No
     """Reject geometries that do not split into K/V planes of whole heads."""
     if head_dim <= 0 or num_planes % 2 or plane_scalars % head_dim:
         raise ValueError("KV planes must hold whole K or V heads")
+
+
+def _validate_tile_scalars(tile_scalars: int) -> None:
+    """Reject tile sizes other than the online codec's.
+
+    Args:
+        tile_scalars: Codec tile size requested by the caller.
+
+    Raises:
+        ValueError: If ``tile_scalars`` is not ``ONLINE_TILE_SCALARS``.
+    """
+    if tile_scalars != ONLINE_TILE_SCALARS:
+        raise ValueError(
+            f"TileLang codec kernels support tile_scalars={ONLINE_TILE_SCALARS}, "
+            f"got {tile_scalars}"
+        )
 
 
 # Device helpers injected into the word-parallel load kernel. ``__byte_perm``
@@ -185,21 +200,24 @@ def compile_store_kernels(
         num_planes: Number of layer/K-or-V planes.
         plane_scalars: BF16 scalars in one plane.
         head_dim: Scalars in one K or V head.
-        tile_scalars: Scalar quantum used by the packed record.
+        tile_scalars: Scalar quantum used by the packed record; must be
+            ``ONLINE_TILE_SCALARS``.
 
     Returns:
         Cached fused encode, layout, and compact kernels.
 
     Raises:
-        ValueError: If the geometry is not positive or exceeds the supported
+        ValueError: If the geometry is not positive, the tile size is not
+            ``ONLINE_TILE_SCALARS``, or the geometry exceeds the supported
             one-tile shared-memory envelope.
 
     Async/thread-safety:
         Compilation is synchronous and intended for registration-time
         warmup. The process-local cache is only mutated during that phase.
     """
-    if min(num_blocks, num_planes, plane_scalars, tile_scalars) <= 0:
+    if min(num_blocks, num_planes, plane_scalars) <= 0:
         raise ValueError("TileLang store geometry must be positive")
+    _validate_tile_scalars(tile_scalars)
     _validate_head_dim(num_planes, plane_scalars, head_dim)
     tiles_per_plane = (plane_scalars + tile_scalars - 1) // tile_scalars
     if tiles_per_plane > 1024:
@@ -254,32 +272,16 @@ def compile_store_kernels(
     return kernels
 
 
-def load_reads_words(tile_scalars: int) -> bool:
-    """Return whether the load kernel for ``tile_scalars`` takes a word view.
-
-    Args:
-        tile_scalars (int): Codec tile size of the decoded records.
-
-    Returns:
-        bool: True for the 256-scalar word-parallel decoder, which takes the
-        staging bytes a second time as an ``int32`` view and therefore needs
-        4-byte aligned staging whose length is a multiple of four.
-    """
-    return tile_scalars == _WORD_PARALLEL_TILE_SCALARS
-
-
-def pack_load_codebooks(codebooks: bytes, num_planes: int, tile_scalars: int) -> bytes:
-    """Lay out per-plane codebooks for the load kernel of ``tile_scalars``.
+def pack_load_codebooks(codebooks: bytes, num_planes: int) -> bytes:
+    """Lay out per-plane codebooks for the load kernel.
 
     Args:
         codebooks (bytes): ``num_planes`` rows of ``CODEBOOK_ENTRIES`` bytes:
             seven primary entries followed by the secondary entries.
         num_planes (int): Number of layer/K-or-V planes.
-        tile_scalars (int): Codec tile size of the decoded records.
 
     Returns:
-        bytes: ``codebooks`` unchanged for the generic decoder. For the
-        256-scalar word-parallel decoder, ``num_planes`` rows of 16 bytes:
+        bytes: ``num_planes`` rows of 16 bytes:
         bytes 0-6 hold the primary entries and bytes 8-14 the first seven
         secondary entries, so each level fits one PRMT byte pair; bytes 7
         and 15 are zero. Symbol 7 is the escape at both levels, so the
@@ -293,8 +295,6 @@ def pack_load_codebooks(codebooks: bytes, num_planes: int, tile_scalars: int) ->
             f"expected {num_planes * _CODEBOOK_ENTRIES} codebook bytes, "
             f"got {len(codebooks)}"
         )
-    if not load_reads_words(tile_scalars):
-        return bytes(codebooks)
     packed = bytearray(num_planes * _PACKED_CODEBOOK_BYTES)
     for plane in range(num_planes):
         row = codebooks[plane * _CODEBOOK_ENTRIES : (plane + 1) * _CODEBOOK_ENTRIES]
@@ -321,10 +321,11 @@ def compile_load_kernel(
         num_planes: Number of layer/K-or-V planes.
         plane_scalars: BF16 scalars in one plane.
         head_dim: Scalars in one K or V head.
-        tile_scalars: Scalar quantum encoded in each record. 256-scalar tiles
-            use the word-parallel decoder, whose launch takes the staging
-            bytes plus their ``int32`` view (see ``load_reads_words``) and
-            codebooks laid out by ``pack_load_codebooks``.
+        tile_scalars: Scalar quantum encoded in each record; must be
+            ``ONLINE_TILE_SCALARS``. The launch takes the staging bytes plus
+            their ``int32`` view, so staging must be 4-byte aligned with a
+            length that is a multiple of four, and codebooks laid out by
+            ``pack_load_codebooks``.
         staging_bytes: Representative staging capacity used for warmup metadata;
             the compiled kernel accepts the actual extent at runtime.
         fanout: Whether sources may have multiple destination blocks. Both
@@ -335,16 +336,17 @@ def compile_load_kernel(
         dimensions, so request metadata does not trigger compilation.
 
     Raises:
-        ValueError: If geometry is not positive or the tile count is too
-            large.
+        ValueError: If geometry is not positive, the tile size is not
+            ``ONLINE_TILE_SCALARS``, or the tile count is too large.
 
     Async/thread-safety:
         Compilation is synchronous and should happen before request traffic.
         The returned kernel launches asynchronously on the current PyTorch
         stream.
     """
-    if min(num_blocks, num_planes, plane_scalars, tile_scalars, staging_bytes) <= 0:
+    if min(num_blocks, num_planes, plane_scalars, staging_bytes) <= 0:
         raise ValueError("TileLang load geometry must be positive")
+    _validate_tile_scalars(tile_scalars)
     _validate_head_dim(num_planes, plane_scalars, head_dim)
     tiles_per_plane = (plane_scalars + tile_scalars - 1) // tile_scalars
     if tiles_per_plane > 1024:
@@ -356,10 +358,8 @@ def compile_load_kernel(
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
-    word_parallel = load_reads_words(tile_scalars)
-    builder = _build_wordparallel_load if word_parallel else _build_load
     kernel = tilelang.compile(
-        builder(
+        _build_load(
             num_blocks=num_blocks,
             num_planes=num_planes,
             plane_scalars=plane_scalars,
@@ -371,11 +371,7 @@ def compile_load_kernel(
         ),
         target="cuda",
         execution_backend="cython",
-        pass_configs=(
-            {PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True}
-            if word_parallel
-            else None
-        ),
+        pass_configs={PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
     )
     _LOAD_CACHE[key] = kernel
     return kernel
@@ -960,398 +956,142 @@ def _build_store_compact(
                                     + symbol_bytes
                                     + prefix_index
                                 ] = scratch[scratch_prefix_base + prefix_index]
-                        if tile_scalars == 256:
-                            # A lane emits eight consecutive scalars. Both
-                            # bitstreams preserve scalar order, while their
-                            # exclusive warp scans run once per tile.
-                            lane_bits = T.alloc_local((8,), "uint16")
-                            lane_codes = T.alloc_local((8,), "int32")
-                            for tile_group in range(
-                                (max_tiles + _COMPACT_WARPS - 1) // _COMPACT_WARPS
-                            ):
-                                tile = tile_group * _COMPACT_WARPS + warp
-                                scalar_start = tile * 256 + lane * 8
-                                primary_word = T.alloc_var(T.uint32, init=0)
-                                secondary_word = T.alloc_var(T.uint32, init=0)
-                                lane_escapes = T.alloc_var(T.int32, init=0)
-                                lane_raw = T.alloc_var(T.int32, init=0)
-                                for i in T.vectorized(8):
-                                    lane_bits[i] = (
-                                        kv_bits[
-                                            block_id,
-                                            plane // 2,
-                                            (scalar_start + i) // head_dim,
-                                            plane % 2,
-                                            (scalar_start + i) % head_dim,
-                                        ]
-                                        if scalar_start + i < plane_scalars
-                                        and scalar_start + i < valid_scalars
-                                        else 0
-                                    )
-                                for i in T.unroll(8):
-                                    scalar = scalar_start + i
-                                    active = scalar < plane_scalars
-                                    valid = active and scalar < valid_scalars
-                                    code = (
-                                        T.cast(
-                                            lookup[plane * 256 + (lane_bits[i] >> 8)],
-                                            T.int32,
-                                        )
-                                        if valid
-                                        else 15
-                                    )
-                                    lane_codes[i] = code
-                                    primary_word = primary_word | (
-                                        T.cast(
-                                            (7 if code >= 7 else code) if active else 0,
-                                            T.uint32,
-                                        )
-                                        << (i * 3)
-                                    )
-                                    if active and code >= 7:
-                                        secondary_word = secondary_word | (
-                                            T.cast(
-                                                7 if code >= 14 else code - 7, T.uint32
-                                            )
-                                            << (lane_escapes * 3)
-                                        )
-                                        lane_escapes = lane_escapes + 1
-                                        lane_raw = lane_raw + T.cast(
-                                            code >= 14, T.int32
-                                        )
-                                escape_scan = T.alloc_var(T.int32, init=lane_escapes)
-                                raw_scan = T.alloc_var(T.int32, init=lane_raw)
-                                for step in T.unroll(5):
-                                    preceding_escape = T.shfl_up(escape_scan, 1 << step)
-                                    preceding_raw = T.shfl_up(raw_scan, 1 << step)
-                                    if lane >= (1 << step):
-                                        escape_scan = escape_scan + preceding_escape
-                                        raw_scan = raw_scan + preceding_raw
-                                tile_prefix = T.alloc_var(T.uint32, init=0)
-                                tile_raw_prefix = T.alloc_var(T.uint32, init=0)
-                                if tile < max_tiles:
-                                    for byte in T.unroll(4):
-                                        tile_prefix = tile_prefix | (
-                                            T.cast(
-                                                scratch[
-                                                    scratch_prefix_base
-                                                    + tile * 4
-                                                    + byte
-                                                ],
-                                                T.uint32,
-                                            )
-                                            << (byte * 8)
-                                        )
-                                        tile_raw_prefix = tile_raw_prefix | (
-                                            T.cast(
-                                                scratch[
-                                                    scratch_raw_prefix_base
-                                                    + tile * 4
-                                                    + byte
-                                                ],
-                                                T.uint32,
-                                            )
-                                            << (byte * 8)
-                                        )
-                                for i in T.vectorized(8):
-                                    if scalar_start + i < plane_scalars:
-                                        destination[
-                                            destination_base + scalar_start + i
-                                        ] = T.cast(lane_bits[i], T.uint8)
-                                for byte in T.unroll(3):
-                                    symbol_index = scalar_start * 3 // 8 + byte
-                                    if symbol_index < symbol_bytes:
-                                        destination[
-                                            destination_base
-                                            + plane_scalars
-                                            + symbol_index
-                                        ] = T.cast(primary_word >> (byte * 8), T.uint8)
-                                if lane_escapes > 0:
-                                    # Atomic additions own disjoint bit ranges
-                                    # in the original zeroed scratch words.
-                                    # Splitting the word preserves that property
-                                    # even when a lane crosses a uint32 boundary.
-                                    escape_rank = (
-                                        T.cast(tile_prefix, T.int32)
-                                        + escape_scan
-                                        - lane_escapes
-                                    )
-                                    bit_offset = escape_rank * 3
-                                    word_index = bit_offset // 32
-                                    word_shift = bit_offset & 31
-                                    T.atomic_add(
-                                        escape_words[escape_word_base + word_index],
-                                        secondary_word << word_shift,
-                                    )
-                                    if word_shift + lane_escapes * 3 > 32:
-                                        T.atomic_add(
-                                            escape_words[
-                                                escape_word_base + word_index + 1
-                                            ],
-                                            secondary_word >> (32 - word_shift),
-                                        )
-                                raw_rank = (
-                                    T.cast(tile_raw_prefix, T.int32)
-                                    + raw_scan
-                                    - lane_raw
+                        # A lane emits eight consecutive scalars. Both
+                        # bitstreams preserve scalar order, while their
+                        # exclusive warp scans run once per tile.
+                        lane_bits = T.alloc_local((8,), "uint16")
+                        lane_codes = T.alloc_local((8,), "int32")
+                        for tile_group in range(
+                            (max_tiles + _COMPACT_WARPS - 1) // _COMPACT_WARPS
+                        ):
+                            tile = tile_group * _COMPACT_WARPS + warp
+                            scalar_start = tile * 256 + lane * 8
+                            primary_word = T.alloc_var(T.uint32, init=0)
+                            secondary_word = T.alloc_var(T.uint32, init=0)
+                            lane_escapes = T.alloc_var(T.int32, init=0)
+                            lane_raw = T.alloc_var(T.int32, init=0)
+                            for i in T.vectorized(8):
+                                lane_bits[i] = (
+                                    kv_bits[
+                                        block_id,
+                                        plane // 2,
+                                        (scalar_start + i) // head_dim,
+                                        plane % 2,
+                                        (scalar_start + i) % head_dim,
+                                    ]
+                                    if scalar_start + i < plane_scalars
+                                    and scalar_start + i < valid_scalars
+                                    else 0
                                 )
-                                local_raw = T.alloc_var(T.int32, init=0)
-                                for i in T.unroll(8):
-                                    if (
-                                        scalar_start + i < plane_scalars
-                                        and lane_codes[i] >= 14
-                                    ):
-                                        destination[
-                                            destination_base
-                                            + base_bytes
-                                            + escape_code_bytes
-                                            + raw_rank
-                                            + local_raw
-                                        ] = T.cast(lane_bits[i] >> 8, T.uint8)
-                                        local_raw = local_raw + 1
-                        else:
-                            for tile_group in range(
-                                (max_tiles + _COMPACT_WARPS - 1) // _COMPACT_WARPS
-                            ):
-                                tile = tile_group * _COMPACT_WARPS + warp
-                                tile_begin = tile * tile_scalars
-                                # Each lane scans the same tile-local scalar groups
-                                # in lockstep. Keeping the preceding-group escape
-                                # count in a lane-local accumulator avoids a
-                                # block-wide prefix or a shuffle dependency in the
-                                # emit pass.
-                                escape_before = T.alloc_var(T.uint32, init=0)
-                                raw_escape_before = T.alloc_var(T.uint32, init=0)
-                                for scalar_group in range((tile_scalars + 31) // 32):
-                                    scalar = tile_begin + scalar_group * 32 + lane
-                                    active = (
-                                        tile < max_tiles
-                                        and scalar < plane_scalars
-                                        and scalar_group * 32 + lane < tile_scalars
+                            for i in T.unroll(8):
+                                scalar = scalar_start + i
+                                active = scalar < plane_scalars
+                                valid = active and scalar < valid_scalars
+                                code = (
+                                    T.cast(
+                                        lookup[plane * 256 + (lane_bits[i] >> 8)],
+                                        T.int32,
                                     )
-                                    valid = active and scalar < valid_scalars
-                                    bits = (
+                                    if valid
+                                    else 15
+                                )
+                                lane_codes[i] = code
+                                primary_word = primary_word | (
+                                    T.cast(
+                                        (7 if code >= 7 else code) if active else 0,
+                                        T.uint32,
+                                    )
+                                    << (i * 3)
+                                )
+                                if active and code >= 7:
+                                    secondary_word = secondary_word | (
+                                        T.cast(7 if code >= 14 else code - 7, T.uint32)
+                                        << (lane_escapes * 3)
+                                    )
+                                    lane_escapes = lane_escapes + 1
+                                    lane_raw = lane_raw + T.cast(code >= 14, T.int32)
+                            escape_scan = T.alloc_var(T.int32, init=lane_escapes)
+                            raw_scan = T.alloc_var(T.int32, init=lane_raw)
+                            for step in T.unroll(5):
+                                preceding_escape = T.shfl_up(escape_scan, 1 << step)
+                                preceding_raw = T.shfl_up(raw_scan, 1 << step)
+                                if lane >= (1 << step):
+                                    escape_scan = escape_scan + preceding_escape
+                                    raw_scan = raw_scan + preceding_raw
+                            tile_prefix = T.alloc_var(T.uint32, init=0)
+                            tile_raw_prefix = T.alloc_var(T.uint32, init=0)
+                            if tile < max_tiles:
+                                for byte in T.unroll(4):
+                                    tile_prefix = tile_prefix | (
                                         T.cast(
-                                            kv_bits[
-                                                block_id,
-                                                plane // 2,
-                                                scalar // head_dim,
-                                                plane % 2,
-                                                scalar % head_dim,
+                                            scratch[
+                                                scratch_prefix_base + tile * 4 + byte
                                             ],
-                                            T.uint16,
-                                        )
-                                        if valid
-                                        else 0
-                                    )
-                                    high = (bits >> 8) & 255
-                                    code = (
-                                        T.cast(lookup[plane * 256 + high], T.uint8)
-                                        if valid
-                                        else 15
-                                    )
-                                    if active:
-                                        destination[destination_base + scalar] = T.cast(
-                                            bits & 255, T.uint8
-                                        )
-                                    if tile_scalars % 32 == 0:
-                                        # Eight adjacent 3-bit codes form exactly
-                                        # three bytes. Combine the codes in registers
-                                        # while the KV scalar is already live, so
-                                        # primary emission needs no second KV scan.
-                                        primary_code = (
-                                            T.cast(7 if code >= 7 else code, T.uint32)
-                                            if active
-                                            else T.cast(0, T.uint32)
-                                        )
-                                        word = T.alloc_var(
                                             T.uint32,
-                                            init=primary_code << ((lane & 7) * 3),
                                         )
-                                        for reduction in range(3):
-                                            word = word | T.shfl_xor(
-                                                word, 4 >> reduction, width=8
-                                            )
-                                        symbol_index = (
-                                            (scalar - lane) * 3 // 8
-                                            + (lane // 8) * 3
-                                            + (lane & 7)
-                                        )
-                                        if (
-                                            lane & 7
-                                        ) < 3 and symbol_index < symbol_bytes:
-                                            destination[
-                                                destination_base
-                                                + plane_scalars
-                                                + symbol_index
-                                            ] = T.cast(
-                                                word >> ((lane & 7) * 8), T.uint8
-                                            )
-                                    mask = T.ballot(active and code >= 7)
-                                    raw_mask = T.ballot(active and code >= 14)
-                                    prefix_value = (
-                                        (
-                                            T.cast(
-                                                scratch[scratch_prefix_base + tile * 4],
-                                                T.uint32,
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_prefix_base
-                                                        + tile * 4
-                                                        + 1
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 8
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_prefix_base
-                                                        + tile * 4
-                                                        + 2
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 16
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_prefix_base
-                                                        + tile * 4
-                                                        + 3
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 24
-                                            )
-                                        )
-                                        if tile < max_tiles
-                                        else 0
+                                        << (byte * 8)
                                     )
-                                    raw_prefix_value = (
-                                        (
-                                            T.cast(
-                                                scratch[
-                                                    scratch_raw_prefix_base + tile * 4
-                                                ],
-                                                T.uint32,
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_raw_prefix_base
-                                                        + tile * 4
-                                                        + 1
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 8
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_raw_prefix_base
-                                                        + tile * 4
-                                                        + 2
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 16
-                                            )
-                                            | (
-                                                T.cast(
-                                                    scratch[
-                                                        scratch_raw_prefix_base
-                                                        + tile * 4
-                                                        + 3
-                                                    ],
-                                                    T.uint32,
-                                                )
-                                                << 24
-                                            )
+                                    tile_raw_prefix = tile_raw_prefix | (
+                                        T.cast(
+                                            scratch[
+                                                scratch_raw_prefix_base
+                                                + tile * 4
+                                                + byte
+                                            ],
+                                            T.uint32,
                                         )
-                                        if tile < max_tiles
-                                        else 0
+                                        << (byte * 8)
                                     )
-                                    if active and code >= 7:
-                                        lower_mask = mask & (
-                                            T.cast(0xFFFFFFFF, T.uint32) >> (lane ^ 31)
-                                        )
-                                        current_bit = T.cast(
-                                            (mask >> lane) & 1, T.uint32
-                                        )
-                                        rank = (
-                                            prefix_value
-                                            + escape_before
-                                            + T.popcount(lower_mask)
-                                            - current_bit
-                                        )
-                                        if packed_escape:
-                                            raw_sentinel = 7
-                                            escape_code = (
-                                                code - 7 if code < 14 else raw_sentinel
-                                            )
-                                            escape_bit_offset = (
-                                                rank * escape_symbol_bits
-                                            )
-                                            escape_byte = escape_bit_offset // 8
-                                            escape_word = escape_bit_offset // 32
-                                            escape_word_shift = escape_bit_offset & 31
-                                            # Escape words are cleared before the
-                                            # tile scan. Atomic additions are safe
-                                            # because adjacent 3-bit tokens occupy
-                                            # disjoint bit ranges; the final copy
-                                            # emits only the required byte extent.
-                                            T.atomic_add(
-                                                escape_words[
-                                                    escape_word_base + escape_word
-                                                ],
-                                                T.cast(escape_code, T.uint32)
-                                                << escape_word_shift,
-                                            )
-                                            if escape_word_shift > 29:
-                                                T.atomic_add(
-                                                    escape_words[
-                                                        escape_word_base
-                                                        + escape_word
-                                                        + 1
-                                                    ],
-                                                    T.cast(escape_code, T.uint32)
-                                                    >> (32 - escape_word_shift),
-                                                )
-                                            if code >= 14:
-                                                raw_lower_mask = raw_mask & (
-                                                    T.cast(0xFFFFFFFF, T.uint32)
-                                                    >> (lane ^ 31)
-                                                )
-                                                raw_current_bit = T.cast(
-                                                    (raw_mask >> lane) & 1, T.uint32
-                                                )
-                                                raw_rank = (
-                                                    raw_prefix_value
-                                                    + raw_escape_before
-                                                    + T.popcount(raw_lower_mask)
-                                                    - raw_current_bit
-                                                )
-                                                destination[
-                                                    destination_base
-                                                    + base_bytes
-                                                    + escape_code_bytes
-                                                    + raw_rank
-                                                ] = T.cast(bits >> 8, T.uint8)
-                                        else:
-                                            destination[
-                                                destination_base + base_bytes + rank
-                                            ] = T.cast(bits >> 8, T.uint8)
-                                    group_count = T.popcount(mask)
-                                    escape_before = escape_before + group_count
-                                    raw_escape_before = raw_escape_before + T.popcount(
-                                        raw_mask
+                            for i in T.vectorized(8):
+                                if scalar_start + i < plane_scalars:
+                                    destination[destination_base + scalar_start + i] = (
+                                        T.cast(lane_bits[i], T.uint8)
                                     )
+                            for byte in T.unroll(3):
+                                symbol_index = scalar_start * 3 // 8 + byte
+                                if symbol_index < symbol_bytes:
+                                    destination[
+                                        destination_base + plane_scalars + symbol_index
+                                    ] = T.cast(primary_word >> (byte * 8), T.uint8)
+                            if lane_escapes > 0:
+                                # Atomic additions own disjoint bit ranges
+                                # in the original zeroed scratch words.
+                                # Splitting the word preserves that property
+                                # even when a lane crosses a uint32 boundary.
+                                escape_rank = (
+                                    T.cast(tile_prefix, T.int32)
+                                    + escape_scan
+                                    - lane_escapes
+                                )
+                                bit_offset = escape_rank * 3
+                                word_index = bit_offset // 32
+                                word_shift = bit_offset & 31
+                                T.atomic_add(
+                                    escape_words[escape_word_base + word_index],
+                                    secondary_word << word_shift,
+                                )
+                                if word_shift + lane_escapes * 3 > 32:
+                                    T.atomic_add(
+                                        escape_words[escape_word_base + word_index + 1],
+                                        secondary_word >> (32 - word_shift),
+                                    )
+                            raw_rank = (
+                                T.cast(tile_raw_prefix, T.int32) + raw_scan - lane_raw
+                            )
+                            local_raw = T.alloc_var(T.int32, init=0)
+                            for i in T.unroll(8):
+                                if (
+                                    scalar_start + i < plane_scalars
+                                    and lane_codes[i] >= 14
+                                ):
+                                    destination[
+                                        destination_base
+                                        + base_bytes
+                                        + escape_code_bytes
+                                        + raw_rank
+                                        + local_raw
+                                    ] = T.cast(lane_bits[i] >> 8, T.uint8)
+                                    local_raw = local_raw + 1
 
                         if packed_escape:
                             # Expand the complete words only after every warp
@@ -1373,58 +1113,10 @@ def _build_store_compact(
                                         T.uint8,
                                     )
 
-                    # Non-aligned tiles can share a symbol byte at their
-                    # boundary, so retain one writer per byte for those shapes.
-                    if tile_scalars % 32 != 0:
-                        symbol_bytes_3 = (plane_scalars * 3 + 7) // 8
-                        for byte_group in range(
-                            (symbol_bytes_3 + _COMPACT_THREADS - 1) // _COMPACT_THREADS
-                        ):
-                            symbol_index = byte_group * _COMPACT_THREADS + tx
-                            if symbol_index < symbol_bytes_3:
-                                first_scalar = symbol_index * 8 // 3
-                                byte_begin = symbol_index * 8
-                                packed = T.alloc_var(T.uint32, init=0)
-                                for code_index in range(4):
-                                    scalar = first_scalar + code_index
-                                    if scalar < plane_scalars:
-                                        valid = scalar < valid_scalars
-                                        bits = (
-                                            kv_bits[
-                                                block_id,
-                                                plane // 2,
-                                                scalar // head_dim,
-                                                plane % 2,
-                                                scalar % head_dim,
-                                            ]
-                                            if valid
-                                            else 0
-                                        )
-                                        high = (bits >> 8) & 255
-                                        code = T.alloc_var(T.uint32, init=7)
-                                        if valid:
-                                            code = T.cast(
-                                                lookup[plane * 256 + high], T.uint32
-                                            )
-                                        code = 7 if code >= 7 else code
-                                        for code_bit in range(3):
-                                            global_bit = scalar * 3 + code_bit
-                                            if (
-                                                global_bit >= byte_begin
-                                                and global_bit < byte_begin + 8
-                                            ):
-                                                packed = packed | (
-                                                    ((code >> code_bit) & 1)
-                                                    << (global_bit - byte_begin)
-                                                )
-                                destination[
-                                    destination_base + plane_scalars + symbol_index
-                                ] = T.cast(packed & 255, T.uint8)
-
     return main
 
 
-def _build_wordparallel_load(
+def _build_load(
     *,
     num_blocks: int,
     num_planes: int,
@@ -1824,383 +1516,6 @@ def _build_wordparallel_load(
     return main
 
 
-def _build_load(
-    *,
-    num_blocks: int,
-    num_planes: int,
-    plane_scalars: int,
-    head_dim: int,
-    tile_scalars: int,
-    tiles_per_plane: int,
-    staging_bytes: int,
-    fanout: bool,
-) -> Any:
-    """Decode each source once and scatter directly to its destination group."""
-    # Keep dynamic extents 64-bit: the staging tensor is a byte extent and
-    # may exceed 2 GiB for a long Qwen3-8B restore.  Using the default int32
-    # shape silently invalidates address bounds after that boundary.
-    n_slots = T.dynamic("N", "int64")
-    n_destinations = T.dynamic("D", "int64")
-    staging_extent = T.dynamic("S", "int64")
-    # A fine rank index need not imply a fine CTA grid. Indexed tiles share
-    # a CTA while each warp consumes one tile without rescanning ranks.
-    warp_tiles = tile_scalars <= 256 and tile_scalars % 32 == 0
-    load_threads = 256 if warp_tiles else _LOAD_THREADS
-    load_warps = load_threads // 32
-    warp_local = warp_tiles or tile_scalars % load_threads == 0
-    grid_tiles = (
-        (tiles_per_plane + load_warps - 1) // load_warps
-        if warp_tiles
-        else tiles_per_plane
-    )
-    group_threads = 32 if warp_tiles else load_threads
-
-    @T.prim_func
-    def main(
-        staging: T.Tensor((staging_extent,), "uint8"),
-        staging_offsets: T.Tensor((n_slots,), "int64"),
-        block_ids: T.Tensor((n_destinations,), "int32"),
-        destination_offsets: T.Tensor((n_slots + 1,), "int32"),
-        modes: T.Tensor((n_slots,), "int32"),
-        codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
-        dst: T.Tensor(
-            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
-        ),
-        plane_base: T.int32,
-        plane_count: T.int32,
-    ):
-        with T.Kernel(n_slots, plane_count, grid_tiles, threads=load_threads) as (
-            bx,
-            by,
-            bz,
-        ):
-            warp_counts = T.alloc_shared((load_warps,), "uint32")
-            warp_prefix = T.alloc_shared((load_warps,), "uint32")
-            warp_raw_counts = T.alloc_shared((load_warps,), "uint32")
-            warp_raw_prefix = T.alloc_shared((load_warps,), "uint32")
-            descriptor_offsets = T.alloc_shared((4,), "uint32")
-            escape_count_shared = T.alloc_shared((1,), "uint32")
-            tx = T.get_thread_binding()
-            slot = bx
-            plane = plane_base + by
-            lane = tx & 31
-            warp = tx // 32
-            tile = bz * load_warps + warp if warp_tiles else bz
-            slot_base = staging_offsets[slot]
-            destination_begin = destination_offsets[slot] if fanout else slot
-            destination_end = destination_offsets[slot + 1] if fanout else slot + 1
-            block_id = block_ids[destination_begin]
-            mode = modes[slot]
-            if mode != 0 and tx < 4:
-                descriptor = (
-                    slot_base + _SLOT_FIXED_HEADER_BYTES + plane * _DESCRIPTOR_BYTES
-                )
-                descriptor_offsets[0] = (
-                    T.cast(staging[descriptor + 20], T.uint32)
-                    | (T.cast(staging[descriptor + 21], T.uint32) << 8)
-                    | (T.cast(staging[descriptor + 22], T.uint32) << 16)
-                    | (T.cast(staging[descriptor + 23], T.uint32) << 24)
-                )
-                descriptor_offsets[1] = (
-                    T.cast(staging[descriptor + 24], T.uint32)
-                    | (T.cast(staging[descriptor + 25], T.uint32) << 8)
-                    | (T.cast(staging[descriptor + 26], T.uint32) << 16)
-                    | (T.cast(staging[descriptor + 27], T.uint32) << 24)
-                )
-                descriptor_offsets[2] = (
-                    T.cast(staging[descriptor + 28], T.uint32)
-                    | (T.cast(staging[descriptor + 29], T.uint32) << 8)
-                    | (T.cast(staging[descriptor + 30], T.uint32) << 16)
-                    | (T.cast(staging[descriptor + 31], T.uint32) << 24)
-                )
-                descriptor_offsets[3] = (
-                    T.cast(staging[descriptor + 32], T.uint32)
-                    | (T.cast(staging[descriptor + 33], T.uint32) << 8)
-                    | (T.cast(staging[descriptor + 34], T.uint32) << 16)
-                    | (T.cast(staging[descriptor + 35], T.uint32) << 24)
-                )
-                if tx == 0:
-                    escape_count_shared[0] = (
-                        T.cast(staging[descriptor + 36], T.uint32)
-                        | (T.cast(staging[descriptor + 37], T.uint32) << 8)
-                        | (T.cast(staging[descriptor + 38], T.uint32) << 16)
-                        | (T.cast(staging[descriptor + 39], T.uint32) << 24)
-                    )
-            T.sync_threads()
-            low_offset = descriptor_offsets[0] if mode != 0 else 0
-            symbol_offset = descriptor_offsets[1] if mode != 0 else 0
-            prefix_offset = descriptor_offsets[2] if mode != 0 else 0
-            escape_offset = descriptor_offsets[3] if mode != 0 else 0
-            prefix_value = T.alloc_var(T.uint32, init=0)
-            raw_prefix_value = T.alloc_var(T.uint32, init=0)
-            if mode != 0 and tile < tiles_per_plane:
-                prefix_base = slot_base + prefix_offset
-                prefix_value = (
-                    T.cast(staging[prefix_base + tile * 4], T.uint32)
-                    | (T.cast(staging[prefix_base + tile * 4 + 1], T.uint32) << 8)
-                    | (T.cast(staging[prefix_base + tile * 4 + 2], T.uint32) << 16)
-                    | (T.cast(staging[prefix_base + tile * 4 + 3], T.uint32) << 24)
-                )
-                raw_prefix_base = prefix_base + 4 * (tiles_per_plane + 1)
-                raw_prefix_value = (
-                    T.cast(staging[raw_prefix_base + tile * 4], T.uint32)
-                    | (T.cast(staging[raw_prefix_base + tile * 4 + 1], T.uint32) << 8)
-                    | (T.cast(staging[raw_prefix_base + tile * 4 + 2], T.uint32) << 16)
-                    | (T.cast(staging[raw_prefix_base + tile * 4 + 3], T.uint32) << 24)
-                )
-            escape_group_prefix = T.alloc_var(T.uint32, init=0)
-            raw_escape_group_prefix = T.alloc_var(T.uint32, init=0)
-            if warp_local and not warp_tiles and mode != 0:
-                # Assign each warp a contiguous quarter tile. Reconstruct
-                # its starting rank from the existing three-bit streams;
-                # this trades bounded redundant reads for the four CTA
-                # barriers previously required by every scalar group.
-                # Eight symbols fit in uint32 even at a seven-bit offset.
-                for rank_pass in T.unroll(2):
-                    rank_start = tile * tile_scalars if rank_pass == 0 else prefix_value
-                    rank_length = (
-                        T.min(
-                            warp * (tile_scalars // load_warps),
-                            plane_scalars - tile * tile_scalars,
-                        )
-                        if rank_pass == 0
-                        else escape_group_prefix
-                    )
-                    rank_stream = symbol_offset if rank_pass == 0 else escape_offset
-                    rank_total = T.alloc_var(T.uint32, init=0)
-                    for rank_group in range((tile_scalars * 3 // 4 + 255) // 256):
-                        rank_first = (rank_group * 32 + lane) * 8
-                        rank_valid = T.min(
-                            T.max(T.cast(rank_length, T.int32) - rank_first, 0), 8
-                        )
-                        rank_bit = (rank_start + rank_first) * 3
-                        rank_shift = rank_bit & 7
-                        rank_word = T.alloc_var(T.uint32, init=0)
-                        for rank_byte in T.unroll(4):
-                            if rank_valid > 0 and rank_byte * 8 < (
-                                rank_shift + rank_valid * 3
-                            ):
-                                rank_word = rank_word | (
-                                    T.cast(
-                                        staging[
-                                            slot_base
-                                            + rank_stream
-                                            + rank_bit // 8
-                                            + rank_byte
-                                        ],
-                                        T.uint32,
-                                    )
-                                    << (rank_byte * 8)
-                                )
-                        rank_word = rank_word >> rank_shift
-                        rank_mask = T.cast(0x00249249, T.uint32) & (
-                            (T.cast(1, T.uint32) << (rank_valid * 3)) - 1
-                        )
-                        rank_total = rank_total + T.popcount(
-                            rank_word & (rank_word >> 1) & (rank_word >> 2) & rank_mask
-                        )
-                    # All lanes participate, including those past the
-                    # scanned prefix. Never shuffle in a partial-lane branch.
-                    for rank_delta in T.unroll(5):
-                        rank_total = rank_total + T.shfl_xor(
-                            rank_total, 1 << rank_delta
-                        )
-                    if rank_pass == 0:
-                        escape_group_prefix = rank_total
-                    else:
-                        raw_escape_group_prefix = rank_total
-            for scalar_group in range(
-                (tile_scalars + group_threads - 1) // group_threads
-            ):
-                scalar = (
-                    tile * tile_scalars + scalar_group * 32 + lane
-                    if warp_tiles
-                    else tile * tile_scalars
-                    + warp * (tile_scalars // load_warps)
-                    + scalar_group * 32
-                    + lane
-                    if warp_local
-                    else tile * tile_scalars + scalar_group * load_threads + tx
-                )
-                # Adjacent non-aligned tiles must never write the same scalar,
-                # including the raw path where identical writes still race.
-                active = scalar < plane_scalars and scalar < (tile + 1) * tile_scalars
-                if mode == 0:
-                    byte_base = slot_base + plane * plane_scalars * 2 + scalar * 2
-                    raw_low = T.cast(staging[byte_base], T.uint16) if active else 0
-                    raw_high = T.cast(staging[byte_base + 1], T.uint16) if active else 0
-                    if active:
-                        if fanout:
-                            for target in range(destination_begin, destination_end):
-                                dst[
-                                    block_ids[target],
-                                    plane // 2,
-                                    scalar // head_dim,
-                                    plane % 2,
-                                    scalar % head_dim,
-                                ] = raw_low | (raw_high << 8)
-                        else:
-                            dst[
-                                block_id,
-                                plane // 2,
-                                scalar // head_dim,
-                                plane % 2,
-                                scalar % head_dim,
-                            ] = raw_low | (raw_high << 8)
-                    continue
-                # Online records always use a three-bit main stream whose
-                # all-ones symbol marks an escape. Keep both as uint32 vars:
-                # folding them into constants makes TVM emit negative
-                # unsigned literals while simplifying the escape predicates.
-                code = T.alloc_var(T.uint32, init=0)
-                escape_code = T.alloc_var(T.uint32, init=7)
-                bit_offset = scalar * 3
-                symbol_byte = bit_offset // 8
-                symbol_shift = bit_offset & 7
-                packed = (
-                    T.cast(
-                        staging[slot_base + symbol_offset + symbol_byte],
-                        T.uint32,
-                    )
-                    | (
-                        T.cast(
-                            staging[slot_base + symbol_offset + symbol_byte + 1],
-                            T.uint32,
-                        )
-                        << 8
-                    )
-                    if active
-                    else 0
-                )
-                code = (packed >> symbol_shift) & 7
-                mask = T.ballot(active and code == escape_code)
-                if not warp_local:
-                    if lane == 0:
-                        warp_counts[warp] = T.popcount(mask)
-                    T.sync_threads()
-                    if tx == 0:
-                        running = T.alloc_var(T.uint32, init=0)
-                        for index in range(load_warps):
-                            warp_prefix[index] = running
-                            running = running + warp_counts[index]
-                    T.sync_threads()
-                token_rank = (
-                    prefix_value
-                    + escape_group_prefix
-                    + (0 if warp_local else warp_prefix[warp])
-                    + T.popcount(mask & ((1 << lane) - 1))
-                )
-                packed_escape_value = T.alloc_var(T.uint32, init=15)
-                if code == escape_code and active:
-                    escape_bit_offset = token_rank * 3
-                    escape_byte = escape_bit_offset // 8
-                    escape_shift = escape_bit_offset & 7
-                    escape_word = T.alloc_var(T.uint32, init=0)
-                    escape_word = T.cast(
-                        staging[slot_base + escape_offset + escape_byte],
-                        T.uint32,
-                    )
-                    escape_word = escape_word | (
-                        T.cast(
-                            staging[slot_base + escape_offset + escape_byte + 1],
-                            T.uint32,
-                        )
-                        << 8
-                    )
-                    packed_escape_value = (escape_word >> escape_shift) & 7
-                raw_mask = T.ballot(
-                    code == escape_code and packed_escape_value == 7 and active
-                )
-                if not warp_local:
-                    if lane == 0:
-                        warp_raw_counts[warp] = T.popcount(raw_mask)
-                    T.sync_threads()
-                    if tx == 0:
-                        raw_running = T.alloc_var(T.uint32, init=0)
-                        for index in range(load_warps):
-                            warp_raw_prefix[index] = raw_running
-                            raw_running = raw_running + warp_raw_counts[index]
-                    T.sync_threads()
-                raw_rank = (
-                    raw_prefix_value
-                    + raw_escape_group_prefix
-                    + (0 if warp_local else warp_raw_prefix[warp])
-                    + T.popcount(raw_mask & ((1 << lane) - 1))
-                )
-                escape_code_bytes = (escape_count_shared[0] * 3 + 7) // 8
-                decoded_high = T.if_then_else(
-                    code == escape_code and packed_escape_value == 7 and active,
-                    T.cast(
-                        staging[
-                            slot_base + escape_offset + escape_code_bytes + raw_rank
-                        ],
-                        T.uint16,
-                    ),
-                    T.if_then_else(
-                        code == escape_code and active,
-                        T.cast(
-                            codebooks[
-                                plane * _CODEBOOK_ENTRIES + 7 + packed_escape_value
-                            ],
-                            T.uint16,
-                        ),
-                        T.cast(
-                            codebooks[plane * _CODEBOOK_ENTRIES + code],
-                            T.uint16,
-                        ),
-                    ),
-                )
-                decoded_low = (
-                    T.cast(staging[slot_base + low_offset + scalar], T.uint16)
-                    if active
-                    else 0
-                )
-                # The transfer planner already deduplicates immutable
-                # sources. Reuse the decoded scalar across all consumers
-                # instead of repeating both escape scans for each target.
-                # Each destination block belongs to exactly one source;
-                # no intermediate raw tensor or cross-block barrier is
-                # required, and the caller retains the staging lease.
-                if active:
-                    if fanout:
-                        for target in range(destination_begin, destination_end):
-                            dst[
-                                block_ids[target],
-                                plane // 2,
-                                scalar // head_dim,
-                                plane % 2,
-                                scalar % head_dim,
-                            ] = decoded_low | (decoded_high << 8)
-                    else:
-                        dst[
-                            block_id,
-                            plane // 2,
-                            scalar // head_dim,
-                            plane % 2,
-                            scalar % head_dim,
-                        ] = decoded_low | (decoded_high << 8)
-                if warp_local:
-                    escape_group_prefix = escape_group_prefix + T.popcount(mask)
-                    raw_escape_group_prefix = raw_escape_group_prefix + T.popcount(
-                        raw_mask
-                    )
-                else:
-                    # Shared prefixes cover one 128-thread group; carry
-                    # the group total into the next group of the tile.
-                    escape_group_prefix = (
-                        escape_group_prefix
-                        + warp_prefix[load_warps - 1]
-                        + warp_counts[load_warps - 1]
-                    )
-                    raw_escape_group_prefix = (
-                        raw_escape_group_prefix
-                        + warp_raw_prefix[load_warps - 1]
-                        + warp_raw_counts[load_warps - 1]
-                    )
-
-    return main
-
-
 def clear_tilelang_codec_cache() -> None:
     """Clear process-local TileLang codec kernels for tests.
 
@@ -2219,6 +1534,5 @@ __all__ = [
     "clear_tilelang_codec_cache",
     "compile_load_kernel",
     "compile_store_kernels",
-    "load_reads_words",
     "pack_load_codebooks",
 ]

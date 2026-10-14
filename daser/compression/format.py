@@ -173,7 +173,7 @@ class CompressedStoreGeometry:
     num_kv_heads: int
     head_dim: int
     dtype_bytes: int = 2
-    tile_scalars: int = 1024
+    tile_scalars: int = ONLINE_TILE_SCALARS
 
     def __post_init__(self) -> None:
         expected = (
