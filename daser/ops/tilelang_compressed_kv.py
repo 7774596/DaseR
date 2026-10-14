@@ -79,13 +79,68 @@ def _validate_head_dim(num_planes: int, plane_scalars: int, head_dim: int) -> No
         raise ValueError("KV planes must hold whole K or V heads")
 
 
-def _byte_perm(low: Any, high: Any, selector: Any) -> Any:
-    """Return the CUDA ``__byte_perm`` of the eight bytes ``high:low``.
+# Device helpers injected into the word-parallel load kernel. ``__byte_perm``
+# masks every non-constant selector with 0x7777 and nvcc expands a C-level
+# bit spread into one operation per code, so both are written as inline PTX.
+_LOAD_DEVICE_SOURCE = r"""
+__device__ __forceinline__ unsigned int daser_prmt(
+    unsigned int low, unsigned int high, unsigned int selector) {
+  unsigned int result;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(result) : "r"(low), "r"(high), "r"(selector));
+  return result;
+}
+__device__ __forceinline__ unsigned int daser_spread_codes(unsigned int word) {
+  unsigned int spread;
+  asm("{\n\t.reg .b32 t;\n\t"
+      "shl.b32 t, %1, 4;\n\t"
+      "lop3.b32 %0, %1, t, 0x0000FFFF, 0xE4;\n\t"
+      "shl.b32 t, %0, 2;\n\t"
+      "lop3.b32 %0, %0, t, 0x003F003F, 0xE4;\n\t"
+      "shl.b32 t, %0, 1;\n\t"
+      "lop3.b32 %0, %0, t, 0x0F0F0F0F, 0xE4;\n\t"
+      "and.b32 %0, %0, 0x77777777;\n\t}"
+      : "=r"(spread) : "r"(word));
+  return spread;
+}
+"""
 
-    Each selector nibble picks one byte of the pair for the result byte at
-    the same position (byte indices 0-7); the instruction is one PRMT.
+
+def _prmt(low: Any, high: Any, selector: Any) -> Any:
+    """Return the PRMT byte permute of the eight bytes ``high:low``.
+
+    Selector nibble ``i`` (bits 16-31 are ignored) picks the byte of the pair
+    placed at result byte ``i``. Callers keep bit 3 of each nibble clear, so
+    no sign replication occurs.
     """
-    return T.call_extern("uint32", "__byte_perm", low, high, T.cast(selector, T.uint32))
+    return T.call_extern("uint32", "daser_prmt", low, high, T.cast(selector, T.uint32))
+
+
+def _spread_codes(word: Any) -> Any:
+    """Move the eight 3-bit codes at bits ``3 * i`` of ``word`` to nibble ``i``."""
+    return T.call_extern("uint32", "daser_spread_codes", word)
+
+
+def _nibble_flags(codes: Any) -> Any:
+    """Return 1 in each nibble of spread ``codes`` that holds the escape code 7."""
+    return codes & (codes >> 1) & (codes >> 2) & T.cast(0x11111111, T.uint32)
+
+
+def _rank_selector(flags: Any) -> Any:
+    """Return a PRMT selector that gathers flagged bytes in order.
+
+    Nibble ``i`` is the number of flagged nibbles below ``i`` when nibble
+    ``i`` of ``flags`` is set (the byte's rank in a packed escape stream),
+    and 7 otherwise. ``flags * 0x11111110`` sums lower flags into each
+    nibble; it never carries because at most eight flags exist.
+    """
+    return (flags * T.cast(0x11111110, T.uint32)) | (
+        T.cast(0x77777777, T.uint32) - flags * T.cast(7, T.uint32)
+    )
+
+
+def _clamp(index: Any, last: Any) -> Any:
+    """Return ``index`` clamped to ``last``, or unchanged when ``last`` is None."""
+    return index if last is None else T.min(index, last)
 
 
 def _record_word(words: Any, word_base: Any, lead: Any, offset: Any, last: Any) -> Any:
@@ -101,10 +156,11 @@ def _record_word(words: Any, word_base: Any, lead: Any, offset: Any, last: Any) 
     word relative to ``word_base``. Every read therefore stays inside the
     staging tensor with 32-bit arithmetic; callers only consume bytes inside
     the record, so clamped tail bytes of a record at the extent are unused.
+    ``last=None`` skips the clamps for reads the caller proved in range.
     """
     total = lead + T.cast(offset, T.uint32)
-    first = T.min(total >> 2, last)
-    second = T.min(first + 1, last)
+    first = _clamp(total >> 2, last)
+    second = _clamp(first + 1, last)
     return T.call_extern(
         "uint32",
         "__funnelshift_r",
@@ -1391,29 +1447,38 @@ def _build_wordparallel_load(
     consecutive eight-tile groups. The five words of a group that do not
     depend on the scans (primary symbols, two low-byte words, two tile
     prefixes) are fetched one group ahead, overlapping the next group's loads
-    with the current group's dependent reads.
+    with the current group's dependent reads. When the descriptor offsets
+    keep every scan-independent read of the CTA inside the staging tensor,
+    those reads skip their clamps; reads addressed by scanned ranks are
+    always clamped.
 
-    High bytes resolve without divergent branches from codebooks packed by
-    ``pack_load_codebooks``: each lane loads its (fewer than eight) raw
-    escape bytes as one clamped eight-byte window, then per scalar selects
-    among three byte permutes (primary codebook, secondary codebook, raw
-    window). Two more permutes per output word interleave low and high
-    bytes. When the head dimension is divisible by eight, each lane writes
-    its eight scalars as one 128-bit store; otherwise a lane's scalars may
-    straddle heads and are stored one by one.
+    High bytes are resolved for all eight scalars at once, without a
+    per-scalar loop. The 3-bit codes are spread to one nibble each, so a
+    code doubles as a PRMT selector into the codebooks packed by
+    ``pack_load_codebooks``, whose escape entry decodes to zero. Escaped
+    scalars take bytes from an in-order stream instead: secondary codebook
+    entries, into which the lane's raw escape bytes (one clamped eight-byte
+    window) are gathered the same way. Each gather is a PRMT whose selector
+    nibbles are the escape ranks (``_rank_selector``), ORed into the
+    codebook bytes. Two more permutes per output word interleave low and
+    high bytes. When the head dimension is divisible by eight, each lane
+    writes its eight scalars as one 128-bit store; otherwise a lane's
+    scalars may straddle heads and are stored one by one.
 
     The kernel is compiled without TileLang's per-access bounds guards.
     Every global write address derives only from host-validated metadata
     (destination blocks, plane range, grid indices), never from record
     bytes, and reads addressed by record bytes are clamped to the staging
-    tensor. A corrupt record therefore yields wrong scalars in its own
-    destination blocks only.
+    tensor or proven in range. A corrupt record therefore yields wrong
+    scalars in its own destination blocks only.
     """
     vector_stores = head_dim % 8 == 0
     head_words = head_dim // 8
     tile_ctas = (
         (tiles_per_plane + 7) // 8 + _LOAD_TILE_GROUPS - 1
     ) // _LOAD_TILE_GROUPS
+    # Tiles addressed by the grid, including the idle tail of the last CTA.
+    grid_tiles = tile_ctas * _LOAD_TILE_GROUPS * 8
     # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
     # while still fitting in the configured staging lease, so shape extents
     # must remain 64-bit; the default ``T.dynamic`` dtype is int32.
@@ -1428,10 +1493,22 @@ def _build_wordparallel_load(
     kv_words = num_blocks * num_planes * plane_scalars // 8
 
     @T.macro
+    def record_pair(words, word_base, lead, offset, last, out, at):
+        # ``out[at]`` and ``out[at + 1]`` get two consecutive record words
+        # from three loads; ``last`` clamps as in ``_record_word``.
+        total = lead + T.cast(offset, T.uint32)
+        first = _clamp(total >> 2, last)
+        a = T.cast(words[word_base + first], T.uint32)
+        b = T.cast(words[word_base + _clamp(first + 1, last)], T.uint32)
+        c = T.cast(words[word_base + _clamp(first + 2, last)], T.uint32)
+        out[at] = T.call_extern("uint32", "__funnelshift_r", a, b, (total & 3) * 8)
+        out[at + 1] = T.call_extern("uint32", "__funnelshift_r", b, c, (total & 3) * 8)
+
+    @T.macro
     def fetch_group(words, word_base, lead, last, descriptor, tile, lane, out):
         # Scan-independent words of one lane in ``tile``: primary symbols, low
-        # bytes [0, 4) and [4, 8), and the tile's escape and raw prefixes.
-        # Reads past the plane are clamped by ``_record_word`` and unused.
+        # bytes [0, 8), and the tile's escape and raw prefixes. Reads past
+        # the plane are clamped (or proven in range) and unused.
         scalar_start = tile * 256 + lane * 8
         out[0] = _record_word(
             words,
@@ -1440,15 +1517,14 @@ def _build_wordparallel_load(
             descriptor[1] + T.cast(scalar_start * 3 // 8, T.uint32),
             last,
         )
-        out[1] = _record_word(
-            words, word_base, lead, descriptor[0] + T.cast(scalar_start, T.uint32), last
-        )
-        out[2] = _record_word(
+        record_pair(
             words,
             word_base,
             lead,
-            descriptor[0] + T.cast(scalar_start + 4, T.uint32),
+            descriptor[0] + T.cast(scalar_start, T.uint32),
             last,
+            out,
+            1,
         )
         out[3] = _record_word(
             words,
@@ -1464,6 +1540,15 @@ def _build_wordparallel_load(
             descriptor[2] + T.cast((tiles_per_plane + 1 + tile) * 4, T.uint32),
             last,
         )
+
+    @T.macro
+    def fetch_group_checked(
+        words, word_base, lead, last, unclamped, descriptor, tile, lane, out
+    ):
+        if unclamped != 0:
+            fetch_group(words, word_base, lead, None, descriptor, tile, lane, out)
+        else:
+            fetch_group(words, word_base, lead, last, descriptor, tile, lane, out)
 
     @T.prim_func
     def main(
@@ -1483,8 +1568,12 @@ def _build_wordparallel_load(
             by,
             bz,
         ):
-            T.annotate_min_blocks_per_sm(8)
-            descriptor = T.alloc_shared((5,), "uint32")
+            T.import_source(_LOAD_DEVICE_SOURCE)
+            if vector_stores:
+                # Full occupancy: 32 registers per thread. Per-scalar stores
+                # need more and would spill.
+                T.annotate_min_blocks_per_sm(8)
+            shared_descriptor = T.alloc_shared((5,), "uint32")
             values = T.alloc_local((8,), "uint16")
             tx = T.get_thread_binding()
             lane = tx & 31
@@ -1508,13 +1597,34 @@ def _build_wordparallel_load(
                     + 20
                     + tx * 4
                 )
-                descriptor[tx] = (
+                shared_descriptor[tx] = (
                     T.cast(staging[address], T.uint32)
                     | (T.cast(staging[address + 1], T.uint32) << 8)
                     | (T.cast(staging[address + 2], T.uint32) << 16)
                     | (T.cast(staging[address + 3], T.uint32) << 24)
                 )
             T.sync_threads()
+            # Low-byte, symbol, prefix and secondary offsets, then the
+            # escape count, held in registers for the whole CTA.
+            descriptor = T.alloc_local((5,), "uint32")
+            for field in T.unroll(5):
+                descriptor[field] = shared_descriptor[field]
+            raw_base = descriptor[3] + ((descriptor[4] * 3 + 7) >> 3)
+            # Bytes readable from the record start. The scan-independent
+            # reads of every grid tile end below these bounds, so a CTA whose
+            # descriptor satisfies them reads without clamps.
+            room = T.cast(word_last, T.int64) * 4 + 4 - T.cast(word_lead, T.int64)
+            unclamped = T.alloc_var(T.int32, init=0)
+            if (
+                mode != 0
+                and T.cast(descriptor[1], T.int64) + grid_tiles * 96 + 8 <= room
+                and T.cast(descriptor[0], T.int64) + grid_tiles * 256 + 12 <= room
+                and T.cast(descriptor[2], T.int64)
+                + (tiles_per_plane + 1 + grid_tiles) * 4
+                + 8
+                <= room
+            ):
+                unclamped = 1
             book_words = T.alloc_local((4,), "uint32")
             high_words = T.alloc_local((2,), "uint32")
             # The packed output words alias ``values`` for the vector store.
@@ -1527,11 +1637,12 @@ def _build_wordparallel_load(
             ahead = T.alloc_local((5,), "uint32")
             current = T.alloc_local((5,), "uint32")
             if mode != 0:
-                fetch_group(
+                fetch_group_checked(
                     words,
                     word_base,
                     word_lead,
                     word_last,
+                    unclamped,
                     descriptor,
                     bz * _LOAD_TILE_GROUPS * 8 + tx // 32,
                     lane,
@@ -1557,34 +1668,27 @@ def _build_wordparallel_load(
                     for entry in T.unroll(5):
                         current[entry] = ahead[entry]
                     if group + 1 < _LOAD_TILE_GROUPS:
-                        fetch_group(
+                        fetch_group_checked(
                             words,
                             word_base,
                             word_lead,
                             word_last,
+                            unclamped,
                             descriptor,
                             tile + 8,
                             lane,
                             ahead,
                         )
-                    high_words[0] = 0
-                    high_words[1] = 0
                     primary_word = current[0] & (
                         (T.cast(1, T.uint32) << (valid * 3)) - 1
                     )
-                    # In each three-bit symbol, the low bit of 111 survives this
-                    # intersection. Spaced bits avoid carries between symbols.
-                    primary_mask = (
-                        primary_word
-                        & (primary_word >> 1)
-                        & (primary_word >> 2)
-                        & T.cast(0x249249, T.uint32)
-                    )
+                    primary_codes = _spread_codes(primary_word)
+                    escapes = _nibble_flags(primary_codes)
                     # Scan indices are signed: subtracting this lane's count
                     # forms an exclusive prefix. Keep packed words unsigned for
                     # logical shifts, but do not mix unsigned rank subtraction
                     # into the compiler's bounds analysis.
-                    primary_count = T.cast(T.popcount(primary_mask), T.int32)
+                    primary_count = T.cast(T.popcount(escapes), T.int32)
                     primary_scan = T.alloc_var(T.int32, init=primary_count)
                     for step in T.unroll(5):
                         prior = T.shfl_up(primary_scan, 1 << step)
@@ -1611,12 +1715,16 @@ def _build_wordparallel_load(
                             word_last,
                         )
                     secondary_word = secondary_word >> ((secondary_start * 3) & 7)
-                    secondary_mask = (
-                        secondary_word
-                        & (secondary_word >> 1)
-                        & (secondary_word >> 2)
-                        & T.cast(0x249249, T.uint32)
-                        & ((T.cast(1, T.uint32) << (primary_count * 3)) - 1)
+                    secondary_codes = _spread_codes(secondary_word)
+                    raw_flags = _nibble_flags(secondary_codes)
+                    # Only the first ``primary_count`` secondary symbols are
+                    # this lane's; the funnel shift keeps that many nibbles.
+                    secondary_mask = raw_flags & T.call_extern(
+                        "uint32",
+                        "__funnelshift_rc",
+                        T.cast(0xFFFFFFFF, T.uint32),
+                        T.cast(0, T.uint32),
+                        T.cast(32 - primary_count * 4, T.uint32),
                     )
                     secondary_count = T.cast(T.popcount(secondary_mask), T.int32)
                     secondary_scan = T.alloc_var(T.int32, init=secondary_count)
@@ -1633,57 +1741,56 @@ def _build_wordparallel_load(
                         low_first = current[1]
                     if valid > 4:
                         low_second = current[2]
-                    # Walk the lane's symbols with running counters: ``pending``
-                    # shifts to the next secondary symbol after each escape,
-                    # and ``raw_rank`` counts earlier raw escapes.
                     raw_window = T.alloc_local((2,), "uint32")
                     raw_window[0] = 0
                     raw_window[1] = 0
                     if secondary_count > 0:
-                        raw_offset = (
-                            descriptor[3]
-                            + ((descriptor[4] * 3 + 7) >> 3)
-                            + T.cast(raw_start, T.uint32)
+                        record_pair(
+                            words,
+                            word_base,
+                            word_lead,
+                            raw_base + T.cast(raw_start, T.uint32),
+                            word_last,
+                            raw_window,
+                            0,
                         )
-                        raw_window[0] = _record_word(
-                            words, word_base, word_lead, raw_offset, word_last
-                        )
-                        raw_window[1] = _record_word(
-                            words, word_base, word_lead, raw_offset + 4, word_last
-                        )
-                    pending = T.alloc_var(T.uint32, init=secondary_word)
-                    raw_rank = T.alloc_var(T.uint32, init=0)
-                    for i in T.unroll(8):
-                        code = (primary_word >> (i * 3)) & T.cast(7, T.uint32)
-                        secondary = pending & T.cast(7, T.uint32)
-                        escaped = code == T.cast(7, T.uint32)
-                        raw = T.And(escaped, secondary == T.cast(7, T.uint32))
-                        # All three candidates are computed and selected so
-                        # the loop has no divergent branches.
-                        from_raw = _byte_perm(raw_window[0], raw_window[1], raw_rank)
-                        from_secondary = _byte_perm(
-                            book_words[2], book_words[3], secondary
-                        )
-                        from_primary = _byte_perm(book_words[0], book_words[1], code)
-                        high = T.Select(
-                            escaped,
-                            T.Select(raw, from_raw, from_secondary),
-                            from_primary,
-                        )
-                        # Insert byte 0 of ``high`` at byte i % 4.
-                        high_words[i // 4] = _byte_perm(
-                            high_words[i // 4],
-                            high,
-                            (0x3210 & ~(0xF << ((i % 4) * 4))) | (0x4 << ((i % 4) * 4)),
-                        )
-                        pending = T.Select(escaped, pending >> 3, pending)
-                        raw_rank = raw_rank + T.cast(raw, T.uint32)
+                    # Rank 7 selects byte 7, which belongs to the stream only
+                    # when all eight entries are escapes; otherwise clear it so
+                    # unflagged nibbles OR in zero.
+                    raw_high = T.Select(
+                        secondary_count < 8,
+                        raw_window[1] & T.cast(0x00FFFFFF, T.uint32),
+                        raw_window[1],
+                    )
+                    raw_select = _rank_selector(raw_flags)
+                    # Secondary-level bytes in stream order: the codebook entry,
+                    # or for code 7 (which decodes to zero) the raw byte.
+                    stream_low = _prmt(
+                        book_words[2], book_words[3], secondary_codes
+                    ) | _prmt(raw_window[0], raw_high, raw_select)
+                    stream_upper = _prmt(
+                        book_words[2], book_words[3], secondary_codes >> 16
+                    ) | _prmt(raw_window[0], raw_high, raw_select >> 16)
+                    # Likewise byte 7 of the stream for the primary ranks.
+                    stream_high = T.Select(
+                        primary_count < 8,
+                        stream_upper & T.cast(0x00FFFFFF, T.uint32),
+                        stream_upper,
+                    )
+                    escape_select = _rank_selector(escapes)
+                    # Primary code 7 decodes to zero, so escaped bytes OR in.
+                    high_words[0] = _prmt(
+                        book_words[0], book_words[1], primary_codes
+                    ) | _prmt(stream_low, stream_high, escape_select)
+                    high_words[1] = _prmt(
+                        book_words[0], book_words[1], primary_codes >> 16
+                    ) | _prmt(stream_low, stream_high, escape_select >> 16)
                     # Interleave four low and four high bytes into two
                     # little-endian BF16 pairs per output word.
-                    out_words[0] = _byte_perm(low_first, high_words[0], 0x5140)
-                    out_words[1] = _byte_perm(low_first, high_words[0], 0x7362)
-                    out_words[2] = _byte_perm(low_second, high_words[1], 0x5140)
-                    out_words[3] = _byte_perm(low_second, high_words[1], 0x7362)
+                    out_words[0] = _prmt(low_first, high_words[0], 0x5140)
+                    out_words[1] = _prmt(low_first, high_words[0], 0x7362)
+                    out_words[2] = _prmt(low_second, high_words[1], 0x5140)
+                    out_words[3] = _prmt(low_second, high_words[1], 0x7362)
                 if vector_stores:
                     # Lane word ``word`` holds plane scalars [8 * word, 8 * word
                     # + 8), which never straddle a head as head_dim % 8 == 0.
