@@ -14,11 +14,9 @@ from daser.compression import (
     encode_slot,
 )
 from daser.compression.format import (
-    GROUP_PREFIX_ENV,
+    FORMAT_VERSION,
     SlotHeader,
     digest_bytes,
-    format_version_for_prefix_group,
-    online_prefix_group_tiles,
     slot_header_bytes,
 )
 from daser.ops.compressed_kv import (
@@ -397,8 +395,7 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
         expected_codebook_hash=digest_bytes(codebooks),
     )
     assert header.stored_length == packed[0].stored_length
-    expected_group = online_prefix_group_tiles() if tile_scalars == 256 else 1
-    assert header.format_version == format_version_for_prefix_group(expected_group)
+    assert header.format_version == FORMAT_VERSION
     # An independent CPU reader checks that the host span, persisted header,
     # and GPU encoder agree; GPU roundtrip alone could share an offset bug.
     assert (
@@ -643,30 +640,6 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
                 f"expected={expected[begin:end].tolist()} "
                 f"actual={actual[begin:end].tolist()}"
             )
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("escape_pattern", ["sparse", "secondary", "clustered_raw"])
-def test_online_packer_group_prefix_switch_writes_version_two(
-    monkeypatch: pytest.MonkeyPatch, escape_pattern: str
-) -> None:
-    """The research switch emits version-2 records that both decoders read."""
-    monkeypatch.setenv(GROUP_PREFIX_ENV, "1")
-    test_online_packer_restores_escapes_and_raw_overflow_byte_exact(256, escape_pattern)
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(("num_layers", "head_dim"), [(2, 127), (18, 129)])
-def test_online_packer_group_prefix_production_batch(
-    monkeypatch: pytest.MonkeyPatch, num_layers: int, head_dim: int
-) -> None:
-    """Version-2 records survive production batches and partial tails."""
-    monkeypatch.setenv(GROUP_PREFIX_ENV, "1")
-    test_online_packer_handles_production_batch_geometry_and_partial_tail(
-        256, num_layers, head_dim
-    )
 
 
 @pytest.mark.integration

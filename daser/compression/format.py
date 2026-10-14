@@ -7,18 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import hashlib
-import os
 import struct
 
-# Version 1 stores one escape and one raw-escape prefix per tile. Version 2
-# stores them once per group of ``PREFIX_GROUP_TILES`` tiles; a decoder
-# recovers a tile's offset inside its group from the preceding tiles' symbol
-# streams. Both versions stay readable; the writer version is fixed per store.
+# Version 1 stores one escape and one raw-escape prefix per tile.
 FORMAT_VERSION = 1
-GROUP_PREFIX_FORMAT_VERSION = 2
-PREFIX_GROUP_TILES = 8
-#: Research switch: ``1`` makes online producers write version-2 records.
-GROUP_PREFIX_ENV = "DASER_PACKED_GROUP_PREFIX"
 IO_ALIGNMENT = 4096
 CODEBOOK_ENTRIES = 15
 KV_PLANES = 2
@@ -62,78 +54,20 @@ def slot_header_bytes(plane_count: int) -> int:
     return align_up(_SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size + 1)
 
 
-def online_prefix_group_tiles() -> int:
-    """Return the tile count covered by one online prefix-table entry.
-
-    Returns:
-        ``PREFIX_GROUP_TILES`` when the ``DASER_PACKED_GROUP_PREFIX=1``
-        research switch is set, otherwise ``1`` (the version-1 layout).
-
-    Async/thread-safety:
-        Reads the process environment; safe to call from any thread.
-    """
-    return PREFIX_GROUP_TILES if os.environ.get(GROUP_PREFIX_ENV) == "1" else 1
-
-
-def prefix_group_tiles_for_version(version: int) -> int:
-    """Return the prefix-table granularity used by one format version.
-
-    Args:
-        version: Slot header format version.
-
-    Returns:
-        Tiles covered by one prefix-table entry.
-
-    Raises:
-        ValueError: If the version is not a supported compressed format.
-
-    Async/thread-safety:
-        Pure and safe to call from any thread.
-    """
-    if version == FORMAT_VERSION:
-        return 1
-    if version == GROUP_PREFIX_FORMAT_VERSION:
-        return PREFIX_GROUP_TILES
-    raise ValueError("unsupported compressed slot format version")
-
-
-def format_version_for_prefix_group(group_tiles: int) -> int:
-    """Return the format version that writes a prefix-table granularity.
-
-    Args:
-        group_tiles: Tiles covered by one prefix-table entry.
-
-    Returns:
-        The slot header format version.
-
-    Raises:
-        ValueError: If no format version uses this granularity.
-
-    Async/thread-safety:
-        Pure and safe to call from any thread.
-    """
-    if group_tiles == 1:
-        return FORMAT_VERSION
-    if group_tiles == PREFIX_GROUP_TILES:
-        return GROUP_PREFIX_FORMAT_VERSION
-    raise ValueError("unsupported prefix group granularity")
-
-
-def prefix_table_bytes(tile_count: int, group_tiles: int) -> int:
+def prefix_table_bytes(tile_count: int) -> int:
     """Return the bytes of one plane's escape and raw-escape prefix tables.
 
     Args:
         tile_count: Tiles in the plane.
-        group_tiles: Tiles covered by one prefix-table entry.
 
     Returns:
-        Two little-endian ``uint32`` tables of ``ceil(tiles / group) + 1``
+        Two little-endian ``uint32`` tables of ``tiles + 1``
         cumulative counts each, stored back-to-back.
 
     Async/thread-safety:
         Pure and safe to call from any thread.
     """
-    return 8 * ((tile_count + group_tiles - 1) // group_tiles + 1)
+    return 8 * (tile_count + 1)
 
 
 def align_up(value: int, alignment: int = IO_ALIGNMENT) -> int:
@@ -163,7 +97,6 @@ def online_fixed_envelope_geometry(
     num_planes: int,
     plane_scalars: int,
     max_tiles: int,
-    prefix_group_tiles: int = 1,
 ) -> tuple[int, int, int] | None:
     """Return the online packed envelope geometry used by the codec.
 
@@ -172,7 +105,6 @@ def online_fixed_envelope_geometry(
         num_planes: Number of K/V planes in the cross-layer record.
         plane_scalars: BF16 scalar count in one plane.
         max_tiles: Maximum codec tiles in one plane.
-        prefix_group_tiles: Tiles covered by one prefix-table entry.
 
     Returns:
         A tuple of per-plane bytes, fixed escape bytes, and aligned stored
@@ -182,9 +114,7 @@ def online_fixed_envelope_geometry(
         Pure arithmetic with no I/O or shared state.
     """
     payload_base = (
-        plane_scalars
-        + (plane_scalars * 3 + 7) // 8
-        + prefix_table_bytes(max_tiles, prefix_group_tiles)
+        plane_scalars + (plane_scalars * 3 + 7) // 8 + prefix_table_bytes(max_tiles)
     )
     if num_planes <= 0:
         return None
@@ -326,8 +256,7 @@ class CompressedStoreGeometry:
 
         Returns:
             The smallest byte range that the online format can describe for
-            this geometry with the prefix granularity selected by
-            ``DASER_PACKED_GROUP_PREFIX``. The value is used only to size
+            this geometry. The value is used only to size
             logical metadata; physical admission still uses each record's
             actual length.
 
@@ -338,7 +267,7 @@ class CompressedStoreGeometry:
         payload_base = (
             self.plane_scalars
             + (self.plane_scalars * 3 + 7) // 8
-            + prefix_table_bytes(max_tiles, online_prefix_group_tiles())
+            + prefix_table_bytes(max_tiles)
         )
         return align_up(self.header_bytes + self.plane_count * payload_base)
 
@@ -410,7 +339,8 @@ class SlotHeader:
         """
         if len(self.codebook_hash) != 32 or len(self.raw_hash) != 32:
             raise ValueError("slot hashes must contain 32 bytes")
-        prefix_group_tiles_for_version(self.format_version)
+        if self.format_version != FORMAT_VERSION:
+            raise ValueError("unsupported compressed slot format version")
         header_bytes = slot_header_bytes(len(self.descriptors))
         page = bytearray(header_bytes)
         _SLOT_HEADER.pack_into(
@@ -481,9 +411,8 @@ class SlotHeader:
         ) = fields
         if magic != SLOT_MAGIC:
             raise ValueError("unsupported compressed slot magic")
-        group_tiles = prefix_group_tiles_for_version(version)
-        if group_tiles > 1 and tile_scalars != ONLINE_TILE_SCALARS:
-            raise ValueError("grouped tile prefixes require online 256-scalar tiles")
+        if version != FORMAT_VERSION:
+            raise ValueError("unsupported compressed slot format version")
         if alignment != IO_ALIGNMENT or plane_count <= 0:
             raise ValueError("compressed slot uses unsupported alignment")
         if header_bytes != slot_header_bytes(plane_count):
@@ -540,7 +469,7 @@ class SlotHeader:
             record_end = descriptor.record_offset + descriptor.record_length
             # Escape and raw-escape prefix tables are stored back-to-back.
             prefix_end = descriptor.prefix_offset + prefix_table_bytes(
-                descriptor.tile_count, group_tiles
+                descriptor.tile_count
             )
             symbol_bytes = (descriptor.scalar_count * SYMBOL_BITS + 7) // 8
             symbol_end = descriptor.symbol_offset + symbol_bytes
@@ -599,11 +528,8 @@ __all__ = [
     "CODEBOOK_ENTRIES",
     "ESCAPE_SYMBOL_BITS",
     "FORMAT_VERSION",
-    "GROUP_PREFIX_ENV",
-    "GROUP_PREFIX_FORMAT_VERSION",
     "IO_ALIGNMENT",
     "KV_PLANES",
-    "PREFIX_GROUP_TILES",
     "SYMBOL_BITS",
     "CompressedStoreGeometry",
     "PlaneDescriptor",
@@ -611,10 +537,7 @@ __all__ = [
     "SlotMode",
     "align_up",
     "digest_bytes",
-    "format_version_for_prefix_group",
     "online_fixed_envelope_geometry",
-    "online_prefix_group_tiles",
-    "prefix_group_tiles_for_version",
     "prefix_table_bytes",
     "slot_header_bytes",
 ]

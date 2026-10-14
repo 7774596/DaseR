@@ -51,10 +51,6 @@ _WORD_PARALLEL_TILE_SCALARS = 256
 _LOAD_TILE_GROUPS = 32
 _ESCAPE_PACKED_FLAG = 0x80
 _ESCAPE_3BIT_FLAG = 0x40
-# Mirrors ``compression.format``: version 2 stores one escape prefix and one
-# raw-escape prefix per group of eight 256-scalar tiles.
-_GROUP_PREFIX_VERSION = 2
-_PREFIX_GROUP_TILES = 8
 
 
 @dataclass(frozen=True)
@@ -66,7 +62,7 @@ class TileLangStoreKernels:
     compact: Any
 
 
-_STORE_CACHE: dict[tuple[int, int, int, int, int, int, int], TileLangStoreKernels] = {}
+_STORE_CACHE: dict[tuple[int, int, int, int, int, int], TileLangStoreKernels] = {}
 _LOAD_CACHE: dict[tuple[int, int, int, int, int, bool], Any] = {}
 
 
@@ -125,7 +121,6 @@ def compile_store_kernels(
     plane_scalars: int,
     head_dim: int,
     tile_scalars: int,
-    prefix_group_tiles: int = 1,
 ) -> TileLangStoreKernels:
     """Compile the online TileLang store stages for one KV geometry.
 
@@ -135,8 +130,6 @@ def compile_store_kernels(
         plane_scalars: BF16 scalars in one plane.
         head_dim: Scalars in one K or V head.
         tile_scalars: Scalar quantum used by the packed record.
-        prefix_group_tiles: Tiles per persisted escape-prefix entry; ``1``
-            writes format version 1 and ``8`` writes version 2.
 
     Returns:
         Cached fused encode, layout, and compact kernels.
@@ -155,10 +148,6 @@ def compile_store_kernels(
     tiles_per_plane = (plane_scalars + tile_scalars - 1) // tile_scalars
     if tiles_per_plane > 1024:
         raise ValueError("TileLang store supports at most 1024 tiles per plane")
-    if prefix_group_tiles not in (1, _PREFIX_GROUP_TILES) or (
-        prefix_group_tiles > 1 and tile_scalars != 256
-    ):
-        raise ValueError("grouped tile prefixes require eight 256-scalar tiles")
     key = (
         num_blocks,
         num_planes,
@@ -166,7 +155,6 @@ def compile_store_kernels(
         head_dim,
         tile_scalars,
         tiles_per_plane,
-        prefix_group_tiles,
     )
     cached = _STORE_CACHE.get(key)
     if cached is not None:
@@ -189,7 +177,6 @@ def compile_store_kernels(
                 num_planes=num_planes,
                 plane_scalars=plane_scalars,
                 max_tiles=tiles_per_plane,
-                prefix_group_tiles=prefix_group_tiles,
             ),
             target="cuda",
             execution_backend="cython",
@@ -202,7 +189,6 @@ def compile_store_kernels(
                 head_dim=head_dim,
                 tile_scalars=tile_scalars,
                 max_tiles=tiles_per_plane,
-                prefix_group_tiles=prefix_group_tiles,
             ),
             target="cuda",
             execution_backend="cython",
@@ -538,9 +524,7 @@ def _build_store_count_prefix(
     return main
 
 
-def _build_store_layout(
-    *, num_planes: int, plane_scalars: int, max_tiles: int, prefix_group_tiles: int
-) -> Any:
+def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) -> Any:
     """Build compact variable-length offsets from device totals."""
     n_slots = T.dynamic("N", "int64")
     row_items = T.dynamic("Q", "int64")
@@ -561,9 +545,7 @@ def _build_store_layout(
         scratch_slot_stride: T.int32,
     ):
         header_bytes = slot_header_bytes(num_planes)
-        prefix_bytes_3 = 8 * (
-            (max_tiles + prefix_group_tiles - 1) // prefix_group_tiles + 1
-        )
+        prefix_bytes_3 = 8 * (max_tiles + 1)
         payload_base_3 = plane_scalars + (plane_scalars * 3 + 7) // 8 + prefix_bytes_3
         # A single warp preserves the exact slot prefix order while computing
         # each consecutive group of plane lengths in parallel. Every lane
@@ -644,7 +626,6 @@ def _build_store_compact(
     head_dim: int,
     tile_scalars: int,
     max_tiles: int,
-    prefix_group_tiles: int,
 ) -> Any:
     """Emit packed records, headers, and raw-overflow slots in one launch.
 
@@ -657,7 +638,6 @@ def _build_store_compact(
     launch as payload bytes, so the caller does not need a pageable or pinned
     host metadata copy on the hot path.
     """
-    format_version = 1 if prefix_group_tiles == 1 else _GROUP_PREFIX_VERSION
     row_items = T.dynamic("Q", "int64")
     slot_items = T.dynamic("N", "int64")
     destination_bytes = T.dynamic("S", "int64")
@@ -739,12 +719,7 @@ def _build_store_compact(
                     # layout planner had reserved the 3-bit payload.
                     packed_escape = True
                     escape_symbol_bits = 3
-                    # Scratch keeps one prefix per tile for escape ranks; the
-                    # record persists every ``prefix_group_tiles``-th entry.
-                    prefix_entries = (
-                        max_tiles + prefix_group_tiles - 1
-                    ) // prefix_group_tiles + 1
-                    prefix_bytes = 8 * prefix_entries
+                    prefix_bytes = 8 * (max_tiles + 1)
                     symbol_bytes = (plane_scalars * 3 + 7) // 8
                     base_bytes = plane_scalars + symbol_bytes + prefix_bytes
                     # Deep models spill descriptors past one 4 KiB page.
@@ -767,7 +742,7 @@ def _build_store_compact(
                             destination[header_base + 7] = 49
                             for byte in range(4):
                                 destination[header_base + 8 + byte] = T.cast(
-                                    (format_version >> (byte * 8)) & 255, T.uint8
+                                    (1 >> (byte * 8)) & 255, T.uint8
                                 )
                                 destination[header_base + 12 + byte] = T.cast(
                                     (header_bytes >> (byte * 8)) & 255, T.uint8
@@ -923,22 +898,12 @@ def _build_store_compact(
                         ):
                             prefix_index = prefix_group * _COMPACT_THREADS + tx
                             if prefix_index < prefix_bytes:
-                                # Entry ``e`` of either persisted table is the
-                                # scratch prefix at tile ``e * group`` (capped
-                                # at the plane total in the final entry).
-                                table = prefix_index // (4 * prefix_entries)
-                                entry = prefix_index // 4 % prefix_entries
                                 destination[
                                     destination_base
                                     + plane_scalars
                                     + symbol_bytes
                                     + prefix_index
-                                ] = scratch[
-                                    scratch_prefix_base
-                                    + table * 4 * (max_tiles + 1)
-                                    + T.min(entry * prefix_group_tiles, max_tiles) * 4
-                                    + prefix_index % 4
-                                ]
+                                ] = scratch[scratch_prefix_base + prefix_index]
                         if tile_scalars == 256:
                             # A lane emits eight consecutive scalars. Both
                             # bitstreams preserve scalar order, while their
@@ -1461,16 +1426,13 @@ def _build_wordparallel_load(
     kv_shape = _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim)
     rows = kv_shape[2]
     kv_words = num_blocks * num_planes * plane_scalars // 8
-    prefix_groups = (tiles_per_plane + _PREFIX_GROUP_TILES - 1) // _PREFIX_GROUP_TILES
 
     @T.macro
-    def fetch_group(words, word_base, lead, last, descriptor, grouped, tile, lane, out):
+    def fetch_group(words, word_base, lead, last, descriptor, tile, lane, out):
         # Scan-independent words of one lane in ``tile``: primary symbols, low
         # bytes [0, 4) and [4, 8), and the tile's escape and raw prefixes.
         # Reads past the plane are clamped by ``_record_word`` and unused.
         scalar_start = tile * 256 + lane * 8
-        prefix_entry = T.if_then_else(grouped, tile // 8, tile)
-        prefix_entries = T.if_then_else(grouped, prefix_groups, tiles_per_plane)
         out[0] = _record_word(
             words,
             word_base,
@@ -1492,14 +1454,14 @@ def _build_wordparallel_load(
             words,
             word_base,
             lead,
-            descriptor[2] + T.cast(prefix_entry * 4, T.uint32),
+            descriptor[2] + T.cast(tile * 4, T.uint32),
             last,
         )
         out[4] = _record_word(
             words,
             word_base,
             lead,
-            descriptor[2] + T.cast((prefix_entries + 1 + prefix_entry) * 4, T.uint32),
+            descriptor[2] + T.cast((tiles_per_plane + 1 + tile) * 4, T.uint32),
             last,
         )
 
@@ -1521,11 +1483,8 @@ def _build_wordparallel_load(
             by,
             bz,
         ):
-            descriptor = T.alloc_shared((6,), "uint32")
-            # Version-2 records keep one prefix per eight-tile group; the
-            # CTA's eight warps recover tile offsets from these group sums.
-            group_escapes = T.alloc_shared((8,), "int32")
-            group_raws = T.alloc_shared((8,), "int32")
+            T.annotate_min_blocks_per_sm(8)
+            descriptor = T.alloc_shared((5,), "uint32")
             values = T.alloc_local((8,), "uint16")
             tx = T.get_thread_binding()
             lane = tx & 31
@@ -1555,12 +1514,7 @@ def _build_wordparallel_load(
                     | (T.cast(staging[address + 2], T.uint32) << 16)
                     | (T.cast(staging[address + 3], T.uint32) << 24)
                 )
-            if mode != 0 and tx == 5:
-                descriptor[5] = T.cast(staging[slot_base + 8], T.uint32)
             T.sync_threads()
-            # The header version is slot-uniform, so grouped-prefix barriers
-            # below are uniform across the CTA.
-            grouped = mode != 0 and descriptor[5] == _GROUP_PREFIX_VERSION
             book_words = T.alloc_local((4,), "uint32")
             high_words = T.alloc_local((2,), "uint32")
             # The packed output words alias ``values`` for the vector store.
@@ -1579,7 +1533,6 @@ def _build_wordparallel_load(
                     word_lead,
                     word_last,
                     descriptor,
-                    grouped,
                     bz * _LOAD_TILE_GROUPS * 8 + tx // 32,
                     lane,
                     ahead,
@@ -1610,7 +1563,6 @@ def _build_wordparallel_load(
                             word_lead,
                             word_last,
                             descriptor,
-                            grouped,
                             tile + 8,
                             lane,
                             ahead,
@@ -1638,19 +1590,6 @@ def _build_wordparallel_load(
                         prior = T.shfl_up(primary_scan, 1 << step)
                         if lane >= (1 << step):
                             primary_scan = primary_scan + prior
-                    # Version 1 indexes one prefix entry per tile; version 2
-                    # indexes the tile's group and adds the escapes of the
-                    # group's preceding warps (tiles) from shared memory.
-                    tile_escape_base = T.alloc_var(T.int32, init=0)
-                    if grouped:
-                        if lane == 31:
-                            group_escapes[tx // 32] = primary_scan
-                        T.sync_threads()
-                        for prior_warp in T.unroll(8):
-                            if prior_warp < tx // 32:
-                                tile_escape_base = (
-                                    tile_escape_base + group_escapes[prior_warp]
-                                )
                     prefix = T.alloc_var(T.uint32, init=0)
                     raw_prefix = T.alloc_var(T.uint32, init=0)
                     # All lanes, including an inactive final warp, participate
@@ -1658,7 +1597,6 @@ def _build_wordparallel_load(
                     if tile < tiles_per_plane:
                         prefix = current[3]
                         raw_prefix = current[4]
-                    prefix = prefix + T.cast(tile_escape_base, T.uint32)
                     secondary_start = (
                         T.cast(prefix, T.int32) + primary_scan - primary_count
                     )
@@ -1686,21 +1624,8 @@ def _build_wordparallel_load(
                         prior_raw = T.shfl_up(secondary_scan, 1 << step)
                         if lane >= (1 << step):
                             secondary_scan = secondary_scan + prior_raw
-                    tile_raw_base = T.alloc_var(T.int32, init=0)
-                    if grouped:
-                        # The barrier also orders this group's escape reads
-                        # before the next group's escape writes.
-                        if lane == 31:
-                            group_raws[tx // 32] = secondary_scan
-                        T.sync_threads()
-                        for prior_warp in T.unroll(8):
-                            if prior_warp < tx // 32:
-                                tile_raw_base = tile_raw_base + group_raws[prior_warp]
                     raw_start = (
-                        T.cast(raw_prefix, T.int32)
-                        + tile_raw_base
-                        + secondary_scan
-                        - secondary_count
+                        T.cast(raw_prefix, T.int32) + secondary_scan - secondary_count
                     )
                     low_first = T.alloc_var(T.uint32, init=0)
                     low_second = T.alloc_var(T.uint32, init=0)

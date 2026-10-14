@@ -11,7 +11,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import PREFIX_GROUP_TILES, SlotHeader
+from daser.compression.format import SlotHeader
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
@@ -149,22 +149,18 @@ def test_reject_misaligned_staging() -> None:
 def test_restore_mixed_records_byte_exact_with_fanout(
     geometry: CompressedStoreGeometry,
 ) -> None:
-    """v2, raw and v1 records restore exactly, including fanout destinations."""
+    """Compressed and raw records restore exactly, including fanout targets."""
     codebooks = default_online_codebooks(geometry)
     raws = [_slot(geometry, seed) for seed in (71, 72, 73)]
-    grouped = encode_slot(
-        raws[0],
-        slot_id=0,
-        geometry=geometry,
-        codebooks=codebooks,
-        prefix_group_tiles=PREFIX_GROUP_TILES,
+    first, last = (
+        encode_slot(raws[i], slot_id=i, geometry=geometry, codebooks=codebooks)
+        for i in (0, 2)
     )
-    per_tile = encode_slot(raws[2], slot_id=2, geometry=geometry, codebooks=codebooks)
-    assert grouped.mode is SlotMode.COMPRESSED
-    assert per_tile.mode is SlotMode.COMPRESSED
-    blob = b"\x03" + grouped.payload + raws[1] + per_tile.payload
+    assert first.mode is SlotMode.COMPRESSED
+    assert last.mode is SlotMode.COMPRESSED
+    blob = b"\x03" + first.payload + raws[1] + last.payload
     blob += b"\x00" * ((-len(blob)) % 4)
-    offsets = [1, 1 + len(grouped.payload), 1 + len(grouped.payload) + len(raws[1])]
+    offsets = [1, 1 + len(first.payload), 1 + len(first.payload) + len(raws[1])]
     staging = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).cuda()
     cache = _cache(5, geometry)
     decoder = FusedCompressedKVDecoder(
@@ -203,11 +199,7 @@ def test_corrupt_records_only_change_their_own_destination(region: str) -> None:
     )
     codebooks = default_online_codebooks(geometry)
     record = encode_slot(
-        _slot(geometry, 81),
-        slot_id=0,
-        geometry=geometry,
-        codebooks=codebooks,
-        prefix_group_tiles=PREFIX_GROUP_TILES,
+        _slot(geometry, 81), slot_id=0, geometry=geometry, codebooks=codebooks
     ).payload
     first = SlotHeader.parse(record).descriptors[0]
     prefix = first.prefix_offset  # descriptor offsets are slot-relative
@@ -250,8 +242,7 @@ def test_corrupt_records_only_change_their_own_destination(region: str) -> None:
         assert torch.equal(cache[2], sentinel)
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_restore_lanes_full_of_raw_escapes(version: str) -> None:
+def test_restore_lanes_full_of_raw_escapes() -> None:
     """Lanes whose eight scalars are all raw escapes restore byte-exact."""
     geometry = CompressedStoreGeometry(
         num_slots=1,
@@ -275,11 +266,7 @@ def test_restore_lanes_full_of_raw_escapes(version: str) -> None:
     high[noisy] = rng.integers(0xD0, 0xF0, int(noisy.sum()), dtype=np.uint8)
     raw[1::2] = high
     encoded = encode_slot(
-        raw.tobytes(),
-        slot_id=0,
-        geometry=geometry,
-        codebooks=codebooks,
-        prefix_group_tiles=PREFIX_GROUP_TILES if version == "v2" else 1,
+        raw.tobytes(), slot_id=0, geometry=geometry, codebooks=codebooks
     )
     assert encoded.mode == SlotMode.COMPRESSED
     blob = b"\x01\x02" + encoded.payload
