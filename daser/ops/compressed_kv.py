@@ -66,8 +66,8 @@ def _fixed_envelope_geometry(
 
 def _fixed_single_read_geometry(
     *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
-) -> tuple[int, int, int] | None:
-    """Return scratch parameters for contiguous per-plane escape prefixes.
+) -> tuple[int, int] | None:
+    """Return per-plane and per-slot scratch bytes for the prefix tables.
 
     Payload emission is fused into the final staging write, so intermediate
     storage contains only the two uint32 prefix tables. The raw fallback
@@ -81,13 +81,10 @@ def _fixed_single_read_geometry(
     )
     if envelope is None or max_tiles <= 0:
         return None
-    _plane_bytes, fixed_escape, _stored_length = envelope
-    tile_capacity = (fixed_escape + max_tiles - 1) // max_tiles
-    # Scratch retains token and raw-escape prefixes for the packed 3-bit
-    # stream. The persisted 4-bit fallback still copies only its first table.
+    # Scratch retains the escape and raw-byte prefixes of every tile.
     scratch_plane_bytes = 8 * (max_tiles + 1)
     scratch_slot_bytes = num_planes * scratch_plane_bytes
-    return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
+    return scratch_plane_bytes, scratch_slot_bytes
 
 
 def warm_fused_online_kv_packer(
@@ -172,7 +169,7 @@ def _warm_tilelang_codec(
     if envelope is None or single_read is None:
         raise ValueError("online packer cannot fit a fixed TileLang envelope")
     plane_record_bytes, fixed_escape_bytes, _ = envelope
-    tile_escape_capacity, scratch_plane_bytes, scratch_slot_stride = single_read
+    scratch_plane_bytes, scratch_slot_stride = single_read
     device = kv_cache.device
     with torch.cuda.device(device), torch.inference_mode(False):
         ids = torch.zeros(1, dtype=torch.int32, device=device)
@@ -190,10 +187,6 @@ def _warm_tilelang_codec(
         slot_offsets = torch.zeros(1, dtype=torch.int64, device=device)
         symbol_bits = torch.zeros(1, dtype=torch.int32, device=device)
         output = torch.empty(int(kv_cache[0].nbytes), dtype=torch.uint8, device=device)
-        max_escape_words = (plane_scalars * 3 + 31) // 32
-        escape_words = torch.zeros(
-            num_planes * max_escape_words, dtype=torch.uint32, device=device
-        )
         # The representative load launch targets block zero because the
         # TileLang destination shape is the production KV cache. Preserve the
         # live cache value across warmup so registration cannot alter the first
@@ -232,7 +225,6 @@ def _warm_tilelang_codec(
             logical_ids,
             overflow,
             output,
-            escape_words,
             destination_offsets,
             payload_bytes,
             totals,
@@ -242,7 +234,6 @@ def _warm_tilelang_codec(
             lookup,
             codebook_hash,
             scratch,
-            tile_escape_capacity,
             scratch_plane_bytes,
             block_tokens,
             block_tokens,
@@ -345,9 +336,6 @@ class FusedOnlineKVPacker:
         # Store uses the TileLang bundle exclusively. Raw fallback records are
         # emitted by the compact stage when a packed record overflows.
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
-        # Online records use only three-bit escape symbols. The ceiling also
-        # includes the last word of a symbol split across a word boundary.
-        self._max_escape_words = (self._plane_scalars * 3 + 31) // 32
         envelope = _fixed_envelope_geometry(
             slot_stride=self._geometry.slot_size,
             num_planes=self._num_planes,
@@ -377,7 +365,6 @@ class FusedOnlineKVPacker:
                 "compressed-online requires single-read TileLang scratch geometry"
             )
         (
-            self._fixed_tile_escape_capacity,
             self._fixed_scratch_plane_record_bytes,
             self._fixed_scratch_slot_stride,
         ) = single_read_geometry
@@ -452,11 +439,6 @@ class FusedOnlineKVPacker:
             self._device_compact_bytes = torch.empty(
                 compact_count, dtype=torch.int64, device=self._device
             )
-            self._device_escape_words = torch.empty(
-                self._max_slots * self._num_planes * self._max_escape_words,
-                dtype=torch.uint32,
-                device=self._device,
-            )
 
     def pack_into(
         self,
@@ -488,6 +470,9 @@ class FusedOnlineKVPacker:
             raise ValueError("online packer staging geometry is invalid")
         if staging.device != self._device or staging.dtype is not torch.uint8:
             raise ValueError("online packer staging must be a CUDA byte tensor")
+        # Compact writes raw-overflow planes and record words vectorized.
+        if staging.data_ptr() % 16:
+            raise ValueError("online packer staging must be 16-byte aligned")
         if staging.numel() < len(block_ids) * slot_stride:
             raise ValueError("online packer staging capacity is insufficient")
         if any(block < 0 or block >= self._num_blocks for block in block_ids):
@@ -552,12 +537,10 @@ class FusedOnlineKVPacker:
             # launch, which ``pack_into`` already enforces.
             scratch_slot_stride = self._fixed_scratch_slot_stride
             scratch_plane_record_bytes = self._fixed_scratch_plane_record_bytes
-            tile_escape_capacity = self._fixed_tile_escape_capacity
             if (
                 self._fixed_scratch is None
                 or scratch_slot_stride <= 0
                 or scratch_plane_record_bytes <= 0
-                or tile_escape_capacity <= 0
             ):
                 raise RuntimeError("single-read fixed scratch geometry is invalid")
             scratch = self._fixed_scratch[: slot_count * scratch_slot_stride]
@@ -574,9 +557,6 @@ class FusedOnlineKVPacker:
             device_sources = self._device_compact_source[:row_count]
             device_destinations = self._device_compact_destination[:row_count]
             device_bytes = self._device_compact_bytes[:row_count]
-            device_escape_words = self._device_escape_words[
-                : row_count * self._max_escape_words
-            ]
             device_slot_offsets = self._device_slot_offsets[:slot_count]
             device_symbol_bits = self._device_symbol_bits[:slot_count]
             with torch.cuda.stream(stream):
@@ -636,7 +616,6 @@ class FusedOnlineKVPacker:
                     device_logical_slots,
                     device_overflow,
                     staging,
-                    device_escape_words,
                     device_destinations,
                     device_bytes,
                     device_totals,
@@ -646,7 +625,6 @@ class FusedOnlineKVPacker:
                     self._lookup,
                     self._device_codebook_hash,
                     scratch,
-                    tile_escape_capacity,
                     scratch_plane_record_bytes,
                     self._geometry.block_tokens,
                     valid_token_count,
