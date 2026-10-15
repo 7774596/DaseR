@@ -266,6 +266,7 @@ class ServerCore:
         self._packed_layout = OnlinePackedLayout(on_held_drop=self._discard_held)
         self._hold_resident: Callable[[int, int], bool] | None = None
         self._discard_held_range: Callable[[int, int], None] | None = None
+        self._release_hold: Callable[[int, int], None] | None = None
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
         # Leaf-first eviction order over prefix-chain parent links; every
@@ -1046,6 +1047,7 @@ class ServerCore:
         self,
         hold_resident: Callable[[int, int], bool],
         discard_held: Callable[[int, int], None],
+        release_hold: Callable[[int, int], None],
     ) -> None:
         """Let packed reclaim keep L1-resident records indexed.
 
@@ -1054,6 +1056,8 @@ class ServerCore:
                 resident record held and returns whether it did.
             discard_held: ``TransferLayer.discard_held``; drops the L1 copy of
                 a held record whose placement is released.
+            release_hold: ``TransferLayer.release_hold``; keeps a held record
+                in L1 as an ordinary entry once it is charged again.
 
         The memory tier reports evicted held records via ``release_held``.
 
@@ -1063,6 +1067,7 @@ class ServerCore:
         """
         self._hold_resident = hold_resident
         self._discard_held_range = discard_held
+        self._release_hold = release_hold
 
     def pin(self, chunk_keys: list[str]) -> None:
         """Keep chunks from being chosen for eviction until ``unpin``.
@@ -1096,18 +1101,19 @@ class ServerCore:
     async def reclaim_packed(self, *, free_address: bool = False) -> bool:
         """Reclaim one chunk's packed records from the L2 budget or arena.
 
-        The victim is the least recently used evictable leaf of the eviction
-        tree. For the L2 budget, chunks already held are ignored; when the
-        attached memory tier holds all the victim's charged records whole they
-        become held and the chunk stays indexed, otherwise it is removed. With
-        ``free_address`` (the arena has no room) the victim is removed. See
-        ``docs/design/tier-residency.md``.
+        For the L2 budget the victim is the least recently used evictable
+        node of the charged frontier (not held, every child held). When the
+        attached memory tier holds all its charged records whole they become
+        held and the chunk stays indexed; otherwise it is removed with the
+        held subtree below it. With ``free_address`` (the arena has no room)
+        the victim is the least recently used evictable leaf and is removed.
+        See ``docs/design/tier-residency.md``.
 
         Args:
             free_address: Free arena bytes instead of L2 budget.
 
         Returns:
-            Whether a chunk was reclaimed; False when every candidate leaf is
+            Whether a chunk was reclaimed; False when every candidate is
             pinned or has a pending writer.
 
         Async/thread-safety:
@@ -1136,6 +1142,11 @@ class ServerCore:
             for record in held:
                 self._discard_held(record.file_offset, record.stored_length)
             self._count_reclaim("removed")
+            # Everything below a charged-frontier victim is held and becomes
+            # unreachable; remove it too (deepest first).
+            for key in self._tree.descendants(victim):
+                if not self._unevictable(key):
+                    await self._remove_chunk(key, reason="orphan")
             await self._remove_chunk(victim, reason="capacity")
             return True
         for record in held:
@@ -1145,7 +1156,10 @@ class ServerCore:
         return True
 
     def release_held(self, file_offset: int, nbytes: int) -> None:
-        """Remove the chunk of a held record that the memory tier evicted.
+        """Handle a held record the memory tier evicted.
+
+        A leaf chunk leaves the index; a chunk with children is charged to
+        the L2 budget again (see ``docs/design/tier-residency.md``).
 
         Args:
             file_offset: Start of the released L1 range.
@@ -1402,10 +1416,34 @@ class ServerCore:
         logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
 
     async def _remove_released_held(self, file_offset: int, nbytes: int) -> None:
-        """Remove the chunk of a released held record if it is still held."""
+        """Handle a held record L1 evicted, if it is still held.
+
+        A chunk with children is charged again instead of removed, so L1
+        replacement never cuts a chain in the middle; only a leaf leaves.
+        """
         chunk_key = self._packed_layout.held_owner(file_offset, nbytes)
-        if chunk_key is not None:
+        if chunk_key is None:
+            return
+        if self._tree.is_leaf(chunk_key):
             await self._remove_chunk(chunk_key, reason="l1_release")
+            return
+        self._recharge_path(chunk_key)
+        self._count_reclaim("recharged")
+
+    def _recharge_path(self, chunk_key: str) -> None:
+        """Charge ``chunk_key`` and its held ancestors to the L2 budget again.
+
+        Keeps the held closure (descendants of a held chunk are held) before
+        a chunk gains a child or is recharged. SSD copies of held records
+        stay valid, so this is bookkeeping only; the next store's budget
+        reclaim takes back any excess from the charged frontier.
+        """
+        for key in self._tree.held_path(chunk_key):
+            for record in self._packed_layout.held_records(key):
+                if self._release_hold is not None:
+                    self._release_hold(record.file_offset, record.stored_length)
+                self._packed_layout.recharge(record.file_offset)
+            self._tree.mark_charged(key)
 
     def _unevictable(self, chunk_key: str) -> bool:
         """Return whether a chunk is pinned or has an uncommitted writer."""
@@ -1541,6 +1579,8 @@ class ServerCore:
             except SlotsExhausted:
                 if not await self._evict_one():
                     raise
+        if parent_key:
+            self._recharge_path(parent_key)
         self._tree.add(chunk_key, parent_key)
         self._record_capacity_metrics()
         return meta

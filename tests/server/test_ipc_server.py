@@ -2597,6 +2597,9 @@ async def test_bip_setting_is_forwarded(
         def discard_held(self, file_offset: int, nbytes: int) -> None:
             pass
 
+        def release_hold(self, file_offset: int, nbytes: int) -> None:
+            pass
+
         def set_held_release_listener(self, listener: Any) -> None:
             pass
 

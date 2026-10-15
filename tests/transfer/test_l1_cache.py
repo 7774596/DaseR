@@ -357,6 +357,25 @@ def test_held_range_leaving_l1_is_reported_once() -> None:
         cache.close()
 
 
+def test_release_hold_keeps_the_range_and_silences_its_eviction() -> None:
+    """``release_hold`` leaves the range resident; its eviction is not reported."""
+    released: list[tuple[int, int]] = []
+    cache = L1Cache(
+        16384, 4096, lambda _key, _data: False, on_held_release=released.append
+    )
+    try:
+        (a,) = _put_held_group(cache, [(0, 4096)])
+        cache.release_hold((0, 4096))
+        cache.release_hold((8192, 4096))  # not resident: ignored
+        assert cache.get((0, 4096)) is a
+
+        cache.drop_overlapping(0, 4096)
+        assert released == []
+        assert cache.get((0, 4096)) is None
+    finally:
+        cache.close()
+
+
 def test_hold_clean_splits_a_resident_entry_without_changing_its_charge() -> None:
     """``hold_clean`` isolates one record of an entry without new charge."""
     released: list[tuple[int, int]] = []

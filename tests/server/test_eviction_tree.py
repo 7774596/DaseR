@@ -210,3 +210,43 @@ def test_return_policy_charged_only_skips_held_leaves():
     clock.now = 6
     assert tree.pop_victim(never, charged_only=True) == "a0"
     assert tree.pop_victim(never) == "b0"
+
+
+def test_charged_frontier_moves_past_held_children():
+    tree = EvictionTree()
+    chain(tree, ["a0", "a1", "a2"])
+    assert tree.pop_victim(never, charged_only=True) == "a2"
+    tree.mark_held("a2")
+    assert tree.pop_victim(never, charged_only=True) == "a1"
+    tree.mark_held("a1")
+    assert tree.pop_victim(never, charged_only=True) == "a0"
+    # Leaf eviction still takes the held tail first.
+    assert tree.pop_victim(never) == "a2"
+
+
+def test_held_closure_is_enforced():
+    tree = EvictionTree()
+    chain(tree, ["a0", "a1"])
+    with pytest.raises(ValueError):
+        tree.mark_held("a0")  # its child is charged
+    tree.mark_held("a1")
+    tree.mark_held("a0")
+    with pytest.raises(ValueError):
+        tree.add("a2", "a1")  # held parent
+    with pytest.raises(ValueError):
+        tree.mark_charged("a1")  # held parent
+    assert tree.held_path("a1") == ["a0", "a1"]
+    for key in tree.held_path("a1"):
+        tree.mark_charged(key)
+    tree.add("a2", "a1")
+    assert tree.pop_victim(never, charged_only=True) == "a2"
+
+
+def test_descendants_are_deepest_first():
+    tree = EvictionTree()
+    chain(tree, ["r", "x", "y"])
+    tree.add("z", "r")
+    order = tree.descendants("r")
+    assert sorted(order) == ["x", "y", "z"]
+    assert order.index("y") < order.index("x")
+    assert tree.descendants("y") == []

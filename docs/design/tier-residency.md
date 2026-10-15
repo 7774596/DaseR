@@ -35,8 +35,8 @@ L1 驻留（held）只用于 compressed-online。
   被跳过的子节点同时让其父节点保持非叶子。
 - lookup 命中一段前缀时按 `parent_key` 刷新整条链（祖先比后代旧），因此
   链尾始终是链上最冷的节点。
-- 实现为两个惰性最小堆：全部叶子，以及未 held 的叶子（供 L2 预算路径）。
-  出堆时校验节点仍存在、仍是叶子、优先级未变；单次淘汰均摊 O(log n)，不产生
+- 实现为两个惰性最小堆：全部叶子，以及 charged 前沿（见「淘汰触发」3）。
+  出堆时校验节点仍存在、仍是候选、优先级未变；单次淘汰均摊 O(log n)，不产生
   IO。
 
 ### 回访感知选择（研究开关 `DASER_EVICTION_POLICY=return`，默认 `lru`）
@@ -49,9 +49,10 @@ L1 驻留（held）只用于 compressed-online。
 - 回访：`add` 与 lookup 命中时记录线程的到达时间；与上次相隔小于 1 s 视为
   同一次访问。回访周期用相邻到达间隔的 EWMA（α=0.5）估计，未知时用全部
   线程周期的均值。
-- 选择：孤儿叶子优先（同 LRU）。否则在有可淘汰叶子的线程中，先选已过期的
+- 选择：孤儿候选优先（同 LRU）。否则在有候选的线程中，先选已过期的
   线程（距上次到达超过 3 个周期，按超期时长从大到小），再选预测下次到达
-  （上次到达 + 周期）最晚的线程；在该线程内淘汰最旧的叶子。
+  （上次到达 + 周期）最晚的线程；在该线程内淘汰最旧的候选（叶子，或 L2
+  预算路径的 charged 前沿节点）。
 - 代价：每次淘汰扫描线程和所选线程的叶子，O(线程数 + 线程内节点数)。只在
   开关打开时运行；默认路径仍是上面的两个堆。
 
@@ -82,12 +83,26 @@ chunk 留在索引中的条件是它的每个 record 要么 charged，要么 hel
 1. 逻辑槽位耗尽：从淘汰树取 victim 删除。
 2. arena 地址空间不足（`PackedArenaFull`）：从淘汰树取 victim 删除（held
    与否都可）；只剩不可淘汰节点时本次 store 失败。
-3. 每次 store 放置后本 lane 的 charged 字节超过 `--l2-size`：从未 held 叶子
-   中取 victim。若它的每个 charged record 都整段驻留在 L1 条目内，
+3. 每次 store 放置后本 lane 的 charged 字节超过 `--l2-size`：从 charged 前沿
+   取 victim。若它的每个 charged record 都整段驻留在 L1 条目内，
    `TransferLayer.hold_resident` 把它们标记为 held（零拷贝 subslice，保留 L1
-   的 LRU/BIP 位置，无 IO），chunk 留在索引中；否则删除 chunk。held 叶子仍让
-   父节点保持非叶子，因此未 held 叶子耗尽时预算可暂时超出，由触发 2 约束
-   （arena = L1 + L2）。
+   的 LRU/BIP 位置，无 IO），chunk 留在索引中；否则删除 chunk，连同它下面
+   （必然全部 held）的子树。
+
+### held 闭包
+
+不变量：held 节点的每个后代都是 held。L2 预算因此只在「charged 前沿」上
+回收：未 held、且没有未 held 子节点的节点（叶子是特例）。held 叶子不再挡住
+父节点，预算不会因为链尾被 held 而失控。维护方式：
+
+- 在 held 节点下新增子节点（会话回来续写链）时，沿父链把 held 祖先重新计入
+  预算（`TransferLayer.release_hold`：L1 条目保留为普通条目，SSD 副本一直
+  有效，无 IO），直到遇到未 held 的祖先。超出的预算由下一次回收从前沿收回。
+- held record 被 L1 淘汰时：chunk 若还有子节点，只把该 record 重新计入预算，
+  chunk 留在索引中；没有子节点才删除 chunk。L1 淘汰因此不会在链中间开洞、
+  把后面的块变成孤儿。
+- 删除一个前沿节点时，它下面的 held 子树一并删除（不可达，留着只占 L1 和
+  arena）。正在写或被固定的后代跳过，成为孤儿按需淘汰。
 
 ## L1 淘汰 held 条目
 
@@ -106,7 +121,8 @@ held 留在索引中，两层合计的不同内容接近 `L1 + L2`。
 ## 已知限制
 
 - held record 的 SSD 字节不打洞，`du` 可超过 `--l2-size`，超出量不超过 held
-  字节（受 L1 容量约束）。
+  字节（受 L1 容量约束）。重新计入预算依赖这一点：held record 的 SSD 副本
+  直到 placement 释放前都有效。
 - raw 格式没有 held 路径，两层合计容量只有 L2；比较 raw 与压缩时需注意。
 - lookup 到 L2 load 之间被淘汰的 chunk 可能被新 chunk 覆盖；lookup 会刷新
   整条链的访问时间，叶子 LRU 下只在容量严重不足时发生。

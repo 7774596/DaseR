@@ -466,6 +466,19 @@ class L1Cache:
         resident.held = True
         return True
 
+    def release_hold(self, key: tuple[int, int]) -> None:
+        """Keep a held range resident as an ordinary entry.
+
+        It keeps its replacement position and leaves L1 later without calling
+        ``on_held_release``.
+
+        Args:
+            key: Held range key; a key that is not held is ignored.
+        """
+        resident = self._entries.get(key)
+        if resident is not None:
+            resident.held = False
+
     def discard_held(self, key: tuple[int, int]) -> None:
         """Drop a held range from L1 without handing it to ``on_held_release``.
 

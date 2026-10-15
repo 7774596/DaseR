@@ -40,7 +40,7 @@ class _Placement:
     holds it is ``retired`` and keeps its bytes until the last hold ends.
     ``written`` marks a record whose store has reported, so it may be loaded.
     ``held`` marks a record kept resident by L1 alone: it is outside the L2
-    budget until its chunk leaves the index.
+    budget until its chunk leaves the index or it is recharged.
     """
 
     owner: ChunkMeta
@@ -477,6 +477,47 @@ class OnlinePackedLayout:
         self._charged_bytes[lane] -= placement.nbytes
         placement.held = True
         self._held_bytes += placement.nbytes
+
+    def held_records(self, chunk_key: str) -> list[PackedRecord]:
+        """Return the held (L1-only) records of a chunk.
+
+        Args:
+            chunk_key: Chunk to inspect.
+
+        Returns:
+            Its held records, in no particular order.
+
+        Async/thread-safety:
+            Pure lookup on the server event loop; O(records of the chunk).
+        """
+        return [
+            self._record(key, placement)
+            for key in self._keys_by_chunk.get(chunk_key, ())
+            if (placement := self._placements[key]).held
+        ]
+
+    def recharge(self, file_offset: int) -> None:
+        """Count a held record against the L2 budget again.
+
+        Its SSD copy stayed valid while held (the placement was never
+        released), so no IO is needed.
+
+        Args:
+            file_offset: Offset of a held record.
+
+        Raises:
+            ValueError: If no held record starts at ``file_offset``.
+
+        Async/thread-safety:
+            Call on the server event loop after L1 released the hold.
+        """
+        key = self._by_offset.get(file_offset)
+        placement = None if key is None else self._placements[key]
+        if placement is None or not placement.held:
+            raise ValueError("recharge requires a held packed placement")
+        placement.held = False
+        self._held_bytes -= placement.nbytes
+        self._charged_bytes[key[0]] += placement.nbytes
 
     def held_owner(self, file_offset: int, nbytes: int) -> str | None:
         """Return the chunk owning the held record at exactly this range.

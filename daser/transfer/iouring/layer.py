@@ -1878,6 +1878,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Register the held-release callback; see ``TransferLayer``."""
         self._held_release_listener = listener
 
+    def release_hold(self, file_offset: int, nbytes: int) -> None:
+        """Keep a held L1 range as an ordinary entry; see ``TransferLayer``.
+
+        Async/thread-safety:
+            Must run on the owning event loop. It does not await, so it is
+            atomic with respect to locked sections.
+        """
+        self._l1.release_hold((file_offset, nbytes))
+
     def discard_held(self, file_offset: int, nbytes: int) -> None:
         """Drop a held L1 range.
 

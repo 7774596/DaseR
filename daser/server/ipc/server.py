@@ -1620,7 +1620,9 @@ class IPCServer:
                 raise ValueError(f"unknown transfer_mode: {mode}")
             if self._packed_tiers:
                 self._core.attach_l1_tier(
-                    self._transfer.hold_resident, self._transfer.discard_held
+                    self._transfer.hold_resident,
+                    self._transfer.discard_held,
+                    self._transfer.release_hold,
                 )
                 self._transfer.set_held_release_listener(self._core.release_held)
         return self._transfer

@@ -1077,6 +1077,7 @@ async def test_reclaim_packed_keeps_l1_resident_victim_indexed() -> None:
     core.attach_l1_tier(
         lambda offset, nbytes: offset in resident,
         lambda offset, nbytes: discarded.append((offset, nbytes)),
+        lambda offset, nbytes: None,
     )
     blocks = await _committed_blocks(core, 3)
     first_key = first_rolling_key(blocks[0])
@@ -1104,7 +1105,7 @@ async def test_reclaim_packed_keeps_l1_resident_victim_indexed() -> None:
 async def test_l1_release_of_a_held_record_removes_its_chunk() -> None:
     """When L1 evicts a held record its chunk leaves the index."""
     core = make_core()
-    core.attach_l1_tier(lambda offset, nbytes: True, lambda offset, nbytes: None)
+    core.attach_l1_tier(lambda o, n: True, lambda o, n: None, lambda o, n: None)
     blocks = await _committed_blocks(core, 2)
     first_key = first_rolling_key(blocks[0])
     (first,) = core.packed_layout.charged_records(first_key)
@@ -1120,11 +1121,111 @@ async def test_l1_release_of_a_held_record_removes_its_chunk() -> None:
     assert core.packed_layout.held_bytes == 0
 
 
+def _attach_l1(core: ServerCore, resident=None) -> dict[str, list]:
+    """Attach a fake L1 tier; ``resident`` limits which offsets it holds."""
+    calls: dict[str, list] = {"discarded": [], "released": []}
+    core.attach_l1_tier(
+        lambda offset, nbytes: resident is None or offset in resident,
+        lambda offset, nbytes: calls["discarded"].append((offset, nbytes)),
+        lambda offset, nbytes: calls["released"].append((offset, nbytes)),
+    )
+    return calls
+
+
+def _offset(core: ServerCore, key: str) -> int:
+    meta = core.chunk_manager.store.get(key)
+    assert meta is not None
+    return meta.start_slot * PACKED_LANE_SLOT
+
+
+async def _settle() -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_budget_reclaim_holds_a_chain_past_its_held_tail() -> None:
+    """A held tail does not block its chain: the frontier moves up."""
+    core = make_core()
+    _attach_l1(core)
+    tokens, keys = await _committed_chain(core, 3)
+    for _ in keys:
+        assert await core.reclaim_packed()
+    assert not await core.reclaim_packed()
+    assert core.packed_layout.charged_bytes() == 0
+    assert core.packed_layout.held_bytes == 3 * 4096
+    assert await _hit_tokens(core, tokens) == 3 * BLOCK_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_extending_a_held_chain_charges_its_held_ancestors() -> None:
+    """A child stored under held chunks charges them again, without IO."""
+    core = make_core()
+    calls = _attach_l1(core)
+    _tokens, keys = await _committed_chain(core, 3)
+    for _ in keys:
+        assert await core.reclaim_packed()
+
+    longer = list(range(1000, 1000 + 4 * BLOCK_TOKENS))
+    child = rolling_prefix_keys(longer, BLOCK_TOKENS)[3]
+    await core.alloc_chunk(
+        child, token_count=BLOCK_TOKENS, model_id="m", parent_key=keys[2]
+    )
+    await core.commit_chunk(child)
+    _place_record(core, child)
+
+    assert sorted(calls["released"]) == sorted((_offset(core, k), 4096) for k in keys)
+    assert core.packed_layout.held_bytes == 0
+    assert core.packed_layout.charged_bytes() == 4 * 4096
+    # The new tail is the frontier again; the chain shrinks from it.
+    assert await core.reclaim_packed()
+    assert core.packed_layout.held_owner(_offset(core, child), 4096) == child
+
+
+@pytest.mark.asyncio
+async def test_l1_release_inside_a_chain_recharges_instead_of_cutting_it() -> None:
+    """L1 evicting a held chunk with children keeps the chain whole."""
+    core = make_core()
+    _attach_l1(core)
+    tokens, keys = await _committed_chain(core, 3)
+    for _ in keys:
+        assert await core.reclaim_packed()
+
+    core.release_held(_offset(core, keys[1]), 4096)
+    await _settle()
+    assert _resident(core, keys) == [True, True, True]
+    assert await _hit_tokens(core, tokens) == 3 * BLOCK_TOKENS
+    # keys[0] was recharged too, so the closure holds.
+    assert core.packed_layout.charged_bytes() == 2 * 4096
+
+    core.release_held(_offset(core, keys[2]), 4096)  # a leaf leaves
+    await _settle()
+    assert _resident(core, keys) == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_failed_hold_removes_the_held_subtree_below_the_victim() -> None:
+    """A frontier victim L1 cannot hold leaves with its unreachable subtree."""
+    core = make_core()
+    resident: set[int] = set()
+    calls = _attach_l1(core, resident)
+    _tokens, keys = await _committed_chain(core, 3)
+    resident.add(_offset(core, keys[2]))
+    tail_offset = _offset(core, keys[2])
+    assert await core.reclaim_packed()  # holds the tail
+
+    assert await core.reclaim_packed()  # middle is not resident
+    assert _resident(core, keys) == [True, False, False]
+    assert calls["discarded"] == [(tail_offset, 4096)]
+    assert core.packed_layout.held_bytes == 0
+    assert core.packed_layout.charged_bytes() == 4096
+
+
 @pytest.mark.asyncio
 async def test_budget_reclaim_skips_held_chunks_arena_reclaim_does_not() -> None:
     """The L2 budget only reclaims charged chunks; the arena takes any leaf."""
     core = make_core()
-    core.attach_l1_tier(lambda offset, nbytes: True, lambda offset, nbytes: None)
+    core.attach_l1_tier(lambda o, n: True, lambda o, n: None, lambda o, n: None)
     blocks = await _committed_blocks(core, 2)
     assert await core.reclaim_packed()  # holds blocks[0]
     assert await core.reclaim_packed()  # holds blocks[1]

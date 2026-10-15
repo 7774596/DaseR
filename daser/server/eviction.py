@@ -33,8 +33,10 @@ class _Node:
     tick: int
     thread: str
     orphan: bool = False
-    # Every record lives only in L1 (no L2 budget to reclaim).
+    # Every record lives only in L1 (outside the L2 budget).
     held: bool = False
+    # Present children that are not held.
+    charged_kids: int = 0
 
 
 @dataclass
@@ -55,18 +57,24 @@ class EvictionTree:
     Children are indexed by parent key whether or not the parent is present,
     so a parent stored again re-adopts them.
 
+    Held closure: every descendant of a held node is held. The caller keeps
+    it by recharging held ancestors (``held_path``) before adding a child or
+    recharging a node. L2 budget reclaim then takes the charged frontier: a
+    node that is not held and has no child that is not held (a leaf is the
+    common case), so held tails never block their chain's budget.
+
     Candidates live in two lazy min-heaps of ``(priority, seq, key)``: every
-    leaf, and leaves that are not held (L2 budget reclaim). Entries are
-    validated when popped, so updates only push. Per-pop cost is amortised
-    O(log n).
+    leaf, and the charged frontier. Entries are validated when popped, so
+    updates only push. Per-pop cost is amortised O(log n).
 
     With ``policy="return"`` the victim is chosen per thread instead (see
     ``docs/design/tier-residency.md``): a node belongs to the thread of its
     parent, or to its parent key (own key for a root) when no parent is
     indexed. Each store or prefix hit of a thread is an arrival; the thread's
-    return period is an EWMA of arrival gaps. Orphan leaves still go first; then threads
-    silent for more than three periods (longest overdue first), then the
-    thread whose predicted return is latest; within it, the oldest leaf.
+    return period is an EWMA of arrival gaps. Orphan candidates still go
+    first; then threads silent for more than three periods (longest overdue
+    first), then the thread whose predicted return is latest; within it, the
+    oldest candidate.
 
     Async/thread-safety:
         Not thread-safe; owned by the server event loop.
@@ -96,8 +104,8 @@ class EvictionTree:
         self._charged_heap: list[tuple[int, int, str]] = []
         self._seq = 0
         self._tick = 0
-        # Return-aware state: leaves per thread and arrival history.
-        self._thread_leaves: dict[str, set[str]] = {}
+        # Return-aware state: candidates per thread and arrival history.
+        self._thread_cands: dict[str, set[str]] = {}
         self._thread_sizes: dict[str, int] = {}
         self._threads: dict[str, _Thread] = {}
 
@@ -117,25 +125,33 @@ class EvictionTree:
             parent_key: Previous chunk of its prefix chain, or empty.
 
         Raises:
-            ValueError: If ``key`` is already a node or its own parent.
+            ValueError: If ``key`` is already a node or its own parent, or the
+                parent is held (recharge ``held_path(parent_key)`` first).
         """
         if key in self._nodes:
             raise ValueError(f"eviction node already exists: {key}")
         if key == parent_key:
             raise ValueError("a chunk cannot be its own parent")
         parent = self._nodes.get(parent_key) if parent_key else None
+        if parent is not None and parent.held:
+            raise ValueError("a held chunk cannot gain a child; recharge it first")
         orphan = bool(parent_key) and (parent is None or parent.orphan)
         thread = parent.thread if parent is not None else (parent_key or key)
-        self._nodes[key] = _Node(parent_key, self._next_tick(), thread, orphan)
+        node = _Node(parent_key, self._next_tick(), thread, orphan)
+        self._nodes[key] = node
         self._thread_sizes[thread] = self._thread_sizes.get(thread, 0) + 1
-        if parent is not None:
-            self._thread_leaves.get(parent.thread, set()).discard(parent_key)
         if parent_key:
             self._children.setdefault(parent_key, set()).add(key)
-        if self._is_leaf(key):
-            self._thread_leaves.setdefault(thread, set()).add(key)
-            self._push(key)
-        else:
+        if parent is not None:
+            parent.charged_kids += 1
+            self._requeue(parent_key)
+        node.charged_kids = sum(
+            1
+            for child in self._children.get(key, ())
+            if child in self._nodes and not self._nodes[child].held
+        )
+        self._requeue(key)
+        if key in self._children:
             # Children stored under this key earlier are re-adopted.
             self._mark_subtree(key, orphan, thread)
         self._arrive(thread)
@@ -143,8 +159,8 @@ class EvictionTree:
     def remove(self, key: str) -> None:
         """Forget a chunk that left the index.
 
-        Its parent may become a leaf; nodes below it (if any) become orphans
-        and their leaves are queued first.
+        Its parent may become a candidate; nodes below it (if any) become
+        orphans and are queued first.
 
         Args:
             key: Chunk key; unknown keys are ignored.
@@ -160,10 +176,11 @@ class EvictionTree:
                 siblings.discard(key)
                 if not siblings:
                     del self._children[parent]
-            if parent in self._nodes and self._is_leaf(parent):
-                parent_node = self._nodes[parent]
-                self._thread_leaves.setdefault(parent_node.thread, set()).add(parent)
-                self._push(parent)
+            parent_node = self._nodes.get(parent)
+            if parent_node is not None:
+                if not node.held:
+                    parent_node.charged_kids -= 1
+                self._requeue(parent)
         if key in self._children:
             self._mark_subtree(key, True)
 
@@ -179,8 +196,7 @@ class EvictionTree:
             if node is None:
                 continue
             node.tick = self._next_tick()
-            if self._is_leaf(key):
-                self._push(key)
+            self._requeue(key)
 
     def touch_path(self, key: str) -> None:
         """Mark a node and all its present ancestors as just used.
@@ -196,105 +212,203 @@ class EvictionTree:
         """
         if key in self._nodes:
             self._arrive(self._nodes[key].thread)
-        path = []
-        seen = set()
-        while key and key not in seen and key in self._nodes:
-            seen.add(key)
-            path.append(key)
-            key = self._nodes[key].parent_key
-        self.touch(path[::-1])
+        self.touch(self._path(key, held_only=False)[::-1])
 
     def refresh(self, key: str) -> None:
         """Re-queue a node a previous ``pop_victim`` skipped.
 
         Args:
-            key: Chunk key; unknown or non-leaf keys are ignored.
+            key: Chunk key; unknown keys or non-candidates are ignored.
         """
-        if key in self._nodes and self._is_leaf(key):
-            self._push(key)
+        if key in self._nodes:
+            self._requeue(key)
 
     def mark_held(self, key: str) -> None:
-        """Exclude a node from ``pop_victim(charged_only=True)``.
+        """Take a node out of the L2 budget (all its records are held).
 
         Args:
-            key: Chunk key whose records all left the L2 budget; unknown keys
-                are ignored. A held node is still a leaf candidate for every
-                other trigger and still keeps its parent from being a leaf.
+            key: Charged-frontier chunk key (every child is held); unknown or
+                already held keys are ignored. A held node is still a leaf
+                candidate for every other trigger and still keeps its parent
+                from being a leaf.
+
+        Raises:
+            ValueError: If a child of ``key`` is not held.
         """
         node = self._nodes.get(key)
-        if node is not None:
-            node.held = True
+        if node is None or node.held:
+            return
+        if node.charged_kids:
+            raise ValueError("only a node whose children are all held can be held")
+        node.held = True
+        self._requeue(key)
+        parent = self._nodes.get(node.parent_key) if node.parent_key else None
+        if parent is not None:
+            parent.charged_kids -= 1
+            self._requeue(node.parent_key)
+
+    def mark_charged(self, key: str) -> None:
+        """Count a held node against the L2 budget again.
+
+        Args:
+            key: Held chunk key whose parent is not held; unknown or charged
+                keys are ignored.
+
+        Raises:
+            ValueError: If the parent is held (recharge ``held_path`` from the
+                top down).
+        """
+        node = self._nodes.get(key)
+        if node is None or not node.held:
+            return
+        parent = self._nodes.get(node.parent_key) if node.parent_key else None
+        if parent is not None and parent.held:
+            raise ValueError("recharge held ancestors first")
+        node.held = False
+        self._requeue(key)
+        if parent is not None:
+            parent.charged_kids += 1
+            self._requeue(node.parent_key)
+
+    def held_path(self, key: str) -> list[str]:
+        """Return ``key`` and its held ancestors up to the first charged one.
+
+        Args:
+            key: Chunk key; an unknown or charged key gives an empty list.
+
+        Returns:
+            Held keys from the top of the run down to ``key``, the order in
+            which ``mark_charged`` accepts them.
+        """
+        return self._path(key, held_only=True)[::-1]
+
+    def descendants(self, key: str) -> list[str]:
+        """Return the present nodes below ``key``, deepest first.
+
+        Args:
+            key: Chunk key (present or not).
+
+        Returns:
+            Keys ordered so that each comes before its parent; removing them
+            in order never orphans a node that is still present.
+        """
+        order: list[str] = []
+        seen = {key}
+        stack = [(key, False)]
+        while stack:
+            current, expanded = stack.pop()
+            if expanded:
+                if current != key:
+                    order.append(current)
+                continue
+            stack.append((current, True))
+            for child in self._children.get(current, ()):
+                if child in self._nodes and child not in seen:
+                    seen.add(child)
+                    stack.append((child, False))
+        return order
+
+    def is_leaf(self, key: str) -> bool:
+        """Return whether no child of ``key`` is present.
+
+        Args:
+            key: Chunk key.
+        """
+        return not self._children.get(key)
 
     def pop_victim(
         self, skip: Callable[[str], bool], *, charged_only: bool = False
     ) -> str | None:
-        """Return the lowest-priority evictable leaf without removing it.
+        """Return the lowest-priority evictable candidate without removing it.
 
         Args:
             skip: Returns True for a key that may not be evicted now. Its entry
                 is dropped from the heap being popped; call ``refresh`` once
                 the condition clears.
-            charged_only: Ignore held nodes.
+            charged_only: Take the charged frontier (L2 budget reclaim)
+                instead of leaves.
 
         Returns:
-            The victim key, or None when no evictable leaf is left. The caller
-            removes the chunk (and calls ``remove``) or holds it.
+            The victim key, or None when no evictable candidate is left. The
+            caller removes the chunk (and calls ``remove``) or holds it.
         """
         if self._policy == POLICY_RETURN:
             return self._pop_return(skip, charged_only)
         heap = self._charged_heap if charged_only else self._heap
         while heap:
             priority, _seq, key = heapq.heappop(heap)
-            node = self._nodes.get(key)
-            if node is None or not self._is_leaf(key):
-                continue
-            if charged_only and node.held:
+            if key not in self._nodes or not self._is_candidate(key, charged_only):
                 continue
             if self._priority(key) != priority:
-                self._push(key)
+                self._requeue(key)
                 continue
             if skip(key):
                 continue
             return key
         return None
 
-    def _is_leaf(self, key: str) -> bool:
-        """Return whether no child of ``key`` is present."""
-        return not self._children.get(key)
+    def _path(self, key: str, *, held_only: bool) -> list[str]:
+        """Return ``key`` and its present (held) ancestors, bottom up."""
+        path = []
+        seen = set()
+        while key and key not in seen and key in self._nodes:
+            if held_only and not self._nodes[key].held:
+                break
+            seen.add(key)
+            path.append(key)
+            key = self._nodes[key].parent_key
+        return path
+
+    def _is_candidate(self, key: str, charged_only: bool) -> bool:
+        """Return whether a present node is a leaf (or charged frontier)."""
+        if charged_only:
+            node = self._nodes[key]
+            return not node.held and node.charged_kids == 0
+        return self.is_leaf(key)
 
     def _priority(self, key: str) -> int:
         """Return the eviction priority of a node (lower goes first)."""
         node = self._nodes[key]
         return _ORPHAN if node.orphan else node.tick
 
-    def _push(self, key: str) -> None:
-        """Queue a leaf at its current priority, compacting stale entries."""
+    def _requeue(self, key: str) -> None:
+        """Queue a present node in the heaps it is a candidate of."""
         if len(self._heap) + len(self._charged_heap) > 4 * len(self._nodes) + 2048:
             self._rebuild_heaps()
+        leaf = self._is_candidate(key, False)
+        frontier = self._is_candidate(key, True)
+        thread = self._nodes[key].thread
+        if leaf or frontier:
+            self._thread_cands.setdefault(thread, set()).add(key)
+        elif (cands := self._thread_cands.get(thread)) is not None:
+            cands.discard(key)
+            if not cands:
+                del self._thread_cands[thread]
         self._seq += 1
         entry = (self._priority(key), self._seq, key)
-        heapq.heappush(self._heap, entry)
-        if not self._nodes[key].held:
+        if leaf:
+            heapq.heappush(self._heap, entry)
+        if frontier:
             heapq.heappush(self._charged_heap, entry)
 
     def _rebuild_heaps(self) -> None:
-        """Replace both heaps with one entry per current leaf."""
+        """Replace both heaps with one entry per current candidate."""
         entries = []
         charged = []
-        for key, node in self._nodes.items():
-            if self._is_leaf(key):
-                self._seq += 1
-                entry = (self._priority(key), self._seq, key)
+        for key in self._nodes:
+            self._seq += 1
+            entry = (self._priority(key), self._seq, key)
+            if self._is_candidate(key, False):
                 entries.append(entry)
-                if not node.held:
-                    charged.append(entry)
+            if self._is_candidate(key, True):
+                charged.append(entry)
         heapq.heapify(entries)
         heapq.heapify(charged)
         self._heap = entries
         self._charged_heap = charged
 
     def _mark_subtree(self, key: str, orphan: bool, thread: str | None = None) -> None:
-        """Set reachability (and optionally thread) below ``key``; re-queue leaves.
+        """Set reachability (and optionally thread) below ``key``; re-queue.
 
         Runs only when a non-leaf leaves or a parent is stored again, so its
         O(subtree) cost is off the common eviction path.
@@ -312,13 +426,8 @@ class EvictionTree:
                 self._drop_from_thread(child, node.thread)
                 node.thread = thread
                 self._thread_sizes[thread] = self._thread_sizes.get(thread, 0) + 1
-                if self._is_leaf(child):
-                    self._thread_leaves.setdefault(thread, set()).add(child)
-            grandchildren = self._children.get(child)
-            if grandchildren:
-                stack.extend(grandchildren)
-            else:
-                self._push(child)
+            self._requeue(child)
+            stack.extend(self._children.get(child, ()))
 
     def _next_tick(self) -> int:
         """Return a fresh access tick."""
@@ -326,12 +435,12 @@ class EvictionTree:
         return self._tick
 
     def _drop_from_thread(self, key: str, thread: str) -> None:
-        """Forget ``key`` in its thread's leaf set and node count."""
-        leaves = self._thread_leaves.get(thread)
-        if leaves is not None:
-            leaves.discard(key)
-            if not leaves:
-                del self._thread_leaves[thread]
+        """Forget ``key`` in its thread's candidate set and node count."""
+        cands = self._thread_cands.get(thread)
+        if cands is not None:
+            cands.discard(key)
+            if not cands:
+                del self._thread_cands[thread]
         size = self._thread_sizes.get(thread, 0) - 1
         if size > 0:
             self._thread_sizes[thread] = size
@@ -374,12 +483,12 @@ class EvictionTree:
     def _pop_return(
         self, skip: Callable[[str], bool], charged_only: bool
     ) -> str | None:
-        """Pick a victim leaf with the return-aware thread order."""
+        """Pick a victim candidate with the return-aware thread order."""
         now = self._clock()
         periods = [t.period for t in self._threads.values() if t.period is not None]
         default = sum(periods) / len(periods) if periods else _DEFAULT_PERIOD_S
         best: tuple[tuple[int, float, int], str] | None = None
-        for thread, leaves in self._thread_leaves.items():
+        for thread, cands in self._thread_cands.items():
             state = self._threads.get(thread)
             period = default
             last_seen = now
@@ -388,10 +497,10 @@ class EvictionTree:
                 if state.period is not None:
                     period = state.period
             silent = now - last_seen
-            for key in leaves:
-                node = self._nodes[key]
-                if charged_only and node.held:
+            for key in cands:
+                if not self._is_candidate(key, charged_only):
                     continue
+                node = self._nodes[key]
                 if node.orphan:
                     rank = (2, 0.0, -node.tick)
                 elif silent > _OVERDUE_PERIODS * period:

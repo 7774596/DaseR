@@ -476,6 +476,21 @@ class TransferLayer(ABC):
             transfer bookkeeping and must not await or call the transfer.
         """
 
+    def release_hold(self, file_offset: int, nbytes: int) -> None:  # noqa: B027
+        """Turn a held range back into an ordinary memory-tier entry.
+
+        The server counts the record against the L2 budget again; its L2 copy
+        stays valid, so the range leaves the memory tier by plain replacement
+        without calling the held-release listener.
+
+        Args:
+            file_offset: Start of the held range.
+            nbytes: Range length. A range no longer held is ignored.
+
+        Async/thread-safety:
+            Call on the server event loop. Does not await.
+        """
+
     def discard_held(self, file_offset: int, nbytes: int) -> None:  # noqa: B027
         """Drop a held range from the memory tier.
 
