@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import random
 
 # Third Party
 import pytest
@@ -1384,3 +1385,66 @@ async def test_store_range_ignores_write_to_a_reallocated_key() -> None:
     assert await core.record_store_ranges([span(stale)], **geometry) == []
     assert core.is_current_allocation(key, fresh.start_slot, fresh.num_slots)
     assert await core.record_store_ranges([span(fresh)], **geometry) == [key]
+
+
+def _assert_held_closure(core: ServerCore) -> None:
+    """Every chunk whose parent is held is itself held; records agree."""
+    layout = core.packed_layout
+    metas = {meta.chunk_key: meta for meta in core.chunk_manager.store.iter_chunks()}
+
+    def held(key: str) -> bool:
+        return bool(layout.held_records(key)) and not layout.charged_records(key)
+
+    for key, meta in metas.items():
+        assert not (layout.held_records(key) and layout.charged_records(key))
+        if meta.parent_key in metas and held(meta.parent_key):
+            assert held(key), (key, meta.parent_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", range(6))
+async def test_held_closure_and_budget_hold_under_random_sessions(seed: int) -> None:
+    """Random chain growth, hits, budget reclaim and L1 releases keep invariants.
+
+    After every store the budget loop (as the IPC store path runs it) brings
+    charged bytes back under the budget, and the held closure always holds.
+    """
+    rng = random.Random(seed)
+    budget = 12 * 4096
+    core = make_core(total_slots=512)
+    resident: set[int] = set()
+    _attach_l1(core, resident)
+    sessions = [
+        list(range(10_000 * s, 10_000 * s + 12 * BLOCK_TOKENS)) for s in range(6)
+    ]
+    lengths = [0] * len(sessions)
+    for _step in range(150):
+        s = rng.randrange(len(sessions))
+        lengths[s] = min(lengths[s] + rng.randint(1, 3), 12)
+        tokens = sessions[s][: lengths[s] * BLOCK_TOKENS]
+        await core.lookup(tokens, "m")
+        parent = ""
+        for key in rolling_prefix_keys(tokens, BLOCK_TOKENS):
+            if core.chunk_manager.store.get(key) is None:
+                await core.alloc_chunk(
+                    key, token_count=BLOCK_TOKENS, model_id="m", parent_key=parent
+                )
+                await core.commit_chunk(key)
+                _place_record(core, key)
+                if rng.random() < 0.7:
+                    resident.add(_offset(core, key))
+            parent = key
+        while core.packed_layout.charged_bytes() > budget:
+            assert await core.reclaim_packed()
+        _assert_held_closure(core)
+        # L1 evicts a random held record now and then.
+        held = [
+            record
+            for meta in core.chunk_manager.store.iter_chunks()
+            for record in core.packed_layout.held_records(meta.chunk_key)
+        ]
+        if held and rng.random() < 0.3:
+            record = rng.choice(held)
+            core.release_held(record.file_offset, record.stored_length)
+            await _settle()
+            _assert_held_closure(core)
