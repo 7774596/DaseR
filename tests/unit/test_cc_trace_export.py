@@ -52,6 +52,21 @@ def test_export_drops_requests_over_max_ctx(tmp_path: Path) -> None:
     assert [row["input_length"] for row in rows] == [1024]
 
 
+def test_max_turns_keeps_each_sessions_first_requests(tmp_path: Path) -> None:
+    """``max_turns`` truncates every session to its first N kept requests."""
+    path = tmp_path / "traces.jsonl"
+    long = _session([(0.0, 1024, 1), (1.0, 1536, 1), (2.0, 2048, 1)])
+    short = _session([(0.0, 1024, 1)])
+    path.write_text("\n".join(json.dumps(s) for s in (long, short)) + "\n")
+
+    rows = export(str(path), 2, 1.0, 262144, 0, seed=0, step_ms=1, max_turns=2)
+
+    by_session: dict[int, list[int]] = {}
+    for row in rows:
+        by_session.setdefault(row["session_id"], []).append(row["input_length"])
+    assert sorted(by_session.values()) == [[1024], [1024, 1536]]
+
+
 def test_round_robin_interleaves_live_sessions_and_refills(tmp_path: Path) -> None:
     """``round_robin`` alternates live sessions and hands freed slots on."""
     path = tmp_path / "traces.jsonl"

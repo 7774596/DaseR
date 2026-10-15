@@ -275,6 +275,7 @@ def export(
     round_robin: int = 0,
     real_time_gap_cap_s: float = 0.0,
     reasoning_strip_think_s: float = 0.0,
+    max_turns: int = 0,
 ) -> list[dict]:
     """Build the merged replay rows.
 
@@ -301,6 +302,9 @@ def export(
             seconds): rewritten blocks get new IDs, and each user-turn row
             carries ``prewarm_tokens``, its prefix known when the previous
             chain ends.
+        max_turns: when positive, keep only each session's first this many
+            requests (after filtering), so a closed session population does
+            not drain into a few long sessions.
 
     Returns:
         Mooncake rows (``timestamp``, ``input_length``, ``output_length``,
@@ -320,7 +324,7 @@ def export(
                 and r["in"] + r["out"] <= max_ctx
             ]
             if len(reqs) >= min_requests and max(r["in"] for r in reqs) >= min_peak_ctx:
-                chains.append(reqs)
+                chains.append(reqs[:max_turns] if max_turns > 0 else reqs)
     rng = random.Random(seed)
     rng.shuffle(chains)
     chains = chains[:sessions]
@@ -379,6 +383,12 @@ def main() -> None:
     p.add_argument("--max-output", type=int, default=0)
     p.add_argument("--min-ctx", type=int, default=0)
     p.add_argument("--min-requests", type=int, default=1)
+    p.add_argument(
+        "--max-turns",
+        type=int,
+        default=0,
+        help="Keep only each session's first N requests (0 = all).",
+    )
     p.add_argument("--round-robin", type=int, default=0)
     p.add_argument(
         "--real-time-gap-cap-s",
@@ -413,6 +423,7 @@ def main() -> None:
         a.round_robin,
         a.real_time_gap_cap_s,
         a.reasoning_strip_think_s,
+        a.max_turns,
     )
     with open(a.output, "w") as f:
         for row in rows:
