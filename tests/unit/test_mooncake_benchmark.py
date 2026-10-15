@@ -793,6 +793,52 @@ def test_session_population_starts_a_session_when_one_ends(
     assert max(sends) - min(sends) < 0.01
 
 
+def test_session_population_waits_for_every_parallel_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session with parallel chains frees its slot only when all of them end.
+
+    Session 0 runs a slow request and, in parallel (disjoint prefix), a fast
+    one that is the session's last row; session 1 must wait for the slow one.
+    """
+    events: list[tuple[int, str, float]] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        index, prompt = args[2].sample_id, args[3]
+        events.append((index, "send", time.perf_counter()))
+        if kwargs.get("on_send"):
+            kwargs["on_send"]()
+        await asyncio.sleep(0.2 if index == 0 else 0.02)
+        events.append((index, "done", time.perf_counter()))
+        return RequestResult(index, "d", "", 1.0, 2.0, len(prompt), 1)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 512, 1, (10,), session_id=0),
+        TraceRequest(1, 0, 512, 1, (20,), session_id=0),
+        TraceRequest(2, 0, 512, 1, (30,), session_id=1),
+    ]
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100_000),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://a",
+            served_model_name="m",
+            output_path=tmp_path / "parallel.jsonl",
+            max_inflight=8,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            prefix_dependencies=True,
+            session_population=1,
+        )
+    )
+    at = {(i, kind): t for i, kind, t in events}
+
+    assert at[(1, "done")] < at[(0, "done")]
+    assert at[(2, "send")] >= at[(0, "done")]
+
+
 def test_corpus_prompt_builder_uses_real_text_and_keeps_hash_identity() -> None:
     """Blocks carry corpus text; equal hashes match and distinct hashes differ."""
     corpus = list(range(5000, 5000 + 3 * MOONCAKE_BLOCK_TOKENS))

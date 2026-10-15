@@ -1067,8 +1067,9 @@ async def replay(
             records carry ``prewarm_pieces`` and ``prewarm_yielded``.
         session_population: When positive, run a closed session population:
             at most this many sessions are active at once, sessions start in
-            trace order, and a session's slot frees when its last selected
-            request finishes, so the next session starts then instead of at
+            trace order, and a session's slot frees when all its selected
+            requests have finished (parallel chains inside a session included),
+            so the next session starts then instead of at
             its timestamp. Requests inside a session keep their prefix
             dependencies and gaps. Zero replays session starts by timestamp.
         session_ramp_s: With a session population, spread the first
@@ -1150,7 +1151,7 @@ async def replay(
                 for request, parent in zip(selection.eligible, chain, strict=True)
             },
         )
-    gates, last_rows = _session_gates(selection.eligible, session_population)
+    gates = _session_gates(selection.eligible, session_population)
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -1190,7 +1191,6 @@ async def replay(
                         prewarm_chunk_tokens=prewarm_chunk_tokens,
                         prewarm_max_waiting=prewarm_max_waiting,
                         start_gate=gates.get(request.session_id),
-                        ends_session=position in last_rows,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -1677,15 +1677,31 @@ async def _rebind_when_waiting(
 
 @dataclass
 class _SessionGate:
-    """Start and end signals of one session in a closed population."""
+    """Start and end signals of one session in a closed population.
+
+    ``pending`` counts the session's requests that have not finished yet; a
+    session may run several requests at once (parallel sub-agent chains), so
+    it ends when the last of them finishes, not when its last row does.
+    """
 
     opened: asyncio.Event
     finished: asyncio.Event
+    pending: int = 0
+
+    def request_done(self) -> None:
+        """Count one finished (or failed) request; end the session at zero.
+
+        Async/thread-safety:
+            Called on the replay event loop only.
+        """
+        self.pending -= 1
+        if self.pending == 0:
+            self.finished.set()
 
 
 def _session_gates(
     requests: Sequence[TraceRequest], population: int
-) -> tuple[dict[int | None, _SessionGate], set[int]]:
+) -> dict[int | None, _SessionGate]:
     """Build per-session gates in first-request order for a closed population.
 
     Args:
@@ -1693,20 +1709,19 @@ def _session_gates(
         population: Maximum concurrently active sessions; zero disables.
 
     Returns:
-        ``(gates, last_rows)``: a gate per session keyed by ``session_id`` in
-        the order sessions first appear, and the positions of each session's
-        last request. Both are empty when ``population`` is zero.
+        A gate per session keyed by ``session_id`` in the order sessions first
+        appear, each counting the session's requests; empty when
+        ``population`` is zero.
     """
     if not population:
-        return {}, set()
+        return {}
     gates: dict[int | None, _SessionGate] = {}
-    last: dict[int | None, int] = {}
-    for position, request in enumerate(requests):
-        gates.setdefault(
+    for request in requests:
+        gate = gates.setdefault(
             request.session_id, _SessionGate(asyncio.Event(), asyncio.Event())
         )
-        last[request.session_id] = position
-    return gates, set(last.values())
+        gate.pending += 1
+    return gates
 
 
 async def _admit_sessions(
@@ -1887,7 +1902,6 @@ async def _run_request(
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
     start_gate: _SessionGate | None = None,
-    ends_session: bool = False,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
@@ -1916,8 +1930,8 @@ async def _run_request(
         done.set()
         if admitted is not None:
             admitted.set()
-        if ends_session and start_gate is not None:
-            start_gate.finished.set()
+        if start_gate is not None:
+            start_gate.request_done()
 
 
 async def _run_request_after_dependency(
