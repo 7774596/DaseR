@@ -13,6 +13,7 @@ from benchmarks.research.agent_trace_arms import (
     ArmTerminated,
     StopSignals,
     _manager,
+    _restore_probe_command,
     parse_args,
     store_disk_usage,
 )
@@ -148,3 +149,34 @@ def test_store_disk_usage_counts_written_blocks_not_apparent_size(
     assert usage["lmcache_mp_disk"] >= 8192
     assert usage["total"] == usage["daser.store"] + usage["lmcache_mp_disk"]
     assert store_disk_usage(tmp_path / "missing") == {"total": 0}
+
+
+def test_restore_probe_command_forwards_the_sweep_arguments(tmp_path: Path) -> None:
+    """The quoted probe string is split into the probe's own argv."""
+    args = parse_args(
+        _args(
+            tmp_path,
+            "--session-tokens",
+            str(tmp_path / "t.npy"),
+            "--max-model-len",
+            "40960",
+            "--prefix-restore-probe",
+            "--total-tokens 32768 --tiers ssd --flush-tokens 9000",
+        )
+    )
+    command = _restore_probe_command(
+        args, "http://v", "http://d", "qwen", tmp_path / "out"
+    )
+    assert command[2] == "benchmarks.research.prefix_restore_probe"
+    assert command[command.index("--daser-url") + 1] == "http://d"
+    assert command[command.index("--block-tokens") + 1] == "128"
+    assert command[-6:] == [
+        "--total-tokens",
+        "32768",
+        "--tiers",
+        "ssd",
+        "--flush-tokens",
+        "9000",
+    ]
+    no_daser = _restore_probe_command(args, "http://v", None, "q", tmp_path)
+    assert "--daser-url" not in no_daser

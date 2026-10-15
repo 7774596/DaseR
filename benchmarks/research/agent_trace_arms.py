@@ -283,6 +283,53 @@ def _probe_command(
     ]
 
 
+def _restore_probe_command(
+    args: argparse.Namespace,
+    server_url: str,
+    daser_url: str | None,
+    model_name: str,
+    out_dir: Path,
+) -> list[str]:
+    """Return the ``prefix_restore_probe`` command replacing an arm's replay.
+
+    Args:
+        args: Parsed runner arguments (``--prefix-restore-probe`` set).
+        server_url: vLLM URL to probe.
+        daser_url: DaseR metrics URL for DaseR arms, else ``None``.
+        model_name: Served model name.
+        out_dir: Arm artifact directory receiving ``summary.json``.
+
+    Returns:
+        argv for ``subprocess.run``.
+
+    Raises:
+        ValueError: When the trace has no ``--session-tokens`` stream.
+    """
+    if args.session_tokens is None:
+        raise ValueError("--prefix-restore-probe needs --session-tokens")
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.research.prefix_restore_probe",
+        "--session-tokens",
+        str(args.session_tokens),
+        "--server-url",
+        server_url,
+        *(["--daser-url", daser_url] if daser_url else []),
+        "--served-model-name",
+        model_name,
+        "--output-dir",
+        str(out_dir),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--block-tokens",
+        str(args.block_size),
+        "--timeout",
+        str(args.timeout),
+        *shlex.split(args.prefix_restore_probe),
+    ]
+
+
 class MatchedServer(ServerManager):
     """ServerManager with prefix caching on and a fixed GPU KV byte budget."""
 
@@ -567,6 +614,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=256,
         help="Decode length of every --cache-state-probe request.",
     )
+    parser.add_argument(
+        "--prefix-restore-probe",
+        default="",
+        help="Instead of replaying the trace, run "
+        "benchmarks.research.prefix_restore_probe with these extra arguments "
+        '(one quoted string, e.g. "--total-tokens 32768 --tiers ssd"); '
+        "needs --session-tokens and VLLM_SERVER_DEV_MODE=1.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -754,90 +809,99 @@ async def run_arm(
         daser_before = await _daser_metrics(arm, manager)
         vllm_before = await _vllm_metrics(manager)
         server_urls = list(manager.vllm_urls)
-        replay_command = (
-            _probe_command(args, server_urls[0], model_name, out_dir)
-            if args.cache_state_probe
-            else [
-                sys.executable,
-                "-m",
-                "benchmarks.mooncake.benchmark",
-                "--trace",
-                args.trace,
-                "--tokenizer",
-                args.model,
-                "--trust-remote-code",
-                "--server-url",
-                *server_urls,
-                "--route",
-                args.route,
-                "--route-local-blocks",
-                str(args.route_local_blocks),
-                "--route-load-tokens-per-s",
-                str(args.route_load_tokens_per_s),
-                "--route-saturation-s",
-                str(args.route_saturation_s),
-                *(
-                    ["--rebind-after-s", str(args.rebind_after_s)]
-                    if args.rebind_after_s is not None
-                    else []
-                ),
-                *(["--prewarm-stripped"] if args.prewarm_stripped else []),
-                *(
-                    ["--prewarm-chunk-tokens", str(args.prewarm_chunk_tokens)]
-                    if args.prewarm_chunk_tokens
-                    else []
-                ),
-                *(
-                    ["--prewarm-max-waiting", str(args.prewarm_max_waiting)]
-                    if args.prewarm_max_waiting is not None
-                    else []
-                ),
-                *(
-                    ["--session-population", str(args.session_population)]
-                    if args.session_population
-                    else []
-                ),
-                *(
-                    ["--session-ramp-s", str(args.session_ramp_s)]
-                    if args.session_ramp_s
-                    else []
-                ),
-                "--served-model-name",
+        if args.prefix_restore_probe:
+            replay_command = _restore_probe_command(
+                args,
+                server_urls[0],
+                manager.daser_url if arm.startswith("daser") else None,
                 model_name,
-                "--output-dir",
-                str(out_dir),
-                "--max-model-len",
-                str(args.max_model_len),
-                "--start-request",
-                str(args.start_request),
-                "--max-requests",
-                str(args.max_requests),
-                "--max-inflight",
-                str(args.max_inflight),
-                "--time-scale",
-                str(args.time_scale),
-                "--timeout",
-                str(args.timeout),
-                "--abort-after-failures",
-                str(args.abort_after_failures),
-                *(["--prefix-dependencies"] if args.prefix_dependencies else []),
-                *(["--strict-order"] if args.strict_order else []),
-                *(["--chain-outputs"] if args.chain_outputs else []),
-                *(["--ordered-admission"] if args.ordered_admission else []),
-                "--dependency-gap-s",
-                str(args.dependency_gap_s),
-                *(
-                    ["--corpus-tokens", str(args.corpus_tokens)]
-                    if args.corpus_tokens is not None
-                    else []
-                ),
-                *(
-                    ["--session-tokens", str(args.session_tokens)]
-                    if args.session_tokens is not None
-                    else []
-                ),
-            ]
-        )
+                out_dir,
+            )
+        else:
+            replay_command = (
+                _probe_command(args, server_urls[0], model_name, out_dir)
+                if args.cache_state_probe
+                else [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.mooncake.benchmark",
+                    "--trace",
+                    args.trace,
+                    "--tokenizer",
+                    args.model,
+                    "--trust-remote-code",
+                    "--server-url",
+                    *server_urls,
+                    "--route",
+                    args.route,
+                    "--route-local-blocks",
+                    str(args.route_local_blocks),
+                    "--route-load-tokens-per-s",
+                    str(args.route_load_tokens_per_s),
+                    "--route-saturation-s",
+                    str(args.route_saturation_s),
+                    *(
+                        ["--rebind-after-s", str(args.rebind_after_s)]
+                        if args.rebind_after_s is not None
+                        else []
+                    ),
+                    *(["--prewarm-stripped"] if args.prewarm_stripped else []),
+                    *(
+                        ["--prewarm-chunk-tokens", str(args.prewarm_chunk_tokens)]
+                        if args.prewarm_chunk_tokens
+                        else []
+                    ),
+                    *(
+                        ["--prewarm-max-waiting", str(args.prewarm_max_waiting)]
+                        if args.prewarm_max_waiting is not None
+                        else []
+                    ),
+                    *(
+                        ["--session-population", str(args.session_population)]
+                        if args.session_population
+                        else []
+                    ),
+                    *(
+                        ["--session-ramp-s", str(args.session_ramp_s)]
+                        if args.session_ramp_s
+                        else []
+                    ),
+                    "--served-model-name",
+                    model_name,
+                    "--output-dir",
+                    str(out_dir),
+                    "--max-model-len",
+                    str(args.max_model_len),
+                    "--start-request",
+                    str(args.start_request),
+                    "--max-requests",
+                    str(args.max_requests),
+                    "--max-inflight",
+                    str(args.max_inflight),
+                    "--time-scale",
+                    str(args.time_scale),
+                    "--timeout",
+                    str(args.timeout),
+                    "--abort-after-failures",
+                    str(args.abort_after_failures),
+                    *(["--prefix-dependencies"] if args.prefix_dependencies else []),
+                    *(["--strict-order"] if args.strict_order else []),
+                    *(["--chain-outputs"] if args.chain_outputs else []),
+                    *(["--ordered-admission"] if args.ordered_admission else []),
+                    "--dependency-gap-s",
+                    str(args.dependency_gap_s),
+                    *(
+                        ["--corpus-tokens", str(args.corpus_tokens)]
+                        if args.corpus_tokens is not None
+                        else []
+                    ),
+                    *(
+                        ["--session-tokens", str(args.session_tokens)]
+                        if args.session_tokens is not None
+                        else []
+                    ),
+                ]
+            )
         counter_trace = (
             CounterTrace(
                 manager.daser_url,
