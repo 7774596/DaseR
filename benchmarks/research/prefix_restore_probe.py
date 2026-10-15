@@ -272,6 +272,75 @@ def summarise(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def compare_arms(
+    summaries: dict[str, Sequence[dict[str, Any]]],
+    raw: str,
+    cmp: str,
+    raw_lw: str,
+    cmp_lw: str,
+) -> list[dict[str, Any]]:
+    """Join four arms' summaries into the layer-wise pipelining gates.
+
+    Per cell, ``C`` is the compute-only control (median ``gpu`` TTFT of the
+    non-layer-wise arms) and ``IO_x = external_x - C``. A perfect layer
+    pipeline hides ``min(IO, C)``, so ``(IO + C) / max(IO, C)`` bounds the
+    layer-wise speedup of each arm.
+
+    Args:
+        summaries: Arm name to :func:`summarise` rows.
+        raw: Raw-record arm without layer-wise loads.
+        cmp: Compressed arm without layer-wise loads.
+        raw_lw: Raw-record arm with layer-wise loads.
+        cmp_lw: Compressed arm with layer-wise loads.
+
+    Returns:
+        One row per cell present in all four arms with ``io_*_ms``, ``c_ms``,
+        the bounds ``bound_raw`` / ``bound_cmp``, measured speedups over
+        ``raw`` (``s_cmp``, ``s_raw_lw``, ``s_cmp_lw``), ``lw_gain_cmp``
+        (``cmp / cmp_lw``) and ``super_additive`` (``s_cmp_lw`` above the
+        product of the two single-factor speedups).
+
+    Thread-safety:
+        Pure function.
+    """
+
+    def by_cell(arm: str) -> dict[tuple[int, int, str], dict[str, Any]]:
+        return {
+            (r["total_tokens"], r["prefix_tokens"], r["tier"]): r
+            for r in summaries[arm]
+        }
+
+    arms = {name: by_cell(name) for name in (raw, cmp, raw_lw, cmp_lw)}
+    rows = []
+    for key in sorted(set.intersection(*(set(a) for a in arms.values()))):
+        ext = {name: arms[name][key]["external_ttft_ms_p50"] for name in arms}
+        gpus = [arms[name][key]["gpu_ttft_ms_p50"] for name in (raw, cmp)]
+        if None in ext.values() or None in gpus:
+            continue
+        c = statistics.median(gpus)
+        io_raw, io_cmp = max(ext[raw] - c, 0.0), max(ext[cmp] - c, 0.0)
+        s_cmp, s_raw_lw = ext[raw] / ext[cmp], ext[raw] / ext[raw_lw]
+        s_cmp_lw = ext[raw] / ext[cmp_lw]
+        rows.append(
+            {
+                "total_tokens": key[0],
+                "prefix_tokens": key[1],
+                "tier": key[2],
+                "c_ms": c,
+                "io_raw_ms": io_raw,
+                "io_cmp_ms": io_cmp,
+                "bound_raw": (io_raw + c) / max(io_raw, c),
+                "bound_cmp": (io_cmp + c) / max(io_cmp, c),
+                "s_cmp": s_cmp,
+                "s_raw_lw": s_raw_lw,
+                "s_cmp_lw": s_cmp_lw,
+                "lw_gain_cmp": ext[cmp] / ext[cmp_lw],
+                "super_additive": s_cmp_lw > s_cmp * s_raw_lw,
+            }
+        )
+    return rows
+
+
 async def run_probe(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Measure every cell against one server and write the artifacts.
 

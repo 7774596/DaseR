@@ -7,6 +7,7 @@ from benchmarks.research.prefix_restore_probe import (
     Cell,
     PromptSource,
     cell_prompts,
+    compare_arms,
     flush_lengths,
     plan_cells,
     summarise,
@@ -94,3 +95,53 @@ def test_summarise_counts_full_prefix_output_mismatches() -> None:
         + [row("external", 1, "a"), row("gpu", 1, "b")]
     )
     assert out[0]["output_mismatch"] == 1
+
+
+def test_compare_arms_bounds_and_super_additivity() -> None:
+    def summary(external: float, gpu: float = 100.0) -> list[dict]:
+        return [
+            {
+                "total_tokens": 1024,
+                "prefix_tokens": 1024,
+                "tier": "ssd",
+                "external_ttft_ms_p50": external,
+                "gpu_ttft_ms_p50": gpu,
+            }
+        ]
+
+    (row,) = compare_arms(
+        {
+            "raw": summary(400.0),
+            "cmp": summary(250.0),
+            "raw-lw": summary(320.0),
+            "cmp-lw": summary(160.0),
+        },
+        "raw",
+        "cmp",
+        "raw-lw",
+        "cmp-lw",
+    )
+    assert row["c_ms"] == 100.0
+    assert row["io_raw_ms"] == 300.0 and row["io_cmp_ms"] == 150.0
+    assert row["bound_raw"] == 400.0 / 300.0
+    assert row["bound_cmp"] == 250.0 / 150.0
+    assert row["lw_gain_cmp"] == 250.0 / 160.0
+    # 400/160 = 2.5 > (400/250) * (400/320) = 2.0
+    assert row["super_additive"]
+
+
+def test_compare_arms_skips_cells_missing_from_an_arm() -> None:
+    rows = {
+        name: [
+            {
+                "total_tokens": 1024,
+                "prefix_tokens": 512,
+                "tier": "l1",
+                "external_ttft_ms_p50": 1.0,
+                "gpu_ttft_ms_p50": 1.0,
+            }
+        ]
+        for name in ("raw", "cmp", "raw-lw")
+    }
+    rows["cmp-lw"] = []
+    assert compare_arms(rows, "raw", "cmp", "raw-lw", "cmp-lw") == []
