@@ -978,6 +978,24 @@ async def run_arm(
             print(f"{arm}: services still alive; kept {manager.store_dir}", flush=True)
 
 
+def _arm_line(arm: str, result: dict[str, Any]) -> str:
+    """Return the one-line console summary of a finished arm."""
+    summary = result["summary"] or {}
+    if isinstance(summary, list):
+        # Restore-probe arms summarise per cell.
+        return f"{arm}: rc={result['replay_returncode']} cells={len(summary)}"
+    ttft = summary.get("ttft_ms", {})
+    return (
+        f"{arm}: rc={result['replay_returncode']} "
+        f"done={summary.get('completed_requests')} "
+        f"failed={summary.get('failed_requests')} "
+        f"aborted={summary.get('aborted')} "
+        f"wall={summary.get('wall_seconds', 0):.0f}s "
+        f"ttft_p50={ttft.get('p50', 0):.0f} p95={ttft.get('p95', 0):.0f} "
+        f"prefix={summary.get('prefix_cache')}"
+    )
+
+
 async def main_async(args: argparse.Namespace) -> None:
     """Run the selected arms sequentially on one GPU."""
     args.artifact.mkdir(parents=True, exist_ok=True)
@@ -985,18 +1003,7 @@ async def main_async(args: argparse.Namespace) -> None:
     stop.install()
     for arm in args.arms:
         result = await run_arm(arm, args, stop)
-        summary = result["summary"] or {}
-        ttft = summary.get("ttft_ms", {})
-        print(
-            f"{arm}: rc={result['replay_returncode']} "
-            f"done={summary.get('completed_requests')} "
-            f"failed={summary.get('failed_requests')} "
-            f"aborted={summary.get('aborted')} "
-            f"wall={summary.get('wall_seconds', 0):.0f}s "
-            f"ttft_p50={ttft.get('p50', 0):.0f} p95={ttft.get('p95', 0):.0f} "
-            f"prefix={summary.get('prefix_cache')}",
-            flush=True,
-        )
+        print(_arm_line(arm, result), flush=True)
         if stop.requested:
             print(f"{arm}: stopped by signal; skipping remaining arms", flush=True)
             break
