@@ -28,6 +28,8 @@ class StoreIntent:
     chunk_key: str
     token_count: int
     block_ids: list[int]
+    # Previous chunk of the rolling-prefix chain; empty for a chain root.
+    parent_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -267,15 +269,16 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             initial_key=key,
         )
 
-        run: list[tuple[int, str]] = []
+        run: list[tuple[int, str, str]] = []
         for next_key in keys:
             if slot_i >= num_slots or slot_i >= len(pending_store.block_ids):
                 break
+            parent_key = "" if key == ROLLING_PREFIX_SEED else key
             key = next_key
             if slot_i >= pending_store.start_slot_index:
                 store_id = f"{req_id}:store:{slot_i}"
                 if store_id not in pending_store_ids:
-                    run.append((slot_i, key))
+                    run.append((slot_i, key, parent_key))
             slot_i += 1
         intents = tuple(
             StoreIntent(
@@ -283,8 +286,9 @@ class PrefixReuseStrategy(CacheReuseStrategy):
                 chunk_key=chunk_key,
                 token_count=self._block_tokens,
                 block_ids=[pending_store.block_ids[store_slot_i]],
+                parent_key=parent_key,
             )
-            for store_slot_i, chunk_key in run
+            for store_slot_i, chunk_key, parent_key in run
         )
         if slot_i >= num_slots:
             if pending_store.chunk_key and pending_store.chunk_key != key:

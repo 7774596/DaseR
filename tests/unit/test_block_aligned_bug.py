@@ -159,7 +159,7 @@ class TestGetNumNewMatchedTokensBug:
             def __init__(self):
                 self.alloc_calls = []
 
-            def alloc_chunk(self, chunk_key, token_count, model_id):
+            def alloc_chunk(self, chunk_key, token_count, model_id, parent_key=""):
                 self.alloc_calls.append((chunk_key, token_count, model_id))
                 return {
                     "start_slot": 39,
@@ -220,7 +220,7 @@ class TestGetNumNewMatchedTokensBug:
             def __init__(self):
                 self.alloc_calls = []
 
-            def alloc_chunk(self, chunk_key, token_count, model_id):
+            def alloc_chunk(self, chunk_key, token_count, model_id, parent_key=""):
                 self.alloc_calls.append((chunk_key, token_count, model_id))
                 return {
                     "start_slot": 39,
@@ -288,7 +288,7 @@ class TestGetNumNewMatchedTokensBug:
             def __init__(self):
                 self.alloc_calls = []
 
-            def alloc_chunk(self, chunk_key, token_count, model_id):
+            def alloc_chunk(self, chunk_key, token_count, model_id, parent_key=""):
                 self.alloc_calls.append((chunk_key, token_count, model_id))
                 return {
                     "start_slot": 39,

@@ -988,15 +988,8 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
     assert not Path(index_path).exists()
 
 
-@pytest.mark.parametrize("exclusive", [False, True])
-def test_compressed_arena_addresses_l2_budget_plus_l1(
-    tmp_path: Path, monkeypatch, exclusive: bool
-) -> None:
-    """Both tier policies size the arena as L1 + L2 and budget L2 at --l2-size."""
-    if exclusive:
-        monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
-    else:
-        monkeypatch.delenv("DASER_EXCLUSIVE_TIERS", raising=False)
+def test_compressed_arena_addresses_l2_budget_plus_l1(tmp_path: Path) -> None:
+    """The arena spans L1 + L2 and the L2 budget is --l2-size."""
     args = _compressed_args(tmp_path)
     config = _build_daser_config(args)
 

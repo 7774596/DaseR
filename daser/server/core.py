@@ -8,7 +8,6 @@ import os
 from typing import Any, Callable, Optional
 
 # First Party
-from daser.config import PREFIX_CLOSED_EVICTION_ENV
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
 from daser.logging import init_logger
@@ -16,8 +15,9 @@ from daser.metrics import REGISTRY, MetricsRegistry
 from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_lifecycle import ChunkLifecycle
-from daser.server.chunk_manager import ChunkManager
+from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.doc_registry import DocEntry, DocRegistry
+from daser.server.eviction import EvictionTree
 from daser.server.metadata_store import ChunkMeta
 from daser.server.packed_layout import OnlinePackedLayout
 
@@ -52,7 +52,7 @@ class ChunkInfo:
 
     Attributes:
         chunk_key: cache key for the token sequence.
-        start_slot: first slot occupied in the ring buffer.
+        start_slot: first slot occupied in the store.
         num_slots: number of contiguous slots occupied.
         token_count: number of tokens covered by the chunk.
         pos_offset: position offset assigned by the position encoder.
@@ -227,7 +227,7 @@ class ServerCore:
     calls connector cache methods.
 
     Args:
-        chunk_manager: ring-buffer allocator and persistence coordinator.
+        chunk_manager: slot allocator and persistence coordinator.
         retrieval_index: cache lookup index.
         position_encoder: position-offset policy.
         slot_size: bytes per KV slot.
@@ -266,17 +266,14 @@ class ServerCore:
         self._discard_held_range: Callable[[int, int], None] | None = None
         self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
-        # Prefix-closed eviction: key -> keys a lookup reaches only through
-        # it, learned from looked-up prompts (on unless the switch is 0). Edges to
-        # children that are neither stored, pending nor learned since the last
-        # prune are dropped periodically, so it stays proportional to the
-        # cache instead of to every prompt ever seen.
-        self._prefix_closed = os.environ.get(PREFIX_CLOSED_EVICTION_ENV) != "0"
-        self._chain_children: dict[str, set[str]] = {}
-        self._chain_prompt: int | None = None
-        self._chain_edges = 0
-        self._chain_fresh: set[str] = set()
-        self._chain_limit = 2 * chunk_manager.total_slots
+        # Leaf-first eviction order over prefix-chain parent links; every
+        # indexed chunk is a node. Pinned keys (a store's placement phase)
+        # and uncommitted writers are never chosen.
+        self._tree = EvictionTree()
+        for meta in chunk_manager.store.iter_chunks():
+            self._tree.add(meta.chunk_key, meta.parent_key)
+        self._pins: dict[str, int] = {}
+        self._held_removals: set[asyncio.Task[None]] = set()
         self._record_capacity_metrics()
 
     @property
@@ -298,7 +295,7 @@ class ServerCore:
 
         Args:
             listener: Called with the chunk key after the chunk is removed by
-                ring eviction, explicit eviction or document deletion.
+                capacity eviction, explicit eviction or document deletion.
 
         Async/thread-safety:
             Listeners run synchronously on the server event loop and must not
@@ -428,8 +425,9 @@ class ServerCore:
         if matches:
             self._lookup_hits += 1
         chunks = [self._chunk_info(match) for match in matches]
-        if self._prefix_closed:
-            self._learn_chain(tokens)
+        # A merged prefix hit is keyed by its last block; touch the chain.
+        for chunk in chunks:
+            self._tree.touch_path(chunk.chunk_key)
         self._metrics.counter(
             "daser_cache_lookup_total",
             "Cache lookup requests by result.",
@@ -532,7 +530,7 @@ class ServerCore:
         ).inc(hits)
 
     async def alloc_chunk(
-        self, chunk_key: str, token_count: int, model_id: str
+        self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
     ) -> Allocation:
         """Allocate slots for a new chunk or reuse a compatible allocation.
 
@@ -540,6 +538,7 @@ class ServerCore:
             chunk_key: cache key for the token sequence.
             token_count: number of tokens in this chunk.
             model_id: model identifier.
+            parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
             Allocation metadata for connector writes.
@@ -548,7 +547,13 @@ class ServerCore:
             Performs in-memory mutation on the server event loop.
         """
         allocations = await self.alloc_chunks(
-            [{"chunk_key": chunk_key, "token_count": token_count}],
+            [
+                {
+                    "chunk_key": chunk_key,
+                    "token_count": token_count,
+                    "parent_key": parent_key,
+                }
+            ],
             model_id,
         )
         return allocations[0]
@@ -561,11 +566,17 @@ class ServerCore:
         """Allocate slots for multiple chunks in one server event-loop turn.
 
         Args:
-            chunks: chunk descriptors with ``chunk_key`` and ``token_count``.
+            chunks: chunk descriptors with ``chunk_key`` and ``token_count``,
+                and optionally ``parent_key`` (previous chunk of the prefix
+                chain; empty or missing for a root).
             model_id: model identifier.
 
         Returns:
             Allocation metadata in the same order as ``chunks``.
+
+        Raises:
+            SlotsExhausted: if no slots can be freed without evicting a
+                pending writer; earlier chunks of the batch stay allocated.
 
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
@@ -581,6 +592,7 @@ class ServerCore:
                 token_count=token_count,
                 num_slots=num_slots,
                 model_id=model_id,
+                parent_key=str(chunk.get("parent_key", "")),
             )
             if should_write:
                 self._lifecycle.mark_write_owner(chunk_key)
@@ -678,6 +690,7 @@ class ServerCore:
             self._lifecycle.abort_publish(chunk_key)
             raise
         publish_s, overlap_wait_s = self._lifecycle.mark_committed(chunk_key)
+        self._tree.touch([chunk_key])
         self._metrics.counter(
             "daser_cache_committed_chunks_total",
             "Chunks committed and published to the retrieval index.",
@@ -1011,6 +1024,7 @@ class ServerCore:
             return False
         self._packed_layout.clear_written(chunk_key)
         self._lifecycle.discard_owner(chunk_key)
+        self._tree.refresh(chunk_key)
         return True
 
     async def evict_chunk(self, chunk_key: str) -> None:
@@ -1037,6 +1051,8 @@ class ServerCore:
             discard_held: ``TransferLayer.discard_held``; drops the L1 copy of
                 a held record whose placement is released.
 
+        The memory tier reports evicted held records via ``release_held``.
+
         Async/thread-safety:
             Call once before the first packed store. Both callables run
             synchronously on the server event loop.
@@ -1044,56 +1060,106 @@ class ServerCore:
         self._hold_resident = hold_resident
         self._discard_held_range = discard_held
 
-    async def reclaim_packed(
-        self,
-        protected_keys: set[str],
-        *,
-        rank_base: int = 0,
-        free_address: bool = False,
-    ) -> bool:
-        """Reclaim the oldest packed record of a lane's L2 FIFO.
-
-        The record leaves the L2 budget: when the attached memory tier holds
-        it whole it stays indexed as an L1-only record, otherwise its chunk is
-        removed. With ``free_address`` (the arena has no room) the record's
-        chunk is always removed, and the longest-held chunk once no charged
-        record is left. See ``docs/design/tier-residency.md``.
+    def pin(self, chunk_keys: list[str]) -> None:
+        """Keep chunks from being chosen for eviction until ``unpin``.
 
         Args:
-            protected_keys: Chunk keys that must stay resident, e.g. the
-                chunks being placed by the current store call.
-            rank_base: Start of the rank lane to reclaim from.
+            chunk_keys: Keys to pin; pins nest.
+
+        Async/thread-safety:
+            Call on the server event loop, e.g. around a store's placement.
+        """
+        for key in chunk_keys:
+            self._pins[key] = self._pins.get(key, 0) + 1
+
+    def unpin(self, chunk_keys: list[str]) -> None:
+        """Release pins taken by ``pin``.
+
+        Args:
+            chunk_keys: The keys passed to ``pin``.
+
+        Async/thread-safety:
+            Call on the server event loop.
+        """
+        for key in chunk_keys:
+            count = self._pins.get(key, 0) - 1
+            if count > 0:
+                self._pins[key] = count
+                continue
+            self._pins.pop(key, None)
+            self._tree.refresh(key)
+
+    async def reclaim_packed(self, *, free_address: bool = False) -> bool:
+        """Reclaim one chunk's packed records from the L2 budget or arena.
+
+        The victim is the least recently used evictable leaf of the eviction
+        tree. For the L2 budget, chunks already held are ignored; when the
+        attached memory tier holds all the victim's charged records whole they
+        become held and the chunk stays indexed, otherwise it is removed. With
+        ``free_address`` (the arena has no room) the victim is removed. See
+        ``docs/design/tier-residency.md``.
+
+        Args:
             free_address: Free arena bytes instead of L2 budget.
 
         Returns:
-            Whether a record was reclaimed; False when only protected records
-            remain.
+            Whether a chunk was reclaimed; False when every candidate leaf is
+            pinned or has a pending writer.
 
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        layout = self._packed_layout
-        victim = layout.oldest_charged(protected_keys, rank_base=rank_base)
-        if free_address and victim is None:
-            victim = layout.oldest_held(protected_keys, rank_base=rank_base)
+        if free_address:
+            victim = self._tree.pop_victim(self._unevictable)
+            if victim is None:
+                return False
+            self._count_reclaim("removed")
+            await self._remove_chunk(victim, reason="capacity")
+            return True
+        victim = self._tree.pop_victim(self._unevictable, charged_only=True)
         if victim is None:
             return False
-        held = (
-            not free_address
-            and self._hold_resident is not None
-            and self._hold_resident(victim.file_offset, victim.stored_length)
-        )
-        self._metrics.counter(
-            "daser_packed_reclaims_total",
-            "Packed records reclaimed, by whether L1 kept them indexed.",
-        ).inc(labels={"outcome": "held" if held else "removed"})
-        if held:
-            layout.hold(victim.file_offset)
+        layout = self._packed_layout
+        records = layout.charged_records(victim)
+        held = []
+        if self._hold_resident is not None:
+            for record in records:
+                if not self._hold_resident(record.file_offset, record.stored_length):
+                    break
+                held.append(record)
+        if not records or len(held) < len(records):
+            # The chunk is removed; drop the L1 copies this pass already held.
+            for record in held:
+                self._discard_held(record.file_offset, record.stored_length)
+            self._count_reclaim("removed")
+            await self._remove_chunk(victim, reason="capacity")
             return True
-        await self._remove_chunk(victim.chunk_key, reason="capacity")
-        if self._prefix_closed:
-            await self._remove_orphans([victim.chunk_key], frozenset(protected_keys))
+        for record in held:
+            layout.hold(record.file_offset)
+        self._tree.mark_held(victim)
+        self._count_reclaim("held")
         return True
+
+    def release_held(self, file_offset: int, nbytes: int) -> None:
+        """Remove the chunk of a held record that the memory tier evicted.
+
+        Args:
+            file_offset: Start of the released L1 range.
+            nbytes: Its length.
+
+        Async/thread-safety:
+            Called synchronously from the transfer layer's L1 eviction on the
+            server event loop. Removal is scheduled as a task so it cannot
+            re-enter the caller; until it runs the placement stays reserved
+            and the SSD copy stays valid, so concurrent loads are correct.
+        """
+        if self._packed_layout.held_owner(file_offset, nbytes) is None:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._remove_released_held(file_offset, nbytes)
+        )
+        self._held_removals.add(task)
+        task.add_done_callback(self._held_removals.discard)
 
     async def register_document(
         self,
@@ -1235,36 +1301,14 @@ class ServerCore:
         )
         return DeleteDocumentResult(chunks_evicted=chunks_evicted)
 
-    async def _drain_ring_evictions(
-        self, protected: frozenset[str] = frozenset()
-    ) -> None:
-        """Remove ring-evicted chunks from retrieval index.
-
-        Args:
-            protected: Chunk keys prefix-closed eviction must keep, e.g. the
-                chunk whose allocation evicted the ring tail.
-
-        Async/thread-safety:
-            Runs on the server event loop after allocation.
-        """
-        evicted = self._cm.drain_evicted_chunk_keys()
-        for chunk_key in evicted:
-            await self._ri.remove(chunk_key)
-            self._lifecycle.mark_evicted(chunk_key)
-            self._notify_chunk_removed(chunk_key)
-            self._metrics.counter(
-                "daser_cache_evicted_chunks_total",
-                "Chunks evicted from cache metadata.",
-            ).inc(labels={"reason": "capacity"})
-            logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
-        if self._prefix_closed and evicted:
-            await self._remove_orphans(evicted, protected)
-        self._record_capacity_metrics()
-
     def _record_capacity_metrics(self) -> None:
         """Publish current byte capacity gauges."""
         total_slots = self._cm.physical_slots
         used_slots = min(total_slots, self._cm.total_slots - self._cm.free_slots)
+        self._metrics.gauge(
+            "daser_store_free_slot_holes",
+            "Disjoint free slot ranges (allocator fragmentation).",
+        ).set(self._cm.free_holes)
         self._metrics.gauge(
             "daser_store_l2_bytes_capacity",
             "Total L2 store capacity in bytes.",
@@ -1311,7 +1355,8 @@ class ServerCore:
             meta.doc_ids.remove(doc_id)
         if meta.doc_ids:
             return False
-        self._cm.store.remove(chunk_key)
+        self._cm.remove(chunk_key)
+        self._tree.remove(chunk_key)
         self._lifecycle.discard(chunk_key)
         self._notify_chunk_removed(chunk_key)
         return True
@@ -1341,7 +1386,8 @@ class ServerCore:
         meta = self._cm.store.get(chunk_key)
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
-            self._cm.store.remove(chunk_key)
+            self._cm.remove(chunk_key)
+            self._tree.remove(chunk_key)
             self._notify_chunk_removed(chunk_key)
         self._lifecycle.mark_evicted(chunk_key)
         self._metrics.counter(
@@ -1351,86 +1397,37 @@ class ServerCore:
         self._record_capacity_metrics()
         logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
 
-    def _learn_chain(self, tokens: TokenSequence) -> None:
-        """Record which keys a lookup of ``tokens`` reaches through which.
+    async def _remove_released_held(self, file_offset: int, nbytes: int) -> None:
+        """Remove the chunk of a released held record if it is still held."""
+        chunk_key = self._packed_layout.held_owner(file_offset, nbytes)
+        if chunk_key is not None:
+            await self._remove_chunk(chunk_key, reason="l1_release")
 
-        Schedulers poll one prompt many times, so a prompt identical to the
-        last linked one is skipped before hashing its chain.
+    def _unevictable(self, chunk_key: str) -> bool:
+        """Return whether a chunk is pinned or has an uncommitted writer."""
+        return chunk_key in self._pins or (
+            chunk_key in self._lifecycle.write_owners
+            and not self._lifecycle.is_committed(chunk_key)
+        )
+
+    async def _evict_one(self) -> bool:
+        """Remove the least recently used evictable leaf chunk.
+
+        Returns:
+            False when every chunk is pinned or has a pending writer.
         """
-        prompt = hash(tokens if isinstance(tokens, bytes) else tuple(tokens))
-        if prompt == self._chain_prompt:
-            return
-        self._chain_prompt = prompt
-        chain = self._ri.chain_keys(tokens)
-        for parent, child in zip(chain, chain[1:], strict=False):
-            children = self._chain_children.setdefault(parent, set())
-            if child not in children:
-                children.add(child)
-                self._chain_edges += 1
-            self._chain_fresh.add(child)
-        if self._chain_edges > self._chain_limit:
-            self._prune_chain()
+        victim = self._tree.pop_victim(self._unevictable)
+        if victim is None:
+            return False
+        await self._remove_chunk(victim, reason="capacity")
+        return True
 
-    def _prune_chain(self) -> None:
-        """Drop reachability edges that can no longer guide a cascade.
-
-        An edge matters only while its child is stored, still being written,
-        or about to be (learned since the last prune); any other edge is
-        relearned by the next lookup that reaches it. The next prune waits
-        for as many new edges as are cached (at least two per slot), so the
-        map stays within three times that and pruning is amortised O(1).
-        """
-        pending = self._lifecycle.pending_write_keys
-        store = self._cm.store
-        edges = cached = 0
-        for parent in list(self._chain_children):
-            children = set()
-            for child in self._chain_children[parent]:
-                if child in pending or store.get(child) is not None:
-                    cached += 1
-                elif child not in self._chain_fresh:
-                    continue
-                children.add(child)
-            if children:
-                self._chain_children[parent] = children
-                edges += len(children)
-            else:
-                del self._chain_children[parent]
-        self._chain_edges = edges
-        self._chain_fresh = set()
-        # Size the next generation by the cached edges, not the kept fresh
-        # ones, so fresh-but-never-stored edges cannot ratchet the limit up.
-        self._chain_limit = edges + max(cached, 2 * self._cm.total_slots)
-        self._metrics.gauge(
-            "daser_prefix_chain_edges",
-            "Reachability edges kept for prefix-closed eviction.",
-        ).set(edges)
-
-    async def _remove_orphans(
-        self, evicted: list[str], protected: frozenset[str]
-    ) -> None:
-        """Remove resident chunks that only evicted chunks led to.
-
-        A lookup stops at the first missing key, so every key reached through
-        an evicted one is dead weight until that key is stored again. Keys
-        still being written (or ``protected``) are kept, and so are their
-        descendants.
-
-        Args:
-            evicted: Keys just removed by capacity eviction.
-            protected: Keys that must stay resident.
-        """
-        keep = protected | self._lifecycle.pending_write_keys
-        stack = list(evicted)
-        seen = set(stack)
-        while stack:
-            for child in tuple(self._chain_children.get(stack.pop(), ())):
-                if child in seen or child in keep:
-                    continue
-                seen.add(child)
-                stack.append(child)
-                if self._cm.store.get(child) is not None:
-                    await self._remove_chunk(child, reason="orphan")
+    def _count_reclaim(self, outcome: str) -> None:
+        """Count one packed reclaim by whether L1 kept the chunk indexed."""
+        self._metrics.counter(
+            "daser_packed_reclaims_total",
+            "Packed records reclaimed, by whether L1 kept them indexed.",
+        ).inc(labels={"outcome": outcome})
 
     def _has_store_owner(
         self,
@@ -1491,21 +1488,26 @@ class ServerCore:
         token_count: int,
         num_slots: int,
         model_id: str,
+        parent_key: str = "",
     ) -> ChunkMeta:
         """Allocate a chunk or reuse a compatible in-flight allocation.
+
+        Evicts least recently used leaves until the slots fit.
 
         Args:
             chunk_key: cache key for the token sequence.
             token_count: number of tokens covered by the chunk.
             num_slots: number of slots required.
             model_id: model identifier.
+            parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
             Existing or newly allocated chunk metadata.
 
         Raises:
             ValueError: if an existing chunk has incompatible metadata.
-            RuntimeError: if allocation does not populate metadata.
+            SlotsExhausted: if no evictable chunk is left and slots still
+                do not fit.
         """
         existing = self._cm.store.get(chunk_key)
         if existing is not None:
@@ -1517,22 +1519,26 @@ class ServerCore:
                 raise ValueError(
                     f"chunk_key already exists with incompatible metadata: {chunk_key}"
                 )
+            self._tree.touch([chunk_key])
             return existing
 
         pos_offset = self._pe.assign_offset(chunk_key, token_count)
-        start_slot = self._cm.alloc(
-            chunk_key=chunk_key,
-            num_slots=num_slots,
-            token_count=token_count,
-            model_id=model_id,
-            pos_offset=pos_offset,
-        )
-        await self._drain_ring_evictions(frozenset((chunk_key,)))
-        meta = self._cm.store.get(chunk_key)
-        if meta is None:
-            raise RuntimeError(
-                f"allocation succeeded at slot {start_slot} but metadata is missing"
-            )
+        while True:
+            try:
+                meta = self._cm.alloc(
+                    chunk_key=chunk_key,
+                    num_slots=num_slots,
+                    token_count=token_count,
+                    model_id=model_id,
+                    pos_offset=pos_offset,
+                    parent_key=parent_key,
+                )
+                break
+            except SlotsExhausted:
+                if not await self._evict_one():
+                    raise
+        self._tree.add(chunk_key, parent_key)
+        self._record_capacity_metrics()
         return meta
 
     def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:

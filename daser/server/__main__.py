@@ -505,7 +505,7 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
     Returns:
         Restored ServerCore.
     """
-    store = MetadataStore(total_slots=cfg.total_slots)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=cfg.total_slots,

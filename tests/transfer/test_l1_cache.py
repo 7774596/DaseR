@@ -306,7 +306,7 @@ def test_mark_read_counts_lease_served_bytes_without_reordering() -> None:
 
 
 def _put_held_group(cache: L1Cache, keys: list[tuple[int, int]]) -> list[object]:
-    """Publish one grouped allocation whose children are all held."""
+    """Publish one grouped allocation and hold each of its children."""
     total = sum(size for _start, size in keys)
     parent = cache.reserve_untracked(total)
     assert parent is not None
@@ -314,73 +314,63 @@ def _put_held_group(cache: L1Cache, keys: list[tuple[int, int]]) -> list[object]
     for _start, size in keys:
         children.append(parent.subslice(cursor, size))
         cursor += size
-    cache.put_reserved_group(
-        list(zip(keys, children, strict=True)), held=[True] * len(keys)
-    )
+    cache.put_reserved_group(list(zip(keys, children, strict=True)))
     parent.close()
-    return children
+    for key in keys:
+        assert cache.hold_clean(key)
+    return [cache.get(key) for key in keys]
 
 
-def test_held_range_leaving_l1_is_handed_over_before_the_pinned_check() -> None:
-    """Eviction and overwrite of a held range call ``on_held_release`` first.
+def test_held_range_leaving_l1_is_reported_once() -> None:
+    """Eviction and overwrite of a held range call ``on_held_release``.
 
-    The callback pins the slice (as starting its L2 write does), so the slice
-    survives eviction; ``discard_held`` skips the callback.
+    ``discard_held`` drops the range without the callback; a slice still
+    pinned by an in-flight write survives its eviction.
     """
     pinned: set[int] = set()
-    released: list[tuple[tuple[int, int], bool]] = []
-
-    def on_held_release(key: tuple[int, int], data: object, dirty: bool) -> None:
-        released.append((key, dirty))
-        pinned.add(id(data))
-
+    released: list[tuple[int, int]] = []
     cache = L1Cache(
         16384,
         4096,
         lambda _key, data: id(data) in pinned,
-        on_held_release=on_held_release,
+        on_held_release=released.append,
     )
     try:
-        _a, b, c = _put_held_group(cache, [(0, 4096), (4096, 4096), (8192, 4096)])
-        # Pool pages are reused uninitialized; give c known bytes.
-        c.view()[:] = b"c" * 4096
+        _a, b, _c = _put_held_group(cache, [(0, 4096), (4096, 4096), (8192, 4096)])
 
         cache.discard_held((0, 4096))
         assert released == [] and cache.get((0, 4096)) is None
         assert cache.get((4096, 4096)) is b
 
-        # Overwriting held ranges hands each one over as dirty.
         cache.drop_overlapping(4096, 8192)
-        assert released == [((4096, 4096), True), ((8192, 4096), True)]
-        assert id(c) in pinned and bytes(c.view()) == b"c" * 4096
+        assert released == [(4096, 4096), (8192, 4096)]
         assert cache.bytes_used == 0
 
         (d,) = _put_held_group(cache, [(12288, 4096)])
-        # A full-pool reservation evicts it; the callback pins it first.
+        pinned.add(id(d))
         assert cache.reserve_untracked(16384) is None
-        assert released[-1] == ((12288, 4096), True)
+        assert released[-1] == (12288, 4096)
         assert cache.eviction_bytes["pinned_bytes"] == 4096
-        for data in (b, c, d):
-            pinned.discard(id(data))
-            cache.release((0, 0), data)
+        pinned.discard(id(d))
+        cache.release((12288, 4096), d)
     finally:
         cache.close()
 
 
 def test_hold_clean_splits_a_resident_entry_without_changing_its_charge() -> None:
-    """``hold_clean`` isolates one record of an entry; it leaves L1 as clean."""
-    released: list[tuple[tuple[int, int], bool]] = []
+    """``hold_clean`` isolates one record of an entry without new charge."""
+    released: list[tuple[int, int]] = []
     cache = L1Cache(
         16384,
         4096,
         lambda _key, _data: False,
-        on_held_release=lambda key, _data, dirty: released.append((key, dirty)),
+        on_held_release=released.append,
     )
     try:
         parent = cache.reserve_untracked(12288)
         assert parent is not None
         parent.view()[:] = b"a" * 4096 + b"b" * 4096 + b"c" * 4096
-        cache.put_reserved_group([((0, 12288), parent)], held=[False])
+        cache.put_reserved_group([((0, 12288), parent)])
         used = cache.bytes_used
 
         assert not cache.hold_clean((8192, 8192))  # not covered by one entry
@@ -392,10 +382,10 @@ def test_hold_clean_splits_a_resident_entry_without_changing_its_charge() -> Non
         side = cache.get((8192, 4096))
         assert side is not None and bytes(side.view()) == b"c" * 4096
 
-        # Evicting the allocation releases the held child once, as clean.
+        # Evicting the allocation releases the held child once.
         whole = cache.reserve_untracked(16384)
         assert whole is not None
-        assert released == [((4096, 4096), False)]
+        assert released == [(4096, 4096)]
         whole.close()
     finally:
         cache.close()

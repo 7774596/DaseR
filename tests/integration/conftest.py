@@ -70,7 +70,7 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
     with open(store_path, "wb") as f:
         f.write(b"\x00" * store_size)
 
-    metadata_store = MetadataStore(total_slots=TOTAL_SLOTS)
+    metadata_store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=TOTAL_SLOTS,

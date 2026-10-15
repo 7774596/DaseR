@@ -4,146 +4,173 @@
 import os
 
 # Third Party
+import msgpack
 import pytest
 
 # First Party
-from daser.server.chunk_manager import ChunkManager
+from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import MetadataStore
 
 
 def make_manager(total_slots: int = 8) -> ChunkManager:
-    store = MetadataStore(total_slots=total_slots)
+    store = MetadataStore()
     return ChunkManager(total_slots=total_slots, metadata_store=store)
 
 
-def test_alloc_returns_correct_start_slot():
-    mgr = make_manager(8)
-    slot = mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    assert slot == 0
-
-
-def test_alloc_advances_head():
-    mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    slot = mgr.alloc("key2", num_slots=2, token_count=32, model_id="m", pos_offset=48)
-    assert slot == 3
-
-
-def test_free_slots_decreases():
-    mgr = make_manager(8)
-    assert mgr.free_slots == 8
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    assert mgr.free_slots == 5
-
-
-def test_evicts_oldest_when_full():
-    mgr = make_manager(6)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
-    assert mgr.store.get("key1") is None
-    assert mgr.store.get("key2") is not None
-    assert mgr.store.get("key3") is not None
-
-
-def test_auto_eviction_keys_can_be_drained():
-    mgr = make_manager(6)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    assert mgr.drain_evicted_chunk_keys() == []
-
-    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
-
-    assert mgr.drain_evicted_chunk_keys() == ["key1"]
-    assert mgr.drain_evicted_chunk_keys() == []
-
-
-def test_evict_oldest_restores_capacity():
-    mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    assert mgr.free_slots == 5
-    mgr.evict_oldest()
-    assert mgr.free_slots == 8
-    assert mgr.store.get("key1") is None
-
-
-def test_tail_skips_chunk_removed_before_eviction():
-    mgr = make_manager(6)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    mgr.store.remove("key2")
-
-    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
-    mgr.alloc("key4", num_slots=3, token_count=48, model_id="m", pos_offset=144)
-
-    assert mgr.store.get("key3") is not None
-    assert mgr.store.get("key4") is not None
-    assert mgr.drain_evicted_chunk_keys() == ["key1"]
-
-
-def test_tail_keeps_reallocated_chunk_with_removed_key():
-    mgr = make_manager(9)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    mgr.store.remove("key1")
-    assert (
-        mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0) == 6
+def alloc(mgr: ChunkManager, key: str, num_slots: int, parent_key: str = "") -> int:
+    meta = mgr.alloc(
+        key,
+        num_slots=num_slots,
+        token_count=16 * num_slots,
+        model_id="m",
+        pos_offset=0,
+        parent_key=parent_key,
     )
-
-    # The tail passes key1's old slots; the re-allocated key1 must survive.
-    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
-
-    assert mgr.store.get("key1") is not None
-    assert mgr.store.get("key2") is not None
-    assert mgr.drain_evicted_chunk_keys() == []
+    return meta.start_slot
 
 
-def test_wrap_around():
-    # total=8; key1(3) at [0..2], key2(3) at [3..5] → head=6
-    # key3(4) needs 4 slots; only 2 remain at tail → SKIP [6,7], head wraps to 0
-    # must evict key1 then key2 to make room; key3 lands at slot 0
+def test_alloc_is_first_fit_from_zero():
     mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    slot = mgr.alloc("key3", num_slots=4, token_count=64, model_id="m", pos_offset=96)
-    assert slot == 0
-    assert mgr.store.get("key3") is not None
+    assert alloc(mgr, "key1", 3) == 0
+    assert alloc(mgr, "key2", 2) == 3
+    assert mgr.free_slots == 3
+    assert mgr.store.get("key2").num_slots == 2
 
 
-def test_wrap_skip_advances_tail():
-    # After wrap: key3 at [0..3], SKIP at [6,7], tail at 6
-    # alloc key4 (2 slots): tail must consume SKIP [6,7] → tail wraps to 0
-    # then key4 sits at slot 4
+def test_alloc_records_parent_key():
     mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
-    mgr.alloc("key3", num_slots=4, token_count=64, model_id="m", pos_offset=96)
-    mgr.alloc("key4", num_slots=2, token_count=32, model_id="m", pos_offset=160)
-    assert mgr.store.get("key4") is not None
-    assert mgr.store.get("key4").start_slot == 4
+    alloc(mgr, "root", 1)
+    alloc(mgr, "child", 1, parent_key="root")
+    assert mgr.store.get("child").parent_key == "root"
+    assert mgr.store.get("root").parent_key == ""
+
+
+def test_full_store_raises_without_evicting():
+    mgr = make_manager(4)
+    alloc(mgr, "a", 2)
+    alloc(mgr, "b", 2)
+    with pytest.raises(SlotsExhausted):
+        alloc(mgr, "c", 1)
+    assert mgr.store.get("a") is not None
+    assert mgr.store.get("b") is not None
+    assert mgr.store.get("c") is None
+
+
+def test_alloc_rejects_invalid_length():
+    mgr = make_manager(4)
+    with pytest.raises(ValueError):
+        alloc(mgr, "zero", 0)
+    with pytest.raises(ValueError):
+        alloc(mgr, "huge", 5)
+
+
+def test_removed_slots_are_reused_and_coalesced():
+    mgr = make_manager(6)
+    alloc(mgr, "a", 2)
+    alloc(mgr, "b", 2)
+    alloc(mgr, "c", 2)
+    mgr.remove("a")
+    mgr.remove("c")
+    assert mgr.free_slots == 4
+    assert mgr.free_holes == 2
+    # Neither hole fits three slots until b leaves and they merge.
+    with pytest.raises(SlotsExhausted):
+        alloc(mgr, "d", 3)
+    mgr.remove("b")
+    assert mgr.free_holes == 1
+    assert alloc(mgr, "d", 3) == 0
+
+
+def test_remove_unknown_raises():
+    mgr = make_manager(4)
+    with pytest.raises(KeyError):
+        mgr.remove("missing")
+
+
+def test_write_hold_defers_slot_reuse():
+    mgr = make_manager(2)
+    alloc(mgr, "a", 2)
+    token = mgr.hold_writes(["a", "missing"])
+    mgr.remove("a")
+    assert mgr.store.get("a") is None
+    with pytest.raises(SlotsExhausted):
+        alloc(mgr, "b", 1)
+    mgr.end_writes(token)
+    assert mgr.free_slots == 2
+    assert alloc(mgr, "b", 2) == 0
+
+
+def test_nested_write_holds_free_after_last():
+    mgr = make_manager(2)
+    alloc(mgr, "a", 2)
+    first = mgr.hold_writes(["a"])
+    second = mgr.hold_writes(["a"])
+    mgr.remove("a")
+    mgr.end_writes(first)
+    assert mgr.free_slots == 0
+    mgr.end_writes(second)
+    assert mgr.free_slots == 2
+
+
+def test_write_hold_on_live_chunk_frees_nothing():
+    mgr = make_manager(2)
+    alloc(mgr, "a", 2)
+    mgr.end_writes(mgr.hold_writes(["a"]))
+    assert mgr.free_slots == 0
+    with pytest.raises(KeyError):
+        mgr.end_writes(12345)
 
 
 def test_save_and_load_state(tmp_path):
     mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    mgr.alloc("key2", num_slots=2, token_count=32, model_id="m", pos_offset=48)
+    alloc(mgr, "key1", 3)
+    alloc(mgr, "key2", 2, parent_key="key1")
+    alloc(mgr, "key3", 1)
+    mgr.remove("key1")
     path = str(tmp_path / "daser.index")
     mgr.save(path)
 
-    store2 = MetadataStore(total_slots=8)
-    mgr2 = ChunkManager(total_slots=8, metadata_store=store2)
+    mgr2 = make_manager(8)
     mgr2.load(path)
-    assert mgr2.store.get("key1") is not None
-    assert mgr2.store.get("key2") is not None
-    assert mgr2.free_slots == 3
-    slot = mgr2.alloc("key3", num_slots=2, token_count=32, model_id="m", pos_offset=80)
-    assert slot == 5
+    assert mgr2.store.get("key1") is None
+    assert mgr2.store.get("key2").parent_key == "key1"
+    assert mgr2.free_slots == 5
+    assert mgr2.free_holes == 2
+    assert alloc(mgr2, "key4", 3) == 0
+
+
+def test_load_rejects_different_slot_capacity(tmp_path):
+    mgr = make_manager(8)
+    alloc(mgr, "key1", 3)
+    path = str(tmp_path / "daser.index")
+    mgr.save(path)
+
+    with pytest.raises(ValueError, match="slot capacity"):
+        make_manager(16).load(path)
+
+
+def test_load_rejects_overlapping_chunks(tmp_path):
+    mgr = make_manager(8)
+    alloc(mgr, "a", 3)
+    alloc(mgr, "b", 3)
+    path = str(tmp_path / "daser.index")
+    mgr.save(path)
+    with open(path, "rb") as f:
+        payload = msgpack.unpackb(f.read(), raw=False)
+    index = msgpack.unpackb(payload["index"], raw=False)
+    index["chunk_index"]["b"]["start_slot"] = 1
+    payload["index"] = msgpack.packb(index, use_bin_type=True)
+    with open(path, "wb") as f:
+        f.write(msgpack.packb(payload, use_bin_type=True))
+
+    with pytest.raises(ValueError, match="not free"):
+        make_manager(8).load(path)
 
 
 def test_load_rejects_different_cache_reuse_mode(tmp_path):
     mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    alloc(mgr, "key1", 3)
     path = str(tmp_path / "daser.index")
     mgr.save(path, cache_reuse_mode="chunk")
 
@@ -154,7 +181,7 @@ def test_load_rejects_different_cache_reuse_mode(tmp_path):
 
 def test_load_rejects_missing_cache_reuse_mode_when_expected(tmp_path):
     mgr = make_manager(8)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    alloc(mgr, "key1", 3)
     path = str(tmp_path / "daser.index")
     mgr.save(path)
 
@@ -165,9 +192,9 @@ def test_load_rejects_missing_cache_reuse_mode_when_expected(tmp_path):
 
 def test_save_and_load_state_includes_doc_registry(tmp_path):
     registry = DocRegistry()
-    store = MetadataStore(total_slots=8)
+    store = MetadataStore()
     mgr = ChunkManager(total_slots=8, metadata_store=store, doc_registry=registry)
-    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    alloc(mgr, "key1", 3)
     registry.insert(
         DocEntry(
             doc_id="doc1",
@@ -186,7 +213,7 @@ def test_save_and_load_state_includes_doc_registry(tmp_path):
     mgr.save(path)
 
     registry2 = DocRegistry()
-    store2 = MetadataStore(total_slots=8)
+    store2 = MetadataStore()
     mgr2 = ChunkManager(
         total_slots=8,
         metadata_store=store2,
@@ -208,10 +235,10 @@ def test_save_failure_keeps_existing_index_readable(
 ):
     path = str(tmp_path / "daser.index")
     mgr = make_manager(8)
-    mgr.alloc("old", num_slots=2, token_count=32, model_id="m", pos_offset=0)
+    alloc(mgr, "old", 2)
     mgr.save(path)
 
-    mgr.alloc("new", num_slots=2, token_count=32, model_id="m", pos_offset=32)
+    alloc(mgr, "new", 2)
     original_replace = os.replace
 
     def fail_replace(src: str, dst: str) -> None:

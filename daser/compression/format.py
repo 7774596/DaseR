@@ -230,7 +230,7 @@ class CompressedStoreGeometry:
 
         Returns:
             The fixed TileLang envelope size used to derive a conservative
-            logical-ring capacity for compressed-online storage.
+            logical slot capacity for compressed-online storage.
 
         Raises:
             ValueError: If this geometry cannot represent a fixed online

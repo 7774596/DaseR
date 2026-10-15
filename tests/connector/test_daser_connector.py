@@ -351,7 +351,9 @@ class _AllocatingSchedulerProbe(RequestLifecycle):
         self.released_allocations: list[tuple[str, int, int]] = []
         self._ipc_sync = self
 
-    def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+    def alloc_chunk(
+        self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+    ) -> dict:
         """Record an allocation call and return server-style metadata."""
         self.alloc_calls.append((chunk_key, token_count, model_id))
         return {
@@ -475,9 +477,10 @@ class _AllocChunkOnlyIPC:
         chunk_key: str,
         token_count: int,
         model_id: str,
+        parent_key: str = "",
     ) -> dict:
         """Forward single-chunk allocation calls to the owner probe."""
-        return self._owner.alloc_chunk(chunk_key, token_count, model_id)
+        return self._owner.alloc_chunk(chunk_key, token_count, model_id, parent_key)
 
 
 def test_dataclasses_instantiate():
@@ -824,7 +827,10 @@ def test_request_lifecycle_rebuilds_prefix_keys_after_block_size_refresh() -> No
         tokens,
         set(),
     )
-    assert [intent.chunk_key for intent in plan.intents] == rolling_keys(tokens, 128)
+    keys = rolling_keys(tokens, 128)
+    assert [intent.chunk_key for intent in plan.intents] == keys
+    # Each block links to the block before it; the chain root has no parent.
+    assert [intent.parent_key for intent in plan.intents] == ["", *keys[:-1]]
 
 
 def test_scheduler_runtime_config_is_owned_by_request_lifecycle(monkeypatch):
@@ -2029,7 +2035,9 @@ def test_chunk_store_allocation_skips_committed_duplicate() -> None:
     """Chunk reuse should not enqueue stores for an already committed key."""
 
     class DuplicateSchedulerProbe(_AllocatingSchedulerProbe):
-        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        def alloc_chunk(
+            self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+        ) -> dict:
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": 5,
@@ -2060,7 +2068,9 @@ def test_prefix_mode_stores_computed_blocks_as_individual_slots():
             super().__init__()
             self.use_prefix_reuse_strategy()
 
-        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        def alloc_chunk(
+            self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+        ) -> dict:
             slot = len(self.alloc_calls) + 20
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
@@ -2129,7 +2139,9 @@ def test_prefix_mode_allocates_slots_incrementally_before_full_prompt_ready():
             self.use_prefix_reuse_strategy()
             self._ipc_sync = _AllocChunkOnlyIPC(self)
 
-        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        def alloc_chunk(
+            self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+        ) -> dict:
             slot = len(self.alloc_calls) + 20
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
@@ -2291,7 +2303,9 @@ def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
             self.use_prefix_reuse_strategy()
             self._ipc_sync = _AllocChunkOnlyIPC(self)
 
-        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        def alloc_chunk(
+            self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+        ) -> dict:
             slot = len(self.alloc_calls)
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
@@ -2685,7 +2699,9 @@ def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
                 }
             }
 
-        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        def alloc_chunk(
+            self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
+        ) -> dict:
             slot = len(self.alloc_calls) + 20
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {

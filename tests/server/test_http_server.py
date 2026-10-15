@@ -35,7 +35,7 @@ def make_core() -> ServerCore:
 
 def make_core_with_index(retrieval_index: Any) -> ServerCore:
     """Create a ServerCore with a custom retrieval index."""
-    store = MetadataStore(total_slots=64)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=64,

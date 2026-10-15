@@ -24,18 +24,9 @@ STORAGE_FORMATS = (
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
-#: Prefix-closed eviction: when FIFO capacity eviction removes a chunk, also
-#: remove its resident descendants, which no lookup can reach until the chunk
-#: is stored again (default on; ``0`` keeps orphans for the ablation).
-PREFIX_CLOSED_EVICTION_ENV = "DASER_PREFIX_CLOSED_EVICTION"
-#: Exclusive L1/L2 tiers under compressed-online storage: new packed records
-#: live only in L1 and reach L2 when L1 evicts them (``1`` opts in for the
-#: ablation; the default is inclusive write-through tiers). See
-#: docs/design/tier-residency.md.
-EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 #: Research control for compressed-online storage: ``1`` makes the worker
 #: store every packed record through the raw fallback, so the packed layout
-#: and exclusive tiers can be measured without compression.
+#: and L1 holds can be measured without compression.
 PACKED_FORCE_RAW_ENV = "DASER_PACKED_FORCE_RAW"
 #: Lookup-triggered L2 readahead: read group size in bytes (default 1 GiB,
 #: ``0`` disables), and the number of groups kept in flight.
@@ -236,7 +227,7 @@ class DaserConfig:
             records kept by L1 alone hold arena addresses but no SSD budget.
         l2_budget_bytes: live packed SSD bytes allowed by compressed-online
             tiering (0 = no budget beyond the arena).
-        total_slots: number of fixed-size slots in the ring buffer.
+        total_slots: number of fixed-size slots in the store.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
         log_level: log level string passed to init_logger.
         block_tokens: tokens per vLLM block (default 16).
@@ -324,7 +315,7 @@ class DaserConfig:
 
     @property
     def total_slots(self) -> int:
-        """Return logical ring slots available to the selected storage format."""
+        """Return logical slots available to the selected storage format."""
         physical_slots = self.physical_total_slots
         if self.storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
             return physical_slots

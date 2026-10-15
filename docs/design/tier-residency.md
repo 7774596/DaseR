@@ -1,93 +1,101 @@
-# 压缩在线存储的 packed arena 与 L1/L2 驻留
+# 槽位分配、叶子优先淘汰与 L1/L2 驻留
 
-本文描述 `--storage-format compressed-online` 下 server 如何放置 packed
-record，以及 L1（pinned host）和 L2（SSD）如何共同决定一个 chunk 是否留在
-索引里。raw 格式按固定 slot 寻址，不使用本文机制。
+本文描述 server 如何分配存储位置、选择淘汰对象，以及在
+`--storage-format compressed-online` 下 L1（pinned host）和 L2（SSD）如何共同
+决定一个 chunk 是否留在索引里。raw 与 compressed-online 共用分配器和淘汰树；
+L1 驻留（held）只用于 compressed-online。
+
+## 槽位分配
+
+`ChunkManager` 用按地址排序、相邻合并的空闲区间列表（`FreeExtents`）分配
+逻辑槽位，first-fit：
+
+- 没有 ring、head/tail 和回绕 SKIP 块；chunk 删除后槽位立即可复用。
+- 空间不足时 `alloc` 抛 `SlotsExhausted`，由 `ServerCore` 从淘汰树取一个
+  victim 删除后重试；没有可淘汰的 chunk 时分配失败，不会淘汰在写的 chunk。
+- 一次 store 期间 IPC server 对其 chunk 持有槽位写保持（write hold）。保持
+  期间被删除的 chunk，其槽位在最后一个保持结束后才归还，避免迟到写覆盖
+  新 chunk。
+- raw 的逻辑槽位数等于 L2 物理槽位数。compressed-online 按最小 packed 长度
+  超额供给逻辑槽位，物理容量由下面的 packed arena 和 L2 预算决定。
+
+## 淘汰树
+
+每个已分配 chunk 是 `EvictionTree` 的一个节点，记录 `parent_key`（前缀链中
+上一个块的 key，由 connector 的 store intent 携带，链首为空）。
+
+- 只有叶子（没有仍在索引中的子节点）可以被淘汰，按最近访问（alloc、commit、
+  lookup 命中）从旧到新。父节点只在最后一个子节点离开后才成为候选，因此
+  前缀闭包天然成立：一个会话的链从冷尾部往前淘汰，链首最后离开。
+- 孤儿：父 key 不在索引中的节点。lookup 在第一个缺失 key 处停止，孤儿不可
+  达，优先级最低。孤儿只在非叶子被删除（held record 被 L1 淘汰、显式淘汰、
+  文档删除）或分配时父节点已不在时出现；不做级联删除，只把子树的叶子重新
+  入堆，按需淘汰。父 key 再次被存入时子节点自动重新挂上。
+- 不可淘汰（跳过）：有未提交写者的 chunk、当前 store 放置阶段固定的 chunk。
+  被跳过的子节点同时让其父节点保持非叶子。
+- lookup 命中一段前缀时按 `parent_key` 刷新整条链（祖先比后代旧），因此
+  链尾始终是链上最冷的节点。
+- 实现为两个惰性最小堆：全部叶子，以及未 held 的叶子（供 L2 预算路径）。
+  出堆时校验节点仍存在、仍是叶子、优先级未变；单次淘汰均摊 O(log n)，不产生
+  IO。
 
 ## packed arena
 
 每个 rank lane 是一段连续字节地址空间，由 `OnlinePackedLayout` 管理：
 
 - 地址空间 = `--l2-size + --l1-size`（`DaserConfig.total_store_bytes`），
-  `daser.store` 按此长度 truncate 成稀疏文件；只有写入 SSD 的 record 占用
-  磁盘块。
-- 空闲区间是按地址排序、相邻合并的 free extent 列表，first-fit 放置。
-  同一批 source 连续的 record 优先放成一个连续区间，以便合并成一次 DMA。
-- 每个 record 在整个索引生命周期内地址不变（placement）。chunk 离开索引时
-  释放其 placement；仍有在途写（write hold）的 placement 先 retired，最后一个
-  写结束后才归还字节，避免迟到写覆盖新 record。
-- 逻辑 ring slot 按最小 packed 长度超额供给，ring 只负责 slot 分配和
-  元数据身份；物理容量由 arena 和下面的 L2 预算决定。
+  `daser.store` 按此长度 truncate 成稀疏文件。
+- 空闲字节同样由 `FreeExtents` 管理。同一批 source 连续的 record 优先放成一
+  个连续区间，以便合并成一次 DMA。
+- record 在索引生命周期内地址不变；仍有在途写的 placement 先 retired，最后
+  一个写结束后才归还字节。
 
-## 两种驻留状态
+## 驻留状态
 
-每个 placement 处于以下状态之一：
+每个 packed record 处于以下状态之一：
 
 | 状态 | 含义 | 计入 L2 预算 |
 |------|------|--------------|
-| charged | SSD 上有（或将有）有效副本，位于 L2 FIFO 中 | 是 |
-| held | 只保证在 L1 中驻留；L1 条目 dirty（尚未写 SSD）或 clean | 否 |
+| charged | SSD 上有有效副本 | 是 |
+| held | L1 中有完整干净副本，SSD 副本不再计入预算 | 否 |
 
-chunk 留在索引中的条件是它的每个 record 要么 charged，要么 held。L2 FIFO
-只回收 L2 预算，不直接决定索引驻留，因此 SSD 的 FIFO 不会淘汰 L1 中的热数据。
+chunk 留在索引中的条件是它的每个 record 要么 charged，要么 held。
 
-### 回收
+## 淘汰触发
 
-每次 store 放置后，server 在本 lane 的 charged 字节超过 `--l2-size` 时
-循环回收（`ServerCore.reclaim_packed`）：
+1. 逻辑槽位耗尽：从淘汰树取 victim 删除。
+2. arena 地址空间不足（`PackedArenaFull`）：从淘汰树取 victim 删除（held
+   与否都可）；只剩不可淘汰节点时本次 store 失败。
+3. 每次 store 放置后本 lane 的 charged 字节超过 `--l2-size`：从未 held 叶子
+   中取 victim。若它的每个 charged record 都整段驻留在 L1 条目内，
+   `TransferLayer.hold_resident` 把它们标记为 held（零拷贝 subslice，保留 L1
+   的 LRU/BIP 位置，无 IO），chunk 留在索引中；否则删除 chunk。held 叶子仍让
+   父节点保持非叶子，因此未 held 叶子耗尽时预算可暂时超出，由触发 2 约束
+   （arena = L1 + L2）。
 
-1. 取 L2 FIFO 中最老且不属于本次 store 的 charged record。
-2. 若该 record 整段驻留在一个 L1 条目内，`TransferLayer.hold_resident`
-   把它切成独立 L1 条目并标记为 held-clean：零拷贝 subslice，保留原
-   allocation 的 LRU/BIP 位置和容量计费，不产生 IO。record 转为 held。
-3. 否则删除整个 chunk（`reason=capacity`）。
+## L1 淘汰 held 条目
 
-arena 地址空间不足（`PackedArenaFull`）时用同一循环，并在 FIFO 耗尽时删除
-最老的 held chunk 作为兜底；正常配置下 held 字节受 L1 容量约束，不会走到
-兜底。
+L1 按自身 LRU/BIP 淘汰。held 条目离开 L1 时只通知 server，server 删除该
+record 所属的 chunk。通知到删除之间 placement 尚未释放，SSD 副本仍有效，
+并发的 L2 load 读到的仍是正确数据。chunk 因其他原因删除时，layout 对其 held
+placement 调用 `discard_held`，L1 中的对应条目被直接丢弃，地址复用前不会
+残留别名条目。
 
-### L1 淘汰 held 条目
+L1 与 L2 内容可以重叠（write-through），被 L2 预算淘汰的 L1 驻留 record 转为
+held 留在索引中，两层合计的不同内容接近 `L1 + L2`。
 
-L1 按自身 LRU/BIP 淘汰。held 条目离开 L1 时：
-
-- dirty：先发起 L2 写回（保留同一地址），然后通知 server。
-- server 把该 record 重新 charge：exclusive 策略放到 FIFO 头（最新），
-  inclusive 策略放到 FIFO 尾（最老，下次超预算时首先淘汰）。
-
-重新 charge 可能使 charged 字节暂时超出预算，超出量受一次 L1 淘汰批次约束，
-在下一次 store 放置时回收。chunk 删除时，layout 对其 held placement 调用
-`discard_held`，L1 中的对应条目被直接丢弃、不写回，因此地址复用前不会残留
-别名条目。
-
-## inclusive 与 exclusive
-
-两者只在 store 策略上不同：
-
-- inclusive（默认）：record 写入 L1 并立即异步写 SSD，放置即 charged。
-  L1 与 L2 内容可以重叠；行为对应 LMCache 的 L1/L2 write-through。
-- exclusive（`DASER_EXCLUSIVE_TIERS=1`，消融用）：新 record 以 held-dirty 放置，只写
-  L1、不计 L2 预算；L1 淘汰时才写 SSD 并进入 FIFO 头。L1 中驻留的数据不占
-  L2 预算，两层合计容量接近 `L1 + L2`。
-
-| | inclusive | exclusive |
-|---|---|---|
-| store 写 SSD | 立即 | L1 淘汰时 |
-| 新 record 状态 | charged | held-dirty |
-| L2 FIFO 淘汰的 L1 驻留 record | 转 held-clean，保留在索引中 | 同左 |
-| held 条目被 L1 淘汰 | 回 FIFO 尾 | 写回（若 dirty）后回 FIFO 头 |
-
-默认取 inclusive：L2 FIFO 淘汰的 L1 驻留 record 已经转 held 保留在索引中，
-inclusive 下两层合计容量同样接近 `L1 + L2`，exclusive 不再多出容量。exclusive
-反而把写 SSD 推到 L1 淘汰时，正好落在新 record 需要 L1 空间的关键路径上，
-热 record 每次被 L1 淘汰都要重写，SSD 写入更多且与 load 读争带宽。
-
-`--skip-l2` 下没有 L2 预算，arena 只寻址 L1，lookup 仍只返回 L1 驻留的前缀；
-GDS backend 没有 L1，`hold_resident` 总是失败，退化为纯 L2 FIFO。
+`--skip-l2` 下没有 L2 预算，arena 只寻址 L1；GDS backend 没有 L1，
+`hold_resident` 总是失败，退化为纯 L2 叶子 LRU。
 
 ## 已知限制
 
+- held record 的 SSD 字节不打洞，`du` 可超过 `--l2-size`，超出量不超过 held
+  字节（受 L1 容量约束）。
+- raw 格式没有 held 路径，两层合计容量只有 L2；比较 raw 与压缩时需注意。
+- lookup 到 L2 load 之间被淘汰的 chunk 可能被新 chunk 覆盖；lookup 会刷新
+  整条链的访问时间，叶子 LRU 下只在容量严重不足时发生。
 - 一个 record 跨两个 L1 条目时（例如被 readahead 分片切开）不能 hold，按
   非驻留处理。
-- ring 仍按 slot 分配顺序回绕；held record 存活时间可以长于 ring 一圈，回绕
-  到它时会被 ring 淘汰。ring 按最小 packed 长度超额供给，实际负载下很少发生。
 - packed placement 只存在于 server 内存，该格式的索引是易失的，启动冷启动。
+  raw 的持久化只保存 chunk 索引（含 `parent_key`），分配器和淘汰树在加载时
+  重建。

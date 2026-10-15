@@ -65,7 +65,7 @@ does not resize `daser.store` back to the raw `--l2-size` value. If an older
 run left a larger raw-size store file, startup truncates it to the aligned
 capacity; smaller existing store files are rejected.
 
-`daser.index` includes ring-buffer state, chunk metadata, and the document
+`daser.index` includes the slot capacity, chunk metadata, and the document
 registry. Only documents whose `register_document` call completed are restored
 by `/documents` after restart. Committed chunks that were not attached to a
 document are retained as ordinary cache entries; if the same document content is

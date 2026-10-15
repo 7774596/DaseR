@@ -19,7 +19,7 @@ class DocEntry:
             the ordering is never reshuffled so that prompt reconstruction
             is deterministic.
         cached_mask: list[bool], same length as chunk_keys; True when the
-            chunk is still resident in the ring buffer, False once it has
+            chunk is still indexed, False once it has
             been evicted. Stored as list[bool] rather than a raw bitset
             for readable msgpack serialization.
         status: "ready", "partial", "evicted", or "failed".
@@ -52,8 +52,8 @@ class DocRegistry:
     The registry is the single source of truth for document metadata. It
     is updated in two places:
     - ServerCore register/delete document methods: explicit admin ops.
-    - ChunkManager.evict: flips cached_mask entries when a referenced
-      chunk is evicted from the ring buffer.
+    - ServerCore chunk removal: flips cached_mask entries when a
+      referenced chunk leaves the index.
 
     Thread-safety: callers run inside the asyncio event loop of
     ServerCore; no additional locking is provided.
@@ -100,7 +100,7 @@ class DocRegistry:
 
         Args:
             doc_id: document whose cached_mask should be updated.
-            chunk_key: chunk that was evicted from the ring buffer.
+            chunk_key: chunk that left the index.
         """
         entry = self._docs.get(doc_id)
         if entry is None:

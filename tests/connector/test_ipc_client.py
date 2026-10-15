@@ -34,7 +34,7 @@ def first_rolling_key(tokens: list[int]) -> str:
 
 def make_core() -> ServerCore:
     """Create a ServerCore for IPC client tests."""
-    store = MetadataStore(total_slots=64)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=64,

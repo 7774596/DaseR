@@ -19,7 +19,7 @@ from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
-from daser.server.chunk_manager import ChunkManager
+from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.core import Allocation, ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
@@ -44,7 +44,7 @@ def place_packed(core: ServerCore, spans: list[dict]) -> list[dict]:
 
 def make_core(total_slots: int = 64) -> ServerCore:
     """Create a ServerCore for tests."""
-    store = MetadataStore(total_slots=total_slots)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=total_slots,
@@ -64,7 +64,7 @@ def make_instrumented_core(
     registry: MetricsRegistry, total_slots: int = 64
 ) -> ServerCore:
     """Create a ServerCore with a per-test metrics registry."""
-    store = MetadataStore(total_slots=total_slots)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=total_slots,
@@ -83,7 +83,7 @@ def make_instrumented_core(
 
 def make_chunk_core(total_slots: int = 64) -> ServerCore:
     """Create a chunk-reuse ServerCore for tests."""
-    store = MetadataStore(total_slots=total_slots)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=total_slots,
@@ -556,8 +556,8 @@ async def test_online_packed_publication_is_hidden_until_commit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_online_packed_publication_clears_after_ring_eviction() -> None:
-    """Automatic ring eviction removes stale packed refs before reuse."""
+async def test_online_packed_publication_clears_after_capacity_eviction() -> None:
+    """Capacity eviction removes stale packed refs before slot reuse."""
     core = make_core(total_slots=1)
     first_tokens = [1, 2, 3, 4]
     first_key = first_rolling_key(first_tokens)
@@ -630,7 +630,7 @@ async def test_online_packed_publication_clears_after_explicit_eviction() -> Non
 
 
 @pytest.mark.asyncio
-async def test_removal_listener_sees_ring_and_explicit_evictions() -> None:
+async def test_removal_listener_sees_capacity_and_explicit_evictions() -> None:
     """Listeners get every removed key; other chunks keep their packed refs."""
     core = make_core(total_slots=2)
     removed: list[str] = []
@@ -681,7 +681,7 @@ async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     await original.commit_chunk(key)
     original.chunk_manager.save(str(tmp_path / "daser.index"))
 
-    store = MetadataStore(total_slots=64)
+    store = MetadataStore()
     doc_registry = DocRegistry()
     cm = ChunkManager(
         total_slots=64,
@@ -884,56 +884,69 @@ async def test_auto_eviction_removes_lookup_and_updates_doc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_late_commit_after_auto_eviction_is_ignored() -> None:
+async def test_capacity_eviction_skips_pending_writer() -> None:
+    """A full store evicts committed chunks, never an uncommitted writer."""
     core = make_core(total_slots=2)
-    first = [1, 2, 3, 4]
-    second = [5, 6, 7, 8]
-    third = [9, 10, 11, 12]
-    first_key = hash_tokens(first)
+    first, second, third = [1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]
+    first_key = first_rolling_key(first)
 
     await core.alloc_chunk(first_key, token_count=len(first), model_id="m")
     for tokens in (second, third):
-        key = hash_tokens(tokens)
+        key = first_rolling_key(tokens)
         await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
         await core.commit_chunk(key)
+    await core.commit_chunk(first_key)
 
+    assert len(await core.lookup(first, "m")) == 1
+    assert await core.lookup(second, "m") == []
+    assert len(await core.lookup(third, "m")) == 1
+
+
+@pytest.mark.asyncio
+async def test_alloc_fails_when_only_pending_writers_remain() -> None:
+    """Allocation raises instead of evicting a chunk that is still being written."""
+    core = make_core(total_slots=2)
+    for tokens in ([1, 2, 3, 4], [5, 6, 7, 8]):
+        await core.alloc_chunk(hash_tokens(tokens), token_count=4, model_id="m")
+    with pytest.raises(SlotsExhausted):
+        await core.alloc_chunk(hash_tokens([9, 10, 11, 12]), 4, "m")
+
+
+@pytest.mark.asyncio
+async def test_late_commit_after_explicit_eviction_is_ignored() -> None:
+    core = make_core(total_slots=2)
+    first = [1, 2, 3, 4]
+    first_key = hash_tokens(first)
+
+    await core.alloc_chunk(first_key, token_count=len(first), model_id="m")
+    await core.evict_chunk(first_key)
     await core.commit_chunk(first_key)
 
     assert await core.lookup(first, "m") == []
     stats = await core.commit_stats()
-    assert stats["commit_requests"] == 3
+    assert stats["commit_requests"] == 1
     assert stats["late_evicted_commits"] == 1
 
 
 @pytest.mark.asyncio
 async def test_is_current_allocation_rejects_evicted_or_reused_slot() -> None:
     """Delayed transfer writes are valid only for the current live chunk."""
-    core = make_core(total_slots=2)
-    first = [1, 2, 3, 4]
-    second = [5, 6, 7, 8]
-    third = [9, 10, 11, 12]
-    first_key = hash_tokens(first)
-
-    first_alloc = await core.alloc_chunk(
-        first_key,
-        token_count=len(first),
-        model_id="m",
-    )
+    core = make_core(total_slots=1)
+    first_key = hash_tokens([1, 2, 3, 4])
+    first_alloc = await core.alloc_chunk(first_key, token_count=4, model_id="m")
     assert core.is_current_allocation(
-        first_key,
-        first_alloc.start_slot,
-        first_alloc.num_slots,
+        first_key, first_alloc.start_slot, first_alloc.num_slots
     )
 
-    for tokens in (second, third):
-        key = hash_tokens(tokens)
-        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
-        await core.commit_chunk(key)
-
+    await core.evict_chunk(first_key)
     assert not core.is_current_allocation(
-        first_key,
-        first_alloc.start_slot,
-        first_alloc.num_slots,
+        first_key, first_alloc.start_slot, first_alloc.num_slots
+    )
+    second_key = hash_tokens([5, 6, 7, 8])
+    second = await core.alloc_chunk(second_key, token_count=4, model_id="m")
+    assert second.start_slot == first_alloc.start_slot
+    assert not core.is_current_allocation(
+        first_key, first_alloc.start_slot, first_alloc.num_slots
     )
 
 
@@ -997,9 +1010,10 @@ def _place_record(core: ServerCore, key: str) -> dict:
     return span
 
 
-async def _committed_blocks(core: ServerCore, count: int) -> list[list[int]]:
-    """Commit ``count`` single-block chunks with one packed record each."""
-    blocks = [[10 * i + j for j in range(BLOCK_TOKENS)] for i in range(count)]
+async def _committed_blocks_from(
+    core: ServerCore, blocks: list[list[int]]
+) -> list[list[int]]:
+    """Commit single-block root chunks with one packed record each."""
     for tokens in blocks:
         key = first_rolling_key(tokens)
         await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
@@ -1008,23 +1022,55 @@ async def _committed_blocks(core: ServerCore, count: int) -> list[list[int]]:
     return blocks
 
 
+async def _committed_blocks(core: ServerCore, count: int) -> list[list[int]]:
+    """Commit ``count`` unrelated single-block chunks."""
+    return await _committed_blocks_from(
+        core, [[10 * i + j for j in range(BLOCK_TOKENS)] for i in range(count)]
+    )
+
+
+async def _committed_chain(
+    core: ServerCore, blocks: int, start: int = 1000
+) -> tuple[list[int], list[str]]:
+    """Commit one prompt's ``blocks`` chained blocks with parent links."""
+    tokens = list(range(start, start + blocks * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    parent = ""
+    for key in keys:
+        await core.alloc_chunk(
+            key, token_count=BLOCK_TOKENS, model_id="m", parent_key=parent
+        )
+        await core.commit_chunk(key)
+        _place_record(core, key)
+        parent = key
+    return tokens, keys
+
+
+def _resident(core: ServerCore, keys: list[str]) -> list[bool]:
+    return [core.chunk_manager.store.get(key) is not None for key in keys]
+
+
+async def _hit_tokens(core: ServerCore, tokens: list[int]) -> int:
+    return sum(chunk.token_count for chunk in await core.lookup(tokens, "m"))
+
+
 @pytest.mark.asyncio
-async def test_reclaim_packed_is_fifo_despite_hits() -> None:
-    """Without an L1 tier, reclaim removes the oldest record even after a hit."""
+async def test_reclaim_packed_takes_the_least_recently_used_leaf() -> None:
+    """Without an L1 tier, reclaim removes the coldest chunk; a hit protects."""
     core = make_core()
     blocks = await _committed_blocks(core, 3)
     assert len(await core.lookup(blocks[0], "m")) == 1
 
-    assert await core.reclaim_packed(set())
+    assert await core.reclaim_packed()
 
-    assert await core.lookup(blocks[0], "m") == []
-    assert len(await core.lookup(blocks[1], "m")) == 1
+    assert len(await core.lookup(blocks[0], "m")) == 1
+    assert await core.lookup(blocks[1], "m") == []
     assert core.packed_layout.charged_bytes() == 2 * 4096
 
 
 @pytest.mark.asyncio
 async def test_reclaim_packed_keeps_l1_resident_victim_indexed() -> None:
-    """An L2 FIFO victim held by L1 stays indexed and leaves only the budget."""
+    """A budget victim held by L1 stays indexed and leaves only the budget."""
     core = make_core()
     resident: set[int] = set()
     discarded: list[tuple[int, int]] = []
@@ -1033,154 +1079,188 @@ async def test_reclaim_packed_keeps_l1_resident_victim_indexed() -> None:
         lambda offset, nbytes: discarded.append((offset, nbytes)),
     )
     blocks = await _committed_blocks(core, 3)
-    first = core.packed_layout.oldest_charged(set())
-    assert first is not None
+    first_key = first_rolling_key(blocks[0])
+    (first,) = core.packed_layout.charged_records(first_key)
     resident.add(first.file_offset)
 
-    assert await core.reclaim_packed(set())
+    assert await core.reclaim_packed()
     assert len(await core.lookup(blocks[0], "m")) == 1
-    assert core.packed_layout.is_held(first.file_offset, 4096)
+    assert core.packed_layout.held_owner(first.file_offset, 4096) == first_key
     assert core.packed_layout.charged_bytes() == 2 * 4096
     assert core.packed_layout.held_bytes == 4096
 
-    # The next victim is not resident, so its chunk leaves the index.
-    assert await core.reclaim_packed(set())
+    # The held chunk is skipped; the next victim is not resident and leaves.
+    assert await core.reclaim_packed()
     assert await core.lookup(blocks[1], "m") == []
     assert discarded == []
 
     # Removing a held chunk drops its L1 copy before the bytes are reused.
-    await core.evict_chunk(first.chunk_key)
+    await core.evict_chunk(first_key)
     assert discarded == [(first.file_offset, 4096)]
     assert core.packed_layout.held_bytes == 0
 
 
 @pytest.mark.asyncio
-async def test_reclaim_packed_frees_arena_from_held_records_last() -> None:
-    """Arena reclaim removes charged records first, then the longest-held."""
+async def test_l1_release_of_a_held_record_removes_its_chunk() -> None:
+    """When L1 evicts a held record its chunk leaves the index."""
     core = make_core()
     core.attach_l1_tier(lambda offset, nbytes: True, lambda offset, nbytes: None)
     blocks = await _committed_blocks(core, 2)
-    assert await core.reclaim_packed(set())  # holds blocks[0]
+    first_key = first_rolling_key(blocks[0])
+    (first,) = core.packed_layout.charged_records(first_key)
+    assert await core.reclaim_packed()
 
-    assert await core.reclaim_packed(set(), free_address=True)
-    assert len(await core.lookup(blocks[0], "m")) == 1
-    assert await core.lookup(blocks[1], "m") == []
+    core.release_held(first.file_offset, 8192)  # not the held range: ignored
+    core.release_held(first.file_offset, 4096)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
-    protected = {first_rolling_key(blocks[0])}
-    assert not await core.reclaim_packed(protected, free_address=True)
-    assert await core.reclaim_packed(set(), free_address=True)
     assert await core.lookup(blocks[0], "m") == []
-    assert not await core.reclaim_packed(set())
-
-
-async def _committed_chain(
-    core: ServerCore, blocks: int
-) -> tuple[list[int], list[str]]:
-    """Commit one prompt's ``blocks`` chained blocks and look it up once."""
-    # Offset keeps these tokens apart from ``_committed_blocks``.
-    tokens = list(range(1000, 1000 + blocks * BLOCK_TOKENS))
-    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
-    for key in keys:
-        await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
-        await core.commit_chunk(key)
-        _place_record(core, key)
-    assert len(await core.lookup(tokens, "m")) == 1
-    return tokens, keys
+    assert len(await core.lookup(blocks[1], "m")) == 1
+    assert core.packed_layout.held_bytes == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("closed", [False, True])
-async def test_prefix_closed_eviction_removes_unreachable_descendants(
-    closed: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Evicting a prefix head also frees the blocks only it led to."""
-    if closed:
-        monkeypatch.delenv("DASER_PREFIX_CLOSED_EVICTION", raising=False)
-    else:
-        monkeypatch.setenv("DASER_PREFIX_CLOSED_EVICTION", "0")
+async def test_budget_reclaim_skips_held_chunks_arena_reclaim_does_not() -> None:
+    """The L2 budget only reclaims charged chunks; the arena takes any leaf."""
+    core = make_core()
+    core.attach_l1_tier(lambda offset, nbytes: True, lambda offset, nbytes: None)
+    blocks = await _committed_blocks(core, 2)
+    assert await core.reclaim_packed()  # holds blocks[0]
+    assert await core.reclaim_packed()  # holds blocks[1]
+    assert not await core.reclaim_packed()
+    assert core.packed_layout.charged_bytes() == 0
+
+    pinned = [first_rolling_key(blocks[0])]
+    core.pin(pinned)
+    assert await core.reclaim_packed(free_address=True)
+    assert await core.lookup(blocks[1], "m") == []
+    assert not await core.reclaim_packed(free_address=True)
+    core.unpin(pinned)
+    assert await core.reclaim_packed(free_address=True)
+    assert await core.lookup(blocks[0], "m") == []
+
+
+@pytest.mark.asyncio
+async def test_chain_evicts_from_its_cold_tail_and_keeps_its_root() -> None:
+    """A prefix chain loses its last block first; lookup keeps the prefix."""
     core = make_core()
     tokens, keys = await _committed_chain(core, 3)
     other = await _committed_blocks(core, 1)
-
-    assert await core.reclaim_packed(set())
-
-    assert core.chunk_manager.store.get(keys[0]) is None
-    assert await core.lookup(tokens, "m") == []
-    resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
-    assert resident == [not closed, not closed]
+    # Touch the chain root only, as a lookup of the short prefix would.
+    assert len(await core.lookup(tokens[:BLOCK_TOKENS], "m")) == 1
     assert len(await core.lookup(other[0], "m")) == 1
 
+    assert await core.reclaim_packed()
+    assert _resident(core, keys) == [True, True, False]
+    assert await _hit_tokens(core, tokens) == 2 * BLOCK_TOKENS
+
+    # That lookup refreshed the whole remaining chain, so other goes next,
+    # then the chain's new tail.
+    assert await core.reclaim_packed()
+    assert await core.lookup(other[0], "m") == []
+    assert await core.reclaim_packed()
+    assert _resident(core, keys) == [True, False, False]
+
 
 @pytest.mark.asyncio
-async def test_prefix_closed_eviction_bounds_learned_edges() -> None:
-    """Lookups of never-stored prompts do not grow the edge map forever."""
-    registry = MetricsRegistry()
-    core = make_instrumented_core(registry, total_slots=8)
+async def test_slot_exhaustion_evicts_cold_leaves_not_chain_heads() -> None:
+    """A full store frees a chain's tail before any of its ancestors."""
+    core = make_core(total_slots=4)
     tokens, keys = await _committed_chain(core, 3)
-    for prompt in range(40):
-        start = 10_000 + prompt * 4 * BLOCK_TOKENS
-        await core.lookup(list(range(start, start + 4 * BLOCK_TOKENS)), "m")
-
-    gauge = [
-        line
-        for line in registry.render_prometheus().splitlines()
-        if line.startswith("daser_prefix_chain_edges ")
-    ]
-    # 40 prompts learn 120 edges; a prune keeps the 2 cached edges plus at
-    # most one generation of fresh ones (2 * 8 slots each).
-    assert gauge and float(gauge[0].split()[1]) <= 2 + 2 * 2 * 8
-    assert await core.reclaim_packed(set())
-    assert core.chunk_manager.store.get(keys[0]) is None
-    resident = [core.chunk_manager.store.get(key) is not None for key in keys[1:]]
-    assert resident == [False, False]
-
-
-@pytest.mark.asyncio
-async def test_prefix_closed_eviction_keeps_pending_and_protected() -> None:
-    """Uncommitted or protected descendants survive, and so does what follows."""
-    core = make_core()
-    tokens = list(range(4 * BLOCK_TOKENS))
-    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
-    for key in keys:
-        await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
-    for key in (keys[0], keys[1], keys[3]):
-        await core.commit_chunk(key)
-        _place_record(core, key)
+    other = await _committed_blocks(core, 1)
     await core.lookup(tokens, "m")
 
-    assert await core.reclaim_packed({keys[1]})
+    await _committed_blocks_from(core, [[7000 + j for j in range(BLOCK_TOKENS)]])
 
-    resident = [core.chunk_manager.store.get(key) is not None for key in keys]
-    assert resident == [False, True, True, True]
+    assert _resident(core, keys) == [True, True, True]
+    assert await core.lookup(other[0], "m") == []
+    fresh = [[8000 + j for j in range(BLOCK_TOKENS)]]
+    await _committed_blocks_from(core, fresh)
+    assert _resident(core, keys) == [True, True, False]
 
 
 @pytest.mark.asyncio
-async def test_prefix_closed_eviction_follows_ring_wrap() -> None:
-    """Ring allocation that evicts a head also frees its descendants."""
-    core = make_core(total_slots=4)
-    _, keys = await _committed_chain(core, 3)
-    fresh = await _committed_blocks(core, 2)
+async def test_pinned_and_pending_chunks_are_never_reclaimed() -> None:
+    """Pins and uncommitted writers are skipped, and so are their ancestors."""
+    core = make_core()
+    tokens = list(range(3 * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    parent = ""
+    for key in keys:
+        await core.alloc_chunk(key, BLOCK_TOKENS, "m", parent_key=parent)
+        parent = key
+    for key in keys[:2]:
+        await core.commit_chunk(key)
+        _place_record(core, key)
+    loose = await _committed_blocks(core, 1)
+    core.pin([first_rolling_key(loose[0])])
 
-    resident = [core.chunk_manager.store.get(key) is not None for key in keys]
-    assert resident == [False, False, False]
-    assert all([len(await core.lookup(block, "m")) == 1 for block in fresh])
+    # keys[2] is pending, so its ancestors are not leaves; loose is pinned.
+    assert not await core.reclaim_packed()
+    assert _resident(core, keys) == [True, True, True]
+
+    await core.commit_chunk(keys[2])
+    _place_record(core, keys[2])
+    assert await core.reclaim_packed()
+    assert _resident(core, keys) == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_orphaned_blocks_are_reclaimed_before_reachable_ones() -> None:
+    """Blocks below an evicted head are unreachable and leave first."""
+    core = make_core()
+    _, keys = await _committed_chain(core, 3)
+    other = await _committed_blocks(core, 1)
+    await core.lookup(other[0], "m")
+    _tokens, newer = await _committed_chain(core, 1, start=5000)
+
+    await core.evict_chunk(keys[0])
+    assert await core.reclaim_packed()
+    assert await core.reclaim_packed()
+
+    assert _resident(core, keys) == [False, False, False]
+    assert len(await core.lookup(other[0], "m")) == 1
+    assert _resident(core, newer) == [True]
+
+
+@pytest.mark.asyncio
+async def test_restored_index_rebuilds_eviction_order(tmp_path) -> None:
+    """A reloaded index evicts chain tails first, as before the restart."""
+    original = make_core(total_slots=3)
+    tokens, keys = await _committed_chain(original, 3)
+    original.chunk_manager.save(str(tmp_path / "daser.index"))
+
+    cm = ChunkManager(total_slots=3, metadata_store=MetadataStore())
+    cm.load(str(tmp_path / "daser.index"))
+    restored = ServerCore(
+        chunk_manager=cm,
+        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        slot_size=SLOT_SIZE,
+        block_tokens=BLOCK_TOKENS,
+    )
+    await restored.rebuild_retrieval_index()
+    assert await _hit_tokens(restored, tokens) == 3 * BLOCK_TOKENS
+
+    await restored.alloc_chunk(hash_tokens([7, 7, 7, 7]), 4, "m")
+    assert _resident(restored, keys) == [True, True, False]
+    assert await _hit_tokens(restored, tokens) == 2 * BLOCK_TOKENS
 
 
 @pytest.mark.asyncio
 async def test_store_range_ignores_write_to_a_reallocated_key() -> None:
     """A write that outlived its allocation is dropped, not fatal.
 
-    Ring eviction can remove a chunk while its store is in flight; a later
-    request may then allocate the same key at another slot before the late
-    write reports. That write must not publish the new allocation or fail.
+    A chunk can be removed while its store is in flight; a later request may
+    then allocate the same key at another slot before the late write reports.
+    That write must not publish the new allocation or fail.
     """
     core = make_core(total_slots=4)
     key = "reused"
     stale = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
-    for index in range(4):
-        await core.alloc_chunk(
-            f"filler-{index}", token_count=BLOCK_TOKENS, model_id="m"
-        )
+    await core.evict_chunk(key)
+    await core.alloc_chunk("filler", token_count=BLOCK_TOKENS, model_id="m")
     assert not core.is_current_allocation(key, stale.start_slot, stale.num_slots)
     fresh = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
     assert fresh.start_slot != stale.start_slot

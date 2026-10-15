@@ -22,7 +22,7 @@ sequenceDiagram
         HTTP->>V: prefill(chunk tokens)
         V->>DC: scheduler lookup / alloc
         DC->>IPC: match_and_alloc / alloc_chunk
-        IPC->>C: allocate ring-buffer slots
+        IPC->>C: allocate slots (evict cold leaves if full)
         V->>DC: worker save KV
         DC->>IPC: commit_chunk
         IPC->>C: publish chunk to RetrievalIndex
@@ -33,7 +33,7 @@ sequenceDiagram
 ```
 
 上传失败时 HTTP server 返回 `502`，不会注册文档。已经成功 commit 的 KV
-chunk 可以保留在 ring buffer 中，后续相同内容仍可复用。
+chunk 可以保留在 store 中，后续相同内容仍可复用。
 
 ---
 
@@ -257,7 +257,8 @@ sequenceDiagram
     IPC->>IPC: drain and close transfer resources
 ```
 
-`daser.index` 保存 ring-buffer head/tail、`MetadataStore` 和 `DocRegistry`。
+`daser.index` 保存槽位总数、`MetadataStore` 和 `DocRegistry`；空闲区间和淘汰树
+在加载时由 chunk 索引重建。
 启动时恢复 metadata 后，`ServerCore.rebuild_retrieval_index()` 会从 committed
 chunk metadata 重建检索索引。
 

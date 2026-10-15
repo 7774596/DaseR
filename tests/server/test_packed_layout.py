@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Public packed placement and FIFO lifetime contracts."""
+"""Public packed placement and record lifetime contracts."""
 
 import random
 from typing import Any
 
 import pytest
 
-from daser.server.chunk_manager import ChunkManager
+from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.metadata_store import MetadataStore
 from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 
@@ -14,8 +14,8 @@ SLOT = 4 * 4096
 
 
 def allocate(manager: ChunkManager, key: str, nbytes: int) -> dict[str, Any]:
-    """Allocate one live ring record and return its validated wire span."""
-    slot = manager.alloc(key, 1, 128, "model", 0)
+    """Allocate one live record and return its validated wire span."""
+    slot = manager.alloc(key, 1, 128, "model", 0).start_slot
     return {
         "chunk_key": key,
         "start_slot": slot,
@@ -30,9 +30,15 @@ def allocate(manager: ChunkManager, key: str, nbytes: int) -> dict[str, Any]:
     }
 
 
+def evict(manager: ChunkManager, layout: OnlinePackedLayout, key: str) -> None:
+    """Remove a chunk from the index and release its packed bytes."""
+    manager.remove(key)
+    layout.release(key, manager)
+
+
 def test_packed_records_bridge_allocations_and_keep_retry_placements() -> None:
     """A retry never relocates an earlier record into a live sibling."""
-    manager = ChunkManager(8, MetadataStore(8))
+    manager = ChunkManager(8, MetadataStore())
     layout = OnlinePackedLayout()
     spans = [allocate(manager, str(i), 4096 * (i + 1)) for i in range(3)]
     spans[1]["source_offset"] = 4096
@@ -47,13 +53,14 @@ def test_packed_records_bridge_allocations_and_keep_retry_placements() -> None:
         layout.compact([{**spans[0], "nbytes": 8192}], manager, local_slot_size=SLOT)
 
 
-def test_packed_arena_separates_live_fifo_generations_without_raw_tail_gaps() -> None:
-    """Different FIFO generations use distinct extents in the shared arena."""
-    manager = ChunkManager(4, MetadataStore(4))
+def test_packed_arena_places_a_reused_slot_without_raw_gaps() -> None:
+    """A record in a reused slot packs next to an older live record."""
+    manager = ChunkManager(4, MetadataStore())
     old = [allocate(manager, f"old{i}", 4096) for i in range(4)]
+    manager.remove("old0")
     new = allocate(manager, "new", 4096)
+    assert new["start_slot"] == 0
     old[1]["source_offset"] = 4096
-    assert manager.tail_slot == 1
     assigned = OnlinePackedLayout().compact(
         [new, old[1]], manager, local_slot_size=SLOT
     )
@@ -61,12 +68,13 @@ def test_packed_arena_separates_live_fifo_generations_without_raw_tail_gaps() ->
 
 
 def test_packed_arena_reclaims_evicted_owner_extent() -> None:
-    """A new generation can reuse bytes after its ring owner is evicted."""
-    manager = ChunkManager(1, MetadataStore(1))
+    """A new generation can reuse bytes after its owner left the index."""
+    manager = ChunkManager(1, MetadataStore())
     layout = OnlinePackedLayout()
     old = allocate(manager, "old", 3 * 4096)
     assert layout.compact([old], manager, local_slot_size=SLOT)[0]["file_offset"] == 0
 
+    manager.remove("old")
     new = allocate(manager, "new", 2 * 4096)
     assigned = layout.compact([new], manager, local_slot_size=SLOT)
 
@@ -75,17 +83,15 @@ def test_packed_arena_reclaims_evicted_owner_extent() -> None:
 
 def test_fragmented_arena_splits_runs_then_reports_deficit() -> None:
     """Runs fall back to per-record holes; a full arena raises a typed deficit."""
-    manager = ChunkManager(8, MetadataStore(8))
+    manager = ChunkManager(8, MetadataStore())
     layout = OnlinePackedLayout()
     arena = 4 * 4096
     spans = {key: allocate(manager, key, 4096) for key in "abcd"}
     for key in "cadb":
         layout.compact([spans[key]], manager, local_slot_size=SLOT, arena_size=arena)
     assert layout.free_bytes() == 0
-    manager.evict_oldest()
-    manager.evict_oldest()
-    for key in manager.drain_evicted_chunk_keys():
-        layout.release(key, manager)  # frees a (page 1) and b (page 3)
+    evict(manager, layout, "a")  # frees page 1
+    evict(manager, layout, "b")  # frees page 3
     assert layout.free_bytes() == 2 * 4096
 
     run = [allocate(manager, key, 4096) for key in "ef"]
@@ -104,7 +110,7 @@ def test_fragmented_arena_splits_runs_then_reports_deficit() -> None:
 
 def test_release_frees_only_stale_generations_and_failures_reserve_nothing() -> None:
     """Release keeps current owners; a failed batch leaves free bytes intact."""
-    manager = ChunkManager(8, MetadataStore(8))
+    manager = ChunkManager(8, MetadataStore())
     layout = OnlinePackedLayout()
     arena = 4 * 4096
     spans = [allocate(manager, key, 4096) for key in "ab"]
@@ -120,9 +126,7 @@ def test_release_frees_only_stale_generations_and_failures_reserve_nothing() -> 
         layout.compact([*run, big], manager, local_slot_size=SLOT, arena_size=arena)
     assert layout.free_bytes() == 2 * 4096
 
-    manager.evict_oldest()
-    for key in manager.drain_evicted_chunk_keys():
-        layout.release(key, manager)
+    evict(manager, layout, "a")
     assert layout.free_bytes() == 3 * 4096
     assigned = layout.compact(run, manager, local_slot_size=SLOT, arena_size=arena)
     # The freed page 0 is too small for the run; the rolled-back tail is used.
@@ -131,7 +135,7 @@ def test_release_frees_only_stale_generations_and_failures_reserve_nothing() -> 
 
 def test_packed_arena_bridges_separate_allocation_calls() -> None:
     """Independent stores can consume adjacent packed bytes without a tail."""
-    manager = ChunkManager(4, MetadataStore(4))
+    manager = ChunkManager(4, MetadataStore())
     layout = OnlinePackedLayout()
     first = allocate(manager, "first", 3 * 4096)
     second = allocate(manager, "second", 2 * 4096)
@@ -145,10 +149,10 @@ def test_packed_arena_bridges_separate_allocation_calls() -> None:
 
 
 @pytest.mark.parametrize("rank_base", [0, SLOT * 17])
-def test_random_fifo_reuse_preserves_all_live_record_bytes(rank_base: int) -> None:
-    """Repeated wrap, retries and variable sizes preserve every live payload."""
+def test_random_reuse_preserves_all_live_record_bytes(rank_base: int) -> None:
+    """Random eviction, retries and variable sizes preserve every live payload."""
     rng = random.Random(8173)
-    manager = ChunkManager(17, MetadataStore(17))
+    manager = ChunkManager(17, MetadataStore())
     layout = OnlinePackedLayout()
     storage = bytearray(rank_base + SLOT * 17)
     live: dict[str, tuple[dict[str, Any], bytes]] = {}
@@ -161,7 +165,14 @@ def test_random_fifo_reuse_preserves_all_live_record_bytes(rank_base: int) -> No
             serial += 1
             key = str(serial)
             nbytes = rng.randint(1, 4) * 4096
-            span = allocate(manager, key, nbytes)
+            while True:
+                try:
+                    span = allocate(manager, key, nbytes)
+                    break
+                except SlotsExhausted:
+                    victims = sorted(set(live) - set(payloads))
+                    evict(manager, layout, rng.choice(victims))
+                    live = {k: v for k, v in live.items() if manager.store.get(k)}
             span["source_offset"] = cursor
             span["file_offset"] += rank_base
             cursor += nbytes
@@ -195,7 +206,7 @@ def test_random_fifo_reuse_preserves_all_live_record_bytes(rank_base: int) -> No
 
 def test_invalid_batch_does_not_reserve_its_valid_prefix() -> None:
     """Rejected input is atomic and leaves future placement unconstrained."""
-    manager = ChunkManager(4, MetadataStore(4))
+    manager = ChunkManager(4, MetadataStore())
     layout = OnlinePackedLayout()
     spans = [allocate(manager, str(i), 4096) for i in range(2)]
     spans[1]["source_offset"] = 4096
@@ -214,7 +225,7 @@ def test_invalid_batch_does_not_reserve_its_valid_prefix() -> None:
 
 def test_partial_multislot_allocations_stop_at_source_gaps() -> None:
     """Separate regions of one allocation never overwrite already placed peers."""
-    manager = ChunkManager(8, MetadataStore(8))
+    manager = ChunkManager(8, MetadataStore())
     manager.alloc("chunk", 4, 512, "model", 0)
     spans = [
         {
@@ -247,12 +258,13 @@ def test_partial_multislot_allocations_stop_at_source_gaps() -> None:
 
 def test_write_hold_keeps_evicted_bytes_until_the_write_ends() -> None:
     """A late write's bytes are not handed to a new record while it is held."""
-    manager = ChunkManager(1, MetadataStore(1))
+    manager = ChunkManager(1, MetadataStore())
     layout = OnlinePackedLayout()
     old = allocate(manager, "old", 3 * 4096)
     placed = layout.compact([old], manager, local_slot_size=SLOT)
     hold = layout.begin_writes(placed)
 
+    manager.remove("old")
     new = allocate(manager, "new", 2 * 4096)
     layout.release("old", manager)
     with pytest.raises(PackedArenaFull):
@@ -266,7 +278,7 @@ def test_write_hold_keeps_evicted_bytes_until_the_write_ends() -> None:
 
 def test_write_hold_of_a_live_record_frees_nothing() -> None:
     """Ending a hold on a record that is still live keeps its placement."""
-    manager = ChunkManager(2, MetadataStore(2))
+    manager = ChunkManager(2, MetadataStore())
     layout = OnlinePackedLayout()
     record = allocate(manager, "live", 4096)
     placed = layout.compact([record], manager, local_slot_size=SLOT)
@@ -280,7 +292,7 @@ def test_write_hold_of_a_live_record_frees_nothing() -> None:
 
 def test_written_records_follow_the_current_placement() -> None:
     """Only a written, current placement at the placed offset is loadable."""
-    manager = ChunkManager(1, MetadataStore(1))
+    manager = ChunkManager(1, MetadataStore())
     layout = OnlinePackedLayout()
     old = layout.compact(
         [allocate(manager, "old", 4096)], manager, local_slot_size=SLOT
@@ -299,7 +311,8 @@ def test_written_records_follow_the_current_placement() -> None:
     layout.clear_written("old")
     assert layout.written_records(slot, 1, manager) is None
 
-    # The ring reuses the slot; the old generation's late write is rejected.
+    # The slot is reused; the old generation's late write is rejected.
+    manager.remove("old")
     new = allocate(manager, "new", 4096)
     layout.release("old", manager)
     assert not layout.mark_written("old", slot, old["file_offset"])
@@ -312,61 +325,48 @@ def test_written_records_follow_the_current_placement() -> None:
 
 
 def _placed_records(
-    layout: OnlinePackedLayout, manager: ChunkManager, keys: str, *, hold: bool
+    layout: OnlinePackedLayout, manager: ChunkManager, keys: str
 ) -> list[int]:
     """Place one 4 KiB record per key in its own call; return their offsets."""
     return [
-        layout.compact(
-            [allocate(manager, key, 4096)], manager, local_slot_size=SLOT, hold=hold
-        )[0]["file_offset"]
+        layout.compact([allocate(manager, key, 4096)], manager, local_slot_size=SLOT)[
+            0
+        ]["file_offset"]
         for key in keys
     ]
 
 
-def test_hold_and_recharge_follow_the_l2_fifo_policy() -> None:
-    """Holding leaves the L2 budget; recharge enters as oldest or newest."""
-    manager = ChunkManager(8, MetadataStore(8))
+def test_hold_moves_records_out_of_the_l2_budget() -> None:
+    """Held records leave the budget and keep their owner."""
+    manager = ChunkManager(8, MetadataStore())
     layout = OnlinePackedLayout()
-    a, b, c = _placed_records(layout, manager, "abc", hold=False)
+    a, b, c = _placed_records(layout, manager, "abc")
     assert layout.charged_bytes() == 3 * 4096
-    assert layout.oldest_charged(set()).chunk_key == "a"
-    assert layout.oldest_charged({"a"}).chunk_key == "b"
+    assert [r.file_offset for r in layout.charged_records("a")] == [a]
 
-    layout.hold(a)
     layout.hold(b)
+    layout.hold(a)
     with pytest.raises(ValueError, match="charged"):
         layout.hold(a)
-    assert layout.is_held(a, 4096) and not layout.is_held(c, 4096)
+    assert layout.charged_records("a") == []
     assert layout.charged_bytes() == 4096 and layout.held_bytes == 2 * 4096
-    assert layout.oldest_held(set()).chunk_key == "a"
-
-    # Inclusive re-charge goes to the FIFO head, exclusive to its tail.
-    assert layout.charge_held(a, 4096, newest=False)
-    assert layout.charge_held(b, 4096, newest=True)
-    assert not layout.charge_held(b, 4096, newest=True)
-    assert not layout.charge_held(c + 1, 4096, newest=True)
-    order = []
-    while (victim := layout.oldest_charged(set(order))) is not None:
-        order.append(victim.chunk_key)
-    assert order == ["a", "c", "b"]
-    assert layout.charged_bytes() == 3 * 4096 and layout.held_bytes == 0
+    assert layout.held_owner(a, 4096) == "a"
+    assert layout.held_owner(a, 8192) is None
+    assert layout.held_owner(c, 4096) is None
 
 
 def test_dropping_a_held_placement_discards_it_before_reuse() -> None:
     """Held records report their range on release, charged ones do not."""
     dropped: list[tuple[int, int]] = []
-    manager = ChunkManager(2, MetadataStore(2))
+    manager = ChunkManager(2, MetadataStore())
     layout = OnlinePackedLayout(on_held_drop=lambda *key: dropped.append(key))
-    (held,) = _placed_records(layout, manager, "h", hold=True)
-    (charged,) = _placed_records(layout, manager, "c", hold=False)
+    held, charged = _placed_records(layout, manager, "hc")
+    layout.hold(held)
     assert layout.held_bytes == 4096 and layout.charged_bytes() == 4096
 
-    # The ring wraps over both records; only the held one is discarded.
-    allocate(manager, "n", 4096)
-    allocate(manager, "m", 4096)
-    for key in manager.drain_evicted_chunk_keys():
-        layout.release(key, manager)
+    evict(manager, layout, "h")
+    evict(manager, layout, "c")
     assert dropped == [(held, 4096)]
-    assert not layout.is_held(held, 4096)
+    assert layout.held_owner(held, 4096) is None
     assert layout.held_bytes == 0 and layout.charged_bytes() == 0
     assert charged != held

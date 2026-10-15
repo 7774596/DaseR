@@ -4,13 +4,12 @@
 See ``docs/design/tier-residency.md``.
 """
 
-from bisect import bisect_left
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from daser.server.chunk_manager import ChunkManager
+from daser.server.extents import FreeExtents
 from daser.server.metadata_store import ChunkMeta
 
 
@@ -41,7 +40,7 @@ class _Placement:
     holds it is ``retired`` and keeps its bytes until the last hold ends.
     ``written`` marks a record whose store has reported, so it may be loaded.
     ``held`` marks a record kept resident by L1 alone: it is outside the L2
-    budget and FIFO until L1 releases it.
+    budget until its chunk leaves the index.
     """
 
     owner: ChunkMeta
@@ -59,7 +58,7 @@ class PackedRecord:
     """Physical location of one written packed slot.
 
     Attributes:
-        slot_id: Logical ring slot the record belongs to.
+        slot_id: Logical slot the record belongs to.
         chunk_key: Chunk that owns the slot.
         mode: Stored representation, e.g. ``"compressed"`` or ``"raw"``.
         file_offset: Byte offset of the record in the rank lane.
@@ -89,57 +88,6 @@ def _span_slot(span: dict[str, Any]) -> int:
     return start + (0 if count == 1 else int(span.get("logical_slot_start", -1)))
 
 
-class _FreeExtents:
-    """Address-ordered free byte ranges of one rank lane.
-
-    Adjacent ranges are always coalesced, so the list length equals the number
-    of holes between live records.
-    """
-
-    def __init__(self, start: int, end: int) -> None:
-        """Start with the whole lane ``[start, end)`` free."""
-        self.start = start
-        self.end = end
-        self.free_bytes = end - start
-        self._starts: list[int] = [start]
-        self._ends: list[int] = [end]
-
-    def reserve(self, nbytes: int) -> int | None:
-        """Carve ``nbytes`` from the first range that fits; return its offset."""
-        for index, (start, end) in enumerate(
-            zip(self._starts, self._ends, strict=True)
-        ):
-            if end - start < nbytes:
-                continue
-            if end - start == nbytes:
-                del self._starts[index]
-                del self._ends[index]
-            else:
-                self._starts[index] = start + nbytes
-            self.free_bytes -= nbytes
-            return start
-        return None
-
-    def free(self, offset: int, nbytes: int) -> None:
-        """Return ``[offset, offset + nbytes)`` and merge it with neighbours."""
-        end = offset + nbytes
-        index = bisect_left(self._starts, offset)
-        merge_prev = index > 0 and self._ends[index - 1] == offset
-        merge_next = index < len(self._starts) and self._starts[index] == end
-        if merge_prev and merge_next:
-            self._ends[index - 1] = self._ends[index]
-            del self._starts[index]
-            del self._ends[index]
-        elif merge_prev:
-            self._ends[index - 1] = end
-        elif merge_next:
-            self._starts[index] = offset
-        else:
-            self._starts.insert(index, offset)
-            self._ends.insert(index, end)
-        self.free_bytes += nbytes
-
-
 class OnlinePackedLayout:
     """Place packed records in free byte ranges and track their tier state.
 
@@ -153,10 +101,10 @@ class OnlinePackedLayout:
     after their owner leaves, so a later record cannot be placed over bytes a
     late write may still target.
 
-    Every live placement is either charged (in its lane's L2 FIFO, counted by
-    ``charged_bytes``) or held (resident in L1 only). The caller enforces the
-    L2 budget with ``oldest_charged``/``hold`` and moves released records back
-    with ``charge_held``.
+    Every live placement is either charged (counted by ``charged_bytes``) or
+    held (resident in L1 only). The caller picks victims and enforces the L2
+    budget with ``charged_records``/``hold``; ``held_owner`` maps an L1
+    release back to its chunk.
 
     Args:
         on_held_drop: Called with ``(file_offset, nbytes)`` when a held
@@ -168,12 +116,9 @@ class OnlinePackedLayout:
         self._placements: dict[tuple[int, int], _Placement] = {}
         self._keys_by_chunk: dict[str, set[tuple[int, int]]] = {}
         self._by_offset: dict[int, tuple[int, int]] = {}
-        self._arenas: dict[int, _FreeExtents] = {}
+        self._arenas: dict[int, FreeExtents] = {}
         self._holds: dict[int, list[tuple[int, _Placement]]] = {}
         self._next_hold = 0
-        # Per lane, oldest first.
-        self._charged: dict[int, OrderedDict[tuple[int, int], _Placement]] = {}
-        self._held: dict[int, OrderedDict[tuple[int, int], _Placement]] = {}
         self._charged_bytes: dict[int, int] = {}
         self._held_bytes = 0
         self._on_held_drop = on_held_drop
@@ -186,19 +131,16 @@ class OnlinePackedLayout:
         local_slot_size: int,
         rank_base: int = 0,
         arena_size: int | None = None,
-        hold: bool = False,
     ) -> list[dict[str, Any]]:
         """Place source-contiguous records into free physical byte ranges.
 
         Args:
             spans: Packed spans carrying current logical allocation metadata.
-            manager: Public owner of current allocation identities and FIFO tail.
+            manager: Public owner of current allocation identities.
             local_slot_size: Positive aligned byte size of one raw local slot.
             rank_base: Nonnegative start of this rank's physical lane.
             arena_size: Physical byte capacity of this rank lane. When omitted,
                 derive it from the manager's logical slot count for unit tests.
-            hold: Place new records held (L1 only, exclusive tiers) instead
-                of charged. Retried records keep their state.
 
         Returns:
             Copied spans with server-assigned physical file offsets.
@@ -297,7 +239,7 @@ class OnlinePackedLayout:
                 if offset is None:
                     # ``offsets`` holds only the records reserved so far.
                     for (prev_index, _, _), prev in zip(run, offsets, strict=False):
-                        arena.free(prev, int(result[prev_index]["nbytes"]))
+                        arena.release(prev, int(result[prev_index]["nbytes"]))
                     return None
                 offsets.append(offset)
             return offsets
@@ -310,8 +252,8 @@ class OnlinePackedLayout:
             if offsets is None:
                 # Roll back earlier runs so a failed call reserves nothing.
                 for placement in pending.values():
-                    arena.free(placement.file_offset, placement.nbytes)
-                free_bytes = arena.free_bytes
+                    arena.release(placement.file_offset, placement.nbytes)
+                free_bytes = arena.free
                 need = int(result[run[0][0]]["nbytes"])
                 raise PackedArenaFull(
                     max(need, unplaced_bytes - free_bytes),
@@ -328,7 +270,6 @@ class OnlinePackedLayout:
                     cursor,
                     nbytes,
                     str(span.get("mode", "compressed")),
-                    held=hold,
                 )
             run.clear()
 
@@ -403,7 +344,7 @@ class OnlinePackedLayout:
         for rank_base, placement in self._holds.pop(token):
             placement.writers -= 1
             if placement.retired and placement.writers == 0:
-                self._arenas[rank_base].free(placement.file_offset, placement.nbytes)
+                self._arenas[rank_base].release(placement.file_offset, placement.nbytes)
                 freed += placement.nbytes
         return freed
 
@@ -432,7 +373,7 @@ class OnlinePackedLayout:
 
         Args:
             chunk_key: Chunk the store wrote.
-            slot: Logical ring slot of the record.
+            slot: Logical slot of the record.
             file_offset: Physical offset the store wrote.
             rank_base: Start of the rank lane the record was placed in.
 
@@ -472,7 +413,7 @@ class OnlinePackedLayout:
         """Return the rank-0 written records of a logical slot interval.
 
         Args:
-            start_slot: First logical ring slot.
+            start_slot: First logical slot.
             num_slots: Number of slots requested.
             manager: Public owner of current allocation identities.
 
@@ -493,58 +434,34 @@ class OnlinePackedLayout:
             owner = placement.owner
             if manager.store.get(owner.chunk_key) is not owner:
                 return None
-            records.append(
-                PackedRecord(
-                    slot,
-                    owner.chunk_key,
-                    placement.mode,
-                    placement.file_offset,
-                    placement.nbytes,
-                )
-            )
+            records.append(self._record((0, slot), placement))
         return records
 
-    def oldest_charged(
-        self, protected_keys: set[str], *, rank_base: int = 0
-    ) -> PackedRecord | None:
-        """Return the oldest charged record of a lane not owned by protected keys.
+    def charged_records(self, chunk_key: str) -> list[PackedRecord]:
+        """Return the charged (L2-budgeted) records of a chunk.
 
         Args:
-            protected_keys: Chunk keys that must not be reclaimed.
-            rank_base: Start of the rank lane.
+            chunk_key: Chunk to inspect.
 
         Returns:
-            The L2 FIFO victim, or None when only protected records are left.
+            Its charged records, in no particular order; empty when every
+            record is held or the chunk has no placement.
 
         Async/thread-safety:
-            Pure lookup on the server event loop. Protected records are the
-            newest, so the scan stops near the FIFO tail.
+            Pure lookup on the server event loop; O(records of the chunk).
         """
-        return self._oldest(self._charged.get(rank_base), protected_keys)
-
-    def oldest_held(
-        self, protected_keys: set[str], *, rank_base: int = 0
-    ) -> PackedRecord | None:
-        """Return the longest-held record of a lane not owned by protected keys.
-
-        Args:
-            protected_keys: Chunk keys that must not be reclaimed.
-            rank_base: Start of the rank lane.
-
-        Returns:
-            The oldest held record, or None.
-
-        Async/thread-safety:
-            Pure lookup on the server event loop.
-        """
-        return self._oldest(self._held.get(rank_base), protected_keys)
+        return [
+            self._record(key, placement)
+            for key in self._keys_by_chunk.get(chunk_key, ())
+            if not (placement := self._placements[key]).held
+        ]
 
     def hold(self, file_offset: int) -> None:
         """Move a charged record out of the L2 budget; L1 now keeps it.
 
         Args:
             file_offset: Offset of a charged record, e.g. from
-                ``oldest_charged``.
+                ``charged_records``.
 
         Raises:
             ValueError: If no charged record starts at ``file_offset``.
@@ -557,62 +474,31 @@ class OnlinePackedLayout:
         if placement is None or placement.held:
             raise ValueError("hold requires a charged packed placement")
         lane = key[0]
-        del self._charged[lane][key]
         self._charged_bytes[lane] -= placement.nbytes
         placement.held = True
-        self._held.setdefault(lane, OrderedDict())[key] = placement
         self._held_bytes += placement.nbytes
 
-    def charge_held(self, file_offset: int, nbytes: int, *, newest: bool) -> bool:
-        """Return a held record that left L1 to the L2 budget and FIFO.
+    def held_owner(self, file_offset: int, nbytes: int) -> str | None:
+        """Return the chunk owning the held record at exactly this range.
 
         Args:
-            file_offset: Offset of the released L1 range.
-            nbytes: Length of the released L1 range.
-            newest: Enter the FIFO as newest (exclusive tiers) instead of
-                oldest (inclusive tiers, so it is reclaimed first).
-
-        Returns:
-            Whether a held placement matched; False for a range whose record
-            has already left.
-
-        Async/thread-safety:
-            Call on the server event loop; may push charged bytes above the
-            budget until the next reclaim.
-        """
-        key = self._by_offset.get(file_offset)
-        placement = None if key is None else self._placements[key]
-        if placement is None or not placement.held or placement.nbytes != nbytes:
-            return False
-        lane = key[0]
-        del self._held[lane][key]
-        self._held_bytes -= placement.nbytes
-        placement.held = False
-        fifo = self._charged.setdefault(lane, OrderedDict())
-        fifo[key] = placement
-        if not newest:
-            fifo.move_to_end(key, last=False)
-        self._charged_bytes[lane] = self._charged_bytes.get(lane, 0) + nbytes
-        return True
-
-    def is_held(self, file_offset: int, nbytes: int) -> bool:
-        """Return whether a live held placement covers exactly this range.
-
-        Args:
-            file_offset: Start of the range.
+            file_offset: Start of a range L1 released.
             nbytes: Range length.
 
         Returns:
-            True for a current held record; False once it was dropped.
+            The owner chunk key, or None when no live held record matches
+            (e.g. it was already dropped).
 
         Async/thread-safety:
             Pure lookup on the server event loop.
         """
         key = self._by_offset.get(file_offset)
         if key is None:
-            return False
+            return None
         placement = self._placements[key]
-        return placement.held and placement.nbytes == nbytes
+        if not placement.held or placement.nbytes != nbytes:
+            return None
+        return placement.owner.chunk_key
 
     def charged_bytes(self, *, rank_base: int = 0) -> int:
         """Return bytes of a lane's records counted against the L2 budget.
@@ -646,49 +532,35 @@ class OnlinePackedLayout:
             Pure lookup on the server event loop.
         """
         arena = self._arenas.get(rank_base)
-        return 0 if arena is None else arena.free_bytes
+        return 0 if arena is None else arena.free
 
-    def _arena(self, rank_base: int, arena_size: int) -> _FreeExtents:
+    def _arena(self, rank_base: int, arena_size: int) -> FreeExtents:
         """Return the free-extent list of a lane, creating it on first use."""
         arena = self._arenas.get(rank_base)
         if arena is None:
-            arena = _FreeExtents(rank_base, rank_base + arena_size)
+            arena = FreeExtents(rank_base, rank_base + arena_size)
             self._arenas[rank_base] = arena
         elif arena.end - arena.start != arena_size:
             raise ValueError("packed arena size changed for a rank lane")
         return arena
 
-    def _oldest(
-        self,
-        records: OrderedDict[tuple[int, int], _Placement] | None,
-        protected_keys: set[str],
-    ) -> PackedRecord | None:
-        """Return the first record of an ordered lane map outside protection."""
-        for (_lane, slot), placement in (records or {}).items():
-            if placement.owner.chunk_key not in protected_keys:
-                return PackedRecord(
-                    slot,
-                    placement.owner.chunk_key,
-                    placement.mode,
-                    placement.file_offset,
-                    placement.nbytes,
-                )
-        return None
+    def _record(self, key: tuple[int, int], placement: _Placement) -> PackedRecord:
+        """Return the public view of one placement."""
+        return PackedRecord(
+            key[1],
+            placement.owner.chunk_key,
+            placement.mode,
+            placement.file_offset,
+            placement.nbytes,
+        )
 
     def _register(self, key: tuple[int, int], placement: _Placement) -> None:
-        """Index one new placement and enter it into its tier."""
+        """Index one new placement; new records are charged."""
         lane = key[0]
         self._placements[key] = placement
         self._keys_by_chunk.setdefault(placement.owner.chunk_key, set()).add(key)
         self._by_offset[placement.file_offset] = key
-        if placement.held:
-            self._held.setdefault(lane, OrderedDict())[key] = placement
-            self._held_bytes += placement.nbytes
-        else:
-            self._charged.setdefault(lane, OrderedDict())[key] = placement
-            self._charged_bytes[lane] = (
-                self._charged_bytes.get(lane, 0) + placement.nbytes
-            )
+        self._charged_bytes[lane] = self._charged_bytes.get(lane, 0) + placement.nbytes
 
     def _drop(self, key: tuple[int, int], placement: _Placement) -> None:
         """Forget one placement and return its bytes unless a write holds them.
@@ -706,14 +578,12 @@ class OnlinePackedLayout:
                 del self._keys_by_chunk[chunk_key]
         lane = key[0]
         if placement.held:
-            del self._held[lane][key]
             self._held_bytes -= placement.nbytes
             if self._on_held_drop is not None:
                 self._on_held_drop(placement.file_offset, placement.nbytes)
         else:
-            del self._charged[lane][key]
             self._charged_bytes[lane] -= placement.nbytes
         if placement.writers:
             placement.retired = True
             return
-        self._arenas[key[0]].free(placement.file_offset, placement.nbytes)
+        self._arenas[key[0]].release(placement.file_offset, placement.nbytes)

@@ -17,8 +17,8 @@ graph TB
         IPC["IPC server<br/>Unix socket + msgpack"]
         subgraph core_owner["ServerCore control plane"]
             CORE["ServerCore<br/>共享控制面核心"]
-            CM["ChunkManager<br/>ring buffer allocator"]
-            MS["MetadataStore<br/>chunk_index + slot_map"]
+            CM["ChunkManager<br/>free-extent slot allocator"]
+            MS["MetadataStore<br/>chunk_index"]
             DR["DocRegistry"]
             RI["RetrievalIndex"]
             PRI["PrefixHashIndex"]
@@ -116,15 +116,15 @@ L1 pinned host memory 到 NVMe 上的 L2 `daser.store` byte ranges。图上用
 可见，再由 iouring transfer 异步持久化到 NVMe L2；load 路径先查 L1，miss
 时由 iouring transfer 从 NVMe L2 读入并 promote 回 L1。L1 的驻留范围和
 LRU 状态只存在于 `TieredIOUringTransferLayer` 内存中，由
-`ReplacementPolicy` 管理；`MetadataStore` 只记录 L2/ring-buffer 级别的
-`chunk_index` 和 `slot_map`，不保存 L1 状态。
+`ReplacementPolicy` 管理；`MetadataStore` 只记录 L2 级别的 `chunk_index`，
+不保存 L1 状态。
 
 `--skip-l2` 选择同一 IPC/control-plane 流程下的 L1-only transfer。server
 仍然用 `ChunkManager` 分配逻辑 slot 和 `file_offset`，lookup/store 仍然经由
 `ServerCore`、`RetrievalIndex` 和 `transfer_store`/`transfer_load` IPC op，
 但 KV bytes 只进入 pinned host L1，不创建 `daser.store`，不做 L2 写入，也不在
 关机时保存 `daser.index`。L1 淘汰后的范围不可从 L2 恢复，重启后总是冷启动。
-ring 索引和 L1 替换彼此独立（pinned pool 压力可能先淘汰仍被索引的 chunk），
+chunk 索引和 L1 替换彼此独立（pinned pool 压力可能先淘汰仍被索引的 chunk），
 所以 lookup 在该模式下只返回字节仍全部驻留 L1 的前缀 chunk，遇到第一个已被
 淘汰的 chunk 就截断，并刷新命中 chunk 的 LRU；lookup 之后、load 之前的并发
 淘汰仍可能让 load 失败。
@@ -291,19 +291,18 @@ system，之后不做运行时切换：
 `iouring + prefix + TP=1 + BF16 + block_tokens=128`；不满足条件时
 启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
 与 `--skip-l2` 同开时 packed arena 只寻址 L1（`--l1-size`），压缩后的 record
-只驻留 pinned memory，容量收益直接作用于 memory-only 缓存；L2 准入和
-inclusive/exclusive 策略在这种模式下不生效。
+只驻留 pinned memory，容量收益直接作用于 memory-only 缓存；L2 预算和
+held 状态在这种模式下不生效。
 
 store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
 record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，默认使用模型无关的
-generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。`ChunkManager` 的逻辑 ring
-按最小 packed 长度超额供给 slot，只负责 slot 身份和元数据；server 在 L1+L2
+generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。`ChunkManager` 的逻辑槽位
+按最小 packed 长度超额供给，只负责 slot 身份和元数据；server 在 L1+L2
 大小的 packed arena 中为每个 record 分配稳定地址，相邻 record 合并成一个 DMA
-span。L1 只为实际写入的字节分配 pinned memory，这是容量收益的来源。L2 FIFO
-只回收 L2 预算（`--l2-size`），整段驻留在 L1 的 record 保留在索引中，因此 SSD
-的 FIFO 不会淘汰 L1 的热数据；inclusive（默认，write-through）与
-exclusive（`DASER_EXCLUSIVE_TIERS=1`，L1 淘汰时才写 SSD）只在 store 策略上不同，见
-[packed arena 与 L1/L2 驻留](tier-residency.md)。
+span。L1 只为实际写入的字节分配 pinned memory，这是容量收益的来源。L2 预算
+（`--l2-size`）超出时按叶子优先 LRU 回收，整段驻留在 L1 的 record 转为 held 保留
+在索引中，因此 L2 预算不会淘汰 L1 的热数据；store 始终 write-through，见
+[槽位分配、叶子优先淘汰与 L1/L2 驻留](tier-residency.md)。
 
 server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、
 stored length），lookup 命中后把有序 record 以 `compressed_slots` 附在 load
@@ -354,7 +353,7 @@ flowchart TB
     C --> D["创建或校验 daser.store"]
     D --> E{"daser.index 是否存在？"}
     E -- 是 --> F["ChunkManager.load()"]
-    E -- 否 --> G["空 ring buffer 冷启动"]
+    E -- 否 --> G["空 store 冷启动"]
     F --> H["构造 RetrievalIndex / PositionEncoder"]
     G --> H
     H --> I["ServerCore.rebuild_retrieval_index()"]

@@ -343,7 +343,7 @@ class IPCClientSync(_IPCClientBase):
         )
 
     def alloc_chunk(
-        self, chunk_key: str, token_count: int, model_id: str
+        self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
     ) -> dict[str, Any]:
         """Allocate a slot for a new chunk.
 
@@ -351,6 +351,7 @@ class IPCClientSync(_IPCClientBase):
             chunk_key: xxh3_128 hex of the token IDs.
             token_count: number of tokens in the chunk.
             model_id: model identifier.
+            parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
             Dict with start_slot, file_offset, pos_offset.
@@ -361,6 +362,7 @@ class IPCClientSync(_IPCClientBase):
                 "chunk_key": chunk_key,
                 "token_count": token_count,
                 "model_id": model_id,
+                "parent_key": parent_key,
             }
         )
 

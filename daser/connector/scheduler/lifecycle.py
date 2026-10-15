@@ -1230,17 +1230,21 @@ class RequestLifecycle:
         self,
         chunk_key: str,
         token_count: int,
+        parent_key: str = "",
     ) -> dict[str, Any]:
         """Allocate server metadata for a pending scheduler store.
 
         Args:
             chunk_key: cache key to allocate.
             token_count: number of tokens covered by the allocation.
+            parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
             Mutable server allocation metadata.
         """
-        return self._ipc_sync.alloc_chunk(chunk_key, token_count, self._model_id)
+        return self._ipc_sync.alloc_chunk(
+            chunk_key, token_count, self._model_id, parent_key
+        )
 
     def allocate_store_chunks(
         self,
@@ -1249,7 +1253,8 @@ class RequestLifecycle:
         """Allocate server metadata for multiple pending scheduler stores.
 
         Args:
-            chunks: chunk descriptors with chunk_key and token_count.
+            chunks: chunk descriptors with chunk_key, token_count and
+                optional parent_key.
 
         Returns:
             Mutable server allocation metadata for each chunk.
@@ -1261,6 +1266,7 @@ class RequestLifecycle:
                     **self.allocate_store_chunk(
                         str(chunk["chunk_key"]),
                         int(chunk["token_count"]),
+                        str(chunk.get("parent_key", "")),
                     ),
                     "chunk_key": str(chunk["chunk_key"]),
                 }
@@ -1389,6 +1395,7 @@ class RequestLifecycle:
                         self.allocate_store_chunk(
                             intent.chunk_key,
                             intent.token_count,
+                            intent.parent_key,
                         )
                     ]
                 else:
@@ -1397,6 +1404,7 @@ class RequestLifecycle:
                             {
                                 "chunk_key": intent.chunk_key,
                                 "token_count": intent.token_count,
+                                "parent_key": intent.parent_key,
                             }
                             for intent in plan.intents
                         ]

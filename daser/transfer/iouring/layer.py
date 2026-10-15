@@ -237,23 +237,6 @@ def _ranges_overlap(left: list[tuple[int, int]], right: list[tuple[int, int]]) -
     )
 
 
-def _sorted_ranges_overlap(
-    left: list[tuple[int, int]], right: list[tuple[int, int]]
-) -> bool:
-    """Return whether two sorted, merged range lists intersect, in linear time."""
-    i = j = 0
-    while i < len(left) and j < len(right):
-        start, size = left[i]
-        other, other_size = right[j]
-        if start < other + other_size and other < start + size:
-            return True
-        if start + size <= other + other_size:
-            i += 1
-        else:
-            j += 1
-    return False
-
-
 def _resolve_from_hits(
     hits: tuple[list[int], list[_LeasedSliceRange]],
     target_offset: int,
@@ -310,33 +293,6 @@ def _resolve_from_hits(
     if cursor < end:
         uncovered.append((target_offset + cursor - file_offset, cursor, end - cursor))
     return chunks, uncovered
-
-
-def _clip_parts(
-    parts: list[tuple[int, int, int, int, int]],
-    window_start: int,
-    window_size: int,
-) -> list[tuple[int, int, int]]:
-    """Clip logical record parts of one physical read to a byte window.
-
-    Args:
-        parts: ``(target_offset, file_offset, nbytes, source_offset, charge)``
-            records of one read, with ``source_offset`` relative to the read.
-        window_start: Window start relative to the read.
-        window_size: Window length in bytes.
-
-    Returns:
-        ``(target_offset, source_offset, nbytes)`` destination copies covering
-        exactly the part bytes inside the window.
-    """
-    window_end = window_start + window_size
-    clipped = []
-    for target_offset, _file_offset, nbytes, source_offset, _charge in parts:
-        start = max(source_offset, window_start)
-        end = min(source_offset + nbytes, window_end)
-        if start < end:
-            clipped.append((target_offset + start - source_offset, start, end - start))
-    return clipped
 
 
 def _split_runs_at_slices(
@@ -779,7 +735,6 @@ class TieredIOUringTransferLayer(TransferLayer):
     """
 
     coalesce_store_spans = True
-    supports_held_stores = True
 
     def __init__(
         self,
@@ -1248,7 +1203,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         ):
             raise ValueError("packed source spans are not contiguous")
         keys = [(int(span["file_offset"]), int(span["nbytes"])) for span in spans]
-        holds = [bool(span.get("hold", False)) for span in spans]
         accounting = [
             self._accounted_nbytes(span, int(span["nbytes"])) for span in spans
         ]
@@ -1364,20 +1318,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                         child = data.subslice(cursor, key[1])
                         children.append((key, child))
                         cursor += key[1]
-                    # Pin every child as held or pending-write before
-                    # publishing: when accounted charges exceed physical
-                    # bytes, publication can evict this group's own
-                    # allocation, and an unpinned child would be closed
-                    # before its bytes reach L2. Held children are marked
-                    # by put_reserved_group before it evicts anything.
-                    for (key, child), hold in zip(children, holds, strict=True):
-                        if not hold:
-                            self._persist_locked(key, child)
-                    self._l1.put_reserved_group(
-                        children,
-                        accounted_nbytes=accounting,
-                        held=holds,
-                    )
+                    # Pin every child as pending-write before publishing:
+                    # when accounted charges exceed physical bytes,
+                    # publication can evict this group's own allocation,
+                    # and an unpinned child would be closed before its
+                    # bytes reach L2.
+                    for key, child in children:
+                        self._persist_locked(key, child)
+                    self._l1.put_reserved_group(children, accounted_nbytes=accounting)
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
                     data.close()
@@ -1931,7 +1879,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._held_release_listener = listener
 
     def discard_held(self, file_offset: int, nbytes: int) -> None:
-        """Drop a held L1 range without writing it to L2.
+        """Drop a held L1 range.
 
         Async/thread-safety:
             Must run on the owning event loop before the file range is reused.
@@ -2032,17 +1980,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         del key
         return id(data) in self._l2_write_buffers or id(data) in self._leased_slices
 
-    def _release_held(
-        self, key: tuple[int, int], data: PinnedMemorySlice, dirty: bool
-    ) -> None:
-        """Hand a held range leaving L1 back to the server.
-
-        A dirty range has never been written to L2, so its writer takes
-        ownership of the slice before L1 decides whether to close it.
-        """
-        if dirty:
-            self._stats.held_evict_persists += 1
-            self._persist_locked(key, data)
+    def _release_held(self, key: tuple[int, int]) -> None:
+        """Hand a held range leaving L1 back to the server."""
         if self._held_release_listener is not None:
             self._held_release_listener(*key)
 

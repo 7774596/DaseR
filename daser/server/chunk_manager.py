@@ -2,7 +2,6 @@
 
 # Standard
 import os
-import tempfile
 from typing import TYPE_CHECKING
 
 # Third Party
@@ -10,6 +9,7 @@ import msgpack
 
 # First Party
 from daser.logging import init_logger
+from daser.server.extents import FreeExtents
 from daser.server.metadata_store import ChunkMeta, MetadataStore
 
 if TYPE_CHECKING:
@@ -18,20 +18,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class ChunkManager:
-    """Ring buffer manager for DaseR's slot-based KV store.
+class SlotsExhausted(MemoryError):
+    """Raised when no free slot range is long enough for an allocation."""
 
-    Allocates contiguous slots from a fixed-size ring buffer. When the
-    buffer is full, the oldest chunk is evicted automatically. Handles
-    wrap-around at the end of the buffer by inserting SKIP blocks.
+
+class ChunkManager:
+    """Slot allocator and chunk index owner for DaseR's KV store.
+
+    Slots are handed out first-fit from address-ordered free ranges. The
+    manager never chooses what to evict: ``alloc`` raises ``SlotsExhausted``
+    and the caller removes chunks (see ``docs/design/tier-residency.md``).
+    A removed chunk's slots are reusable at once, unless a write hold still
+    covers it.
 
     Args:
-        total_slots: total number of slots in the ring buffer.
+        total_slots: number of logical slots.
         metadata_store: MetadataStore instance this manager operates on.
-        doc_registry: optional DocRegistry; when provided, evictions
-            cascade into the registry so DocEntry.cached_mask stays in
-            sync with the ring buffer. Omitting it keeps chunk-only
-            behavior for tests and the legacy server entry point.
+        doc_registry: optional DocRegistry persisted with the index.
+        physical_slots: raw-envelope slots the on-disk L2 file represents;
+            defaults to ``total_slots``.
+
+    Async/thread-safety:
+        Not thread-safe; owned by the server event loop.
     """
 
     def __init__(
@@ -47,31 +55,24 @@ class ChunkManager:
             raise ValueError("physical_slots must be within logical slot capacity")
         self._store = metadata_store
         self._doc_registry = doc_registry
-        self._head: int = 0  # next slot to write
-        self._tail: int = 0  # oldest chunk's first slot
-        self._evicted_chunk_keys: list[str] = []
+        self._free = FreeExtents(0, total_slots)
+        # Write holds: token -> chunk metas, and per-meta hold counts. A
+        # removed meta with holds keeps its slots until the count drops to 0.
+        self._holds: dict[int, list[ChunkMeta]] = {}
+        self._hold_counts: dict[int, int] = {}
+        self._retired: dict[int, ChunkMeta] = {}
+        self._next_hold = 0
+        self._rebuild_free()
 
     @property
     def total_slots(self) -> int:
-        """Return total ring-buffer slot capacity."""
+        """Return logical slot capacity."""
         return self._total_slots
 
     @property
     def physical_slots(self) -> int:
         """Return raw-envelope slots represented by the physical L2 lane."""
         return self._physical_slots
-
-    @property
-    def tail_slot(self) -> int:
-        """Return the next FIFO reclamation slot for server layout planning.
-
-        Returns:
-            Logical slot index at the ring's oldest allocation or wrap padding.
-
-        Async/thread-safety:
-            Read on the owning server event loop; does not advance the ring.
-        """
-        return self._tail
 
     @property
     def doc_registry(self) -> "DocRegistry | None":
@@ -85,16 +86,13 @@ class ChunkManager:
 
     @property
     def free_slots(self) -> int:
-        """Number of slots currently available without eviction.
+        """Return slots not owned by a chunk or a pending write hold."""
+        return self._free.free
 
-        When head == tail the buffer is either completely empty or completely
-        full.  We disambiguate by checking whether any chunks are stored.
-        """
-        if self._head == self._tail:
-            return 0 if len(self._store) > 0 else self._total_slots
-        if self._head > self._tail:
-            return self._total_slots - (self._head - self._tail)
-        return self._tail - self._head
+    @property
+    def free_holes(self) -> int:
+        """Return the number of disjoint free slot ranges (fragmentation)."""
+        return self._free.holes
 
     def alloc(
         self,
@@ -103,12 +101,9 @@ class ChunkManager:
         token_count: int,
         model_id: str,
         pos_offset: int,
-    ) -> int:
+        parent_key: str = "",
+    ) -> ChunkMeta:
         """Allocate contiguous slots for a new chunk.
-
-        Evicts oldest chunks as needed. Inserts a SKIP block and wraps
-        head to 0 if there is not enough contiguous space at the end of
-        the buffer.
 
         Args:
             chunk_key: unique identifier for the chunk.
@@ -116,32 +111,25 @@ class ChunkManager:
             token_count: number of tokens in this chunk.
             model_id: model identifier for cache invalidation.
             pos_offset: position encoding offset for this chunk.
+            parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
-            start_slot: index of the first allocated slot.
+            The inserted chunk metadata.
 
         Raises:
-            ValueError: if num_slots > total_slots.
+            ValueError: if num_slots is not in ``[1, total_slots]``.
+            SlotsExhausted: if no free range is long enough; nothing changed.
         """
-        if num_slots > self._total_slots:
+        if not 0 < num_slots <= self._total_slots:
             raise ValueError(
-                f"num_slots={num_slots} exceeds total_slots={self._total_slots}"
+                f"num_slots={num_slots} must be within total_slots={self._total_slots}"
             )
-
-        # Wrap if not enough contiguous space at end of buffer
-        tail_space = self._total_slots - self._head
-        if 0 < tail_space < num_slots:
-            # Evict any chunk whose first slot falls in the about-to-be-skipped region
-            self._evict_range(self._head, tail_space)
-            self._store.insert_skip(self._head, tail_space)
-            logger.debug("[CHUNK] wrap: SKIP %d slots at %d", tail_space, self._head)
-            self._head = 0
-
-        # Evict until we have enough free space
-        while self.free_slots < num_slots:
-            self.evict_oldest()
-
-        start_slot = self._head
+        start_slot = self._free.reserve(num_slots)
+        if start_slot is None:
+            raise SlotsExhausted(
+                f"no {num_slots} contiguous free slots "
+                f"(free={self._free.free} holes={self._free.holes})"
+            )
         meta = ChunkMeta(
             chunk_key=chunk_key,
             start_slot=start_slot,
@@ -149,111 +137,116 @@ class ChunkManager:
             token_count=token_count,
             pos_offset=pos_offset,
             model_id=model_id,
+            parent_key=parent_key,
         )
         self._store.insert(meta)
-        self._head += num_slots
-        if self._head == self._total_slots:
-            self._head = 0
         logger.debug(
-            "[CHUNK] alloc chunk_key=%s start=%d num=%d head=%d tail=%d",
+            "[CHUNK] alloc chunk_key=%s start=%d num=%d free=%d",
             chunk_key,
             start_slot,
             num_slots,
-            self._head,
-            self._tail,
+            self._free.free,
         )
-        return start_slot
+        return meta
 
-    def evict_oldest(self) -> None:
-        """Evict the oldest chunk (or skip block) at tail and advance tail.
+    def remove(self, chunk_key: str) -> ChunkMeta:
+        """Remove a chunk from the index and free its slots.
 
-        Raises:
-            RuntimeError: if the buffer is empty.
-        """
-        if self._tail == self._head and len(self._store) == 0:
-            raise RuntimeError("evict_oldest called on empty ring buffer")
+        Slots of a chunk under a write hold are freed when the hold ends.
 
-        entry = self._store.get_slot_entry(self._tail)
-        if entry.kind == "chunk":
-            if entry.chunk_key is None:
-                raise RuntimeError(
-                    f"slot_map invariant violated: kind='chunk' at tail={self._tail} "
-                    "but chunk_key is None"
-                )
-            self._notify_eviction(entry.chunk_key)
-            self._store.remove(entry.chunk_key)
-            self._evicted_chunk_keys.append(entry.chunk_key)
-            self._tail = (self._tail + entry.num_slots) % self._total_slots
-            logger.debug(
-                "[CHUNK] evict chunk_key=%s tail=%d", entry.chunk_key, self._tail
-            )
-        elif entry.kind == "skip":
-            self._tail = (self._tail + entry.num_slots) % self._total_slots
-            logger.debug("[CHUNK] skip block consumed, tail=%d", self._tail)
-        else:
-            # cont slot at tail is a bug — advance by 1 to recover
-            logger.warning("[CHUNK] unexpected cont slot at tail=%d", self._tail)
-            self._tail = (self._tail + 1) % self._total_slots
-
-    def drain_evicted_chunk_keys(self) -> list[str]:
-        """Return and clear chunk keys evicted by automatic ring operations.
-
-        The ring allocator does not own any retrieval index. Server-level
-        coordinators consume this list after allocation and remove the same
-        keys from their retrieval index, keeping metadata and lookup state in
-        sync without coupling storage allocation to a concrete index.
+        Args:
+            chunk_key: key of a stored chunk.
 
         Returns:
-            List of chunk keys evicted since the previous drain.
+            The removed metadata.
+
+        Raises:
+            KeyError: if the chunk is not stored.
         """
-        evicted = list(self._evicted_chunk_keys)
-        self._evicted_chunk_keys.clear()
-        return evicted
+        meta = self._store.remove(chunk_key)
+        if self._hold_counts.get(id(meta)):
+            self._retired[id(meta)] = meta
+        else:
+            self._free.release(meta.start_slot, meta.num_slots)
+        return meta
+
+    def hold_writes(self, chunk_keys: list[str]) -> int:
+        """Keep the slots of stored chunks reserved until a write ends.
+
+        Args:
+            chunk_keys: Keys a transfer is about to write; unknown keys are
+                ignored.
+
+        Returns:
+            Token to pass to ``end_writes`` exactly once.
+
+        Async/thread-safety:
+            Call on the server event loop before yielding to the transfer.
+        """
+        metas = []
+        for key in dict.fromkeys(chunk_keys):
+            meta = self._store.get(key)
+            if meta is not None:
+                metas.append(meta)
+                self._hold_counts[id(meta)] = self._hold_counts.get(id(meta), 0) + 1
+        token = self._next_hold
+        self._next_hold += 1
+        self._holds[token] = metas
+        return token
+
+    def end_writes(self, token: int) -> None:
+        """End a write hold and free slots whose chunk left meanwhile.
+
+        Args:
+            token: Value returned by ``hold_writes``.
+
+        Raises:
+            KeyError: If the token is unknown or already ended.
+        """
+        for meta in self._holds.pop(token):
+            count = self._hold_counts[id(meta)] - 1
+            if count:
+                self._hold_counts[id(meta)] = count
+                continue
+            del self._hold_counts[id(meta)]
+            retired = self._retired.pop(id(meta), None)
+            if retired is not None:
+                self._free.release(retired.start_slot, retired.num_slots)
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
     def save(self, path: str, cache_reuse_mode: str | None = None) -> None:
-        """Persist full ring buffer state (index + head/tail) to path.
+        """Persist the chunk index and document registry to path.
 
         Args:
             path: absolute file path to write.
             cache_reuse_mode: optional cache reuse mode that created the
                 persisted metadata.
         """
-        tmp_store_path = path + ".tmp_store"
         tmp_path = path + ".tmp"
+        payload = {
+            "total_slots": self._total_slots,
+            "index": self._store.to_bytes(),
+            "cache_reuse_mode": cache_reuse_mode,
+            "doc_registry": (
+                self._doc_registry.to_dict() if self._doc_registry is not None else {}
+            ),
+        }
         try:
-            self._store.save(tmp_store_path)
-            with open(tmp_store_path, "rb") as f:
-                index_bytes = f.read()
-
-            payload = {
-                "head": self._head,
-                "tail": self._tail,
-                "index": index_bytes,
-                "cache_reuse_mode": cache_reuse_mode,
-                "doc_registry": (
-                    self._doc_registry.to_dict()
-                    if self._doc_registry is not None
-                    else {}
-                ),
-            }
             with open(tmp_path, "wb") as f:
                 f.write(msgpack.packb(payload, use_bin_type=True))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
         finally:
-            for cleanup_path in (tmp_store_path, tmp_path):
-                if os.path.exists(cleanup_path):
-                    os.unlink(cleanup_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         logger.info(
-            "[CHUNK] state saved to %s (head=%d tail=%d docs=%d)",
+            "[CHUNK] state saved to %s (chunks=%d docs=%d)",
             path,
-            self._head,
-            self._tail,
+            len(self._store),
             len(self._doc_registry) if self._doc_registry is not None else 0,
         )
 
@@ -262,12 +255,16 @@ class ChunkManager:
         path: str,
         expected_cache_reuse_mode: str | None = None,
     ) -> None:
-        """Restore ring buffer state from path, replacing current state.
+        """Restore the chunk index from path and rebuild slot occupancy.
 
         Args:
             path: absolute file path to read.
             expected_cache_reuse_mode: optional startup cache reuse mode. When
                 set, persisted metadata from a different mode is rejected.
+
+        Raises:
+            ValueError: on a reuse-mode or slot-capacity mismatch, or when
+                persisted chunks overlap.
         """
         with open(path, "rb") as f:
             payload = msgpack.unpackb(f.read(), raw=False)
@@ -286,27 +283,20 @@ class ChunkManager:
                 f"index was saved with {saved_mode!r}, "
                 f"server started with {expected_cache_reuse_mode!r}"
             )
-
-        self._head = payload["head"]
-        self._tail = payload["tail"]
-
-        # Restore index via a temp file
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".index")
-        tmp.write(payload["index"])
-        tmp.close()
-        try:
-            self._store.load(tmp.name)
-        finally:
-            os.unlink(tmp.name)
-
+        if payload.get("total_slots") != self._total_slots:
+            raise ValueError(
+                f"slot capacity mismatch: index has {payload.get('total_slots')}, "
+                f"server has {self._total_slots}"
+            )
+        self._store.load_bytes(payload["index"])
+        self._rebuild_free()
         if self._doc_registry is not None:
             self._doc_registry.load_dict(payload.get("doc_registry", {}) or {})
 
         logger.info(
-            "[CHUNK] state loaded from %s (head=%d tail=%d docs=%d)",
+            "[CHUNK] state loaded from %s (chunks=%d docs=%d)",
             path,
-            self._head,
-            self._tail,
+            len(self._store),
             len(self._doc_registry) if self._doc_registry is not None else 0,
         )
 
@@ -314,40 +304,8 @@ class ChunkManager:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _evict_range(self, start: int, count: int) -> None:
-        """Evict any chunks whose first slot falls within [start, start+count).
-
-        Used before inserting a SKIP block during wrap-around.
-
-        Args:
-            start: first slot of the range.
-            count: number of slots in the range.
-        """
-        for slot_id in range(start, start + count):
-            entry = self._store.get_slot_entry(slot_id)
-            if entry.kind == "chunk" and entry.chunk_key is not None:
-                # Slots behind the tail keep their last entry. Only evict the
-                # chunk if this slot is still its live head.
-                meta = self._store.get(entry.chunk_key)
-                if meta is not None and meta.start_slot == slot_id:
-                    self._notify_eviction(entry.chunk_key)
-                    self._store.remove(entry.chunk_key)
-                    self._evicted_chunk_keys.append(entry.chunk_key)
-
-    def _notify_eviction(self, chunk_key: str) -> None:
-        """Forward a chunk eviction to the attached DocRegistry.
-
-        Reads the ChunkMeta so the doc_ids referencing this chunk are
-        known, then flips their cached_mask bits. Silently no-ops when
-        no DocRegistry is attached.
-
-        Args:
-            chunk_key: chunk that is about to be removed from the store.
-        """
-        if self._doc_registry is None:
-            return
-        meta = self._store.get(chunk_key)
-        if meta is None:
-            return
-        for doc_id in list(meta.doc_ids):
-            self._doc_registry.mark_chunk_evicted(doc_id, chunk_key)
+    def _rebuild_free(self) -> None:
+        """Recompute free slot ranges from the chunk index."""
+        self._free = FreeExtents(0, self._total_slots)
+        for meta in sorted(self._store.iter_chunks(), key=lambda m: m.start_slot):
+            self._free.take(meta.start_slot, meta.num_slots)

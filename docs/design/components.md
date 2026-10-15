@@ -24,8 +24,9 @@
 | `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、op→handler dispatch table |
 | `ServerCore` | DaseR | 共享控制面核心；管理 chunk、doc、retrieval、position 状态 |
 | `ChunkLifecycle` | DaseR | `daser/server/chunk_lifecycle.py`；chunk commit/写者归属/淘汰状态 + commit waiter，由 `ServerCore` 持有 |
-| `ChunkManager` | DaseR | ring buffer slot 分配、淘汰、引用计数和持久化 |
-| `MetadataStore` | DaseR | `chunk_index` 和 `slot_map` 内存状态 |
+| `ChunkManager` | DaseR | `daser/server/chunk_manager.py`；first-fit 空闲区间槽位分配、槽位写保持和 index 持久化 |
+| `EvictionTree` | DaseR | `daser/server/eviction.py`；按前缀链 `parent_key` 的叶子优先 LRU 淘汰顺序，由 `ServerCore` 持有 |
+| `MetadataStore` | DaseR | `chunk_index` 内存状态 |
 | lossless KV codec | shared production module | `daser/compression/`：slot header/descriptor 格式、静态 codebook 和 CPU reference encode/decode；`daser/ops/` 的 TileLang kernel 在 worker 上做在线 pack 和 fused restore |
 | `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
 | `RetrievalIndex` | DaseR | cache lookup 抽象；当前实现为 `PrefixHashIndex` 和 `ChunkReuseIndex` |
@@ -43,21 +44,21 @@ KV bytes 的 load/store，而是把请求分发给更窄的组件：slot 分配�
 `ChunkLifecycle` 集中维护，保证这几个并行集合的状态转换一致。
 
 `ChunkManager` 和 `MetadataStore` 刻意保持分离。`MetadataStore` 是纯状态容器，
-保存 `chunk_key -> ChunkMeta` 的 `chunk_index` 和 `slot_id -> SlotEntry` 的
-`slot_map`，并负责这部分状态的 msgpack 序列化。`ChunkManager` 是 ring-buffer
-allocator，维护 head/tail，处理 wrap-around skip block、自动淘汰、引用计数联动
-和完整 index save/load。也就是说，`MetadataStore` 描述“现在有哪些 chunk 以及
-占哪些 slot”，`ChunkManager` 决定“下一次应该写到哪里以及需要淘汰谁”。
+保存 `chunk_key -> ChunkMeta` 的 `chunk_index`（含前缀链 `parent_key`），并负责
+其 msgpack 序列化。`ChunkManager` 用按地址排序的空闲区间 first-fit 分配槽位，
+空间不足时抛 `SlotsExhausted`，并负责完整 index save/load（加载时从索引重建
+空闲区间）。它不决定淘汰谁：`ServerCore` 从 `EvictionTree` 取最冷的可淘汰叶子
+删除后重试，见 [槽位分配、叶子优先淘汰与 L1/L2 驻留](tier-residency.md)。
 
 `DocRegistry` 记录用户文档视角的状态：`doc_id`、title、原始 token 数、
 chunk 列表和每个 chunk 是否仍被 cache 命中。`ChunkManager` 只关心 KV store
-里的 slot 资源；当 chunk 被淘汰时，它通知 `DocRegistry` 更新文档的 cached mask。
-因此一个是文档目录，一个是 KV ring buffer allocator，二者不能合并。
+里的 slot 资源；当 chunk 被淘汰时，`ServerCore` 通知 `DocRegistry` 更新文档的
+cached mask。因此一个是文档目录，一个是 KV slot allocator，二者不能合并。
 
 iouring transfer 的 L1 状态不进入 `MetadataStore`。L1 是
 `TieredIOUringTransferLayer` 进程内的 pinned-memory 热缓存，按 byte range 维护
 命中表和 LRU `ReplacementPolicy`；它是可丢失的加速层，重启后可以从 L2
-`daser.store` 重新填充。L2/ring-buffer metadata 才需要随 `daser.index` 持久化。
+`daser.store` 重新填充。L2 chunk metadata 才需要随 `daser.index` 持久化。
 
 `--skip-l2` 下，`TieredIOUringTransferLayer` 复用同样的 logical
 slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rings，也不保存
@@ -69,7 +70,7 @@ L1 淘汰或进程重启后没有 L2 可恢复。
 stored length），写完后 `record_store_ranges` 把对应 placement 标为已写；chunk
 离开 metadata store 时由 `ServerCore` 释放其 placement，再通知 removal listener。
 lookup 仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
-展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入 ring
+展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入槽位
 allocator，transfer backend 也不依赖 server 实现类型。这些 record 只在内存中，
 因此该模式不保存也不恢复 `daser.index`。
 
@@ -92,7 +93,7 @@ DaseR 在 `--store-dir` 下维护两个文件：
 block-beta
     columns 7
     s0["s0\nchunk A"]:2
-    s2["s2\nSKIP"]:1
+    s2["s2\nfree"]:1
     s3["s3\nchunk B"]:2
     s5["s5\nchunk C"]:2
 ```
@@ -148,11 +149,8 @@ generic static codebook（可由离线 model-bound calibration artifact 显式�
 escape bytes。generic codebook 是启动期默认常量；离线 calibration artifact
 必须绑定模型身份和 plane-major 几何，单次请求不自适应更新。
 
-`slot_map` 记录每个 slot 的状态：
-
-- `chunk`：chunk 的首 slot，保存 chunk_key 和 num_slots。
-- `cont`：chunk 的后续 slot。
-- `skip`：wrap-around 时用于填充文件尾部碎片。
+每个 chunk 占一段连续 slot（`ChunkMeta.start_slot`、`num_slots`）；未被占用的
+slot 由 `ChunkManager` 的空闲区间表示，不单独持久化。
 
 ---
 

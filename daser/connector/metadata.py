@@ -84,7 +84,7 @@ class ReqStoreSpec:
         token_count: number of tokens to store.
         logical_slot_start: first prompt-relative slot represented by this
             allocation. This is distinct from ``start_slot``, the physical
-            ring-buffer slot allocated by DaseR.
+            slot allocated by DaseR.
     """
 
     chunk_key: str
@@ -105,7 +105,7 @@ class StoreWriteSpan:
         nbytes: Number of bytes to write.
         file_offset: Byte offset in the DaseR store file.
         chunk_key: Optional chunk key used by the server to suppress stale
-            delayed writes after ring-buffer eviction.
+            delayed writes after eviction.
         start_slot: First slot allocated for chunk_key.
         num_slots: Number of slots allocated for chunk_key.
     """

@@ -36,7 +36,7 @@ def _make_core() -> Any:
     from daser.server.doc_registry import DocRegistry
     from daser.server.metadata_store import MetadataStore
 
-    store = MetadataStore(total_slots=64)
+    store = MetadataStore()
     manager = ChunkManager(
         total_slots=64, metadata_store=store, doc_registry=DocRegistry()
     )
