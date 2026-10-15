@@ -6,7 +6,9 @@ pytest.importorskip("daser.ops.tilelang_compressed_kv")
 from benchmarks.research.codec_pareto_bench import (  # noqa: E402
     byte_shuffle,
     byte_unshuffle,
+    call_groups,
     pareto_front,
+    scattered_block_ids,
 )
 
 
@@ -26,3 +28,20 @@ def test_pareto_front_keeps_only_non_dominated_arms() -> None:
         {"arm": "failed", "error": "unsupported"},
     ]
     assert pareto_front(rows) == ["memcpy", "fast", "dense"]
+
+
+def test_scattered_block_ids_are_distinct_seeded_and_in_pool() -> None:
+    ids = scattered_block_ids(8, 16, seed=3)
+    assert len(set(ids)) == 8 and all(0 <= b < 16 for b in ids)
+    assert ids == scattered_block_ids(8, 16, seed=3)
+    assert ids != list(range(8))
+    with pytest.raises(ValueError):
+        scattered_block_ids(17, 16, seed=0)
+
+
+def test_call_groups_cover_every_block_once_in_order() -> None:
+    groups = call_groups(10, 4)
+    assert [list(range(10))[g] for g in groups] == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+    assert call_groups(3, 16) == [slice(0, 3)]
+    with pytest.raises(ValueError):
+        call_groups(3, 0)

@@ -1,21 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Same-card codec Pareto microbenchmark: stored ratio against GPU throughput.
+"""Same-card codec Pareto microbenchmark: stored ratio against restore throughput.
 
 Loads captured BF16 KV slots (``[slots, layers, 2, tokens, heads, head_dim]``
-uint16 ``.npy``), calibrates per-plane codebooks on the first slots and
-measures, on the remaining slots of the same card:
+uint16 ``.npy``), calibrates per-plane codebooks on the first slots and places
+the remaining slots (repeated cyclically up to ``--eval-blocks``) at seeded
+random blocks of a larger paged KV pool, as a paged allocator would. Every arm
+restores into those scattered paged blocks, ``--blocks-per-call`` blocks per
+codec call, on the same card:
 
-- the raw device-to-device copy bound;
+- the contiguous device-to-device copy bound and the raw paged copy;
 - DaseR online encode (``FusedOnlineKVPacker.pack_into``) and decode
-  (``FusedCompressedKVDecoder``);
-- optionally nvCOMP algorithms with and without a BF16 byte shuffle, the
-  shuffle and unshuffle kernels included in the timed region;
-- optionally the SplitZip GPU codec, calibrated on the same slots as DaseR;
+  (``FusedCompressedKVDecoder``), which read and write the paged blocks;
+- optionally nvCOMP algorithms with and without a BF16 byte shuffle, and the
+  SplitZip GPU codec calibrated on the same slots as DaseR. These codecs work
+  on contiguous buffers, so restore adds a copy into the paged blocks
+  (``dec_gbs``); ``dec_contig_gbs`` stops at the codec's own output;
 - optionally single-core CPU zstd over byte-shuffled slots.
 
-Every decode row is checked byte-exact. One JSON object per arm is printed
-and the Pareto front (lowest ratio for a given decode throughput) is marked.
+Every restore is checked byte-exact. One JSON object per arm and call size is
+printed, then the Pareto front (lowest ratio for a given ``dec_gbs``) per call
+size.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ import torch
 from daser.compression.calibration import calibrate_codebooks
 from daser.compression.format import ONLINE_TILE_SCALARS, CompressedStoreGeometry
 from daser.ops.compressed_kv import FusedCompressedKVDecoder, FusedOnlineKVPacker
-from daser.ops.kv_layout import allocate_cross_layer_kv_cache
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache, physical_kv_view
 
 
 def byte_shuffle(data: torch.Tensor) -> torch.Tensor:
@@ -81,19 +86,67 @@ def pareto_front(rows: list[dict[str, Any]]) -> list[str]:
     return front
 
 
-def _best_ms(fn: Callable[[], Any], stream: torch.cuda.Stream, repeats: int) -> float:
-    """Return the best event-timed milliseconds of ``fn`` on ``stream``."""
+def scattered_block_ids(count: int, pool_blocks: int, seed: int) -> list[int]:
+    """Return distinct pool blocks in seeded random order, like a paged allocator.
+
+    Args:
+        count (int): Number of destination blocks.
+        pool_blocks (int): Size of the paged KV pool to draw from.
+        seed (int): Permutation seed.
+
+    Returns:
+        list[int]: ``count`` distinct block IDs in ``[0, pool_blocks)``.
+
+    Raises:
+        ValueError: If the pool is smaller than ``count``.
+    """
+    if not 0 < count <= pool_blocks:
+        raise ValueError("block count must be positive and fit in the pool")
+    return np.random.default_rng(seed).permutation(pool_blocks)[:count].tolist()
+
+
+def call_groups(count: int, blocks_per_call: int) -> list[slice]:
+    """Split ``count`` blocks into consecutive restore calls.
+
+    Args:
+        count (int): Total blocks restored per timed pass.
+        blocks_per_call (int): Blocks handed to one codec call.
+
+    Returns:
+        list[slice]: Consecutive slices covering ``range(count)``; the last
+        one may be short.
+    """
+    if count <= 0 or blocks_per_call <= 0:
+        raise ValueError("block counts must be positive")
+    return [
+        slice(first, min(first + blocks_per_call, count))
+        for first in range(0, count, blocks_per_call)
+    ]
+
+
+def _best_ms(
+    run: Callable[[Any], Any],
+    stream: torch.cuda.Stream,
+    repeats: int,
+    prepare: Callable[[], Any] = lambda: None,
+) -> float:
+    """Return the best event-timed milliseconds of ``run(prepare())``.
+
+    ``prepare`` runs before the start event of every repeat, so host-side
+    setup that the serving path overlaps with payload transfer stays untimed.
+    """
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
-    fn()
+    run(prepare())
     torch.cuda.synchronize()
     best = float("inf")
     for _ in range(repeats):
+        state = prepare()
         torch.cuda.synchronize()
         start.record(stream)
-        fn()
+        run(state)
         end.record(stream)
         torch.cuda.synchronize()
         best = min(best, start.elapsed_time(end))
@@ -106,105 +159,174 @@ def _emit(rows: list[dict[str, Any]], row: dict[str, Any]) -> None:
     print(json.dumps(row), flush=True)
 
 
-def _memcpy_row(raw: np.ndarray, repeats: int) -> dict[str, Any]:
-    """Time one device-to-device copy of the evaluation slots (the bound)."""
-    source = torch.from_numpy(raw.reshape(-1).view(np.uint8)).cuda()
-    target = torch.empty_like(source)
-    ms = _best_ms(lambda: target.copy_(source), torch.cuda.current_stream(), repeats)
-    return {"arm": "memcpy", "ratio": 1.0, "dec_gbs": raw.nbytes / ms / 1e6}
+class _PagedKV:
+    """Scattered destination blocks of one paged cross-layer KV pool.
+
+    ``rows`` is the contiguous physical ``[pool_blocks, slot_scalars]`` int16
+    view of ``kv_cache``; ``reference`` holds the expected physical bytes of
+    ``block_ids`` in order. External codecs compress and restore those
+    physical rows, which is what a codec outside the KV layout would see.
+    """
+
+    def __init__(
+        self, slots: torch.Tensor, pool_blocks: int, block_ids: list[int]
+    ) -> None:
+        """Allocate the pool and write logical ``slots`` at ``block_ids``."""
+        _, layers, _, tokens, heads, dim = slots.shape
+        self.kv_cache = allocate_cross_layer_kv_cache(
+            pool_blocks, layers, tokens, heads, dim, dtype=torch.bfloat16, device="cuda"
+        )
+        self.rows = (
+            physical_kv_view(self.kv_cache).view(torch.int16).view(pool_blocks, -1)
+        )
+        self.block_ids = block_ids
+        self.ids = torch.tensor(block_ids, dtype=torch.long, device="cuda")
+        self.kv_cache.zero_()
+        self.kv_cache.view(torch.int16)[self.ids] = slots
+        self.reference = self.rows[self.ids].clone()
+        self.slot_bytes = int(self.reference[0].nbytes)
+        self.total = int(self.reference.nbytes)
+
+    def clear(self) -> None:
+        """Zero the destination blocks before a correctness pass."""
+        self.rows.index_fill_(0, self.ids, 0)
+
+    def exact(self) -> bool:
+        """Return whether every destination block matches its source bytes."""
+        torch.cuda.synchronize()
+        return torch.equal(self.rows[self.ids], self.reference)
 
 
-def _daser_rows(raw: np.ndarray, books: bytes, repeats: int) -> list[dict[str, Any]]:
-    """Encode and decode the evaluation slots with the DaseR online codec."""
-    rows: list[dict[str, Any]] = []
-    n, layers, _, tokens, heads, dim = raw.shape
-    slot_size = raw[0].nbytes
-    total = raw.nbytes
-    stream = torch.cuda.Stream()
-    source = torch.from_numpy(raw.view(np.int16)).cuda()
-    kv_cache = allocate_cross_layer_kv_cache(
-        n, layers, tokens, heads, dim, dtype=torch.bfloat16, device="cuda"
+def _memcpy_row(kv: _PagedKV, repeats: int) -> dict[str, Any]:
+    """Time one contiguous device-to-device copy of every slot (the bound)."""
+    target = torch.empty_like(kv.reference)
+    ms = _best_ms(
+        lambda _: target.copy_(kv.reference), torch.cuda.current_stream(), repeats
     )
-    staging = torch.empty(n * slot_size, dtype=torch.uint8, device="cuda")
-    blocks = list(range(n))
-    kv_cache.view(torch.int16).copy_(source)
+    return {"arm": "memcpy", "ratio": 1.0, "dec_gbs": kv.total / ms / 1e6}
+
+
+def _raw_copy_rows(kv: _PagedKV, ks: list[int], repeats: int) -> list[dict[str, Any]]:
+    """Time the uncompressed restore: contiguous staging into paged blocks."""
+    rows = []
+    stream = torch.cuda.current_stream()
+    for k in ks:
+        groups = call_groups(len(kv.block_ids), k)
+
+        def run(_: Any, groups: list[slice] = groups) -> None:
+            for g in groups:
+                kv.rows.index_copy_(0, kv.ids[g], kv.reference[g])
+
+        kv.clear()
+        run(None)
+        rows.append(
+            {
+                "arm": "raw_copy",
+                "blocks_per_call": k,
+                "ratio": 1.0,
+                "dec_gbs": kv.total / _best_ms(run, stream, repeats) / 1e6,
+                "exact": kv.exact(),
+            }
+        )
+    return rows
+
+
+def _daser_rows(
+    kv: _PagedKV, books: bytes, ks: list[int], repeats: int
+) -> list[dict[str, Any]]:
+    """Encode from and decode into the scattered paged blocks with DaseR."""
+    rows: list[dict[str, Any]] = []
+    count = len(kv.block_ids)
+    stream = torch.cuda.Stream()
+    staging = torch.empty(count * kv.slot_bytes, dtype=torch.uint8, device="cuda")
+    scratch = torch.empty(max(ks) * kv.slot_bytes, dtype=torch.uint8, device="cuda")
     packer = FusedOnlineKVPacker(
-        kv_cache=kv_cache,
+        kv_cache=kv.kv_cache,
         codebooks=books,
         tile_scalars=ONLINE_TILE_SCALARS,
-        max_slots_per_buffer=n,
+        max_slots_per_buffer=count,
     )
-
-    def pack() -> list[Any]:
-        return packer.pack_into(
-            staging=staging,
-            block_ids=blocks,
-            logical_slots=blocks,
-            slot_stride=slot_size,
-            stream=stream,
-        )
-
-    slots = pack()
+    slots = packer.pack_into(
+        staging=staging,
+        block_ids=kv.block_ids,
+        logical_slots=list(range(count)),
+        slot_stride=kv.slot_bytes,
+        stream=stream,
+    )
     torch.cuda.synchronize()
-    stored = sum(s.stored_length for s in slots)
+    ratio = sum(s.stored_length for s in slots) / kv.total
     modes = [int(s.mode) for s in slots]
     # Records are packed back to back; their staging offsets are cumulative.
     offsets = [s.source_offset for s in slots]
-    best = float("inf")
-    for _ in range(repeats):  # pack_into synchronizes to read lengths
-        torch.cuda.synchronize()
-        began = time.perf_counter()
-        pack()
-        torch.cuda.synchronize()
-        best = min(best, time.perf_counter() - began)
-    _emit(
-        rows,
-        {
-            "arm": "daser_encode",
-            "ratio": stored / total,
-            "enc_gbs": total / best / 1e9,
-        },
-    )
+    # One metadata ring per call so a pass prepares every call up front.
     decoder = FusedCompressedKVDecoder(
-        kv_cache=kv_cache,
+        kv_cache=kv.kv_cache,
         codebooks=books,
         tile_scalars=ONLINE_TILE_SCALARS,
-        ring_depth=1,
-        max_slots_per_buffer=n,
+        ring_depth=count,
+        max_slots_per_buffer=count,
     )
+    for k in ks:
+        groups = call_groups(count, k)
+        best = float("inf")
+        for _ in range(repeats + 1):  # pack_into synchronizes to read lengths
+            torch.cuda.synchronize()
+            began = time.perf_counter()
+            for g in groups:
+                ids = kv.block_ids[g]
+                packer.pack_into(
+                    staging=scratch,
+                    block_ids=ids,
+                    logical_slots=list(range(len(ids))),
+                    slot_stride=kv.slot_bytes,
+                    stream=stream,
+                )
+            torch.cuda.synchronize()
+            best = min(best, time.perf_counter() - began)
 
-    def decode() -> int:
-        plan = decoder.prepare(
-            staging=staging,
-            staging_offsets=offsets,
-            block_ids=blocks,
-            modes=modes,
-            buffer_index=0,
-            stream=stream,
+        def prepare(groups: list[slice] = groups) -> list[Any]:
+            return [
+                decoder.prepare(
+                    staging=staging,
+                    staging_offsets=offsets[g],
+                    block_ids=kv.block_ids[g],
+                    modes=modes[g],
+                    buffer_index=index,
+                    stream=stream,
+                )
+                for index, g in enumerate(groups)
+            ]
+
+        def run(plans: list[Any]) -> None:
+            for plan in plans:
+                plan.submit()
+
+        kv.clear()
+        run(prepare())
+        exact = kv.exact()
+        _emit(
+            rows,
+            {
+                "arm": "daser",
+                "blocks_per_call": k,
+                "ratio": ratio,
+                "enc_gbs": kv.total / best / 1e9,
+                "dec_gbs": kv.total / _best_ms(run, stream, repeats, prepare) / 1e6,
+                "exact": exact,
+            },
         )
-        return plan.submit() if plan is not None else 0
-
-    kv_cache.zero_()
-    decode()
-    torch.cuda.synchronize()
-    exact = torch.equal(kv_cache.view(torch.int16), source)
-    ms = _best_ms(decode, stream, repeats)
-    _emit(
-        rows,
-        {
-            "arm": "daser_decode",
-            "ratio": stored / total,
-            "dec_gbs": total / ms / 1e6,
-            "exact": exact,
-        },
-    )
     return rows
 
 
 def _nvcomp_rows(
-    raw: np.ndarray, nvcomp_path: str, algorithms: list[str], repeats: int
+    kv: _PagedKV, nvcomp_path: str, algorithms: list[str], ks: list[int], repeats: int
 ) -> list[dict[str, Any]]:
-    """Time nvCOMP batched slot compression with and without byte shuffle."""
+    """Time nvCOMP per-block compression; restore copies into the paged blocks.
+
+    ``dec_contig_gbs`` stops at nvCOMP's own output buffers (plus unshuffle);
+    ``dec_gbs`` adds the copy into the scattered paged blocks, with the byte
+    unshuffle fused into that copy.
+    """
     import nvidia
 
     nvidia.__path__.append(nvcomp_path)
@@ -212,8 +334,7 @@ def _nvcomp_rows(
 
     rows: list[dict[str, Any]] = []
     stream = torch.cuda.current_stream()
-    slots = [torch.from_numpy(s.reshape(-1).view(np.uint8)).cuda() for s in raw]
-    total = raw.nbytes
+    blocks = [kv.rows[b].view(torch.uint8) for b in kv.block_ids]
     # BF16-aware modes; ANS with "<f2" is nvCOMP's best ratio on KV (R194).
     options = {
         "Cascaded": {"data_type": "<u2"},
@@ -229,84 +350,148 @@ def _nvcomp_rows(
                     cuda_stream=stream.cuda_stream,
                     **({} if shuffled else options.get(algorithm, {})),
                 )
-                prep = byte_shuffle if shuffled else (lambda t: t)
-                post = byte_unshuffle if shuffled else (lambda t: t)
-
-                def encode(codec: Any = codec, prep: Callable = prep) -> Any:
-                    return codec.encode([nvcomp.as_array(prep(s)) for s in slots])
-
-                encoded = encode()
-                torch.cuda.synchronize()
-
-                def decode(
-                    codec: Any = codec, encoded: Any = encoded, post: Callable = post
-                ) -> tuple[Any, list[torch.Tensor]]:
-                    # DLPack views do not own nvCOMP buffers: return the
-                    # arrays too so the views stay valid while in use.
-                    out = codec.decode(encoded)
-                    return out, [
-                        post(torch.from_dlpack(o).view(torch.uint8).reshape(-1))
-                        for o in out
-                    ]
-
-                _, decoded = decode()
-                exact = all(
-                    torch.equal(d, s) for d, s in zip(decoded, slots, strict=True)
-                )
-                _emit(
-                    rows,
-                    {
-                        "arm": arm,
-                        "ratio": sum(e.buffer_size for e in encoded) / total,
-                        "enc_gbs": total / _best_ms(encode, stream, repeats) / 1e6,
-                        "dec_gbs": total / _best_ms(decode, stream, repeats) / 1e6,
-                        "exact": exact,
-                    },
-                )
             except Exception as exc:  # report unsupported options and continue
                 _emit(rows, {"arm": arm, "error": repr(exc)[:200]})
+                continue
+            prep = byte_shuffle if shuffled else (lambda t: t)
+            for k in ks:
+                groups = call_groups(len(blocks), k)
+
+                def encode(
+                    _: Any, codec: Any = codec, prep: Callable = prep, groups=groups
+                ) -> list[Any]:
+                    return [
+                        codec.encode([nvcomp.as_array(prep(b)) for b in blocks[g]])
+                        for g in groups
+                    ]
+
+                try:
+                    encoded = encode(None)
+                    torch.cuda.synchronize()
+                    stored = sum(e.buffer_size for batch in encoded for e in batch)
+
+                    def contig(
+                        _: Any, codec: Any = codec, encoded=encoded, shuffled=shuffled
+                    ) -> list[Any]:
+                        # DLPack views do not own nvCOMP buffers: return the
+                        # arrays so the views stay valid while in use.
+                        kept = []
+                        for batch in encoded:
+                            out = codec.decode(batch)
+                            kept.append(out)
+                            if shuffled:
+                                kept += [
+                                    byte_unshuffle(
+                                        torch.from_dlpack(o).view(torch.uint8)
+                                    )
+                                    for o in out
+                                ]
+                        return kept
+
+                    def paged(
+                        _: Any,
+                        codec: Any = codec,
+                        encoded=encoded,
+                        shuffled=shuffled,
+                        groups=groups,
+                    ) -> list[Any]:
+                        kept = []
+                        for batch, g in zip(encoded, groups, strict=True):
+                            out = codec.decode(batch)
+                            kept.append(out)
+                            for o, dst in zip(out, blocks[g], strict=True):
+                                src = torch.from_dlpack(o).view(torch.uint8).reshape(-1)
+                                if shuffled:
+                                    dst.view(-1, 2).copy_(src.view(2, -1).t())
+                                else:
+                                    dst.copy_(src)
+                        return kept
+
+                    kv.clear()
+                    paged(None)
+                    exact = kv.exact()
+                    _emit(
+                        rows,
+                        {
+                            "arm": arm,
+                            "blocks_per_call": k,
+                            "ratio": stored / kv.total,
+                            "enc_gbs": kv.total
+                            / _best_ms(encode, stream, repeats)
+                            / 1e6,
+                            "dec_gbs": kv.total
+                            / _best_ms(paged, stream, repeats)
+                            / 1e6,
+                            "dec_contig_gbs": kv.total
+                            / _best_ms(contig, stream, repeats)
+                            / 1e6,
+                            "exact": exact,
+                        },
+                    )
+                    del encoded
+                except Exception as exc:  # report failures and continue
+                    _emit(
+                        rows,
+                        {"arm": arm, "blocks_per_call": k, "error": repr(exc)[:200]},
+                    )
     return rows
 
 
 def _splitzip_rows(
-    raw: np.ndarray, calibration: np.ndarray, splitzip_path: str, repeats: int
+    kv: _PagedKV,
+    calibration: torch.Tensor,
+    splitzip_path: str,
+    ks: list[int],
+    repeats: int,
 ) -> list[dict[str, Any]]:
-    """Time the SplitZip GPU codec, calibrated on the DaseR calibration slots."""
+    """Time the SplitZip GPU codec, calibrated on the DaseR calibration slots.
+
+    SplitZip takes and returns contiguous tensors, so encode gathers the paged
+    blocks first and restore copies the decoded tensor into the paged blocks
+    (``dec_gbs``); ``dec_contig_gbs`` stops at SplitZip's output buffer.
+    """
     sys.path.insert(0, splitzip_path)
     from codec_gpu import ChunkLocalSplitZipGPU
 
     codec = ChunkLocalSplitZipGPU(device="cuda", chunk_size=1024)
-    codec.calibrate(torch.from_numpy(calibration.view(np.int16)).cuda().view(-1))
-    data = torch.from_numpy(raw.view(np.int16)).cuda().view(-1)
-    encoded = codec.encode(data)
-    exact = torch.equal(codec.decode(encoded).view(torch.int16), data)
+    codec.calibrate(calibration.view(-1))
     stream = torch.cuda.current_stream()
-    kv = torch.empty_like(data)
+    rows = []
+    for k in ks:
+        groups = call_groups(len(kv.block_ids), k)
 
-    def decode_into_kv() -> None:
-        # SplitZip decodes to a fresh contiguous tensor; restoring it needs at
-        # least one more pass into the KV buffer, which DaseR's restore fuses.
-        kv.copy_(codec.decode(encoded).view(torch.int16))
+        def encode(_: Any, groups: list[slice] = groups) -> list[Any]:
+            return [codec.encode(kv.rows.index_select(0, kv.ids[g])) for g in groups]
 
-    return [
-        {
-            "arm": "splitzip_then_copy",
-            "ratio": encoded.compressed_bytes / raw.nbytes,
-            "dec_gbs": raw.nbytes / _best_ms(decode_into_kv, stream, repeats) / 1e6,
-            "exact": exact,
-        },
-        {
-            "arm": "splitzip",
-            "ratio": encoded.compressed_bytes / raw.nbytes,
-            "enc_gbs": raw.nbytes
-            / _best_ms(lambda: codec.encode(data), stream, repeats)
-            / 1e6,
-            "dec_gbs": raw.nbytes
-            / _best_ms(lambda: codec.decode(encoded), stream, repeats)
-            / 1e6,
-            "exact": exact,
-        },
-    ]
+        encoded = encode(None)
+        stored = sum(e.compressed_bytes for e in encoded)
+
+        def contig(_: Any, encoded: list[Any] = encoded) -> None:
+            for e in encoded:
+                codec.decode(e)
+
+        def paged(
+            _: Any, encoded: list[Any] = encoded, groups: list[slice] = groups
+        ) -> None:
+            for e, g in zip(encoded, groups, strict=True):
+                out = codec.decode(e).view(torch.int16).view(g.stop - g.start, -1)
+                kv.rows.index_copy_(0, kv.ids[g], out)
+
+        kv.clear()
+        paged(None)
+        rows.append(
+            {
+                "arm": "splitzip",
+                "blocks_per_call": k,
+                "ratio": stored / kv.total,
+                "enc_gbs": kv.total / _best_ms(encode, stream, repeats) / 1e6,
+                "dec_gbs": kv.total / _best_ms(paged, stream, repeats) / 1e6,
+                "dec_contig_gbs": kv.total / _best_ms(contig, stream, repeats) / 1e6,
+                "exact": kv.exact(),
+            }
+        )
+        del encoded
+    return rows
 
 
 def _cpu_zstd_rows(raw: np.ndarray, level: int) -> list[dict[str, Any]]:
@@ -336,12 +521,26 @@ def _cpu_zstd_rows(raw: np.ndarray, level: int) -> list[dict[str, Any]]:
 
 
 def main() -> None:
-    """Run the Pareto sweep and print one JSON row per arm plus the front."""
+    """Run the Pareto sweep and print one JSON row per arm plus the fronts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--slots", required=True, help="captured KV .npy")
     parser.add_argument("--model-id", default="captured")
     parser.add_argument("--calibration-slots", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument(
+        "--eval-blocks",
+        type=int,
+        default=256,
+        help="destination blocks per timed pass (evaluation slots repeat cyclically)",
+    )
+    parser.add_argument("--blocks-per-call", type=int, nargs="+", default=[1, 16, 256])
+    parser.add_argument(
+        "--pool-factor",
+        type=int,
+        default=2,
+        help="paged pool size as a multiple of --eval-blocks",
+    )
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--nvcomp-path",
         default=None,
@@ -378,23 +577,36 @@ def main() -> None:
         geometry=geometry,
     ).codebooks
     evaluate = np.ascontiguousarray(slots[ncal:])
+    ks = sorted(set(args.blocks_per_call))
     rows: list[dict[str, Any]] = []
     with torch.inference_mode():
-        _emit(rows, _memcpy_row(evaluate, args.repeats))
-        rows += _daser_rows(evaluate, books, args.repeats)
+        source = torch.from_numpy(evaluate.view(np.int16)).cuda()
+        cyclic = torch.arange(args.eval_blocks, device="cuda") % source.shape[0]
+        block_ids = scattered_block_ids(
+            args.eval_blocks, args.pool_factor * args.eval_blocks, args.seed
+        )
+        kv = _PagedKV(source[cyclic], args.pool_factor * args.eval_blocks, block_ids)
+        del source, cyclic
+        _emit(rows, _memcpy_row(kv, args.repeats))
+        for row in _raw_copy_rows(kv, ks, args.repeats):
+            _emit(rows, row)
+        rows += _daser_rows(kv, books, ks, args.repeats)
         if args.nvcomp_path:
             rows += _nvcomp_rows(
-                evaluate, args.nvcomp_path, args.nvcomp_algorithms, args.repeats
+                kv, args.nvcomp_path, args.nvcomp_algorithms, ks, args.repeats
             )
         if args.splitzip_path:
+            calibration = torch.from_numpy(slots[:ncal].view(np.int16)).cuda()
             for row in _splitzip_rows(
-                evaluate, slots[:ncal], args.splitzip_path, args.repeats
+                kv, calibration, args.splitzip_path, ks, args.repeats
             ):
                 _emit(rows, row)
     if args.cpu_zstd_level is not None:
         for row in _cpu_zstd_rows(evaluate, args.cpu_zstd_level):
             _emit(rows, row)
-    print(json.dumps({"pareto_front": pareto_front(rows)}), file=sys.stdout)
+    for k in ks:
+        front = pareto_front([r for r in rows if r.get("blocks_per_call") == k])
+        print(json.dumps({"blocks_per_call": k, "pareto_front": front}))
 
 
 if __name__ == "__main__":
