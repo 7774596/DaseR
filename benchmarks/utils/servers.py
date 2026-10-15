@@ -432,7 +432,6 @@ class ServerManager:
         daser_codebooks: Path | None = None,
         daser_coalesce_loads: bool = False,
         daser_layerwise_load: bool = False,
-        daser_piecewise_cudagraph: bool = False,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
@@ -488,10 +487,7 @@ class ServerManager:
             daser_coalesce_loads: let the connector hold back requests whose
                 prefix another request is already loading.
             daser_layerwise_load: restore fully leased packed or raw hits
-                layer by layer inside the forward pass (forces PIECEWISE
-                graphs).
-            daser_piecewise_cudagraph: force PIECEWISE graphs without
-                layer-wise loads, as the like-for-like baseline.
+                layer by layer inside the forward pass.
             storage_format: DaseR physical KV storage format.
             lmcache_l2_odirect: open LMCache fs L2 files with ``O_DIRECT`` so
                 its reads bypass the OS page cache, as DaseR's L2 reads do.
@@ -589,7 +585,6 @@ class ServerManager:
         self.daser_codebooks = daser_codebooks
         self.daser_coalesce_loads = daser_coalesce_loads
         self.daser_layerwise_load = daser_layerwise_load
-        self.daser_piecewise_cudagraph = daser_piecewise_cudagraph
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
@@ -865,8 +860,6 @@ class ServerManager:
             extra_config["coalesce_loads"] = True
         if self.daser_layerwise_load:
             extra_config["layerwise_load"] = True
-        if self.daser_piecewise_cudagraph:
-            extra_config["piecewise_cudagraph"] = True
         return {
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",

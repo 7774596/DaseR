@@ -166,13 +166,61 @@ def test_other_hits_keep_the_async_load_path(layerwise: bool, modes: list[str]) 
     assert ipc.released == ["req"]
 
 
-def test_connector_requires_piecewise_graphs_only_when_requested() -> None:
-    """Layer-wise loads and the piecewise baseline both force PIECEWISE."""
+def test_layerwise_load_keeps_vllm_cudagraph_mode() -> None:
+    """Layer-wise loads no longer force PIECEWISE graphs on every step."""
     connector = pytest.importorskip("daser.connector.daser_connector")
     cls = connector.DaserConnector
-    assert not cls.requires_piecewise_for_cudagraph({})
-    assert cls.requires_piecewise_for_cudagraph({"layerwise_load": True})
-    assert cls.requires_piecewise_for_cudagraph({"piecewise_cudagraph": True})
+    assert not cls.requires_piecewise_for_cudagraph({"layerwise_load": True})
+
+
+def _forward_context(mode: Any, num_tokens: int, uniform: bool) -> Any:
+    from vllm.forward_context import BatchDescriptor, ForwardContext
+
+    return ForwardContext(
+        no_compile_layers={},
+        attn_metadata={"layer.0": object()},
+        slot_mapping={},
+        cudagraph_runtime_mode=mode,
+        batch_descriptor=BatchDescriptor(num_tokens, 1, uniform),
+    )
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
+def test_full_graph_steps_need_the_whole_restore_up_front(
+    num_speculative_tokens: int,
+) -> None:
+    """A uniform-decode FULL replay skips the layer hooks, also with spec decode.
+
+    vLLM replays a full graph when every request schedules exactly
+    ``1 + num_speculative_tokens`` tokens; a layer-wise hit leaving that many
+    tokens to compute lands there.
+    """
+    runtime = pytest.importorskip("daser.connector.worker.runtime")
+    from vllm.config import CUDAGraphMode
+
+    decode_len = 1 + num_speculative_tokens
+    full = _forward_context(CUDAGraphMode.FULL, decode_len, uniform=True)
+    assert runtime.forward_skips_layer_waits(full)
+
+
+@pytest.mark.parametrize("mode", ["PIECEWISE", "NONE"])
+def test_prefill_steps_wait_per_layer(mode: str) -> None:
+    """PIECEWISE and eager forwards run ``wait_for_layer_load`` per layer."""
+    runtime = pytest.importorskip("daser.connector.worker.runtime")
+    from vllm.config import CUDAGraphMode
+
+    context = _forward_context(CUDAGraphMode[mode], 512, uniform=False)
+    assert not runtime.forward_skips_layer_waits(context)
+
+
+def test_steps_without_attention_need_the_whole_restore_up_front() -> None:
+    """No-forward steps (and model runner V2 full replays) run no attention."""
+    runtime = pytest.importorskip("daser.connector.worker.runtime")
+    from vllm.forward_context import ForwardContext
+
+    empty = ForwardContext(no_compile_layers={}, attn_metadata=None, slot_mapping={})
+    assert runtime.forward_skips_layer_waits(empty)
+    assert runtime.forward_skips_layer_waits(None)
 
 
 async def test_async_client_releases_transfer_lease(

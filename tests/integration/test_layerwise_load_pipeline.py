@@ -134,7 +134,7 @@ class _FakeLoadClient:
 
 
 def _restore(
-    monkeypatch: pytest.MonkeyPatch, fail_on_call: int = -1
+    monkeypatch: pytest.MonkeyPatch, fail_on_call: int = -1, whole_step: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, LoadPipeline, list[int]]:
     geometry = _geometry()
     codebooks = default_online_codebooks(geometry)
@@ -216,6 +216,11 @@ def _restore(
         ],
     )
     pipeline.start_layerwise({"req": spec})
+    if whole_step:
+        # A full graph replay: the forward runs no layer hook.
+        pipeline.wait_for_all_layers()
+        torch.cuda.current_stream().synchronize()
+        return actual, expected, pipeline, blocks
     for layer in range(_LAYERS):
         pipeline.wait_for_layer(layer)
         # Attention of this layer runs on the current stream after the wait.
@@ -225,11 +230,12 @@ def _restore(
     return actual, expected, pipeline, blocks
 
 
+@pytest.mark.parametrize("whole_step", [False, True])
 def test_layerwise_restore_matches_record_major(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, whole_step: bool
 ) -> None:
-    """Every layer is restored exactly before its wait."""
-    actual, expected, pipeline, _ = _restore(monkeypatch)
+    """Every layer is restored exactly before its wait (or the whole step's)."""
+    actual, expected, pipeline, _ = _restore(monkeypatch, whole_step=whole_step)
     pipeline.start_layerwise({})
     try:
         assert torch.equal(actual, expected)

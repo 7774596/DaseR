@@ -250,7 +250,8 @@ bounded buffer；单批和未完成后台 batch 的字节上限会根据 vLLM �
 load 路径在 `start_load_kv` 中把本 step 的命中 chunk 拆成 bounded staging
 batch，导出 CUDA IPC handle，请求 server 读回 spans，再按层批量拷回 vLLM
 KV cache。load 和 store 使用同一套 worker-side staging 抽象。
-`wait_for_layer_load` 是 no-op，以兼容 vLLM FULL CUDA graph 模式。
+`wait_for_layer_load` 只在 `layerwise_load` 的 step 上等待对应层；FULL CUDA graph
+replay 的 step 由 `start_load_kv` 先等完全部层，所以不需要强制 PIECEWISE。
 
 `WorkerConnectorMixin` 只适配 vLLM hooks；`WorkerRuntime` 集中 KV layout、step
 metadata、completion 和 shutdown，内部的 load/store pipeline 各自拥有 queue、

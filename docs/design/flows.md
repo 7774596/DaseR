@@ -232,8 +232,11 @@ sequenceDiagram
     end
 ```
 
-`start_load_kv` 返回前 KV cache 已就绪。`wait_for_layer_load(layer_name)` 是
-no-op，因为 FULL CUDA graph replay 不保证逐层 Python hook 执行。
+异步 load 在 `WAITING_FOR_REMOTE_KVS` 期间完成，不在 forward 关键路径上。
+`layerwise_load`（默认关）只作用于已 lease 进 L1 的命中：`start_load_kv` 启动按层
+恢复，`wait_for_layer_load(layer_name)` 让该层 attention 只等自己那一层。vLLM 只在
+uniform decode batch 上 replay FULL CUDA graph（会跳过逐层 hook），所以 forward
+context 为 FULL 或没有 attention metadata 时，`start_load_kv` 在返回前等完全部层。
 
 ---
 

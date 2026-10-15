@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 # Third Party
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 if TYPE_CHECKING:
@@ -56,6 +57,24 @@ _LOAD_REQUEST_MAX_INFLIGHT = 8
 _LOAD_STAGING_RESERVE_BYTES = 1 << 30
 _TRANSFER_WARMUP_RETRY_S = 0.2
 _TRANSFER_WARMUP_JOIN_TIMEOUT_S = 125.0
+
+
+def forward_skips_layer_waits(forward_context: ForwardContext | None) -> bool:
+    """Return whether this step's forward will not call ``wait_for_layer_load``.
+
+    A full CUDA graph replay skips the Python layer hooks, and a step without
+    attention metadata (no forward, or vLLM's model runner V2 entering a full
+    graph) runs no attention layer at all.
+
+    Args:
+        forward_context: Context passed to ``start_load_kv``.
+
+    Returns:
+        True when per-layer waits cannot order the forward after the restore.
+    """
+    if forward_context is None or forward_context.attn_metadata is None:
+        return True
+    return forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
 
 
 def _local_slot_bytes(connector: Any) -> int:
@@ -353,9 +372,10 @@ class WorkerRuntime:
 
         Async/thread-safety:
             Called on the vLLM worker thread. Transfer and restore execute on
-            the load pipeline thread.
+            the load pipeline thread. A layer-wise load in a step whose
+            forward skips the layer hooks blocks here until fully restored.
         """
-        del forward_context, kwargs
+        del kwargs
         meta = self._meta
         reqs_to_load = dict(meta.reqs_to_load) if meta is not None else {}
         layerwise_ids = meta.layerwise_req_ids if meta is not None else set()
@@ -377,6 +397,11 @@ class WorkerRuntime:
             return
         # Called every step: this also retires the previous layer-wise state.
         self._load_pipeline.start_layerwise(layerwise)
+        if layerwise and forward_skips_layer_waits(forward_context):
+            # vLLM picks a full graph only for uniform decode batches, so this
+            # is a layer-wise hit that left one token to compute: restore the
+            # whole step before the replay instead of per layer.
+            self._load_pipeline.wait_for_all_layers()
         if reqs_to_load:
             self._load_pipeline.start(reqs_to_load)
 

@@ -637,6 +637,21 @@ class LoadPipeline:
             after.record(stream)
             state.gpu_marks.append((before, after))
 
+    def wait_for_all_layers(self) -> None:
+        """Order the current stream after this step's whole restore.
+
+        Used when the step's forward will not call ``wait_for_layer`` (a
+        full CUDA graph replay or a step without a forward), so every layer
+        must be restored before the forward is enqueued.
+
+        Async/thread-safety:
+            Called on the worker thread after ``start_layerwise``. Blocks the
+            host until the load thread enqueued every layer's decode.
+        """
+        state = self._layerwise
+        for layer in range(len(state.ready) if state is not None else 0):
+            self.wait_for_layer(layer)
+
     def mark_failed(
         self,
         reqs_to_load: dict[str, ReqLoadSpec],

@@ -51,13 +51,10 @@ ARMS = (
     # load instead of loading their own copy.
     "daser-raw-coalesce",
     "daser-compressed-coalesce",
-    # Fully leased hits restored layer by layer inside the forward pass, and
-    # their PIECEWISE-graph baselines (need prefetch for leases), on packed
-    # and raw stores.
+    # Fully leased hits restored layer by layer inside the forward pass (need
+    # prefetch for leases), on packed and raw stores.
     "daser-compressed-layerwise",
-    "daser-compressed-piecewise",
     "daser-raw-layerwise",
-    "daser-raw-piecewise",
     # LMCache MP server (L1 + O_DIRECT fs L2) through its vLLM connector,
     # raw and with the DaseR lossless chunk codec (codec-patched checkout).
     "lmcache",
@@ -684,7 +681,6 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_coalesce_loads=arm.endswith("-coalesce"),
         daser_layerwise_load=arm.endswith("-layerwise"),
-        daser_piecewise_cudagraph=arm.endswith("-piecewise"),
         skip_l2=args.skip_l2 and arm.startswith("daser"),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0
