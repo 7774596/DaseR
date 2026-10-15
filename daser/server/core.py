@@ -17,7 +17,7 @@ from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_lifecycle import ChunkLifecycle
 from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.doc_registry import DocEntry, DocRegistry
-from daser.server.eviction import EvictionTree
+from daser.server.eviction import POLICY_LRU, EvictionTree
 from daser.server.metadata_store import ChunkMeta
 from daser.server.packed_layout import OnlinePackedLayout
 
@@ -27,6 +27,8 @@ logger = init_logger(__name__)
 # writer are recorded so commit can report how long that lookup was early.
 # Off by default because it hashes every prompt's candidate keys.
 PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
+# Research switch: eviction policy, "lru" (default) or "return" (return-aware).
+EVICTION_POLICY_ENV = "DASER_EVICTION_POLICY"
 # Writer claims happen at scheduling time, so publication latency spans the
 # request's queueing and prefill (seconds) as well as the save window (ms).
 _PUBLISH_BUCKETS = (
@@ -269,7 +271,9 @@ class ServerCore:
         # Leaf-first eviction order over prefix-chain parent links; every
         # indexed chunk is a node. Pinned keys (a store's placement phase)
         # and uncommitted writers are never chosen.
-        self._tree = EvictionTree()
+        self._tree = EvictionTree(
+            policy=os.environ.get(EVICTION_POLICY_ENV, POLICY_LRU)
+        )
         for meta in chunk_manager.store.iter_chunks():
             self._tree.add(meta.chunk_key, meta.parent_key)
         self._pins: dict[str, int] = {}

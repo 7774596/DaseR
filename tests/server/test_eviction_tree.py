@@ -118,3 +118,95 @@ def test_repeated_touches_keep_chain_order():
     for _ in range(5000):
         tree.touch(["k9"])
     assert drain(tree) == [f"k{i}" for i in reversed(range(10))]
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def visit(
+    tree: EvictionTree, clock: FakeClock, at: float, key: str, parent: str
+) -> None:
+    clock.now = at
+    tree.add(key, parent)
+
+
+def return_tree() -> tuple[EvictionTree, FakeClock]:
+    clock = FakeClock()
+    return EvictionTree(policy="return", clock=clock), clock
+
+
+def test_unknown_policy_is_rejected():
+    with pytest.raises(ValueError):
+        EvictionTree(policy="mru")
+
+
+def test_return_policy_evicts_the_thread_that_returns_last():
+    # A and B alternate with period 10. LRU would evict A, which returns
+    # next; the return-aware order evicts B (predicted at 35, A at 30).
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "a0", "")
+    visit(tree, clock, 5, "b0", "")
+    visit(tree, clock, 10, "a1", "a0")
+    visit(tree, clock, 15, "b1", "b0")
+    visit(tree, clock, 20, "a2", "a1")
+    visit(tree, clock, 25, "b2", "b1")
+    clock.now = 26
+    assert tree.pop_victim(never) == "b2"
+    assert EvictionTree().pop_victim(never) is None
+
+
+def test_return_policy_evicts_overdue_threads_first():
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "a0", "")
+    visit(tree, clock, 10, "a1", "a0")
+    for t in range(10):
+        visit(tree, clock, 12 + 10 * t, f"b{t}", f"b{t - 1}" if t else "")
+    # A (period 10) has been silent for 101 s; B returns every 10 s.
+    clock.now = 111
+    assert drain(tree)[:2] == ["a1", "a0"]
+
+
+def test_return_policy_still_evicts_orphans_first():
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "a0", "")
+    visit(tree, clock, 10, "a1", "a0")
+    visit(tree, clock, 20, "x1", "missing")
+    clock.now = 21
+    assert tree.pop_victim(never) == "x1"
+
+
+def test_return_policy_takes_oldest_leaf_of_the_chosen_thread():
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "root", "")
+    visit(tree, clock, 0.1, "old", "root")
+    visit(tree, clock, 0.2, "new", "root")
+    clock.now = 1
+    assert drain(tree) == ["old", "new", "root"]
+
+
+def test_return_policy_counts_prefix_hits_as_arrivals():
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "a0", "")
+    visit(tree, clock, 1, "b0", "")
+    visit(tree, clock, 10, "a1", "a0")
+    visit(tree, clock, 11, "b1", "b0")
+    # A hit on A's chain at 20 moves its predicted return past B's (21).
+    clock.now = 20
+    tree.touch_path("a1")
+    clock.now = 20.5
+    assert tree.pop_victim(never) == "a1"
+
+
+def test_return_policy_charged_only_skips_held_leaves():
+    tree, clock = return_tree()
+    visit(tree, clock, 0, "a0", "")
+    visit(tree, clock, 5, "b0", "")
+    tree.mark_held("b0")
+    clock.now = 6
+    assert tree.pop_victim(never, charged_only=True) == "a0"
+    assert tree.pop_victim(never) == "b0"
