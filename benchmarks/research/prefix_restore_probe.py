@@ -335,7 +335,10 @@ async def run_probe(args: argparse.Namespace) -> list[dict[str, Any]]:
                 await asyncio.sleep(args.settle_s)
                 if cell.tier == "ssd":
                     for n, length in enumerate(
-                        flush_lengths(args.flush_tokens, args.max_model_len - 1)
+                        flush_lengths(
+                            args.flush_tokens,
+                            min(args.flush_prompt_tokens, args.max_model_len - 1),
+                        )
                     ):
                         await send(
                             source.header() + source.body(length - HEADER_TOKENS),
@@ -402,6 +405,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="tokens of unrelated prompts sent before an ssd-tier read",
+    )
+    p.add_argument(
+        "--flush-prompt-tokens",
+        type=int,
+        default=32768,
+        help="longest flush prompt (shorter prompts prefill faster)",
     )
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--settle-s", type=float, default=3.0)
