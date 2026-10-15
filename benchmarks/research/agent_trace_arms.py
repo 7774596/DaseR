@@ -468,12 +468,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=131072)
-    parser.add_argument("--max-num-seqs", type=int, default=16)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="vLLM max_num_seqs; the engine default when omitted.",
+    )
     parser.add_argument(
         "--async-scheduling",
-        action="store_true",
-        help="Enable vLLM async scheduling (CPU scheduling overlaps GPU steps) "
-        "for every arm; off by default to match earlier evidence.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="vLLM async scheduling (CPU scheduling overlaps GPU steps) for "
+        "every arm; on as in vLLM, --no-async-scheduling is an ablation.",
     )
     parser.add_argument("--max-requests", type=int, default=3000)
     parser.add_argument("--start-request", type=int, default=0)

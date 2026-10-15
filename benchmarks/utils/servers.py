@@ -409,7 +409,7 @@ class ServerManager:
         store_dir: str | Path,
         gpu_id: str,
         gpu_util: float | None,
-        max_num_seqs: int,
+        max_num_seqs: int | None,
         l1_size_bytes: int,
         l2_size_bytes: int,
         max_num_batched_tokens: int | None = None,
@@ -434,7 +434,7 @@ class ServerManager:
         daser_layerwise_load: bool = False,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         extra_vllm_gpu_ids: tuple[str, ...] = (),
         lmcache_l2_odirect: bool = False,
         lmcache_eviction_watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
@@ -457,7 +457,7 @@ class ServerManager:
             gpu_id: GPU ID exposed through CUDA_VISIBLE_DEVICES.
             gpu_util: Optional explicit vLLM GPU memory utilization. ``None``
                 leaves vLLM's own default unchanged.
-            max_num_seqs: vLLM max_num_seqs.
+            max_num_seqs: vLLM max_num_seqs; ``None`` keeps the engine default.
             max_num_batched_tokens: Optional vLLM scheduler token budget.
             block_size: vLLM KV block size in tokens.
             l1_size_bytes: L1 size.
@@ -516,7 +516,8 @@ class ServerManager:
                 codec; ``None`` uses the generic codebooks.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
-            async_scheduling: Enable vLLM async scheduling for matched protocols.
+            async_scheduling: vLLM async scheduling, on by default as in vLLM;
+                ``False`` is an ablation.
             extra_vllm_gpu_ids: GPUs for additional vLLM instances that share
                 this service's DaseR server (DaseR backend only). Instance
                 ``i`` (1-based) listens on ``vllm_port + i``; the DaseR server
@@ -993,19 +994,15 @@ class ServerManager:
             self.model,
             "--port",
             str(self.vllm_port if port is None else port),
-            "--max-num-seqs",
-            str(self.max_num_seqs),
             "--no-enable-prefix-caching",
             "--generation-config",
             "vllm",
             "--block-size",
             str(self.block_size),
-            # Keep benchmark scheduler behavior identical to the clean
-            # master evidence. The two flags below are optional in older
-            # vLLM command lines; the compatibility switch is only for a
-            # runner whose installed CLI rejects them.
             "--async-scheduling" if self.async_scheduling else "--no-async-scheduling",
         ]
+        if self.max_num_seqs is not None:
+            cmd.extend(["--max-num-seqs", str(self.max_num_seqs)])
         if os.environ.get("DASER_BENCH_SKIP_OPTIONAL_VLLM_FLAGS", "0") != "1":
             # Prompt token details carry per-request cached tokens (GPU plus
             # connector), so replays can audit hits request by request.

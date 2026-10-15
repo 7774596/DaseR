@@ -33,14 +33,20 @@ def _args(tmp_path: Path, *extra: str) -> list[str]:
     ]
 
 
-def test_async_scheduling_defaults_off(tmp_path: Path) -> None:
-    """Arms keep vLLM async scheduling off unless asked."""
-    assert parse_args(_args(tmp_path)).async_scheduling is False
+def test_async_scheduling_defaults_on(tmp_path: Path) -> None:
+    """Arms run vLLM's default async scheduling and engine max_num_seqs."""
+    args = parse_args(_args(tmp_path))
+    assert args.async_scheduling is True
+    assert args.max_num_seqs is None
+    command = _manager("daser-compressed", args).vllm_command(None)
+    assert "--async-scheduling" in command
+    assert "--max-num-seqs" not in command
 
 
-def test_async_scheduling_flag_enables_it(tmp_path: Path) -> None:
-    """``--async-scheduling`` turns it on for every arm."""
-    assert parse_args(_args(tmp_path, "--async-scheduling")).async_scheduling is True
+def test_no_async_scheduling_flag_disables_it(tmp_path: Path) -> None:
+    """``--no-async-scheduling`` is the ablation for every arm."""
+    args = parse_args(_args(tmp_path, "--no-async-scheduling"))
+    assert args.async_scheduling is False
 
 
 def test_speculative_config_reaches_every_arm_as_one_argument(tmp_path: Path) -> None:

@@ -3590,7 +3590,8 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
-    assert "--no-async-scheduling" in command
+    assert "--async-scheduling" in command
+    assert command[command.index("--max-num-seqs") + 1] == "32"
     assert command[command.index("--stream-interval") + 1] == "1"
     assert command[command.index("--attention-backend") + 1] == "FLASH_ATTN"
     assert "--enable-prompt-tokens-details" in command
