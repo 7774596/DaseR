@@ -86,6 +86,33 @@ def _compressed_request_identity(
     )
 
 
+def _model_stream_fence(
+    kv_caches: dict[str, torch.Tensor],
+) -> torch.cuda.Event | None:
+    """Record the worker's current stream for restores into its blocks.
+
+    Restores run on their own streams and wait for this event before writing
+    (see ``LoadPipeline.begin_step``).
+
+    Args:
+        kv_caches: Registered KV cache tensors keyed by layer name.
+
+    Returns:
+        Event recorded on the current stream of the KV cache device, or None
+        when no CUDA KV cache is registered.
+
+    Async/thread-safety:
+        Call on the vLLM worker thread, where the current stream is the model
+        stream. Recording an event does not block the host.
+    """
+    tensor = next(iter(kv_caches.values()), None)
+    if tensor is None or not tensor.is_cuda:
+        return None
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(tensor.device))
+    return event
+
+
 def _coalesce_compressed_requests(
     requests: list[_LoadRequest],
 ) -> list[_LoadRequest]:
@@ -130,6 +157,7 @@ def _coalesce_compressed_requests(
             req_ids=(*existing.req_ids, *request.req_ids),
             specs=merged_specs,
             future=existing.future,
+            ready_after=existing.ready_after,
         )
         destination_blocks[matched_index].update(request_blocks)
     return coalesced
@@ -269,6 +297,7 @@ class _LayerwiseLoad:
         default_factory=list
     )
     started_at: float = field(default_factory=time.perf_counter)
+    ready_after: torch.cuda.Event | None = None
 
 
 @dataclass
@@ -278,6 +307,9 @@ class _LoadRequest:
     req_ids: tuple[str, ...]
     specs: dict[str, ReqLoadSpec]
     future: Future[None]
+    # Model-stream event recorded when the step handed these blocks over;
+    # restores wait on it before writing them.
+    ready_after: torch.cuda.Event | None = None
 
     @property
     def req_id(self) -> str:
@@ -316,6 +348,7 @@ class _InflightLoadBatch:
     copy_runs: int = 0
     restore_future: asyncio.Future[float] | None = None
     prepared_restore: PreparedKVRestore | None = None
+    ready_after: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -396,6 +429,8 @@ class LoadPipeline:
         self._time_gpu_stall = os.environ.get(LAYERWISE_GPU_STALL_ENV) == "1"
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._layerwise: _LayerwiseLoad | None = None
+        # Model-stream point this step's restores wait for (see begin_step).
+        self._step_fence: torch.cuda.Event | None = None
         self._timeline = LoadTimeline.from_env()
         # Pinned landing buffer for layer-wise header pages, grown on demand
         # and touched only by the load thread.
@@ -522,6 +557,28 @@ class LoadPipeline:
         self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
 
+    def begin_step(self, expect_loads: bool) -> None:
+        """Mark the model-stream point this step's restores must wait for.
+
+        Blocks handed to a load may still be read or written by kernels of
+        their previous owner queued on the model stream (vLLM async
+        scheduling, preemption). Fencing here, before the step's forward is
+        launched, orders restores after that work without also waiting for
+        this step's forward, which never touches blocks being loaded.
+
+        Args:
+            expect_loads: Whether this step's metadata schedules any load; no
+                event is recorded otherwise.
+
+        Async/thread-safety:
+            Call on the vLLM worker thread, where the current stream is the
+            model stream, once per step before ``start``/``start_layerwise``.
+            Recording an event does not block the host.
+        """
+        self._step_fence = (
+            _model_stream_fence(self._kv_caches) if expect_loads else None
+        )
+
     def start(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
         """Queue request loads for background transfer and restore.
 
@@ -530,7 +587,9 @@ class LoadPipeline:
 
         Async/thread-safety:
             Called from the worker thread. Queue dispatch, IPC, and restore run
-            on the private load thread.
+            on the private load thread. Restores write their blocks only after
+            the model stream reaches this step's ``begin_step`` point, or this
+            call when the step did not mark one.
         """
         if not reqs_to_load:
             return
@@ -541,8 +600,9 @@ class LoadPipeline:
         grouped: dict[str, dict[str, ReqLoadSpec]] = {}
         for spec_id, spec in reqs_to_load.items():
             grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
+        ready_after = self._step_fence or _model_stream_fence(self._kv_caches)
         requests = [
-            _LoadRequest((req_id,), specs, Future())
+            _LoadRequest((req_id,), specs, Future(), ready_after)
             for req_id, specs in grouped.items()
         ]
         for request in _coalesce_compressed_requests(requests):
@@ -598,6 +658,7 @@ class LoadPipeline:
             ],
             ready=[threading.Event() for _ in range(layers)],
             events=[None] * layers,
+            ready_after=self._step_fence or _model_stream_fence(self._kv_caches),
         )
         self._layerwise = state
         state.future = self._submit(self._run_layerwise(state, dict(reqs_to_load)))
@@ -1043,7 +1104,7 @@ class LoadPipeline:
             buffer_index=buffer_index,
             batches=batches,
             active=self._submit_batch(
-                request.lease_id,
+                request,
                 batches.popleft(),
                 buffer_index,
             ),
@@ -1053,7 +1114,7 @@ class LoadPipeline:
 
     def _submit_batch(
         self,
-        lease_id: str | None,
+        request: _LoadRequest,
         batch: _LoadBatch,
         buffer_index: int,
     ) -> _InflightLoadBatch:
@@ -1067,11 +1128,14 @@ class LoadPipeline:
             staging_lease=lease,
             submitted_at=time.perf_counter(),
             buffer_index=buffer_index,
+            ready_after=request.ready_after,
         )
         # The dispatcher must know the lease before metadata preparation or
         # CUDA IPC export can fail. Owning those operations in the batch Task
         # gives their partial GPU work the same failure drain as the transfer.
-        state.future = asyncio.create_task(self._transfer_batch(state, spans, lease_id))
+        state.future = asyncio.create_task(
+            self._transfer_batch(state, spans, request.lease_id)
+        )
         return state
 
     async def _transfer_batch(
@@ -1159,7 +1223,7 @@ class LoadPipeline:
                 batch = state.batches.popleft()
                 try:
                     state.lookahead = self._submit_batch(
-                        state.request.lease_id,
+                        state.request,
                         batch,
                         released_buffer,
                     )
@@ -1189,7 +1253,7 @@ class LoadPipeline:
                 state.request.future.set_result(None)
             return released_buffer, True
         state.active = self._submit_batch(
-            state.request.lease_id,
+            state.request,
             state.batches.popleft(),
             released_buffer,
         )
@@ -1230,7 +1294,7 @@ class LoadPipeline:
         batch = state.batches.popleft()
         try:
             state.lookahead = self._submit_batch(
-                state.request.lease_id,
+                state.request,
                 batch,
                 lookahead_buffer,
             )
@@ -1358,6 +1422,8 @@ class LoadPipeline:
                     buffer_index=state.buffer_index,
                     stream=restore_stream,
                 )
+            if state.ready_after is not None:
+                restore_stream.wait_event(state.ready_after)
             restored = 0 if plan is None else plan.submit()
             event = torch.cuda.Event(blocking=False)
             event.record(restore_stream)
@@ -1369,6 +1435,8 @@ class LoadPipeline:
             if self._cuda_stream is not None
             else nullcontext()
         )
+        if self._cuda_stream is not None and state.ready_after is not None:
+            self._cuda_stream.wait_event(state.ready_after)
         with context:
             for run in runs:
                 copies += copy_staging_to_kv_cache(
@@ -1449,6 +1517,8 @@ class LoadPipeline:
                 )
             state.records = records
             state.header_ms = (time.perf_counter() - state.started_at) * 1000
+            if state.ready_after is not None:
+                stream.wait_event(state.ready_after)
 
             async def transfer(group: int) -> dict[str, Any]:
                 group_files, targets, sizes = plan_group(group)

@@ -302,6 +302,9 @@ def _daser_rows(
                 plan.submit()
 
         kv.clear()
+        # The decoder runs on its own stream: order it after the clear, or
+        # the first launches race the zero fill of their destination blocks.
+        stream.wait_stream(torch.cuda.current_stream())
         run(prepare())
         exact = kv.exact()
         _emit(
