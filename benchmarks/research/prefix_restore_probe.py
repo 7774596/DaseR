@@ -14,7 +14,9 @@ idle server:
 4. ``gpu``: the same prefix with a different suffix and no reset, so the GPU
    prefix cache serves the prefix and only the suffix is computed. It is the
    compute-only control ``C`` of the cell; ``external - gpu`` is the exposed
-   restore time.
+   restore time. For a full-prompt prefix both passes send the same prompt,
+   so their greedy outputs must match: a mismatch means the restored KV was
+   wrong when the forward read it.
 
 Without a connector ``external`` is a full recompute. Every prompt starts
 with a random header unique to its cell and repeat, so cells never share
@@ -218,6 +220,8 @@ def summarise(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         restore time ``external - gpu`` and the failure / off-state counts.
         A pass is off-state when the cache it must not use served over half
         of its prefix (GPU hits for ``external``, external hits for ``gpu``).
+        Full-prompt prefixes also count the repeats whose two greedy outputs
+        differ (``output_mismatch``).
 
     Thread-safety:
         Pure function.
@@ -256,6 +260,14 @@ def summarise(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             and out["gpu_ttft_ms_p50"] is not None
         ):
             out["restore_ms_p50"] = out["external_ttft_ms_p50"] - out["gpu_ttft_ms_p50"]
+        if prefix == total:
+            texts: dict[int, dict[str, str]] = {}
+            for r in cell:
+                if r["error"] is None:
+                    texts.setdefault(r["repeat"], {})[r["pass"]] = r["text"]
+            out["output_mismatch"] = sum(
+                1 for t in texts.values() if len(t) == 2 and len(set(t.values())) > 1
+            )
         rows.append(out)
     return rows
 
@@ -362,6 +374,7 @@ async def run_probe(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "ttft_ms": result.ttft_ms,
                         "latency_ms": result.latency_ms,
                         "completion_tokens": result.completion_tokens,
+                        "text": result.generated_text,
                         "cached_tokens": result.cached_tokens,
                         "itl_ms": list(result.token_gaps_ms),
                         **{k: delta.get(m, 0.0) for k, m in VLLM_COUNTERS.items()},

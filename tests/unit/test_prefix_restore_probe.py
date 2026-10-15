@@ -71,3 +71,26 @@ def test_summarise_reports_restore_time_and_off_state() -> None:
     assert out[0]["restore_ms_p50"] == 300
     assert out[0]["external_off_state"] == 1 and out[0]["gpu_off_state"] == 0
     assert out[0]["gpu_itl_ms_p99"] == 12.0
+
+
+def test_summarise_counts_full_prefix_output_mismatches() -> None:
+    def row(name: str, repeat: int, text: str) -> dict:
+        return {
+            "total_tokens": 256,
+            "prefix_tokens": 256,
+            "tier": "l1",
+            "repeat": repeat,
+            "pass": name,
+            "error": None,
+            "ttft_ms": 1.0,
+            "itl_ms": [],
+            "text": text,
+            "gpu_hit_tokens": 0,
+            "external_hit_tokens": 0,
+        }
+
+    out = summarise(
+        [row("external", 0, "a"), row("gpu", 0, "a")]
+        + [row("external", 1, "a"), row("gpu", 1, "b")]
+    )
+    assert out[0]["output_mismatch"] == 1
