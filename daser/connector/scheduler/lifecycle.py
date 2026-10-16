@@ -151,13 +151,6 @@ class RequestLifecycle:
         # paired with the vLLM computed-token count their spans start at.
         self._prefetch_lookup_results: dict[str, tuple[int, PrefetchLookupResult]] = {}
         self._leased_request_ids: set[str] = set()
-        # Research switch (server ``protect_waiting_bytes`` > 0): requests
-        # whose cached prefix the server protects while they wait in vLLM's
-        # queue; released once vLLM allocates their blocks without an
-        # external load, the load lands, or the request is preempted or
-        # finishes.
-        self._protect_waiting = False
-        self._protected_request_ids: set[str] = set()
         # Research switch: fully leased packed or raw hits load synchronously
         # and are restored layer by layer inside the forward pass. The worker
         # then owns the request lease, so these IDs never report
@@ -187,36 +180,6 @@ class RequestLifecycle:
                 "now": time.monotonic(),
             },
         )
-
-    def on_new_request(self, request: "Request") -> None:
-        """Protect a request's cached prefix while it waits to be scheduled.
-
-        When the server enables queued-request protection, the prompt is
-        sent with the request id as lease, so the prefix indexed at arrival
-        is not evicted before the scheduling lookup or, for a request that
-        loads external KV, before that load lands. Best effort: failures
-        are logged and the request is scheduled normally.
-
-        Args:
-            request: vLLM Request entering the waiting queue.
-
-        Thread-safety:
-            Runs on the scheduler thread through its synchronous IPC client.
-        """
-        if not getattr(self, "_runtime_config_ready", True):
-            self._refresh_runtime_config()
-        if not getattr(self, "_protect_waiting", False):
-            return
-        req_id = request.request_id
-        try:
-            protected = self._ipc_sync.protect_prefix(
-                req_id, list(request.prompt_token_ids)
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[CONNECTOR] protect failed req=%s: %s", req_id[:8], exc)
-            return
-        if protected:
-            self._protected_request_ids.add(req_id)
 
     def get_num_new_matched_tokens(
         self,
@@ -591,11 +554,6 @@ class RequestLifecycle:
         """
         req_id = request.request_id
         self._trace_admit("alloc", req_id)
-        if not num_external_tokens:
-            # A request loading external KV keeps its prefix protected until
-            # the load lands, so its chunks cannot be evicted and their bytes
-            # reused while the read is queued.
-            self._release_protection(req_id)
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
         getattr(self, "_retry_lookups", {}).pop(req_id, None)
 
@@ -793,7 +751,6 @@ class RequestLifecycle:
             getattr(self, "_retry_lookups", {}).pop(base_req_id, None)
             pending_async_saves.discard(base_req_id)
             self._release_transfer_lease(base_req_id, force=True)
-            self._release_protection(base_req_id)
             getattr(self, "_prefetch_lookup_results", {}).pop(base_req_id, None)
             getattr(self, "_prefetch_signatures", {}).pop(base_req_id, None)
             self._cancel_prefetch_future(base_req_id)
@@ -1169,20 +1126,6 @@ class RequestLifecycle:
         finally:
             leased_ids.discard(req_id)
 
-    def _release_protection(self, req_id: str) -> None:
-        """Release a request's queued-prefix protection, if it holds one."""
-        protected = getattr(self, "_protected_request_ids", None)
-        if not protected or req_id not in protected:
-            return
-        protected.discard(req_id)
-        try:
-            self._ipc_sync.release_protection(req_id)
-        except Exception as exc:  # noqa: BLE001
-            # The server releases leaked leases after a timeout.
-            logger.debug(
-                "[CONNECTOR] release protection failed req=%s: %s", req_id[:8], exc
-            )
-
     def _cancel_prefetch_future(self, req_id: str) -> bool:
         """Cancel queued prefetch or release its lease after an active RPC exits."""
         future = getattr(self, "_prefetch_futures", {}).pop(req_id, None)
@@ -1249,7 +1192,6 @@ class RequestLifecycle:
             )
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
-        self._protect_waiting = int(config.get("protect_waiting_bytes", 0)) > 0
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))
         if (
             cache_reuse_mode != self._cache_reuse_mode
@@ -1506,7 +1448,6 @@ class RequestLifecycle:
             (True, None) when DaseR is still storing this request's KV blocks,
             otherwise (False, None).
         """
-        self._release_protection(request.request_id)
         self._defer_deadlines().pop(request.request_id, None)
         getattr(self, "_inflight_loads", {}).pop(request.request_id, None)
         getattr(self, "_coalesce_followers", {}).pop(request.request_id, None)
@@ -1535,7 +1476,6 @@ class RequestLifecycle:
         inflight_loads = getattr(self, "_inflight_loads", {})
         for req_id in getattr(connector_output, "finished_recving", None) or ():
             self._trace_admit("loaded", req_id)
-            self._release_protection(req_id)
             landed = inflight_loads.get(req_id)
             if landed is not None:
                 inflight_loads[req_id] = (

@@ -27,7 +27,6 @@ from daser.config import (
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
     L1_ACCOUNTING_MODES,
-    PROTECT_WAITING_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -412,7 +411,6 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
         l2_read_stripe_bytes=int(getattr(args, "l2_read_stripe", 0)),
         extra_kv_layers=int(getattr(args, "extra_kv_layers", 0)),
-        protect_waiting_fraction=float(os.environ.get(PROTECT_WAITING_ENV, "0")),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:

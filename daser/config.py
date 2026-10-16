@@ -45,9 +45,6 @@ L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
 #: Research switch: share of L1 that readahead leases may retain at once
 #: (default 0.5).
 READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
-#: Research switch: share of store capacity that queued requests may protect
-#: from eviction until they are scheduled (default 0 = off).
-PROTECT_WAITING_ENV = "DASER_PROTECT_WAITING"
 
 
 @dataclass(frozen=True)
@@ -252,9 +249,6 @@ class DaserConfig:
         extra_kv_layers: attention layers the vLLM worker registers beyond
             the model's own, for example an EAGLE drafter's; they share the
             target layers' KV shape and are stored in every slot.
-        protect_waiting_fraction: share of ``l2_size_bytes`` that queued
-            requests' indexed prefixes may hold unevictable until scheduled
-            (0 = off; see ``docs/design/tier-residency.md``).
     """
 
     model_path: str = ""
@@ -277,7 +271,6 @@ class DaserConfig:
     prefetch_lease_budget_bytes: int = 0
     l2_read_stripe_bytes: int = 0
     extra_kv_layers: int = 0
-    protect_waiting_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate startup-immutable transfer settings."""
@@ -291,8 +284,6 @@ class DaserConfig:
             raise ValueError("l2_read_stripe_bytes must be non-negative")
         if self.extra_kv_layers < 0:
             raise ValueError("extra_kv_layers must be non-negative")
-        if not 0.0 <= self.protect_waiting_fraction < 1.0:
-            raise ValueError("protect_waiting_fraction must be in [0, 1)")
 
     @property
     def store_path(self) -> str:
@@ -431,7 +422,4 @@ class DaserConfig:
             "l1_accounting": self.l1_accounting,
             "prefetch_lease_budget_bytes": self.prefetch_lease_budget_bytes,
             "l2_read_stripe_bytes": self.l2_read_stripe_bytes,
-            "protect_waiting_bytes": int(
-                self.protect_waiting_fraction * self.l2_size_bytes
-            ),
         }

@@ -31,60 +31,13 @@ L1 驻留（held）只用于 compressed-online。
   达，优先级最低。孤儿只在非叶子被删除（held record 被 L1 淘汰、显式淘汰、
   文档删除）或分配时父节点已不在时出现；不做级联删除，只把子树的叶子重新
   入堆，按需淘汰。父 key 再次被存入时子节点自动重新挂上。
-- 不可淘汰（跳过）：有未提交写者的 chunk、当前 store 放置阶段固定的 chunk、
-  排队保护的 chunk（见下）。
+- 不可淘汰（跳过）：有未提交写者的 chunk、当前 store 放置阶段固定的 chunk。
   被跳过的子节点同时让其父节点保持非叶子。
 - lookup 命中一段前缀时按 `parent_key` 刷新整条链（祖先比后代旧），因此
   链尾始终是链上最冷的节点。
 - 实现为两个惰性最小堆：全部叶子，以及 charged 前沿（见「淘汰触发」3）。
   出堆时校验节点仍存在、仍是候选、优先级未变；单次淘汰均摊 O(log n)，不产生
   IO。
-
-### 回访感知选择（研究开关 `DASER_EVICTION_POLICY=return`，默认 `lru`）
-
-多个 agent 会话轮流回访、总工作集超过容量时，叶子 LRU 淘汰的正是下一个
-要回来的会话（循环抖动）。`return` 策略按线程选牺牲者：
-
-- 线程：节点继承父节点的线程；没有在索引中的父节点时，以父 key（链首则用
-  自身 key）为线程 id。线程即一条前缀链的根，服务端不需要 session id。
-- 回访：`add` 与 lookup 命中时记录线程的到达时间；与上次相隔小于 1 s 视为
-  同一次访问。回访周期用相邻到达间隔的 EWMA（α=0.5）估计，未知时用全部
-  线程周期的均值。
-- 选择：孤儿候选优先（同 LRU）。否则在有候选的线程中，先选已过期的
-  线程（距上次到达超过 3 个周期，按超期时长从大到小），再选预测下次到达
-  （上次到达 + 周期）最晚的线程；在该线程内淘汰最旧的候选（叶子，或 L2
-  预算路径的 charged 前沿节点）。
-- 代价：每次淘汰扫描线程和所选线程的叶子，O(线程数 + 线程内节点数)。只在
-  开关打开时运行；默认路径仍是上面的两个堆。
-
-### 排队保护（研究开关 `DASER_PROTECT_WAITING=<比例>`，默认 0 关闭）
-
-高并发下请求在 vLLM waiting 队列里可能等上百秒，DaseR 只在调度时
-（`get_num_new_matched_tokens`）查找。这段时间里其他请求的 store 会把它的
-前缀挤出去：前缀明明在到达时还在，调度时已经没了。保护让到达时已命中的
-前缀撑到调度：
-
-- connector 在 `on_new_request`（请求进入 waiting 队列）时发 `protect_prefix`，
-  以 request id 为 lease。释放：`update_state_after_alloc` 且没有外部 token；
-  有外部 load 时等它落地（`finished_recving`），避免 chunk 在读排队期间被
-  淘汰、字节被复用；以及抢占、`request_finished`（含 waiting 中被 abort）。
-  layer-wise load 没有 `finished_recving`，到 `request_finished` 才释放。
-- server 沿 `RetrievalIndex.chain_keys` 从链首往后保护仍在淘汰树中的 key
-  （包括尚未提交的写者），遇到第一个缺失 key 停止。保护的 key 不可淘汰
-  （和 pin 一样被三种触发跳过）；held 的被保护叶子被 L1 淘汰时重新计入
-  预算而不删除。保护不刷新访问时间，不计 lookup 指标。
-- 预算：被保护 key 的去重字节合计不超过比例 × 容量。compressed-online 按
-  record 的 stored 字节计（同一预算下能保护更多块），容量为 packed arena
-  （L1 + L2）；raw 按槽位计，容量为 L2。字节未知的 key（未提交写者）按 raw
-  槽位计。超出预算时只保护链首方向能放下的部分，链首被多个请求共享时只
-  计一次。
-- 泄漏兜底：lease 超过 10 min（实测排队 p90 的约 2 倍）未释放，在下一次
-  `protect_prefix` 时回收。
-- 只适用于有固定匹配顺序的索引（前缀链）；chunk 复用索引的 `chain_keys`
-  为空，不保护。
-
-与已有工作的关系：CachedAttention/AttentionStore（ATC'24）按调度队列决定外存
-淘汰与预取。这里的差别在保护预算按压缩字节计，以及叶子优先树上的链保护。
 
 ## packed arena
 
