@@ -153,7 +153,9 @@ class RequestLifecycle:
         self._leased_request_ids: set[str] = set()
         # Research switch (server ``protect_waiting_bytes`` > 0): requests
         # whose cached prefix the server protects while they wait in vLLM's
-        # queue; released once vLLM allocates their blocks or drops them.
+        # queue; released once vLLM allocates their blocks without an
+        # external load, the load lands, or the request is preempted or
+        # finishes.
         self._protect_waiting = False
         self._protected_request_ids: set[str] = set()
         # Research switch: fully leased packed or raw hits load synchronously
@@ -191,7 +193,8 @@ class RequestLifecycle:
 
         When the server enables queued-request protection, the prompt is
         sent with the request id as lease, so the prefix indexed at arrival
-        is not evicted before the scheduling lookup. Best effort: failures
+        is not evicted before the scheduling lookup or, for a request that
+        loads external KV, before that load lands. Best effort: failures
         are logged and the request is scheduled normally.
 
         Args:
@@ -588,7 +591,11 @@ class RequestLifecycle:
         """
         req_id = request.request_id
         self._trace_admit("alloc", req_id)
-        self._release_protection(req_id)
+        if not num_external_tokens:
+            # A request loading external KV keeps its prefix protected until
+            # the load lands, so its chunks cannot be evicted and their bytes
+            # reused while the read is queued.
+            self._release_protection(req_id)
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
         getattr(self, "_retry_lookups", {}).pop(req_id, None)
 
@@ -786,6 +793,7 @@ class RequestLifecycle:
             getattr(self, "_retry_lookups", {}).pop(base_req_id, None)
             pending_async_saves.discard(base_req_id)
             self._release_transfer_lease(base_req_id, force=True)
+            self._release_protection(base_req_id)
             getattr(self, "_prefetch_lookup_results", {}).pop(base_req_id, None)
             getattr(self, "_prefetch_signatures", {}).pop(base_req_id, None)
             self._cancel_prefetch_future(base_req_id)
@@ -1527,6 +1535,7 @@ class RequestLifecycle:
         inflight_loads = getattr(self, "_inflight_loads", {})
         for req_id in getattr(connector_output, "finished_recving", None) or ():
             self._trace_admit("loaded", req_id)
+            self._release_protection(req_id)
             landed = inflight_loads.get(req_id)
             if landed is not None:
                 inflight_loads[req_id] = (

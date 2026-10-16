@@ -65,8 +65,10 @@ L1 驻留（held）只用于 compressed-online。
 前缀撑到调度：
 
 - connector 在 `on_new_request`（请求进入 waiting 队列）时发 `protect_prefix`，
-  在 `update_state_after_alloc`（vLLM 已分配块，查找结果已用掉）或
-  `request_finished` 时发 `release_protection`。以 request id 为 lease。
+  以 request id 为 lease。释放：`update_state_after_alloc` 且没有外部 token；
+  有外部 load 时等它落地（`finished_recving`），避免 chunk 在读排队期间被
+  淘汰、字节被复用；以及抢占、`request_finished`（含 waiting 中被 abort）。
+  layer-wise load 没有 `finished_recving`，到 `request_finished` 才释放。
 - server 沿 `RetrievalIndex.chain_keys` 从链首往后保护仍在淘汰树中的 key
   （包括尚未提交的写者），遇到第一个缺失 key 停止。保护的 key 不可淘汰
   （和 pin 一样被三种触发跳过）；held 的被保护叶子被 L1 淘汰时重新计入
@@ -76,7 +78,8 @@ L1 驻留（held）只用于 compressed-online。
   （L1 + L2）；raw 按槽位计，容量为 L2。字节未知的 key（未提交写者）按 raw
   槽位计。超出预算时只保护链首方向能放下的部分，链首被多个请求共享时只
   计一次。
-- 泄漏兜底：lease 超过 30 min 未释放，在下一次 `protect_prefix` 时回收。
+- 泄漏兜底：lease 超过 10 min（实测排队 p90 的约 2 倍）未释放，在下一次
+  `protect_prefix` 时回收。
 - 只适用于有固定匹配顺序的索引（前缀链）；chunk 复用索引的 `chain_keys`
   为空，不保护。
 

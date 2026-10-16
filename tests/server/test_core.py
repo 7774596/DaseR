@@ -1544,8 +1544,20 @@ async def test_stale_protection_lease_is_released_by_the_next_protect(
     monkeypatch.setattr(core_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
 
     assert core.protect("leaked", tokens, budget_bytes=4096) == 1
-    now[0] = 1800.5
+    now[0] = 600.5
     assert core.protect("fresh", other, budget_bytes=4096) == 1
     # Only the fresh lease remains, so the leaked chain is evictable again.
     assert await core.reclaim_packed()
     assert _resident(core, keys) == [False]
+
+
+@pytest.mark.asyncio
+async def test_alloc_fails_fast_when_only_protected_chunks_remain() -> None:
+    """A full store whose chunks are all protected raises instead of stalling."""
+    core = make_core(total_slots=2)
+    tokens, _keys = await _committed_chain(core, 2)
+    assert core.protect("req", tokens, budget_bytes=1 << 20) == 2
+    with pytest.raises(SlotsExhausted):
+        await core.alloc_chunk(hash_tokens([9, 10, 11, 12]), 4, "m")
+    core.release_protection("req")
+    await core.alloc_chunk(hash_tokens([9, 10, 11, 12]), 4, "m")

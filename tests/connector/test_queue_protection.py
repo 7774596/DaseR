@@ -89,3 +89,37 @@ def test_protect_failure_is_ignored() -> None:
     lifecycle.on_new_request(request)
     lifecycle.request_finished(request, [])
     assert ipc.calls == []
+
+
+def test_external_load_keeps_protection_until_it_lands() -> None:
+    """A request loading external KV is released when its load lands."""
+    ipc = _ProtectIPC(budget=1 << 20)
+    lifecycle = _lifecycle(ipc)
+    request = _request()
+    lifecycle.on_new_request(request)
+    lifecycle.update_state_after_alloc(request, SimpleNamespace(blocks=[[]]), 8)
+    assert ipc.calls == [("protect", "req-1")]
+    lifecycle.update_connector_output(
+        SimpleNamespace(finished_sending=(), finished_recving=("req-1",))
+    )
+    lifecycle.request_finished(request, [])
+    assert ipc.calls == [("protect", "req-1"), ("release", "req-1")]
+
+
+def test_preemption_releases_protection() -> None:
+    """A preempted request drops its protection with its pending state."""
+    ipc = _ProtectIPC(budget=1 << 20)
+    lifecycle = _lifecycle(ipc)
+    request = _request()
+    lifecycle.on_new_request(request)
+    lifecycle.update_state_after_alloc(request, SimpleNamespace(blocks=[[]]), 8)
+    lifecycle.build_connector_meta(
+        SimpleNamespace(
+            preempted_req_ids={"req-1"},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+            num_scheduled_tokens={},
+            finished_req_ids=set(),
+        )
+    )
+    assert ("release", "req-1") in ipc.calls

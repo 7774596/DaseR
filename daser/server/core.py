@@ -32,7 +32,7 @@ PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
 EVICTION_POLICY_ENV = "DASER_EVICTION_POLICY"
 # A queued-request protection lease older than this is presumed leaked and
 # released by the next ``protect`` call.
-_PROTECT_TTL_S = 1800.0
+_PROTECT_TTL_S = 600.0
 # Writer claims happen at scheduling time, so publication latency spans the
 # request's queueing and prefill (seconds) as well as the save window (ms).
 _PUBLISH_BUCKETS = (
@@ -1119,7 +1119,7 @@ class ServerCore:
         yet) and counts once however many leases share it. Protected keys
         are skipped by every eviction trigger; a held protected leaf that L1
         evicts is charged to the L2 budget again instead of removed. Access
-        times and lookup metrics are not changed. Leases older than 30 min
+        times and lookup metrics are not changed. Leases older than 10 min
         are released first. See ``docs/design/tier-residency.md``.
 
         Args:
