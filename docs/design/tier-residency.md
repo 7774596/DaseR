@@ -31,7 +31,8 @@ L1 驻留（held）只用于 compressed-online。
   达，优先级最低。孤儿只在非叶子被删除（held record 被 L1 淘汰、显式淘汰、
   文档删除）或分配时父节点已不在时出现；不做级联删除，只把子树的叶子重新
   入堆，按需淘汰。父 key 再次被存入时子节点自动重新挂上。
-- 不可淘汰（跳过）：有未提交写者的 chunk、当前 store 放置阶段固定的 chunk。
+- 不可淘汰（跳过）：有未提交写者的 chunk、当前 store 放置阶段固定的 chunk、
+  排队保护的 chunk（见下）。
   被跳过的子节点同时让其父节点保持非叶子。
 - lookup 命中一段前缀时按 `parent_key` 刷新整条链（祖先比后代旧），因此
   链尾始终是链上最冷的节点。
@@ -55,6 +56,32 @@ L1 驻留（held）只用于 compressed-online。
   预算路径的 charged 前沿节点）。
 - 代价：每次淘汰扫描线程和所选线程的叶子，O(线程数 + 线程内节点数)。只在
   开关打开时运行；默认路径仍是上面的两个堆。
+
+### 排队保护（研究开关 `DASER_PROTECT_WAITING=<比例>`，默认 0 关闭）
+
+高并发下请求在 vLLM waiting 队列里可能等上百秒，DaseR 只在调度时
+（`get_num_new_matched_tokens`）查找。这段时间里其他请求的 store 会把它的
+前缀挤出去：前缀明明在到达时还在，调度时已经没了。保护让到达时已命中的
+前缀撑到调度：
+
+- connector 在 `on_new_request`（请求进入 waiting 队列）时发 `protect_prefix`，
+  在 `update_state_after_alloc`（vLLM 已分配块，查找结果已用掉）或
+  `request_finished` 时发 `release_protection`。以 request id 为 lease。
+- server 沿 `RetrievalIndex.chain_keys` 从链首往后保护仍在淘汰树中的 key
+  （包括尚未提交的写者），遇到第一个缺失 key 停止。保护的 key 不可淘汰
+  （和 pin 一样被三种触发跳过）；held 的被保护叶子被 L1 淘汰时重新计入
+  预算而不删除。保护不刷新访问时间，不计 lookup 指标。
+- 预算：被保护 key 的去重字节合计不超过比例 × 容量。compressed-online 按
+  record 的 stored 字节计（同一预算下能保护更多块），容量为 packed arena
+  （L1 + L2）；raw 按槽位计，容量为 L2。字节未知的 key（未提交写者）按 raw
+  槽位计。超出预算时只保护链首方向能放下的部分，链首被多个请求共享时只
+  计一次。
+- 泄漏兜底：lease 超过 30 min 未释放，在下一次 `protect_prefix` 时回收。
+- 只适用于有固定匹配顺序的索引（前缀链）；chunk 复用索引的 `chain_keys`
+  为空，不保护。
+
+与已有工作的关系：CachedAttention/AttentionStore（ATC'24）按调度队列决定外存
+淘汰与预取。这里的差别在保护预算按压缩字节计，以及叶子优先树上的链保护。
 
 ## packed arena
 

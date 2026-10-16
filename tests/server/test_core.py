@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 import random
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -20,6 +21,7 @@ from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
+from daser.server import core as core_module
 from daser.server.chunk_manager import ChunkManager, SlotsExhausted
 from daser.server.core import Allocation, ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -1448,3 +1450,102 @@ async def test_held_closure_and_budget_hold_under_random_sessions(seed: int) -> 
             core.release_held(record.file_offset, record.stored_length)
             await _settle()
             _assert_held_closure(core)
+
+
+@pytest.mark.asyncio
+async def test_protected_prefix_survives_reclaim_until_released() -> None:
+    """A queued request's chain is skipped by every trigger until released.
+
+    Protection does not refresh recency: once released, the chain is the
+    oldest candidate again.
+    """
+    core = make_core()
+    tokens, keys = await _committed_chain(core, 2)
+    other = await _committed_blocks(core, 1)
+
+    assert core.protect("req", tokens + [1, 2], budget_bytes=1 << 20) == 2
+    assert await core.reclaim_packed()
+    assert await core.lookup(other[0], "m") == []
+    assert not await core.reclaim_packed()
+    assert not await core.reclaim_packed(free_address=True)
+    assert _resident(core, keys) == [True, True]
+
+    core.release_protection("req")
+    core.release_protection("req")  # idempotent
+    assert await core.reclaim_packed()
+    assert _resident(core, keys) == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_protection_budget_counts_shared_prefix_once() -> None:
+    """The budget covers distinct stored bytes; a walk stops when it is full."""
+    core = make_core()
+    tokens, keys = await _committed_chain(core, 3)
+
+    # Each record is 4 KiB: two of the three blocks fit.
+    assert core.protect("a", tokens, budget_bytes=2 * 4096) == 2
+    # The shared blocks are already paid for.
+    assert core.protect("b", tokens[: 2 * BLOCK_TOKENS], budget_bytes=2 * 4096) == 2
+    assert core.protect("c", tokens, budget_bytes=2 * 4096) == 2
+    assert await core.reclaim_packed()  # only the tail is evictable
+    assert not await core.reclaim_packed()
+    assert _resident(core, keys) == [True, True, False]
+
+    for lease in ("a", "b", "c"):
+        core.release_protection(lease)
+    # Released bytes are reusable: a new lease fits the whole remaining chain.
+    assert core.protect("d", tokens, budget_bytes=2 * 4096) == 2
+
+
+@pytest.mark.asyncio
+async def test_protection_covers_pending_writers_at_raw_slot_cost() -> None:
+    """An uncommitted writer is protected and costs one raw slot."""
+    core = make_core()
+    tokens = list(range(2 * BLOCK_TOKENS))
+    root, tail = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await core.alloc_chunk(root, BLOCK_TOKENS, "m")
+    await core.commit_chunk(root)
+    _place_record(core, root)
+    await core.alloc_chunk(tail, BLOCK_TOKENS, "m", parent_key=root)
+
+    assert core.protect("req", tokens, budget_bytes=4096 + SLOT_SIZE) == 2
+    await core.commit_chunk(tail)
+    _place_record(core, tail)
+    assert not await core.reclaim_packed()
+    assert _resident(core, [root, tail]) == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_l1_release_of_a_protected_held_leaf_recharges_it() -> None:
+    """L1 evicting a protected held leaf charges it again instead of removing."""
+    core = make_core()
+    _attach_l1(core)
+    tokens, keys = await _committed_chain(core, 2)
+    for _ in keys:
+        assert await core.reclaim_packed()
+    assert core.protect("req", tokens, budget_bytes=1 << 20) == 2
+
+    core.release_held(_offset(core, keys[1]), 4096)
+    await _settle()
+    assert _resident(core, keys) == [True, True]
+    assert core.packed_layout.charged_bytes() == 2 * 4096
+    assert await _hit_tokens(core, tokens) == 2 * BLOCK_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_stale_protection_lease_is_released_by_the_next_protect(
+    monkeypatch,
+) -> None:
+    """A lease never released (leaked) expires after the protection TTL."""
+    core = make_core()
+    tokens, keys = await _committed_chain(core, 1)
+    other, _ = await _committed_chain(core, 1, start=5000)
+    now = [0.0]
+    monkeypatch.setattr(core_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    assert core.protect("leaked", tokens, budget_bytes=4096) == 1
+    now[0] = 1800.5
+    assert core.protect("fresh", other, budget_bytes=4096) == 1
+    # Only the fresh lease remains, so the leaked chain is evictable again.
+    assert await core.reclaim_packed()
+    assert _resident(core, keys) == [False]

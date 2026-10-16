@@ -316,6 +316,8 @@ class IPCServer:
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
+            "protect_prefix": self._op_protect_prefix,
+            "release_protection": self._op_release_protection,
         }
 
     async def start(self) -> None:
@@ -822,6 +824,37 @@ class IPCServer:
         transfer = self._transfer
         if transfer is not None:
             await transfer.release_lease(lease_id)
+        return {"ok": True}
+
+    async def _op_protect_prefix(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Protect a queued request's indexed prefix until it is scheduled.
+
+        Args:
+            msg: ``lease_id`` (the vLLM request id) and ``token_bytes`` (or
+                ``tokens``).
+
+        Returns:
+            ``{"protected": n}``: keys protected; 0 when protection is off
+            (``protect_waiting_bytes`` is 0).
+
+        Async/thread-safety:
+            Runs on the IPC server event loop; in-memory only.
+        """
+        lease_id = str(msg.get("lease_id", ""))
+        if not lease_id:
+            raise ValueError("protect_prefix requires lease_id")
+        budget = int(self._runtime_config.get("protect_waiting_bytes", 0))
+        if budget <= 0:
+            return {"protected": 0}
+        protected = self._core.protect(lease_id, self._lookup_tokens(msg), budget)
+        return {"protected": protected}
+
+    async def _op_release_protection(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Idempotently release the prefix protected for one request."""
+        lease_id = str(msg.get("lease_id", ""))
+        if not lease_id:
+            raise ValueError("release_protection requires lease_id")
+        self._core.release_protection(lease_id)
         return {"ok": True}
 
     async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:

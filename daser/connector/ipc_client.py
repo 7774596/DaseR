@@ -461,6 +461,39 @@ class IPCClientSync(_IPCClientBase):
         """
         self.call({"op": "release_transfer_lease", "lease_id": lease_id})
 
+    def protect_prefix(self, lease_id: str, tokens: list[int]) -> int:
+        """Protect a queued request's cached prefix from eviction.
+
+        Args:
+            lease_id: vLLM request ID; pass it to ``release_protection``.
+            tokens: Prompt token IDs.
+
+        Returns:
+            Number of chunk keys the server protects.
+
+        Thread-safety:
+            Uses the lock-protected scheduler IPC connection.
+        """
+        resp = self.call(
+            {
+                "op": "protect_prefix",
+                "lease_id": lease_id,
+                "token_bytes": _pack_lookup_tokens(tokens),
+            }
+        )
+        return int(resp.get("protected", 0))
+
+    def release_protection(self, lease_id: str) -> None:
+        """Idempotently release the prefix protected by ``protect_prefix``.
+
+        Args:
+            lease_id: vLLM request ID.
+
+        Thread-safety:
+            Uses the lock-protected scheduler IPC connection.
+        """
+        self.call({"op": "release_protection", "lease_id": lease_id})
+
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.
 

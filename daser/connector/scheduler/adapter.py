@@ -16,6 +16,10 @@ from daser.connector.metadata import DaserConnectorMeta
 class SchedulerConnectorMixin:
     """Adapt vLLM scheduler hooks to the request lifecycle interface."""
 
+    def on_new_request(self, request: "Request") -> None:
+        """Forward vLLM's waiting-queue arrival to the request lifecycle."""
+        self._request_lifecycle.on_new_request(request)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

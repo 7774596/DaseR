@@ -2771,3 +2771,40 @@ class _ReadaheadRecordingTransfer(TransferLayer):
 
     def close(self) -> None:
         pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [0, 8192])
+async def test_ipc_protect_prefix_blocks_eviction_until_released(
+    tmp_path, budget: int
+) -> None:
+    """``protect_prefix`` keeps a queued prefix indexed; 0 budget is off."""
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    runtime_config = make_runtime_config(tmp_path)
+    runtime_config["protect_waiting_bytes"] = budget
+    server = IPCServer(socket_path, core, runtime_config)
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(socket_path, {"op": "commit_chunk", "chunk_key": key})
+        resp = await _send_recv(
+            socket_path, {"op": "protect_prefix", "lease_id": "r", "tokens": tokens}
+        )
+        assert resp == {"protected": 1 if budget else 0}
+        assert await core.reclaim_packed() is not bool(budget)
+        if budget:
+            await _send_recv(socket_path, {"op": "release_protection", "lease_id": "r"})
+            assert await core.reclaim_packed()
+    finally:
+        await server.stop()

@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import math
 import os
+import time
 from typing import Any, Callable, Optional
 
 # First Party
@@ -29,6 +30,9 @@ logger = init_logger(__name__)
 PUBLISH_PROBE_ENV = "DASER_PUBLISH_PROBE"
 # Research switch: eviction policy, "lru" (default) or "return" (return-aware).
 EVICTION_POLICY_ENV = "DASER_EVICTION_POLICY"
+# A queued-request protection lease older than this is presumed leaked and
+# released by the next ``protect`` call.
+_PROTECT_TTL_S = 1800.0
 # Writer claims happen at scheduling time, so publication latency spans the
 # request's queueing and prefill (seconds) as well as the save window (ms).
 _PUBLISH_BUCKETS = (
@@ -278,6 +282,12 @@ class ServerCore:
         for meta in chunk_manager.store.iter_chunks():
             self._tree.add(meta.chunk_key, meta.parent_key)
         self._pins: dict[str, int] = {}
+        # Queued-request prefix protection: lease id -> (start time, keys),
+        # nested counts per key and each protected key's charged bytes.
+        self._protect_leases: dict[str, tuple[float, list[str]]] = {}
+        self._protected: dict[str, int] = {}
+        self._protect_costs: dict[str, int] = {}
+        self._protected_bytes = 0
         self._held_removals: set[asyncio.Task[None]] = set()
         self._record_capacity_metrics()
 
@@ -1098,6 +1108,79 @@ class ServerCore:
             self._pins.pop(key, None)
             self._tree.refresh(key)
 
+    def protect(self, lease_id: str, tokens: TokenSequence, budget_bytes: int) -> int:
+        """Keep a queued request's indexed prefix from eviction until released.
+
+        Walks the request's prefix chain (``RetrievalIndex.chain_keys``) from
+        its first block and protects each key still indexed, including keys
+        whose writer has not committed, stopping at the first missing key or
+        when the protected keys of all leases would exceed ``budget_bytes``.
+        A key costs its packed stored bytes (raw slot size when it has none
+        yet) and counts once however many leases share it. Protected keys
+        are skipped by every eviction trigger; a held protected leaf that L1
+        evicts is charged to the L2 budget again instead of removed. Access
+        times and lookup metrics are not changed. Leases older than 30 min
+        are released first. See ``docs/design/tier-residency.md``.
+
+        Args:
+            lease_id: Caller-chosen id (the vLLM request id); an existing
+                lease with this id is replaced.
+            tokens: Prompt token IDs.
+            budget_bytes: Cap on the distinct protected bytes of all leases.
+
+        Returns:
+            Number of keys this lease protects.
+
+        Async/thread-safety:
+            Pure in-memory mutation on the server event loop.
+        """
+        now = time.monotonic()
+        self.release_protection(lease_id)
+        for stale in [
+            lease
+            for lease, (started, _keys) in self._protect_leases.items()
+            if now - started > _PROTECT_TTL_S
+        ]:
+            self.release_protection(stale)
+        keys: list[str] = []
+        for key in self._ri.chain_keys(tokens):
+            if key not in self._tree:
+                break
+            if key not in self._protected:
+                cost = self._protect_cost(key)
+                if self._protected_bytes + cost > budget_bytes:
+                    break
+                self._protect_costs[key] = cost
+                self._protected_bytes += cost
+            self._protected[key] = self._protected.get(key, 0) + 1
+            keys.append(key)
+        if keys:
+            self._protect_leases[lease_id] = (now, keys)
+        self._record_protected_bytes()
+        return len(keys)
+
+    def release_protection(self, lease_id: str) -> None:
+        """Release the keys protected by one ``protect`` lease.
+
+        Args:
+            lease_id: Lease id passed to ``protect``; unknown ids are ignored.
+
+        Async/thread-safety:
+            Pure in-memory mutation on the server event loop.
+        """
+        lease = self._protect_leases.pop(lease_id, None)
+        if lease is None:
+            return
+        for key in lease[1]:
+            count = self._protected.get(key, 0) - 1
+            if count > 0:
+                self._protected[key] = count
+                continue
+            self._protected.pop(key, None)
+            self._protected_bytes -= self._protect_costs.pop(key, 0)
+            self._tree.refresh(key)
+        self._record_protected_bytes()
+
     async def reclaim_packed(self, *, free_address: bool = False) -> bool:
         """Reclaim one chunk's packed records from the L2 budget or arena.
 
@@ -1419,12 +1502,13 @@ class ServerCore:
         """Handle a held record L1 evicted, if it is still held.
 
         A chunk with children is charged again instead of removed, so L1
-        replacement never cuts a chain in the middle; only a leaf leaves.
+        replacement never cuts a chain in the middle; only a leaf leaves,
+        unless a queued request protects it.
         """
         chunk_key = self._packed_layout.held_owner(file_offset, nbytes)
         if chunk_key is None:
             return
-        if self._tree.is_leaf(chunk_key):
+        if self._tree.is_leaf(chunk_key) and chunk_key not in self._protected:
             await self._remove_chunk(chunk_key, reason="l1_release")
             return
         self._recharge_path(chunk_key)
@@ -1446,10 +1530,14 @@ class ServerCore:
             self._tree.mark_charged(key)
 
     def _unevictable(self, chunk_key: str) -> bool:
-        """Return whether a chunk is pinned or has an uncommitted writer."""
-        return chunk_key in self._pins or (
-            chunk_key in self._lifecycle.write_owners
-            and not self._lifecycle.is_committed(chunk_key)
+        """Return whether a chunk is pinned, protected or has an uncommitted writer."""
+        return (
+            chunk_key in self._pins
+            or chunk_key in self._protected
+            or (
+                chunk_key in self._lifecycle.write_owners
+                and not self._lifecycle.is_committed(chunk_key)
+            )
         )
 
     async def _evict_one(self) -> bool:
@@ -1463,6 +1551,21 @@ class ServerCore:
             return False
         await self._remove_chunk(victim, reason="capacity")
         return True
+
+    def _protect_cost(self, chunk_key: str) -> int:
+        """Return the bytes one protected chunk keeps resident."""
+        layout = self._packed_layout
+        records = layout.charged_records(chunk_key) + layout.held_records(chunk_key)
+        if not records:
+            return self._slot_size
+        return sum(record.stored_length for record in records)
+
+    def _record_protected_bytes(self) -> None:
+        """Publish the distinct bytes held by queued-request protection."""
+        self._metrics.gauge(
+            "daser_protected_bytes",
+            "Distinct bytes protected for queued requests.",
+        ).set(self._protected_bytes)
 
     def _count_reclaim(self, outcome: str) -> None:
         """Count one packed reclaim by whether L1 kept the chunk indexed."""
