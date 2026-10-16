@@ -699,7 +699,8 @@ class TieredIOUringTransferLayer(TransferLayer):
     tiering and L2 persistence policy.
 
     Args:
-        path: pre-allocated or creatable L2 store file.
+        path: existing L2 store file of at least ``l2_bytes`` (created by the
+            server); unused when ``skip_l2``.
         l1_bytes: maximum memory-tier bytes.
         l2_bytes: SSD-tier capacity.
         io_workers: number of native io_uring rings and executor threads used

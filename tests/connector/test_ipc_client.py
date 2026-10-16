@@ -22,6 +22,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
+from daser.server.store_file import ensure_store_file
 
 SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
@@ -51,13 +52,15 @@ def make_core() -> ServerCore:
 
 
 def make_server(tmp_path) -> IPCServer:
-    """Create an IPC server for client tests."""
+    """Create an IPC server, and its L2 store file, for client tests."""
     socket_path = str(tmp_path / "ipc.sock")
+    store_path = str(tmp_path / "daser.store")
+    ensure_store_file(store_path, 8192)
     return IPCServer(
         socket_path=socket_path,
         core=make_core(),
         runtime_config={
-            "store_path": str(tmp_path / "daser.store"),
+            "store_path": store_path,
             "slot_size": SLOT_SIZE,
             "block_tokens": BLOCK_TOKENS,
             "model_id": "m",

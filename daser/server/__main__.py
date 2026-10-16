@@ -45,6 +45,7 @@ from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
+from daser.server.store_file import ensure_store_file
 
 logger = init_logger(__name__)
 
@@ -124,38 +125,20 @@ def _parse_size_bytes(value: str) -> int:
 
 
 def _ensure_store_file(cfg: DaserConfig) -> None:
-    """Create the KV store file if it does not exist.
+    """Create the store directory and, unless skip_l2, the L2 store file.
 
     Args:
         cfg: resolved DaseR server config.
 
     Raises:
-        ValueError: if an existing store file has the wrong size.
+        ValueError: if an existing store file is smaller than the aligned
+            store size.
     """
     os.makedirs(cfg.store_dir, exist_ok=True)
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
         return
-    if os.path.exists(cfg.store_path):
-        existing = os.path.getsize(cfg.store_path)
-        if existing > cfg.aligned_store_bytes:
-            logger.warning(
-                "[SERVER] truncating store file %s from %d to aligned size %d",
-                cfg.store_path,
-                existing,
-                cfg.aligned_store_bytes,
-            )
-            with open(cfg.store_path, "r+b") as f:
-                f.truncate(cfg.aligned_store_bytes)
-            return
-        if existing < cfg.aligned_store_bytes:
-            raise ValueError(
-                f"existing store file {cfg.store_path} has size {existing}, "
-                f"expected {cfg.aligned_store_bytes}"
-            )
-        return
-    with open(cfg.store_path, "wb") as f:
-        f.truncate(cfg.aligned_store_bytes)
+    ensure_store_file(cfg.store_path, cfg.aligned_store_bytes)
 
 
 def _parse_args() -> argparse.Namespace:

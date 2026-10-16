@@ -42,8 +42,10 @@ class L2IoEngine:
     """Round-robin io_uring positioned reads/writes against the L2 store file.
 
     Args:
-        path: pre-allocated or creatable L2 store file.
-        l2_bytes: SSD-tier capacity; the file is truncated to this size.
+        path: existing L2 store file, created by the server
+            (``daser.server.store_file``); it is opened, never created or
+            resized.
+        l2_bytes: SSD-tier capacity; the file must be at least this large.
         io_workers: number of native io_uring rings and executor threads.
         write_gate: Research switch. Writes run on their own executor and are
             issued in ``_GATE_CHUNK_BYTES`` pieces; before each piece a write
@@ -64,11 +66,16 @@ class L2IoEngine:
             raise ValueError("l2_bytes must be positive")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a+b") as f:
-            f.truncate(l2_bytes)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"L2 store file {path} does not exist; the server creates it "
+                "before starting the transfer layer"
+            )
+        existing = os.path.getsize(path)
+        if existing < l2_bytes:
+            raise ValueError(
+                f"L2 store file {path} has size {existing}, need {l2_bytes}"
+            )
         self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
         self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
         self._executor = concurrent.futures.ThreadPoolExecutor(

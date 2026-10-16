@@ -7,6 +7,7 @@ import threading
 
 # First Party
 from daser.transfer.iouring.l2_engine import L2IoEngine
+from tests.transfer.store_files import create_store_file
 
 PAGE = 4096
 
@@ -27,7 +28,7 @@ def _hold(engine: L2IoEngine, kind: str, release: threading.Event) -> threading.
 
 
 def test_lone_read_counts_in_bucket_one_with_bytes(tmp_path: Path) -> None:
-    engine = L2IoEngine(str(tmp_path / "l2"), 4 * PAGE, 2)
+    engine = L2IoEngine(create_store_file(str(tmp_path / "l2"), 4 * PAGE), 4 * PAGE, 2)
     dst = memoryview(mmap.mmap(-1, PAGE))
     assert engine.timed("read", engine.read_into)(0, dst, engine.next_uring()) == PAGE
     contention = engine.read_contention
@@ -39,7 +40,7 @@ def test_lone_read_counts_in_bucket_one_with_bytes(tmp_path: Path) -> None:
 
 
 def test_reads_bucket_by_concurrency_and_write_activity(tmp_path: Path) -> None:
-    engine = L2IoEngine(str(tmp_path / "l2"), 4 * PAGE, 4)
+    engine = L2IoEngine(create_store_file(str(tmp_path / "l2"), 4 * PAGE), 4 * PAGE, 4)
     release = threading.Event()
     held = [_hold(engine, "read", release) for _ in range(2)]
     writer = _hold(engine, "write", release)
@@ -57,7 +58,7 @@ def test_reads_bucket_by_concurrency_and_write_activity(tmp_path: Path) -> None:
 
 
 def test_writes_do_not_count_as_reads(tmp_path: Path) -> None:
-    engine = L2IoEngine(str(tmp_path / "l2"), 4 * PAGE, 2)
+    engine = L2IoEngine(create_store_file(str(tmp_path / "l2"), 4 * PAGE), 4 * PAGE, 2)
     data = memoryview(mmap.mmap(-1, PAGE))
     engine.timed("write", engine.write)(0, data, engine.next_uring())
     assert engine.read_contention == {}

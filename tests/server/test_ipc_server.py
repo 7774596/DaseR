@@ -27,6 +27,7 @@ from daser.server.ipc.server import (
     _coalesce_transfer_spans,
 )
 from daser.server.metadata_store import MetadataStore
+from daser.server.store_file import ensure_store_file
 from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
 
 SLOT_SIZE = 4096
@@ -49,10 +50,17 @@ RUNTIME_CONFIG = {
 }
 
 
-def make_runtime_config(tmp_path: Any) -> dict[str, Any]:
-    """Create runtime config with a per-test store path."""
+def make_runtime_config(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
+    """Create runtime config with a per-test store path.
+
+    As the server CLI does at startup, the L2 store file is created at the
+    configured ``l2_size_bytes`` unless the config disables L2.
+    """
     runtime_config = dict(RUNTIME_CONFIG)
     runtime_config["store_path"] = str(tmp_path / "daser.store")
+    runtime_config.update(overrides)
+    if not runtime_config.get("skip_l2"):
+        ensure_store_file(runtime_config["store_path"], runtime_config["l2_size_bytes"])
     return runtime_config
 
 
@@ -1234,7 +1242,7 @@ async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
 async def test_packed_store_coalescing_streams_through_l1(tmp_path: Any) -> None:
     """IPC merges adjacent records without making a span larger than L1."""
     socket_path = str(tmp_path / "s.sock")
-    config = {**make_runtime_config(tmp_path), "l2_size_bytes": 4 * SLOT_SIZE}
+    config = make_runtime_config(tmp_path, l2_size_bytes=4 * SLOT_SIZE)
     server = IPCServer(socket_path, make_core(), config)
     await server.start()
     source = b"a" * SLOT_SIZE + b"b" * SLOT_SIZE + b"c" * SLOT_SIZE
@@ -1328,8 +1336,9 @@ async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_memory_only_lookup_skips_chunks_evicted_from_l1(tmp_path) -> None:
     """Without L2, a chunk L1 evicted is a miss even while the ring indexes it."""
-    runtime_config = make_runtime_config(tmp_path)
-    runtime_config.update(skip_l2=True, store_path="", l1_size_bytes=SLOT_SIZE)
+    runtime_config = make_runtime_config(
+        tmp_path, skip_l2=True, store_path="", l1_size_bytes=SLOT_SIZE
+    )
     core = make_core(total_slots=8)
     socket_path = str(tmp_path / "test.sock")
     server = IPCServer(socket_path, core, runtime_config)
@@ -1405,14 +1414,14 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
         slot_size=local_slot_size,
         block_tokens=BLOCK_TOKENS,
     )
-    config = {
-        **make_runtime_config(tmp_path),
-        "slot_size": local_slot_size,
-        "storage_format": "compressed-online",
-        "bip_enabled": True,
-        "l1_size_bytes": local_slot_size,
-        "l2_size_bytes": 8 * local_slot_size,
-    }
+    config = make_runtime_config(
+        tmp_path,
+        slot_size=local_slot_size,
+        storage_format="compressed-online",
+        bip_enabled=True,
+        l1_size_bytes=local_slot_size,
+        l2_size_bytes=8 * local_slot_size,
+    )
     socket_path = str(tmp_path / "tail.sock")
     server = IPCServer(socket_path, core, config)
     await server.start()
@@ -1542,8 +1551,7 @@ def _online_arena_server(
         slot_size=local_slot_size,
         block_tokens=BLOCK_TOKENS,
     )
-    config = {
-        **make_runtime_config(tmp_path),
+    overrides: dict[str, Any] = {
         "slot_size": local_slot_size,
         "storage_format": "compressed-online",
         "bip_enabled": bip_enabled,
@@ -1552,13 +1560,14 @@ def _online_arena_server(
         "l2_budget_bytes": arena_slots * local_slot_size,
     }
     if skip_l2:
-        config.update(
+        overrides.update(
             skip_l2=True,
             store_path="",
             l1_size_bytes=arena_slots * local_slot_size,
             l2_size_bytes=arena_slots * local_slot_size,
             l2_budget_bytes=0,
         )
+    config = make_runtime_config(tmp_path, **overrides)
     socket_path = str(tmp_path / "arena.sock")
     server = IPCServer(socket_path, core, config, metrics_registry=metrics_registry)
     return core, server, socket_path, local_slot_size
@@ -2524,9 +2533,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
         FakeTieredIOUringTransfer,
     )
 
-    runtime_config = make_runtime_config(tmp_path)
-    runtime_config["skip_l2"] = True
-    runtime_config["store_path"] = ""
+    runtime_config = make_runtime_config(tmp_path, skip_l2=True, store_path="")
     core = make_core()
     socket_path = str(tmp_path / "test.sock")
     server = IPCServer(socket_path, core, runtime_config)
