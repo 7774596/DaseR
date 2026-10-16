@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 import mmap
 from pathlib import Path
 import threading
@@ -60,6 +61,6 @@ def test_reads_bucket_by_concurrency_and_write_activity(tmp_path: Path) -> None:
 def test_writes_do_not_count_as_reads(tmp_path: Path) -> None:
     engine = L2IoEngine(create_store_file(str(tmp_path / "l2"), 4 * PAGE), 4 * PAGE, 2)
     data = memoryview(mmap.mmap(-1, PAGE))
-    engine.timed("write", engine.write)(0, data, engine.next_uring())
+    assert asyncio.run(engine.write_batch([(0, data)])) == PAGE
     assert engine.read_contention == {}
     engine.close()

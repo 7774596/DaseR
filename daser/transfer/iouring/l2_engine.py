@@ -39,6 +39,38 @@ def _contention_bucket(level: int) -> int:
     return bucket
 
 
+def _gate_pieces(
+    writes: list[tuple[int, memoryview]], capacity: int
+) -> list[list[tuple[int, memoryview]]]:
+    """Pack extents into gated write pieces.
+
+    Args:
+        writes: (file offset, source) pairs.
+        capacity: most IOs one native batch takes.
+
+    Returns:
+        Native batches of at most ``capacity`` IOs and ``_GATE_CHUNK_BYTES``
+        in total, in input order; longer extents are split at that size.
+    """
+    pieces: list[list[tuple[int, memoryview]]] = []
+    batch: list[tuple[int, memoryview]] = []
+    nbytes = 0
+    for file_offset, data in writes:
+        view = memoryview(data).cast("B")
+        for start in range(0, len(view), _GATE_CHUNK_BYTES):
+            part = view[start : start + _GATE_CHUNK_BYTES]
+            if batch and (
+                len(batch) == capacity or nbytes + len(part) > _GATE_CHUNK_BYTES
+            ):
+                pieces.append(batch)
+                batch, nbytes = [], 0
+            batch.append((file_offset + start, part))
+            nbytes += len(part)
+    if batch:
+        pieces.append(batch)
+    return pieces
+
+
 class L2IoEngine:
     """Round-robin io_uring positioned reads/writes against the L2 store file.
 
@@ -48,11 +80,12 @@ class L2IoEngine:
             resized.
         l2_bytes: SSD-tier capacity; the file must be at least this large.
         io_workers: number of native io_uring rings and executor threads.
-        write_gate: Research switch. Writes run on their own executor and are
-            issued in ``_GATE_CHUNK_BYTES`` pieces; before each piece a write
-            waits, at most ``_GATE_MAX_WAIT_S``, while any read job is in
-            native IO, because concurrent O_DIRECT writes cut the read
-            bandwidth of the shared devices by half or more.
+        write_gate: Research switch. Writes run on their own executor; each
+            ``write_batch`` call is one job issuing native batches of at most
+            ``_GATE_CHUNK_BYTES`` in turn, and before each batch it waits, at
+            most ``_GATE_MAX_WAIT_S``, while any read job is in native IO,
+            because concurrent O_DIRECT writes cut the read bandwidth of the
+            shared devices by half or more.
 
     Async/thread-safety:
         Ring selection is serialized by an internal lock. Blocking syscalls are
@@ -234,42 +267,14 @@ class L2IoEngine:
         """
         return uring.read_into(self._fd, file_offset, dst)
 
-    def write(self, file_offset: int, data: memoryview, uring: NativeIOUring) -> int:
-        """Blocking io_uring L2 write of ``data``.
-
-        Args:
-            file_offset: byte offset in the L2 store file.
-            data: readable memoryview to persist.
-            uring: ring to submit on (from ``next_uring``).
-
-        Returns:
-            Number of bytes written.
-
-        Async/thread-safety:
-            With ``write_gate`` the write is split into pieces that each wait,
-            bounded, while a read job is in native IO; the ring is not held
-            while waiting.
-        """
-        if not self._write_gate:
-            return uring.write(self._fd, file_offset, data)
-        view = memoryview(data).cast("B")
-        written = 0
-        while written < len(view):
-            waited = self._wait_reads_drained()
-            if waited:
-                with self._timing_lock:
-                    self._timing_us["write_gate"] += waited
-            piece = view[written : written + _GATE_CHUNK_BYTES]
-            written += uring.write(self._fd, file_offset + written, piece)
-        return written
-
     async def write_batch(self, writes: list[tuple[int, memoryview]]) -> int:
         """Persist many extents with as few executor jobs as possible.
 
         Ungated, the writes are submitted in native batches of up to one
         ring's capacity, one executor job per batch, so they do not queue
-        ahead of reads one job per extent. With ``write_gate`` it issues
-        each extent as its own job through ``write`` (gated pieces).
+        ahead of reads one job per extent. With ``write_gate`` the call is a
+        single job that issues gate-sized native batches one after another,
+        waiting for in-flight reads before each.
 
         Args:
             writes: Aligned (file offset, source) pairs; sources follow the
@@ -293,12 +298,10 @@ class L2IoEngine:
             jobs = [
                 loop.run_in_executor(
                     self._write_executor,
-                    self.timed("write", self._write_exact),
-                    file_offset,
-                    data,
+                    self.timed("write", self._write_gated),
+                    _gate_pieces(writes, self._urings[0].batch_capacity),
                     self.next_uring(),
                 )
-                for file_offset, data in writes
             ]
         else:
             jobs = []
@@ -373,13 +376,21 @@ class L2IoEngine:
             uring.close()
         os.close(self._fd)
 
-    def _write_exact(
-        self, file_offset: int, data: memoryview, uring: NativeIOUring
+    def _write_gated(
+        self, pieces: list[list[tuple[int, memoryview]]], uring: NativeIOUring
     ) -> int:
-        """Blocking (gated) write of one extent that fails on a short write."""
-        written = self.write(file_offset, data, uring)
-        if written != len(data):
-            raise IOError(f"short io_uring write: {written} != {len(data)}")
+        """Blocking: issue ``pieces`` in turn, each after the read gate.
+
+        Returns:
+            Bytes written.
+        """
+        written = 0
+        for piece in pieces:
+            waited = self._wait_reads_drained()
+            if waited:
+                with self._timing_lock:
+                    self._timing_us["write_gate"] += waited
+            written += uring.write_batch_from(self._fd, piece)
         return written
 
     def _wait_reads_drained(self) -> int:
