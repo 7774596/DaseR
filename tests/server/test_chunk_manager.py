@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import dataclasses
 import os
+from pathlib import Path
 
 # Third Party
 import msgpack
 import pytest
 
 # First Party
-from daser.server.chunk_manager import ChunkManager, SlotsExhausted
+from daser.server.chunk_manager import ChunkManager, IndexSnapshot
 from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import MetadataStore
+from daser.server.tiers import L2Placement
 
 
-def make_manager(total_slots: int = 8) -> ChunkManager:
-    store = MetadataStore()
-    return ChunkManager(total_slots=total_slots, metadata_store=store)
+def make_manager(registry: DocRegistry | None = None) -> ChunkManager:
+    return ChunkManager(MetadataStore(), registry)
 
 
 def alloc(mgr: ChunkManager, key: str, num_slots: int, parent_key: str = "") -> int:
@@ -30,213 +32,173 @@ def alloc(mgr: ChunkManager, key: str, num_slots: int, parent_key: str = "") -> 
     return meta.start_slot
 
 
-def test_alloc_is_first_fit_from_zero():
-    mgr = make_manager(8)
-    assert alloc(mgr, "key1", 3) == 0
-    assert alloc(mgr, "key2", 2) == 3
-    assert mgr.free_slots == 3
-    assert mgr.store.get("key2").num_slots == 2
+def snapshot_of(mgr: ChunkManager, mode: str | None = None) -> IndexSnapshot:
+    """Return a snapshot of every chunk, each with a one-grain L2 copy."""
+    metas = list(mgr.store.iter_chunks())
+    registry = mgr.doc_registry
+    return IndexSnapshot(
+        cache_reuse_mode=mode,
+        next_slot=mgr.next_slot,
+        tier_grain=4096,
+        l2_lane_bytes=64 * 4096,
+        tensor_parallel_size=1,
+        metas=metas,
+        l2=[
+            L2Placement(meta.chunk_key, index * 4096, (4096,) * meta.num_slots)
+            for index, meta in enumerate(metas)
+        ],
+        docs=registry.to_dict() if registry is not None else {},
+    )
 
 
-def test_alloc_records_parent_key():
-    mgr = make_manager(8)
-    alloc(mgr, "root", 1)
-    alloc(mgr, "child", 1, parent_key="root")
-    assert mgr.store.get("child").parent_key == "root"
-    assert mgr.store.get("root").parent_key == ""
+def test_alloc_assigns_consecutive_ids_that_are_never_reused() -> None:
+    mgr = make_manager()
+    assert alloc(mgr, "a", 3) == 0
+    assert alloc(mgr, "b", 2, parent_key="a") == 3
+    assert mgr.store.get("b").parent_key == "a"
+    mgr.remove("a")
+    assert alloc(mgr, "a", 1) == 5
+    assert mgr.next_slot == 6
 
 
-def test_full_store_raises_without_evicting():
-    mgr = make_manager(4)
-    alloc(mgr, "a", 2)
-    alloc(mgr, "b", 2)
-    with pytest.raises(SlotsExhausted):
-        alloc(mgr, "c", 1)
-    assert mgr.store.get("a") is not None
-    assert mgr.store.get("b") is not None
-    assert mgr.store.get("c") is None
-
-
-def test_alloc_rejects_invalid_length():
-    mgr = make_manager(4)
+def test_alloc_rejects_invalid_requests() -> None:
+    mgr = make_manager()
     with pytest.raises(ValueError):
         alloc(mgr, "zero", 0)
+    alloc(mgr, "a", 1)
     with pytest.raises(ValueError):
-        alloc(mgr, "huge", 5)
-
-
-def test_removed_slots_are_reused_and_coalesced():
-    mgr = make_manager(6)
-    alloc(mgr, "a", 2)
-    alloc(mgr, "b", 2)
-    alloc(mgr, "c", 2)
-    mgr.remove("a")
-    mgr.remove("c")
-    assert mgr.free_slots == 4
-    assert mgr.free_holes == 2
-    # Neither hole fits three slots until b leaves and they merge.
-    with pytest.raises(SlotsExhausted):
-        alloc(mgr, "d", 3)
-    mgr.remove("b")
-    assert mgr.free_holes == 1
-    assert alloc(mgr, "d", 3) == 0
-
-
-def test_remove_unknown_raises():
-    mgr = make_manager(4)
+        alloc(mgr, "a", 1)
     with pytest.raises(KeyError):
         mgr.remove("missing")
 
 
-def test_write_hold_defers_slot_reuse():
-    mgr = make_manager(2)
+def test_resolve_slot_maps_ids_to_live_chunks() -> None:
+    mgr = make_manager()
     alloc(mgr, "a", 2)
-    token = mgr.hold_writes(["a", "missing"])
-    mgr.remove("a")
-    assert mgr.store.get("a") is None
-    with pytest.raises(SlotsExhausted):
-        alloc(mgr, "b", 1)
-    mgr.end_writes(token)
-    assert mgr.free_slots == 2
-    assert alloc(mgr, "b", 2) == 0
+    alloc(mgr, "b", 3)
+    meta, index = mgr.resolve_slot(3)
+    assert (meta.chunk_key, index) == ("b", 1)
+    mgr.remove("b")
+    assert mgr.resolve_slot(3) is None
+    assert mgr.resolve_slot(99) is None
+    assert mgr.resolve_slot(1)[0].chunk_key == "a"
 
 
-def test_nested_write_holds_free_after_last():
-    mgr = make_manager(2)
-    alloc(mgr, "a", 2)
-    first = mgr.hold_writes(["a"])
-    second = mgr.hold_writes(["a"])
-    mgr.remove("a")
-    mgr.end_writes(first)
-    assert mgr.free_slots == 0
-    mgr.end_writes(second)
-    assert mgr.free_slots == 2
+def test_existing_store_entries_seed_ids() -> None:
+    first = make_manager()
+    alloc(first, "a", 4)
+    second = ChunkManager(first.store)
+    assert second.next_slot == 4
+    assert second.resolve_slot(2)[0].chunk_key == "a"
 
 
-def test_write_hold_on_live_chunk_frees_nothing():
-    mgr = make_manager(2)
-    alloc(mgr, "a", 2)
-    mgr.end_writes(mgr.hold_writes(["a"]))
-    assert mgr.free_slots == 0
-    with pytest.raises(KeyError):
-        mgr.end_writes(12345)
-
-
-def test_save_and_load_state(tmp_path):
-    mgr = make_manager(8)
-    alloc(mgr, "key1", 3)
-    alloc(mgr, "key2", 2, parent_key="key1")
-    alloc(mgr, "key3", 1)
-    mgr.remove("key1")
+def test_snapshot_round_trip(tmp_path: Path) -> None:
+    mgr = make_manager()
+    alloc(mgr, "a", 3)
+    alloc(mgr, "b", 2, parent_key="a")
     path = str(tmp_path / "daser.index")
-    mgr.save(path)
+    mgr.save(path, snapshot_of(mgr, "prefix"))
 
-    mgr2 = make_manager(8)
-    mgr2.load(path)
-    assert mgr2.store.get("key1") is None
-    assert mgr2.store.get("key2").parent_key == "key1"
-    assert mgr2.free_slots == 5
-    assert mgr2.free_holes == 2
-    assert alloc(mgr2, "key4", 3) == 0
+    snapshot = ChunkManager.read_snapshot(path, expected_cache_reuse_mode="prefix")
+    assert snapshot == snapshot_of(mgr, "prefix")
+    restored = make_manager()
+    restored.restore(snapshot)
+    assert restored.store.get("b").parent_key == "a"
+    assert restored.resolve_slot(4)[0].chunk_key == "b"
+    assert alloc(restored, "c", 1) == 5
 
 
-def test_load_rejects_different_slot_capacity(tmp_path):
-    mgr = make_manager(8)
-    alloc(mgr, "key1", 3)
+def test_read_snapshot_rejects_other_formats_and_modes(tmp_path: Path) -> None:
+    mgr = make_manager()
+    alloc(mgr, "a", 1)
     path = str(tmp_path / "daser.index")
-    mgr.save(path)
+    mgr.save(path, snapshot_of(mgr, "chunk"))
+    with pytest.raises(ValueError, match="cache reuse mode"):
+        ChunkManager.read_snapshot(path, expected_cache_reuse_mode="prefix")
 
-    with pytest.raises(ValueError, match="slot capacity"):
-        make_manager(16).load(path)
+    mgr.save(path, snapshot_of(mgr, None))
+    ChunkManager.read_snapshot(path)
+    with pytest.raises(ValueError, match="cache reuse mode"):
+        ChunkManager.read_snapshot(path, expected_cache_reuse_mode="chunk")
+
+    old = tmp_path / "old.index"
+    old.write_bytes(msgpack.packb({"index": b"", "total_slots": 8}))
+    with pytest.raises(ValueError, match="format"):
+        ChunkManager.read_snapshot(str(old))
 
 
-def test_load_rejects_overlapping_chunks(tmp_path):
-    mgr = make_manager(8)
+def test_validate_snapshot_rejects_bad_ranges() -> None:
+    mgr = make_manager()
     alloc(mgr, "a", 3)
     alloc(mgr, "b", 3)
-    path = str(tmp_path / "daser.index")
-    mgr.save(path)
-    with open(path, "rb") as f:
-        payload = msgpack.unpackb(f.read(), raw=False)
-    index = msgpack.unpackb(payload["index"], raw=False)
-    index["chunk_index"]["b"]["start_slot"] = 1
-    payload["index"] = msgpack.packb(index, use_bin_type=True)
-    with open(path, "wb") as f:
-        f.write(msgpack.packb(payload, use_bin_type=True))
-
-    with pytest.raises(ValueError, match="not free"):
-        make_manager(8).load(path)
-
-
-def test_load_rejects_different_cache_reuse_mode(tmp_path):
-    mgr = make_manager(8)
-    alloc(mgr, "key1", 3)
-    path = str(tmp_path / "daser.index")
-    mgr.save(path, cache_reuse_mode="chunk")
-
-    restored = make_manager(8)
-    with pytest.raises(ValueError, match="cache reuse mode"):
-        restored.load(path, expected_cache_reuse_mode="prefix")
+    good = snapshot_of(mgr)
+    a, b = good.metas
+    cases = [
+        dataclasses.replace(good, metas=[a, dataclasses.replace(b, start_slot=1)]),
+        dataclasses.replace(good, metas=[a, dataclasses.replace(b, chunk_key="a")]),
+        dataclasses.replace(good, next_slot=5),
+        dataclasses.replace(good, metas=[dataclasses.replace(a, start_slot=-1)]),
+        dataclasses.replace(good, metas=[dataclasses.replace(a, num_slots=0)]),
+    ]
+    for snapshot in cases:
+        with pytest.raises(ValueError):
+            make_manager().validate_snapshot(snapshot)
+    with pytest.raises(ValueError, match="empty"):
+        mgr.validate_snapshot(good)
+    make_manager().validate_snapshot(good)
 
 
-def test_load_rejects_missing_cache_reuse_mode_when_expected(tmp_path):
-    mgr = make_manager(8)
-    alloc(mgr, "key1", 3)
-    path = str(tmp_path / "daser.index")
-    mgr.save(path)
+def test_restore_rejection_leaves_the_manager_empty() -> None:
+    mgr = make_manager()
+    alloc(mgr, "a", 2)
+    bad = dataclasses.replace(snapshot_of(mgr), next_slot=1)
+    target = make_manager()
+    with pytest.raises(ValueError):
+        target.restore(bad)
+    assert target.next_slot == 0 and len(target.store) == 0
 
-    restored = make_manager(8)
-    with pytest.raises(ValueError, match="cache reuse mode"):
-        restored.load(path, expected_cache_reuse_mode="chunk")
 
-
-def test_save_and_load_state_includes_doc_registry(tmp_path):
+def test_restore_marks_documents_of_unsaved_chunks_evicted() -> None:
     registry = DocRegistry()
-    store = MetadataStore()
-    mgr = ChunkManager(total_slots=8, metadata_store=store, doc_registry=registry)
-    alloc(mgr, "key1", 3)
+    mgr = make_manager(registry)
+    alloc(mgr, "kept", 1)
+    alloc(mgr, "lost", 1)
     registry.insert(
         DocEntry(
             doc_id="doc1",
             title="Doc 1",
-            token_count=48,
-            chunk_keys=["key1"],
-            cached_mask=[True],
+            token_count=32,
+            chunk_keys=["kept", "lost"],
+            cached_mask=[True, True],
             tokens=[1, 2, 3],
         )
     )
-    meta = mgr.store.get("key1")
-    assert meta is not None
-    meta.doc_ids.append("doc1")
-    path = str(tmp_path / "daser.index")
-
-    mgr.save(path)
+    mgr.store.get("kept").doc_ids.append("doc1")
+    snapshot = snapshot_of(mgr)
+    snapshot = dataclasses.replace(
+        snapshot,
+        metas=[m for m in snapshot.metas if m.chunk_key == "kept"],
+        l2=[p for p in snapshot.l2 if p.chunk_key == "kept"],
+    )
 
     registry2 = DocRegistry()
-    store2 = MetadataStore()
-    mgr2 = ChunkManager(
-        total_slots=8,
-        metadata_store=store2,
-        doc_registry=registry2,
-    )
-    mgr2.load(path)
-
-    restored_doc = registry2.get("doc1")
-    restored_meta = mgr2.store.get("key1")
-    assert restored_doc is not None
-    assert restored_doc.title == "Doc 1"
-    assert restored_doc.tokens == [1, 2, 3]
-    assert restored_meta is not None
-    assert restored_meta.doc_ids == ["doc1"]
+    restored = make_manager(registry2)
+    restored.restore(snapshot)
+    doc = registry2.get("doc1")
+    assert doc is not None
+    assert doc.title == "Doc 1" and doc.tokens == [1, 2, 3]
+    assert doc.cached_mask == [True, False]
+    assert restored.store.get("kept").doc_ids == ["doc1"]
+    assert restored.next_slot == 2
 
 
 def test_save_failure_keeps_existing_index_readable(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = str(tmp_path / "daser.index")
-    mgr = make_manager(8)
+    mgr = make_manager()
     alloc(mgr, "old", 2)
-    mgr.save(path)
+    mgr.save(path, snapshot_of(mgr))
 
     alloc(mgr, "new", 2)
     original_replace = os.replace
@@ -247,11 +209,9 @@ def test_save_failure_keeps_existing_index_readable(
         original_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", fail_replace)
-
     with pytest.raises(OSError, match="replace failed"):
-        mgr.save(path)
+        mgr.save(path, snapshot_of(mgr))
+    assert not os.path.exists(path + ".tmp")
 
-    restored = make_manager(8)
-    restored.load(path)
-    assert restored.store.get("old") is not None
-    assert restored.store.get("new") is None
+    keys = [meta.chunk_key for meta in ChunkManager.read_snapshot(path).metas]
+    assert keys == ["old"]

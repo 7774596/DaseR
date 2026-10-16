@@ -45,5 +45,4 @@ jobs:
           -m "not integration"
           --ignore=tests/integration
           --ignore=tests/connector/test_daser_connector.py
-          --ignore=tests/connector/test_gds_transfer.py
           tests/

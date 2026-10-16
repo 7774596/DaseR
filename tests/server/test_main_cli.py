@@ -17,7 +17,11 @@ from daser.compression import (
     default_online_codebooks,
     write_calibration_artifact,
 )
-from daser.config import DEFAULT_IOURING_L1_BYTES, model_geometry_from_path
+from daser.config import (
+    DEFAULT_IOURING_L1_BYTES,
+    DEFAULT_TIER_GRAIN,
+    model_geometry_from_path,
+)
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -42,6 +46,7 @@ from daser.server.__main__ import (
     _shutdown_server,
     main,
 )
+from tests.server.core_helpers import alloc_and_store
 
 
 def _run_parse(argv: list[str]):
@@ -139,10 +144,9 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert cfg.index_path == str(store_dir / "daser.index")
     assert cfg.transfer_mode == "iouring"
     assert cfg.l1_size_bytes == 1000**3
-    assert cfg.l2_size_bytes == cfg.aligned_store_bytes
-    assert cfg.total_slots > 0
-    assert cfg.aligned_store_bytes <= 10 * 1000**3
-    assert cfg.aligned_store_bytes == cfg.total_slots * cfg.resolved_slot_size()
+    assert cfg.l2_size_bytes == 10 * 1000**3
+    assert cfg.tier_grain == DEFAULT_TIER_GRAIN
+    assert cfg.l2_lane_bytes == 10 * 1000**3 // DEFAULT_TIER_GRAIN * DEFAULT_TIER_GRAIN
 
     http_cfg = _build_http_config(args)
     assert http_cfg.vllm_base_url == "http://127.0.0.1:8001"
@@ -154,39 +158,41 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
-    assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
-    assert runtime["bip_enabled"] is True
-    assert "coalesce_load_misses" not in runtime
-
-
-def test_bip_default_matches_across_storage_formats(tmp_path: Path) -> None:
-    """Raw and compressed-online both enable BIP by default."""
-    raw_model = tmp_path / "raw-model"
-    compressed_model = tmp_path / "compressed-model"
-    _write_model_config(raw_model)
-    _write_model_config(compressed_model)
-
-    raw_args = _run_parse(
-        [
-            "--model-path",
-            str(raw_model),
-            "--store-dir",
-            str(tmp_path / "raw-store"),
-            "--vllm-base-url",
-            "http://127.0.0.1:8001",
-        ]
+    assert runtime["l2_size_bytes"] == cfg.store_file_bytes
+    assert runtime["tier_grain"] == DEFAULT_TIER_GRAIN
+    assert runtime["l1_enabled"] is True and runtime["l2_enabled"] is True
+    assert runtime["staging_bytes"] == 1000**3 // 8 // DEFAULT_TIER_GRAIN * (
+        DEFAULT_TIER_GRAIN
     )
-    compressed_args = _compressed_args(tmp_path, extra=[])
-
-    raw_cfg = _build_daser_config(raw_args)
-    compressed_cfg = _build_daser_config(compressed_args)
-
-    assert raw_cfg.bip_enabled is True
-    assert compressed_cfg.bip_enabled is True
+    assert runtime["l1_lane_bytes"] == cfg.l1_lane_bytes > 0
+    assert "coalesce_load_misses" not in runtime
+    assert "bip_enabled" not in runtime
 
 
-def test_bip_flag_overrides_default(tmp_path: Path) -> None:
-    """``--no-bip-enabled`` disables BIP in config and runtime config."""
+def test_tier_grain_flag_sets_the_allocation_unit(tmp_path: Path) -> None:
+    """``--tier-grain`` reaches config and runtime config and is validated."""
+    base = [
+        "--model-path",
+        str(tmp_path / "model"),
+        "--store-dir",
+        str(tmp_path / "store"),
+        "--vllm-base-url",
+        "http://127.0.0.1:8001",
+    ]
+    _write_model_config(tmp_path / "model")
+
+    cfg = _build_daser_config(_run_parse([*base, "--tier-grain", "1MiB"]))
+
+    assert cfg.tier_grain == 1 << 20
+    assert cfg.l2_lane_bytes % (1 << 20) == 0
+    assert cfg.runtime_config()["tier_grain"] == 1 << 20
+    with pytest.raises(ValueError, match="tier_grain"):
+        _build_daser_config(_run_parse([*base, "--tier-grain", "96KiB"]))
+
+
+def test_gds_has_no_l1_tier(tmp_path: Path) -> None:
+    """GDS ignores --l1-size: no L1 lanes and no staging pool."""
+    _write_model_config(tmp_path / "model")
     args = _run_parse(
         [
             "--model-path",
@@ -195,15 +201,21 @@ def test_bip_flag_overrides_default(tmp_path: Path) -> None:
             str(tmp_path / "store"),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--no-bip-enabled",
+            "--transfer-mode",
+            "gds",
+            "--l1-size",
+            "1GiB",
         ]
     )
-    _write_model_config(tmp_path / "model")
 
     cfg = _build_daser_config(args)
+    runtime = cfg.runtime_config()
 
-    assert cfg.bip_enabled is False
-    assert cfg.runtime_config()["bip_enabled"] is False
+    assert cfg.l1_size_bytes == 0
+    assert runtime["l1_enabled"] is False
+    assert runtime["l1_lane_bytes"] == 0
+    assert runtime["staging_bytes"] == 0
+    assert runtime["l2_lane_bytes"] == cfg.l2_lane_bytes > 0
 
 
 def test_prefetch_lease_budget_flag_populates_runtime_config(tmp_path: Path) -> None:
@@ -294,13 +306,13 @@ def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
 
     assert args.transfer_mode == "iouring"
     assert cfg.transfer_mode == "iouring"
-    assert cfg.l1_size_bytes == min(DEFAULT_IOURING_L1_BYTES, cfg.l2_size_bytes)
+    assert cfg.l1_size_bytes == DEFAULT_IOURING_L1_BYTES
     assert cfg.runtime_config()["transfer_mode"] == "iouring"
     assert cfg.runtime_config()["l1_size_bytes"] == cfg.l1_size_bytes
 
 
 def test_skip_l2_populates_memory_only_runtime_config(tmp_path: Path) -> None:
-    """--skip-l2 keeps logical slots but disables store/index persistence."""
+    """--skip-l2 drops the L2 tier, the store file and index persistence."""
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(model_path)
@@ -323,18 +335,20 @@ def test_skip_l2_populates_memory_only_runtime_config(tmp_path: Path) -> None:
 
     assert cfg.skip_l2 is True
     assert cfg.transfer_mode == "iouring"
-    assert cfg.l1_size_bytes == min(DEFAULT_IOURING_L1_BYTES, cfg.l2_size_bytes)
+    assert cfg.l1_size_bytes == DEFAULT_IOURING_L1_BYTES
+    assert cfg.persists_index is False
     assert runtime["skip_l2"] is True
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["store_path"] == ""
-    assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
-    assert runtime["total_slots"] == cfg.total_slots
+    assert runtime["l2_enabled"] is False
+    assert runtime["l2_size_bytes"] == 0
+    assert runtime["l2_lane_bytes"] == 0
 
 
-def test_skip_l2_uses_l1_size_as_logical_capacity_without_l2_arg(
+def test_skip_l2_gives_the_whole_l1_budget_to_l1_lanes(
     tmp_path: Path,
 ) -> None:
-    """--skip-l2 does not require an explicit L2 capacity."""
+    """Without L2 nothing stages, so the L1 lanes take the whole budget."""
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(model_path)
@@ -356,11 +370,11 @@ def test_skip_l2_uses_l1_size_as_logical_capacity_without_l2_arg(
     runtime = cfg.runtime_config()
 
     assert cfg.skip_l2 is True
-    assert cfg.l1_size_bytes <= 2 * 1024**3
-    assert cfg.l2_size_bytes == cfg.l1_size_bytes
+    assert cfg.l1_size_bytes == 2 * 1024**3
     assert runtime["store_path"] == ""
-    assert runtime["l2_size_bytes"] == cfg.l1_size_bytes
-    assert runtime["total_store_bytes"] == cfg.l1_size_bytes
+    assert runtime["staging_bytes"] == 0
+    assert runtime["l1_lane_bytes"] == 2 * 1024**3
+    assert runtime["l2_size_bytes"] == 0
 
 
 def test_skip_l2_rejects_gds_with_clear_message(tmp_path: Path) -> None:
@@ -438,7 +452,8 @@ def test_cache_reuse_mode_prefix_selects_prefix_components(tmp_path: Path) -> No
     assert isinstance(position, FixedOffsetEncoder)
 
 
-def test_l2_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("flag", ["--l2-size", "--l1-size"])
+def test_each_tier_lane_must_fit_one_record(tmp_path: Path, flag: str) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(model_path)
@@ -450,11 +465,12 @@ def test_l2_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
             str(store_dir),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--l2-size",
-            "1",
+            flag,
+            # One raw 16-token record of the test model is 896 KiB.
+            "512kib",
         ]
     )
-    with pytest.raises(ValueError, match="at least one slot"):
+    with pytest.raises(ValueError, match=f"{flag}.*one record needs"):
         _build_daser_config(args)
 
 
@@ -477,11 +493,11 @@ def test_ensure_store_file_truncates_larger_legacy_file(tmp_path: Path) -> None:
     cfg = _build_daser_config(args)
     store_dir.mkdir()
     with open(cfg.store_path, "wb") as f:
-        f.truncate(cfg.total_store_bytes)
+        f.truncate(cfg.store_file_bytes + cfg.tier_grain)
 
     _ensure_store_file(cfg)
 
-    assert Path(cfg.store_path).stat().st_size == cfg.aligned_store_bytes
+    assert Path(cfg.store_path).stat().st_size == cfg.store_file_bytes
 
 
 def test_ensure_store_file_rejects_smaller_existing_file(tmp_path: Path) -> None:
@@ -503,7 +519,7 @@ def test_ensure_store_file_rejects_smaller_existing_file(tmp_path: Path) -> None
     cfg = _build_daser_config(args)
     store_dir.mkdir()
     with open(cfg.store_path, "wb") as f:
-        f.truncate(cfg.aligned_store_bytes - 1)
+        f.truncate(cfg.store_file_bytes - 1)
 
     with pytest.raises(ValueError, match="has size"):
         _ensure_store_file(cfg)
@@ -560,8 +576,8 @@ def test_compressed_online_accepts_memory_only_store(tmp_path: Path) -> None:
 
     assert cfg.skip_l2 is True
     assert cfg.storage_format == "compressed-online"
-    # The arena addresses L1 only; sizes round to whole slots.
-    assert 0 < cfg.l1_size_bytes == cfg.l2_size_bytes <= 64 * 1024**2
+    assert cfg.l1_lane_bytes == 64 * 1024**2
+    assert cfg.l2_lane_bytes == 0
     assert cfg.persists_index is False
 
 
@@ -576,7 +592,6 @@ def _calibrated_dir(tmp_path: Path, cfg: Any, *, num_layers: int) -> Path:
     """Fit a calibration artifact whose high bytes favor a fixed palette."""
     model = cfg.model_geometry()
     geometry = CompressedStoreGeometry(
-        num_slots=1,
         slot_size=num_layers * 2 * 128 * model.num_kv_heads * model.head_dim * 2,
         block_tokens=128,
         num_layers=num_layers,
@@ -604,7 +619,6 @@ def test_compression_runtime_config_defaults_to_generic_palette(
     runtime = _compression_runtime_config(cfg, args)
 
     geometry = CompressedStoreGeometry(
-        num_slots=cfg.physical_total_slots,
         slot_size=cfg.resolved_local_slot_size(),
         block_tokens=128,
         num_layers=model.num_layers,
@@ -669,6 +683,66 @@ async def test_compressed_online_discards_stale_index(
     await _build_core(cfg)
 
     assert not Path(cfg.index_path).exists()
+
+
+def _raw_config(tmp_path: Path, *extra: str) -> Any:
+    """Build a raw-storage config with a small L2 tier."""
+    model_path = tmp_path / "model"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--l2-size",
+            "64mib",
+            "--cache-reuse-mode",
+            "prefix",
+            *extra,
+        ]
+    )
+    return _build_daser_config(args)
+
+
+@pytest.mark.asyncio
+async def test_build_core_restores_a_saved_index(tmp_path: Path) -> None:
+    cfg = _raw_config(tmp_path)
+    Path(cfg.store_dir).mkdir(parents=True)
+    core = await _build_core(cfg)
+    await alloc_and_store(core, "a", token_count=16)
+    core.save_index(cfg.index_path, cache_reuse_mode=cfg.cache_reuse_mode)
+
+    restored = await _build_core(cfg)
+
+    assert restored.is_chunk_committed("a")
+    assert restored.tier_layout == core.tier_layout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["corrupt", "layout"])
+async def test_build_core_cold_starts_on_an_unusable_index(
+    tmp_path: Path, change: str
+) -> None:
+    """A corrupt index or one saved for other lanes falls back to cold start."""
+    cfg = _raw_config(tmp_path)
+    Path(cfg.store_dir).mkdir(parents=True)
+    if change == "corrupt":
+        Path(cfg.index_path).write_bytes(b"not-an-index")
+    else:
+        core = await _build_core(cfg)
+        await alloc_and_store(core, "a", token_count=16)
+        core.save_index(cfg.index_path, cache_reuse_mode=cfg.cache_reuse_mode)
+        (tmp_path / "other").mkdir()
+        cfg = _raw_config(tmp_path / "other", "--tier-grain", "128KiB")
+        cfg.store_dir = str(tmp_path / "store")
+
+    restored = await _build_core(cfg)
+
+    assert not restored.is_chunk_committed("a")
+    assert restored.chunk_manager.next_slot == 0
 
 
 def test_model_path_is_optional_when_vllm_model_is_local_path(
@@ -862,12 +936,9 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_index(self, path: str, cache_reuse_mode: str | None) -> None:
+            events.append(f"save:{path}:{cache_reuse_mode}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:
@@ -888,11 +959,17 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
         ipc_server=FakeIPCServer(),
         core=FakeCore(),
         index_path=index_path,
+        cache_reuse_mode="prefix",
         wait_for=fake_wait_for,
     )
 
     assert http_server.should_exit is True
-    assert events == ["http_wait", "stop_accepting", f"save:{index_path}", "close"]
+    assert events == [
+        "http_wait",
+        "stop_accepting",
+        f"save:{index_path}:prefix",
+        "close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -909,12 +986,9 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_index(self, path: str, cache_reuse_mode: str | None) -> None:
+            events.append(f"save:{path}:{cache_reuse_mode}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:
@@ -941,7 +1015,7 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
     assert events == [
         "http_cancelled",
         "stop_accepting",
-        f"save:{index_path}",
+        f"save:{index_path}:None",
         "close",
     ]
 
@@ -961,12 +1035,9 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_index(self, path: str, cache_reuse_mode: str | None) -> None:
+            events.append(f"save:{path}:{cache_reuse_mode}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:
@@ -988,11 +1059,14 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
     assert not Path(index_path).exists()
 
 
-def test_compressed_arena_addresses_l2_budget_plus_l1(tmp_path: Path) -> None:
-    """The arena spans L1 + L2 and the L2 budget is --l2-size."""
+def test_compressed_l2_is_sized_by_l2_size_alone(tmp_path: Path) -> None:
+    """Compressed-online sizes L2 like raw: --l2-size, without an L1 arena."""
     args = _compressed_args(tmp_path)
     config = _build_daser_config(args)
+    runtime = config.runtime_config()
 
-    assert config.l2_budget_bytes == int(args.l2_size)
-    assert config.total_store_bytes == config.l2_budget_bytes + config.l1_size_bytes
-    assert config.runtime_config()["l2_budget_bytes"] == config.l2_budget_bytes
+    assert config.l2_size_bytes == int(args.l2_size)
+    assert config.store_file_bytes == config.l2_lane_bytes == int(args.l2_size)
+    assert runtime["l2_size_bytes"] == config.store_file_bytes
+    assert "l2_budget_bytes" not in runtime
+    assert "total_store_bytes" not in runtime

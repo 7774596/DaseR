@@ -18,9 +18,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, build_http_app
 from daser.server.metadata_store import MetadataStore
-
-SLOT_SIZE = 1024
-BLOCK_TOKENS = 4
+from tests.server.core_helpers import BLOCK_TOKENS, make_layout, store_all_ranks
 
 
 def first_rolling_key(tokens: list[int]) -> str:
@@ -35,20 +33,20 @@ def make_core() -> ServerCore:
 
 def make_core_with_index(retrieval_index: Any) -> ServerCore:
     """Create a ServerCore with a custom retrieval index."""
-    store = MetadataStore()
-    doc_registry = DocRegistry()
-    cm = ChunkManager(
-        total_slots=64,
-        metadata_store=store,
-        doc_registry=doc_registry,
-    )
     return ServerCore(
-        chunk_manager=cm,
+        chunk_manager=ChunkManager(MetadataStore(), DocRegistry()),
         retrieval_index=retrieval_index,
         position_encoder=FixedOffsetEncoder(fixed_offset=0),
-        slot_size=SLOT_SIZE,
+        tier_layout=make_layout(),
         block_tokens=BLOCK_TOKENS,
     )
+
+
+def store_chunk(core: ServerCore, key: str, token_count: int) -> None:
+    """Allocate and store one chunk outside a running event loop."""
+    loop = asyncio.get_event_loop()
+    alloc = loop.run_until_complete(core.alloc_chunk(key, token_count, "m"))
+    loop.run_until_complete(store_all_ranks(core, alloc))
 
 
 class FakeTokenizer:
@@ -130,7 +128,7 @@ class FakeVLLMClient:
         )
         if alloc.skipped:
             return
-        await self.commit_core.commit_chunk(key)
+        await store_all_ranks(self.commit_core, alloc)
 
     async def completion(
         self,
@@ -452,11 +450,7 @@ def test_chunk_reuse_lifespan_skips_restored_fixed_segments() -> None:
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
     fake_vllm = FakeVLLMClient(commit_core=core)
     prefix = [*_chat_prefix(), 32]
-    prefix_key = hash_tokens(prefix)
-    asyncio.get_event_loop().run_until_complete(
-        core.alloc_chunk(prefix_key, token_count=len(prefix), model_id="m")
-    )
-    asyncio.get_event_loop().run_until_complete(core.commit_chunk(prefix_key))
+    store_chunk(core, hash_tokens(prefix), len(prefix))
     app = build_http_app(
         HTTPServerConfig(
             vllm_base_url="http://vllm",
@@ -729,11 +723,7 @@ def test_infer_trace_cache_returns_lookup_hits() -> None:
         "doc_id"
     ]
     key = first_rolling_key(_chat_prefix())
-
-    asyncio.get_event_loop().run_until_complete(
-        core.alloc_chunk(key, token_count=4, model_id="m")
-    )
-    asyncio.get_event_loop().run_until_complete(core.commit_chunk(key))
+    store_chunk(core, key, 4)
 
     resp = client.post(
         "/infer",
@@ -757,10 +747,7 @@ def test_infer_traces_cache_by_default() -> None:
         "doc_id"
     ]
     key = first_rolling_key(_chat_prefix())
-    asyncio.get_event_loop().run_until_complete(
-        core.alloc_chunk(key, token_count=4, model_id="m")
-    )
-    asyncio.get_event_loop().run_until_complete(core.commit_chunk(key))
+    store_chunk(core, key, 4)
 
     resp = client.post(
         "/infer",

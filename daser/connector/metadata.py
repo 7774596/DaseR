@@ -8,25 +8,25 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 
 @dataclass(frozen=True)
 class CompressedLoadSlot:
-    """One indexed physical slot record carried to the worker load path.
+    """One packed slot record carried to the worker load path.
+
+    The server resolves the record's tier location from ``slot_id``.
 
     Attributes:
-        slot_id: Logical fixed-envelope DaseR slot.
+        slot_id: DaseR slot id of the record.
         mode: Explicit ``raw`` or ``compressed`` record mode.
-        file_offset: Physical aligned offset in ``daser.store``.
-        stored_length: Aligned bytes to transfer, excluding envelope tail.
+        stored_length: Aligned record bytes to transfer.
     """
 
     slot_id: int
     mode: Literal["raw", "compressed"]
-    file_offset: int
     stored_length: int
 
     def __post_init__(self) -> None:
         if self.slot_id < 0 or self.mode not in ("raw", "compressed"):
             raise ValueError("invalid compressed load slot identity")
-        if self.file_offset < 0 or self.stored_length <= 0:
-            raise ValueError("invalid compressed load slot byte range")
+        if self.stored_length <= 0:
+            raise ValueError("invalid compressed load slot length")
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CompressedLoadSlot":
@@ -34,7 +34,6 @@ class CompressedLoadSlot:
         return cls(
             slot_id=int(payload["slot_id"]),
             mode=str(payload["mode"]),  # type: ignore[arg-type]
-            file_offset=int(payload["file_offset"]),
             stored_length=int(payload["stored_length"]),
         )
 
@@ -48,7 +47,6 @@ class ReqLoadSpec:
         start_slot: first DaseR slot for this chunk.
         num_slots: number of slots in the chunk.
         block_ids: vLLM block IDs allocated to hold the loaded KV.
-        file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens covered.
         target_token_start: token offset where this chunk starts in the
             current prompt.
@@ -63,7 +61,6 @@ class ReqLoadSpec:
     start_slot: int
     num_slots: int
     block_ids: list[int]
-    file_offset: int
     token_count: int
     target_token_start: int = 0
     pos_offset: int = 0
@@ -80,7 +77,6 @@ class ReqStoreSpec:
         start_slot: first DaseR slot allocated for this chunk.
         num_slots: number of slots allocated.
         block_ids: vLLM block IDs whose KV to save.
-        file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens to store.
         logical_slot_start: first prompt-relative slot represented by this
             allocation. This is distinct from ``start_slot``, the physical
@@ -91,28 +87,33 @@ class ReqStoreSpec:
     start_slot: int
     num_slots: int
     block_ids: list[int]
-    file_offset: int
     token_count: int
     logical_slot_start: int = 0
 
 
 @dataclass(frozen=True)
 class StoreWriteSpan:
-    """One contiguous source-buffer slice to write to the store file.
+    """One contiguous source-buffer slice holding records of one chunk.
+
+    The server places the chunk and resolves where the records go.
 
     Attributes:
         source_offset: Byte offset in the CUDA IPC source buffer.
-        nbytes: Number of bytes to write.
-        file_offset: Byte offset in the DaseR store file.
-        chunk_key: Optional chunk key used by the server to suppress stale
-            delayed writes after eviction.
-        start_slot: First slot allocated for chunk_key.
+        nbytes: Number of bytes to write: whole raw slots, or one packed
+            record.
+        slot_index: Index of the first record within the chunk allocation.
+        chunk_key: Chunk key of the allocation.
+        start_slot: First slot id allocated for chunk_key.
         num_slots: Number of slots allocated for chunk_key.
+        logical_slot_start: First prompt-relative slot of the span.
+        logical_slot_count: Prompt-relative slots the span covers.
+        packed: Whether the span is one packed (codec) record.
+        packed_mode: ``raw`` or ``compressed`` mode of a packed record.
     """
 
     source_offset: int
     nbytes: int
-    file_offset: int
+    slot_index: int
     chunk_key: str = ""
     start_slot: int = -1
     num_slots: int = 0

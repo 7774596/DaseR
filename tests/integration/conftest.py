@@ -16,6 +16,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
+from daser.server.tiers import TierLayout
 
 # ---------------------------------------------------------------------------
 # Qwen3-8B KV geometry (verified against config.json)
@@ -26,13 +27,13 @@ NUM_LAYERS: int = 36
 BLOCK_TOKENS: int = 16  # vLLM default block size
 DTYPE_BYTES: int = 2  # bfloat16
 
-# Bytes per vLLM block across all layers.
-# Must match DaserConnector's computed slot_size so that file_offset
-# arithmetic agrees between the server and the connector.
-# = 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296
+# Bytes per vLLM block across all layers; must match the connector's
+# computed slot_size so raw records fit the tier extents.
+# = 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296 (a multiple of the 64 KiB grain)
 SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 
-TOTAL_SLOTS: int = 128  # ring buffer capacity for the test
+L2_RECORDS: int = 128  # raw records the test L2 lane holds
+TIER_GRAIN: int = 64 * 1024
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -66,22 +67,20 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
     store_path = str(tmp / "daser.store")
 
     # Pre-allocate the store file so GDS writes never need to extend it.
-    store_size = TOTAL_SLOTS * SLOT_SIZE
+    store_size = L2_RECORDS * SLOT_SIZE
     with open(store_path, "wb") as f:
         f.write(b"\x00" * store_size)
 
-    metadata_store = MetadataStore()
-    doc_registry = DocRegistry()
-    cm = ChunkManager(
-        total_slots=TOTAL_SLOTS,
-        metadata_store=metadata_store,
-        doc_registry=doc_registry,
-    )
     core = ServerCore(
-        chunk_manager=cm,
+        chunk_manager=ChunkManager(MetadataStore(), DocRegistry()),
         retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
         position_encoder=FixedOffsetEncoder(fixed_offset=0),
-        slot_size=SLOT_SIZE,
+        tier_layout=TierLayout(
+            grain=TIER_GRAIN,
+            l1_lane_bytes=0,
+            l2_lane_bytes=store_size,
+            tensor_parallel_size=1,
+        ),
         block_tokens=BLOCK_TOKENS,
     )
     server = IPCServer(
@@ -91,6 +90,7 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
             "socket_path": socket_path,
             "store_path": store_path,
             "slot_size": SLOT_SIZE,
+            "local_slot_size": SLOT_SIZE,  # TP=1: one rank holds the full slot
             "block_tokens": BLOCK_TOKENS,
             "model_id": "qwen3-8b",
             "cache_reuse_mode": "prefix",

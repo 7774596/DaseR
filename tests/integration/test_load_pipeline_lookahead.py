@@ -24,8 +24,14 @@ from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 class MemoryLoadClient:
     """Supply immutable pinned bytes through the production async IPC boundary."""
 
-    def __init__(self, pool: FixedCudaStagingPool, payload: bytes) -> None:
+    def __init__(
+        self, pool: FixedCudaStagingPool, payload: bytes, refs: list[Any]
+    ) -> None:
         self.pool = pool
+        # Records sit back to back, as the server lays out one chunk extent.
+        self.slot_offsets = np.concatenate(
+            ([0], np.cumsum([ref.stored_length for ref in refs]))
+        ).tolist()
         self.host = torch.empty(len(payload), dtype=torch.uint8, pin_memory=True)
         self.host.copy_(torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy()))
         self.calls: list[int] = []
@@ -47,8 +53,11 @@ class MemoryLoadClient:
         with torch.cuda.stream(stream):
             for span in kwargs["spans"]:
                 start = int(span["target_offset"])
-                offset = int(span["file_offset"])
+                first = int(span["start_slot"])
+                offset = self.slot_offsets[first]
                 nbytes = int(span["nbytes"])
+                end = self.slot_offsets[first + int(span["num_slots"])]
+                assert offset + nbytes == end
                 target[start : start + nbytes].copy_(
                     self.host[offset : offset + nbytes], non_blocking=True
                 )
@@ -75,7 +84,7 @@ def wait_finished(pipeline: LoadPipeline, request: str) -> None:
 def _packed_fixture(
     num_slots: int,
 ) -> tuple[CompressedStoreGeometry, Any, list[bytes], list[Any], bytes]:
-    """Encode mixed raw/packed slots and their back-to-back load references."""
+    """Encode mixed raw/packed slots and their load references."""
     geometry = CompressedStoreGeometry(
         num_slots=num_slots,
         slot_size=2 * 2 * 128 * 32 * 2,
@@ -100,17 +109,14 @@ def _packed_fixture(
         for index, raw in enumerate(raw_slots)
     ]
     refs = []
-    offset = 0
     for index, slot in enumerate(encoded):
         refs.append(
             CompressedLoadSlot(
                 index,
                 "raw" if int(slot.mode) == 0 else "compressed",
-                offset,
                 len(slot.payload),
             )
         )
-        offset += len(slot.payload)
     return geometry, codebooks, raw_slots, refs, b"".join(s.payload for s in encoded)
 
 
@@ -121,7 +127,6 @@ def _full_spec(geometry: CompressedStoreGeometry, refs: list[Any]) -> ReqLoadSpe
         start_slot=0,
         num_slots=geometry.num_slots,
         block_ids=list(range(geometry.num_slots)),
-        file_offset=0,
         token_count=geometry.num_slots * geometry.block_tokens,
         compressed_slots=refs,
     )
@@ -141,7 +146,7 @@ def test_packed_restore_waits_for_queued_model_stream_writes(
     """
     geometry, codebooks, raw_slots, refs, payload = _packed_fixture(4)
     pool = FixedCudaStagingPool(torch.device("cuda:0"), 4 * geometry.slot_size, 2)
-    client = MemoryLoadClient(pool, payload)
+    client = MemoryLoadClient(pool, payload, refs)
     monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
     destination = allocate_cross_layer_kv_cache(
         geometry.num_slots, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"
@@ -152,7 +157,6 @@ def test_packed_restore_waits_for_queued_model_stream_writes(
         kv_caches={"cross": destination},
         layer_names=["a", "b"],
         local_slot_size=geometry.slot_size,
-        rank_stride_bytes=0,
         tp_rank=0,
         staging_pool=pool,
         load_key_scale=1.0,
@@ -207,7 +211,7 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
     geometry, codebooks, raw_slots, refs, payload = _packed_fixture(9)
     assert {ref.mode for ref in refs} == {"raw", "compressed"}
     pool = FixedCudaStagingPool(torch.device("cuda:0"), 2 * geometry.slot_size, 2)
-    client = MemoryLoadClient(pool, payload)
+    client = MemoryLoadClient(pool, payload, refs)
     monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
     destination = allocate_cross_layer_kv_cache(
         geometry.num_slots, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"
@@ -218,7 +222,6 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
         kv_caches={"cross": destination},
         layer_names=["a", "b"],
         local_slot_size=geometry.slot_size,
-        rank_stride_bytes=0,
         tp_rank=0,
         staging_pool=pool,
         load_key_scale=1.0,
@@ -267,7 +270,6 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
                         start_slot=0,
                         num_slots=geometry.num_slots,
                         block_ids=list(range(geometry.num_slots)),
-                        file_offset=0,
                         token_count=geometry.num_slots * geometry.block_tokens,
                         compressed_slots=refs,
                     )

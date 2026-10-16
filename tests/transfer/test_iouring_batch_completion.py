@@ -1,19 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sparse read completion and buffer lifetime through the public transfer API."""
 
+# Standard
 import asyncio
 from collections.abc import Callable, Sequence
 from pathlib import Path
 import threading
 
+# Third Party
 import pytest
 
+# First Party
+from daser.transfer import Move
 from daser.transfer.iouring import TieredIOUringTransferLayer
 from daser.transfer.iouring.native import NativeIOUring
+from tests.transfer.store_files import create_store_file
+
+PAGE = 4096
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-def test_packed_batch_copies_ready_extent_before_slow_read_finishes(
+def test_batch_copies_ready_read_before_slow_read_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool
 ) -> None:
     """Early CQEs copy immediately; cancellation drains the remaining IO."""
@@ -28,6 +35,8 @@ def test_packed_batch_copies_ready_extent_before_slow_read_finishes(
         on_complete: Callable[[int, int], None] | None = None,
     ) -> int:
         count = original(self, fd, reads[:1], on_complete)
+        if len(reads) == 1:
+            return count
         started.set()
         assert release.wait(timeout=10)
 
@@ -41,36 +50,25 @@ def test_packed_batch_copies_ready_extent_before_slow_read_finishes(
 
     async def scenario() -> None:
         path = tmp_path / "sparse.store"
-        second_offset = 8192
-        path.write_bytes(b"a" * 4096 + bytes(second_offset - 4096) + b"b" * 4096)
+        path.write_bytes(b"a" * PAGE + bytes(PAGE) + b"b" * PAGE)
         layer = TieredIOUringTransferLayer(
-            path=str(path),
-            l1_bytes=8192,
-            l2_bytes=12288,
+            create_store_file(str(path), 3 * PAGE),
+            l1_bytes=0,
+            staging_bytes=2 * PAGE,
+            l2_bytes=3 * PAGE,
         )
-        dst = bytearray(8192)
-        loading = asyncio.create_task(
-            layer.load_bytes_grouped(
-                dst,
-                [
-                    {"file_offset": 0, "target_offset": 0, "nbytes": 4096},
-                    {
-                        "file_offset": second_offset,
-                        "target_offset": 4096,
-                        "nbytes": 4096,
-                    },
-                ],
-            )
-        )
+        dst = bytearray(2 * PAGE)
+        moves = [Move(0, PAGE, l2_offset=0), Move(PAGE, PAGE, l2_offset=2 * PAGE)]
+        loading = asyncio.create_task(layer.load(dst, moves, "l2"))
         try:
 
             async def wait_for_first_copy() -> None:
-                while not started.is_set() or dst[:4096] != b"a" * 4096:
+                while not started.is_set() or dst[:PAGE] != b"a" * PAGE:
                     await asyncio.sleep(0.001)
 
             await asyncio.wait_for(wait_for_first_copy(), timeout=5)
             assert not loading.done()
-            assert dst[4096:] == bytes(4096)
+            assert dst[PAGE:] == bytes(PAGE)
             if cancel:
                 loading.cancel()
                 await asyncio.sleep(0.02)
@@ -80,75 +78,17 @@ def test_packed_batch_copies_ready_extent_before_slow_read_finishes(
                 with pytest.raises(asyncio.CancelledError):
                     await loading
             else:
-                assert await loading == 8192
-                assert dst == b"a" * 4096 + b"b" * 4096
+                await loading
+                assert dst == b"a" * PAGE + b"b" * PAGE
                 assert layer.stats.l2_reads == 2
-            # The cancelled request's buffer leases must be usable again.
-            restored = bytearray(4096)
-            assert await layer.load_bytes(restored, second_offset, 4096) == 4096
-            assert restored == b"b" * 4096
+            # The cancelled load returned every staging slice.
+            assert layer.debug_state()["staging_used_bytes"] == 0
+            restored = bytearray(PAGE)
+            await layer.load(restored, [Move(0, PAGE, l2_offset=2 * PAGE)], "l2")
+            assert restored == b"b" * PAGE
         finally:
             release.set()
             await asyncio.gather(loading, return_exceptions=True)
-            layer.close()
-
-    asyncio.run(scenario())
-
-
-def test_ready_packed_reads_copy_before_stale_promotions_are_released(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A concurrent store preserves new L1 bytes and the older captured read."""
-    original = NativeIOUring.read_batch_into
-    captured = threading.Event()
-    release = threading.Event()
-
-    def delayed(
-        self: NativeIOUring,
-        fd: int,
-        reads: Sequence[tuple[int, memoryview]],
-        on_complete: Callable[[int, int], None] | None = None,
-    ) -> int:
-        result = original(self, fd, reads)
-        captured.set()
-        assert release.wait(timeout=10)
-        if on_complete is not None:
-            for index, (_offset, view) in enumerate(reads):
-                on_complete(index, len(view))
-        return result
-
-    monkeypatch.setattr(NativeIOUring, "read_batch_into", delayed)
-
-    async def scenario() -> None:
-        path = tmp_path / "stale-batch.store"
-        path.write_bytes(b"a" * 4096 + bytes(4096) + b"b" * 4096 + bytes(4096))
-        layer = TieredIOUringTransferLayer(
-            path=str(path),
-            l1_bytes=16384,
-            l2_bytes=16384,
-        )
-        spans = [
-            {"file_offset": 0, "target_offset": 0, "nbytes": 4096},
-            {"file_offset": 8192, "target_offset": 4096, "nbytes": 4096},
-        ]
-        dst = bytearray(8192)
-        loading = asyncio.create_task(layer.load_bytes_grouped(dst, spans))
-        try:
-            assert await asyncio.to_thread(captured.wait, timeout=5)
-            await layer.store_bytes(b"x" * 4096, 0, 4096)
-            await layer.store_bytes(b"y" * 4096, 8192, 4096)
-            release.set()
-            assert await asyncio.wait_for(loading, timeout=5) == 8192
-            assert dst == b"a" * 4096 + b"b" * 4096
-            await layer.drain()
-            restored = bytearray(8192)
-            assert await layer.load_bytes_grouped(restored, spans) == 8192
-            assert restored == b"x" * 4096 + b"y" * 4096
-            assert layer.stats.l2_reads == 2
-        finally:
-            release.set()
-            await asyncio.gather(loading, return_exceptions=True)
-            await layer.drain()
-            layer.close()
+            await layer.close()
 
     asyncio.run(scenario())

@@ -6,8 +6,7 @@ import pytest
 
 from daser.transfer.iouring import copy_ops
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool
-
-cupy = pytest.importorskip("cupy")
+from tests.transfer.cuda import require_cuda
 
 
 class _StreamDestination:
@@ -32,8 +31,7 @@ def _scattered_copy(piece: int) -> tuple[bytes, bytes, int]:
 
     Returns the expected bytes, the GPU result and the reported run count.
     """
-    if cupy.cuda.runtime.getDeviceCount() == 0:
-        pytest.skip("CUDA device required")
+    cupy = require_cuda()
     count = 8
     stride = 3 * piece + 512
     pool = PinnedMemoryPool(stride * count + piece)

@@ -24,8 +24,8 @@ sequenceDiagram
         DC->>IPC: match_and_alloc / alloc_chunk
         IPC->>C: allocate slots (evict cold leaves if full)
         V->>DC: worker save KV
-        DC->>IPC: commit_chunk
-        IPC->>C: publish chunk to RetrievalIndex
+        DC->>IPC: transfer_store(spans, tp_rank)
+        IPC->>C: place + store; publish once every rank reported
     end
     HTTP->>C: register_document(doc_id, chunk_keys, tokens)
     C-->>HTTP: cached count
@@ -94,9 +94,9 @@ sequenceDiagram
     S->>SL: update_state_after_alloc(block_ids)
     SL->>IPC: alloc_chunk(chunk_key, token_count, model_id)
     IPC->>C: alloc_chunk(...)
-    C->>CM: allocate slots, evict old chunks if needed
+    C->>CM: assign monotonic slot ids (no capacity check)
     CM-->>C: start_slot, num_slots
-    C-->>IPC: file_offset, pos_offset
+    C-->>IPC: start_slot, num_slots, pos_offset
     IPC-->>SL: allocation
     S->>SL: build_connector_meta(scheduler_output)
     SL-->>S: reqs_to_store
@@ -128,11 +128,13 @@ sequenceDiagram
         BG->>BG: record producer CUDA event
         BG->>BG: wait producer event
         BG->>IPC: transfer_store(cuda_ipc_handle, spans)
-        IPC->>TL: store_bytes_grouped(staging slices, file_offset)
-        TL-->>IPC: bytes accepted
+        IPC->>C: place_store(chunks, record sizes)
+        C-->>IPC: L2 extent + L1 extent or L1 skip, evicting per tier
+        IPC->>TL: store(staging buffer, moves)
+        TL-->>IPC: staged (L1 copy valid) / persisted (L2 written)
         IPC-->>BG: stored chunk keys
     end
-    IPC->>C: record accepted ranges after transfer completion
+    IPC->>C: mark per-rank tier validity
     C->>C: commit complete chunk coverage through existing TP quorum
 ```
 
@@ -152,13 +154,15 @@ sequenceDiagram
     participant C as ServerCore
     participant RI as RetrievalIndex
 
-    IPC->>C: record_store_ranges(chunk spans)
-    C->>C: commit complete coverage through TP quorum
+    IPC->>C: store_staged / store_persisted(placement, tp_rank)
+    C->>C: publish once every rank reported and a copy is valid on all ranks
     C->>RI: insert(ChunkMeta)
-    C-->>IPC: transfer response
+    C-->>IPC: chunk committed
 ```
 
-commit 完成后 chunk 才能被 lookup 命中。
+commit 完成后 chunk 才能被 lookup 命中。`transfer_store` 在本请求的 chunk 都有
+L1 extent 时于 staging 完成后回复，否则等 L2 写完；L2 写失败时 `store_failed`
+丢弃不完整副本，没有副本的未 commit chunk 被移除，L2-only 请求回复错误。
 
 ---
 
@@ -218,8 +222,9 @@ sequenceDiagram
         BG->>BG: lease GPU uint8 staging view
         BG->>BG: export CUDA IPC handle for staging
         BG->>IPC: transfer_load(cuda_ipc_handle, spans)
-        IPC->>TL: load_bytes_grouped(staging slices, file_offset)
-        TL-->>IPC: bytes read
+        IPC->>IPC: resolve (start_slot, num_slots) spans via plan_load
+        IPC->>TL: load(staging buffer, moves, source l1 or l2)
+        TL-->>IPC: bytes read (L2 reads may also fill a new L1 extent)
         IPC-->>BG: ok
         BG-->>W: read complete
         loop each copy run and layer
@@ -233,7 +238,16 @@ sequenceDiagram
 ```
 
 异步 load 在 `WAITING_FOR_REMOTE_KVS` 期间完成，不在 forward 关键路径上。
-`layerwise_load`（默认关）只作用于已 lease 进 L1 的命中：`start_load_kv` 启动按层
+load span 只带 `(start_slot, num_slots)` 和 `tp_rank`，server 用 `plan_load` 按
+chunk 选层；整 chunk 的 L2 读在 L1 可接纳时同一次读 promote 进 L1。回复中的
+`l1_segments` / `l2_segments` 是本次读各层的 chunk 段数。
+
+开启 prefetch（`prefetch_max_requests > 0`）时，scheduler 先 `lookup_prefetch`
+固定外部窗口的 chunk，再 `transfer_prefetch` 把只有 L2 的 chunk promote 进 L1；
+错误回复表示 lease 不可用，scheduler 释放 lease 后按普通 load 继续。lease 在请求
+load 结束后由 `release_transfer_lease` 释放。prefix lookup 返回的 run 可能合并
+多个相邻 chunk，server 按 chunk（`resolve_slots`）取 lease 和 promote。
+`layerwise_load`（默认关）只作用于 L1 副本已被 prefetch lease 固定的命中：`start_load_kv` 启动按层
 恢复，`wait_for_layer_load(layer_name)` 让该层 attention 只等自己那一层。vLLM 只在
 uniform decode batch 上 replay FULL CUDA graph（会跳过逐层 hook），所以 forward
 context 为 FULL 或没有 attention metadata 时，`start_load_kv` 在返回前等完全部层。
@@ -257,14 +271,15 @@ sequenceDiagram
     IPC->>IPC: drain and close transfer resources
 ```
 
-`daser.index` 保存槽位总数、`MetadataStore` 和 `DocRegistry`；空闲区间和淘汰树
-在加载时由 chunk 索引重建。
+`daser.index` 保存 `MetadataStore`、`DocRegistry`、`next_slot`、每个 chunk 的
+L2 偏移和 record 长度，以及粒度和 lane 大小；L2 分配器和淘汰树在加载时由索引
+重建，L1 为空。
 启动时恢复 metadata 后，`ServerCore.rebuild_retrieval_index()` 会从 committed
 chunk metadata 重建检索索引。
 
 关机采用 fast consistent stop。收到 SIGTERM/SIGINT 后，server 先停止 HTTP
 和 IPC 新请求入口，再保存当时已经 commit 的 chunk metadata 和已经完成注册的
-文档。connector 侧尚未完成的后台写入或尚未到达 `commit_chunk` 的数据不会进入
+文档。connector 侧尚未完成的后台写入或尚未发布的 chunk 不会进入
 `daser.index`；即使底层 `daser.store` 已有部分字节，重启后也不会被检索索引命中。
 已经 commit 但还没有绑定到文档的 orphan chunk 会作为普通 cache chunk 保留，
 后续再次上传相同内容时可以通过相同 chunk key 复用。

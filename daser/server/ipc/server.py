@@ -1,59 +1,69 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Connector IPC server: cache control plane and server-placed transfers.
+
+The connector names chunks and slot ids only. Every byte location is chosen
+here from ``ServerCore`` tier placements and handed to the transfer layer as
+absolute ``Move`` offsets:
+
+- ``transfer_store``: ``place_store`` -> ``TransferLayer.store`` ->
+  ``store_staged`` / ``store_persisted`` (or ``store_failed``). The reply is
+  sent once the worker buffer was consumed; a chunk without an L1 copy is
+  replied after its L2 write, so the chunk is published by then.
+- ``transfer_load``: ``plan_load`` per span -> one ``TransferLayer.load`` per
+  source tier; whole L2-only chunks are promoted into L1 on the same read.
+- Lookup readahead promotes the external window's L2-only chunks in the
+  background (bounded in flight).
+- Prefetch leases pin the L1 copies of a request's window; layer-wise runs
+  read them through ``load_runs``.
+"""
+
 # Standard
 import asyncio
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 import contextlib
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 import os
 import threading
 import time
 from typing import Any
 
+# Third Party
+import numpy
+
+# First Party
 from daser import stalldump
 from daser.config import (
     DEFAULT_LOAD_READAHEAD_BYTES,
     L2_WRITE_GATE_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
-    READAHEAD_BUDGET_FRACTION_ENV,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
 )
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
-
-# First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
-from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import PackedArenaFull
-from daser.transfer import LeaseIncompleteError, TransferLayer
+from daser.server.core import ChunkInfo, LoadSegment, ServerCore, StoreRequest
+from daser.server.tiers import (
+    L1,
+    L2,
+    ChunkUnavailable,
+    Lease,
+    Promotion,
+    StorePlacement,
+    TierLayout,
+    record_offsets,
+)
+from daser.transfer import Move, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
 
-# Bound adjacent packed writes independently of logical commit granularity.
-# The configured L1 capacity below further limits each merge: the transfer
-# layer cannot split an individual span to fit its pinned pool. Raw spans
-# keep the existing unbounded adjacency coalescing contract.
-_PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
-
-
 _CUDA_IPC_CACHE_LIMIT = 16
-# Grouped-load phases exported as daser_load_phase_seconds_total{phase}; each
-# maps to a TransferStats load_<phase>_us counter.
-_LOAD_PHASES = (
-    "readahead_wait",
-    "resolve",
-    "pending_write",
-    "l2",
-    "copy_drain",
-    "ra_window",
-    "l2_reserve",
-    "l2_io",
-)
+_RECORD_MODES = ("raw", "compressed")
 
 
 def _external_prefix_hits(
@@ -114,134 +124,193 @@ def _external_load_window(
     return load_start, min(load_end, target_end)
 
 
-def _prefetch_spans_from_chunks(
+def _window_slots(
     chunks: list[ChunkInfo],
-    *,
     external_start: int,
     external_tokens: int,
     block_tokens: int,
-    slot_size: int,
-    tensor_parallel_size: int,
-    rank_stride_bytes: int,
-) -> list[dict[str, int]]:
-    """Translate an admitted external KV window into physical TP-lane spans.
+) -> list[tuple[ChunkInfo, int, int]]:
+    """Return the slot range of each chunk a worker load of a window reads.
 
     Args:
-        chunks: Server lookup chunks covering the prompt prefix.
-        external_start: Token offset where external cache loading begins.
-        external_tokens: Number of externally admitted tokens.
-        block_tokens: Tokens stored in one logical cache slot.
-        slot_size: Aggregate bytes per logical slot across TP ranks.
-        tensor_parallel_size: Number of physical rank lanes.
-        rank_stride_bytes: Byte distance between adjacent rank lanes.
+        chunks: Lookup chunks covering the prompt prefix.
+        external_start: Token offset where external loading begins.
+        external_tokens: Externally admitted tokens.
+        block_tokens: Tokens per slot.
 
     Returns:
-        Sorted block-aligned physical storage ranges for host-tier admission.
+        ``(chunk, first slot index in the chunk, slot count)`` in prompt
+        order; empty when the window is empty or not block aligned.
+
+    Raises:
+        ValueError: If ``block_tokens`` is not positive.
     """
     if block_tokens <= 0:
-        raise ValueError("block_tokens must be positive for prefetch lookup")
-    if external_tokens <= 0 or external_start % block_tokens != 0:
+        raise ValueError("block_tokens must be positive for external windows")
+    if external_tokens <= 0 or external_start % block_tokens:
         return []
-    if slot_size <= 0 or tensor_parallel_size <= 0:
-        raise ValueError("invalid transfer geometry for prefetch lookup")
-    if slot_size % tensor_parallel_size:
-        raise ValueError("slot_size must divide evenly across tensor-parallel ranks")
-    local_slot_size = slot_size // tensor_parallel_size
     external_end = external_start + external_tokens
-    spans: list[dict[str, int]] = []
+    windows = []
     for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
         target_start = int(chunk.target_token_start)
-        target_end = target_start + int(chunk.token_count)
         load_start, load_end = _external_load_window(
-            target_start, target_end, external_start, external_end, block_tokens
+            target_start,
+            target_start + int(chunk.token_count),
+            external_start,
+            external_end,
+            block_tokens,
         )
-        if load_end <= load_start:
-            continue
-        start_slot = int(chunk.start_slot) + (
-            (load_start - target_start) // block_tokens
-        )
-        nbytes = ((load_end - load_start) // block_tokens) * local_slot_size
-        for rank in range(tensor_parallel_size):
-            spans.append(
-                {
-                    "file_offset": rank * rank_stride_bytes
-                    + start_slot * local_slot_size,
-                    "nbytes": nbytes,
-                }
+        if load_end > load_start:
+            windows.append(
+                (
+                    chunk,
+                    (load_start - target_start) // block_tokens,
+                    (load_end - load_start) // block_tokens,
+                )
             )
-    return spans
+    return windows
 
 
-def _coalesce_transfer_spans(
-    spans: list[dict[str, Any]],
-    *,
-    max_packed_bytes: int | None = None,
-) -> list[dict[str, Any]]:
-    """Merge adjacent transfer spans without changing byte contents.
+def _first_error(futures: Sequence[asyncio.Future[Any]]) -> BaseException | None:
+    """Return the first failure among completed futures, or None.
 
     Args:
-        spans: transfer spans with source_offset, file_offset, and nbytes.
-        max_packed_bytes: Optional upper bound for one coalesced packed span.
-            Raw spans and individual packed spans larger than the bound are
-            unchanged.
+        futures: Completed futures.
+    """
+    for future in futures:
+        if future.cancelled():
+            return asyncio.CancelledError()
+        error = future.exception()
+        if error is not None:
+            return error
+    return None
+
+
+async def _outcome(futures: Sequence[asyncio.Future[Any]]) -> BaseException | None:
+    """Wait for every future without cancelling any; return the first failure.
+
+    Args:
+        futures: Futures to wait for; shared futures may appear in several
+            callers' lists.
 
     Returns:
-        Coalesced spans sorted by source and file offset.
-    """
-    if max_packed_bytes is not None and max_packed_bytes <= 0:
-        raise ValueError("max_packed_bytes must be positive when provided")
-    normalized = [
-        {
-            "source_offset": int(span.get("source_offset", 0)),
-            "file_offset": int(span["file_offset"]),
-            "nbytes": int(span["nbytes"]),
-            "packed": bool(span.get("packed", False)),
-            "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
-        }
-        for span in spans
-        if int(span["nbytes"]) > 0
-    ]
-    normalized.sort(key=lambda span: (span["source_offset"], span["file_offset"]))
-    if not normalized:
-        return []
+        The first failure in ``futures`` order, or None when all succeeded.
 
-    merged = [normalized[0]]
-    for span in normalized[1:]:
-        prev = merged[-1]
-        prev_source_end = prev["source_offset"] + prev["nbytes"]
-        prev_file_end = prev["file_offset"] + prev["nbytes"]
-        if (
-            span["source_offset"] == prev_source_end
-            and span["file_offset"] == prev_file_end
-            and span["packed"] == prev["packed"]
-            and (
-                not span["packed"]
-                or max_packed_bytes is None
-                or prev["nbytes"] + span["nbytes"] <= max_packed_bytes
-            )
-        ):
-            prev["nbytes"] += span["nbytes"]
-            prev["accounted_nbytes"] += span["accounted_nbytes"]
-        else:
-            merged.append(span)
-    return merged
+    Async/thread-safety:
+        Shields the futures, so cancelling the caller never cancels them; a
+        cancellation of the caller is re-raised once they all ended.
+    """
+    pending = [future for future in futures if not future.done()]
+    cancelled: asyncio.CancelledError | None = None
+    while pending:
+        try:
+            await asyncio.shield(asyncio.wait(pending))
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        pending = [future for future in pending if not future.done()]
+    if cancelled is not None:
+        raise cancelled
+    return _first_error(futures)
+
+
+@dataclass(eq=False)
+class _ChunkStore:
+    """Store progress of one chunk on one rank across store requests.
+
+    A raw chunk larger than one worker staging batch arrives in several
+    requests. Every request places the chunk (placement is idempotent) and
+    moves its slots; the request that completes the slot set reports the
+    chunk's outcome once every request's IO ended.
+
+    Attributes:
+        num_slots: Slots of the allocation.
+        slots: Slot indices received so far.
+        staged: ``StoreHandle.staged`` of every request carrying the chunk.
+        persisted: ``StoreHandle.persisted`` of those requests.
+    """
+
+    num_slots: int
+    slots: set[int] = field(default_factory=set)
+    staged: list[asyncio.Future[None]] = field(default_factory=list)
+    persisted: list[asyncio.Future[None]] = field(default_factory=list)
+
+
+@dataclass(eq=False)
+class _StorePart:
+    """One chunk carried by one store request.
+
+    Attributes:
+        key: ``(chunk_key, start_slot, tp_rank)`` of the chunk store.
+        num_slots: Slots of the allocation.
+        slots: Slot indices this request writes.
+        placement: This request's placement (its own io pins).
+        tracker: Progress shared by the chunk's requests; set when the
+            request's IO was submitted.
+        reporter: Whether this request completed the slot set and reports
+            the chunk's outcome; other requests only release their pins.
+    """
+
+    key: tuple[str, int, int]
+    num_slots: int
+    slots: frozenset[int]
+    placement: StorePlacement
+    tracker: _ChunkStore | None = None
+    reporter: bool = False
+
+
+@dataclass(eq=False)
+class _LeaseState:
+    """Server state of one request prefetch lease.
+
+    Attributes:
+        lease_id: Scheduler request id.
+        leases: Tier lease pins, one per leased chunk.
+        windows: ``(start_slot, num_slots)`` the request loads, per chunk.
+        promote_keys: Chunks that had no L1 copy at lookup.
+        nbytes: L1 extent bytes of the leased chunks over all ranks,
+            counted against the prefetch lease budget.
+        admitted: Whether ``nbytes`` is counted in the budget.
+        released: Set by ``release_transfer_lease``.
+        task: Promotes ``promote_keys`` and pins ``segments``; shared by
+            ``transfer_prefetch`` and the first ``transfer_load_runs``.
+        segments: L1 segments of every window, io pinned until release.
+        slot_ids: Sorted slot ids of ``segments``.
+        lane_offsets: L1 lane offset of each slot id's record.
+        record_sizes: Record bytes of each slot id.
+    """
+
+    lease_id: str
+    leases: list[Lease]
+    windows: list[tuple[int, int]]
+    promote_keys: list[str]
+    nbytes: int
+    admitted: bool = False
+    released: bool = False
+    task: asyncio.Task[None] | None = None
+    segments: list[LoadSegment] = field(default_factory=list)
+    slot_ids: numpy.ndarray | None = None
+    lane_offsets: numpy.ndarray | None = None
+    record_sizes: numpy.ndarray | None = None
 
 
 class IPCServer:
     """IPC server over Unix socket + msgpack.
 
-    This server is the internal IPC interface for vLLM DaserConnector. It only
-    exposes connector cache operations and delegates all business logic to
-    ServerCore.
+    This server is the internal IPC interface for vLLM DaserConnector. It
+    exposes connector cache operations, places every transfer through
+    ``ServerCore`` and drives the server-owned transfer layer.
 
     Args:
         socket_path: Unix socket path.
         core: shared DaseR server core.
         runtime_config: connector runtime values returned by
             ``get_runtime_config``.
+        metrics_registry: registry for IPC and transfer metrics.
 
     Async/thread-safety:
-        Must be started and stopped from the server asyncio event loop.
+        Must be started, used and stopped from the server asyncio event loop.
+        Only ``initialize_transfer`` runs transfer construction on an
+        executor thread, guarded by a lock.
     """
 
     def __init__(
@@ -253,40 +322,51 @@ class IPCServer:
     ) -> None:
         self._socket_path = socket_path
         self._core = core
+        self._layout: TierLayout = core.tier_layout
         self._runtime_config = runtime_config or {}
         self._metrics = metrics_registry or REGISTRY
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
+        self._local_slot_size = int(self._runtime_config.get("local_slot_size", 0))
+        self._block_tokens = int(self._runtime_config.get("block_tokens", 0))
         # Online packed stores publish asynchronously after the worker has
         # released its source snapshot, so a successor lookup can observe the
         # writer key during the short transfer/commit interval. Retry for this
         # format; raw keeps immediate-miss semantics.
-        self._lookup_wait_pending = (
+        self._packed_format = (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
         )
+        self._lookup_wait_pending = self._packed_format
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
-        # L2 readahead group size started by plain lookups (0 disables).
-        self._readahead_piece = int(
-            os.environ.get(LOAD_READAHEAD_ENV) or DEFAULT_LOAD_READAHEAD_BYTES
+        # Lookup readahead: promotion group size (0 disables) and groups in
+        # flight. It needs both tiers.
+        promotes = self._layout.enabled(L1) and self._layout.enabled(L2)
+        self._readahead_piece = (
+            int(os.environ.get(LOAD_READAHEAD_ENV) or DEFAULT_LOAD_READAHEAD_BYTES)
+            if promotes
+            else 0
         )
-        self._prev_readahead_bytes: dict[str, int] = {}
-        self._prev_promotion_wait_us: dict[str, int] = {}
-        self._prev_store_lease_wait_us = 0
-        self._prev_load_phase_us: dict[str, int] = {}
+        self._readahead_budget = self._readahead_piece * int(
+            os.environ.get(LOAD_READAHEAD_WINDOW_ENV) or 4
+        )
+        self._readahead_inflight = 0
+        self._lease_budget = int(
+            self._runtime_config.get("prefetch_lease_budget_bytes", 0)
+        )
+        self._leased_bytes = 0
+        self._lease_waiters: list[asyncio.Future[None]] = []
+        self._leases: dict[str, _LeaseState] = {}
+        self._chunk_stores: dict[tuple[str, int, int], _ChunkStore] = {}
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._prev_l2_write_bytes = 0
+        self._prev_l2_reads = 0
+        self._prev_l2_timing_us: dict[str, int] = {}
+        self._prev_l2_read_contention: dict[tuple[int, bool], tuple[int, int, int]] = {}
         self._prev_dst_copy: dict[str, int] = {}
-        self._prev_l1_evicted: dict[str, int] = {}
-        # Packed records are tiered across L1 and an L2 budget when both
-        # tiers exist; see docs/design/tier-residency.md. Tiers attach with
-        # the transfer layer.
-        self._packed_tiers = self._runtime_config.get(
-            "storage_format"
-        ) == STORAGE_FORMAT_COMPRESSED_ONLINE and not bool(
-            self._runtime_config.get("skip_l2", False)
-        )
         self._cuda_ipc_cache: OrderedDict[
-            tuple[int, int, int, int | None], "_CachedCudaArray"
+            tuple[int, int, int, str | None], "_CachedCudaArray"
         ] = OrderedDict()
         self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._store_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
@@ -301,18 +381,16 @@ class IPCServer:
             "alloc_chunk": self._op_alloc_chunk,
             "alloc_chunks": self._op_alloc_chunks,
             "match_and_alloc": self._op_match_and_alloc,
-            "commit_chunk": self._op_commit_chunk,
-            "commit_chunks": self._op_commit_chunks,
             "commit_stats": self._op_commit_stats,
             "live_allocations": self._op_live_allocations,
             "transfer_drain": self._op_transfer_drain,
-            "transfer_prefetch": self._transfer_prefetch,
+            "transfer_prefetch": self._op_transfer_prefetch,
             "init_transfer": self._op_init_transfer,
-            "transfer_store": self._transfer_store,
-            "transfer_load": self._transfer_load,
-            "transfer_load_runs": self._transfer_load_runs,
-            "register_load_staging": self._register_load_staging,
-            "register_store_staging": self._register_store_staging,
+            "transfer_store": self._op_transfer_store,
+            "transfer_load": self._op_transfer_load,
+            "transfer_load_runs": self._op_transfer_load_runs,
+            "register_load_staging": self._op_register_load_staging,
+            "register_store_staging": self._op_register_store_staging,
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
@@ -331,6 +409,16 @@ class IPCServer:
             "server-transfer",
             lambda: {} if self._transfer is None else self._transfer.debug_state(),
         )
+        stalldump.register_state(
+            "server-ipc",
+            lambda: {
+                "tasks": len(self._tasks),
+                "chunk_stores": len(self._chunk_stores),
+                "leases": len(self._leases),
+                "lease_waiters": len(self._lease_waiters),
+                "readahead_inflight": self._readahead_inflight,
+            },
+        )
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=self._socket_path
         )
@@ -339,32 +427,37 @@ class IPCServer:
     async def initialize_transfer(self) -> None:
         """Eagerly create the transfer layer off the event loop.
 
-        Offloads the blocking ``_ensure_transfer`` call (which may allocate
-        pinned memory pools, open io_uring rings, etc.) to a thread so the
-        server is fully provisioned before the first inference request.
+        Offloads the blocking ``_ensure_transfer`` call (pinned memory
+        allocation, io_uring rings, cuFile handles) to a thread so the server
+        is fully provisioned before the first inference request.
 
         Async/thread-safety:
-            Must be called from the server asyncio event loop during startup.
+            Must be called from the server asyncio event loop.
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._ensure_transfer)
 
     async def drain_transfer(self) -> None:
-        """Wait for server-owned transfer-layer background work.
+        """Wait for background store reports, promotions and transfer IO.
+
+        Raises:
+            RuntimeError: For the first transfer-layer store failure not yet
+                reported by an earlier drain.
 
         Async/thread-safety:
-            Runs on the server asyncio event loop. The transfer layer is
-            initialized on demand, then its async ``drain`` method is awaited
-            when present.
+            Runs on the server asyncio event loop. Work started while
+            draining is waited for as well.
         """
-        transfer = self._ensure_transfer()
-        await transfer.drain()
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        if self._transfer is not None:
+            await self._transfer.drain()
 
     async def stop(self) -> None:
-        """Stop the server and remove the socket file.
+        """Stop accepting connections and close transfer resources.
 
         Async/thread-safety:
-            Closes the asyncio server on the current event loop.
+            Runs on the server asyncio event loop.
         """
         await self.stop_accepting()
         await self.close()
@@ -386,15 +479,20 @@ class IPCServer:
         logger.info("[IPC] server stopped accepting")
 
     async def close(self) -> None:
-        """Drain and close transfer resources owned by the IPC server.
+        """Release leases, drain transfer work and close transfer resources.
 
         Async/thread-safety:
             Runs on the server asyncio event loop after new IPC work has been
-            rejected.
+            rejected. Store failures found while draining are logged.
         """
+        for lease_id in list(self._leases):
+            self._release_lease(lease_id)
         if self._transfer is not None:
-            await self._transfer.drain()
-            self._transfer.close()
+            try:
+                await self.drain_transfer()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[IPC] transfer drain at close failed: %r", exc)
+            await self._transfer.close()
             self._transfer = None
         self._close_cuda_ipc_cache()
         logger.info("[IPC] resources closed")
@@ -423,10 +521,8 @@ class IPCServer:
                 await write_frame(writer, response)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] error handling request: %s", exc)
-            try:
+            with contextlib.suppress(Exception):
                 await write_frame(writer, {"error": str(exc)})
-            except Exception:
-                pass
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
@@ -478,6 +574,10 @@ class IPCServer:
                 buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
             ).observe(elapsed, labels=ipc_labels)
 
+    # ------------------------------------------------------------------
+    # Lookup and allocation
+    # ------------------------------------------------------------------
+
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``lookup`` request, recording external prefix counters.
 
@@ -485,6 +585,8 @@ class IPCServer:
         extend is answered when pending waits are enabled: absent keeps the
         server-side wait, True replies ``{"pending": True}`` at once so a
         synchronous caller can retry later, and False resolves immediately.
+        With ``external_prefix_queries`` the external window's L2-only chunks
+        are promoted into L1 in the background (readahead).
         """
         tokens = self._lookup_tokens(msg)
         # Read before the lookup awaits: a removal during it advances the
@@ -505,16 +607,12 @@ class IPCServer:
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             num_computed_tokens = int(msg.get("num_computed_tokens", 0))
-            hits = _external_prefix_hits(
-                chunks,
-                num_computed_tokens=num_computed_tokens,
-                queries=queries,
-            )
+            hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
             await self._core.record_external_prefix_cache(queries=queries, hits=hits)
             if self._readahead_piece and chunks and hits > 0:
-                spans = self._external_spans(chunks, num_computed_tokens, hits)
-                if spans:
-                    await self._ensure_transfer().start_readahead(spans)
+                await self._start_readahead(
+                    _window_slots(chunks, num_computed_tokens, hits, self._block_tokens)
+                )
         return {"chunks": self._chunk_payloads(chunks), "index_epoch": epoch}
 
     async def _op_index_epoch(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -527,39 +625,85 @@ class IPCServer:
         return {"index_epoch": self._core.index_epoch}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Lookup, classify exact external spans, and lease an all-L1 result."""
+        """Look up a prompt and lease the L1 copies of its external window.
+
+        Every chunk of the window is lease pinned. ``tier`` is ``l1`` when
+        all of them already have an L1 copy, else ``mixed`` (some) or ``l2``
+        (none); ``transfer_prefetch`` then promotes the rest. Without an L1
+        tier, or for an empty window, no lease is taken and ``tier`` is None.
+
+        Returns:
+            ``{"chunks", "spans", "tier"}``; ``spans`` are the window's
+            ``{start_slot, num_slots, nbytes}`` (``nbytes`` per rank) and are
+            empty exactly when ``tier`` is None.
+        """
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("lookup_prefetch requires lease_id")
+        self._release_lease(lease_id)
         tokens = self._lookup_tokens(msg)
         chunks = await self._lookup_core(tokens, msg["model_id"])
         queries = int(msg.get("external_prefix_queries", 0))
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
-        if not chunks or hits <= 0:
-            return {"chunks": self._chunk_payloads(chunks), "spans": []}
-
-        spans = self._external_spans(chunks, num_computed_tokens, hits)
+        payloads = self._chunk_payloads(chunks)
+        if not chunks or hits <= 0 or not self._layout.enabled(L1):
+            return {"chunks": payloads, "spans": [], "tier": None}
+        windows = _window_slots(chunks, num_computed_tokens, hits, self._block_tokens)
+        leases: list[Lease] = []
+        spans: list[dict[str, int]] = []
+        promote_keys: list[str] = []
+        nbytes = 0
+        tp = self._layout.tensor_parallel_size
+        for chunk, first, count in windows:
+            start_slot = int(chunk.start_slot) + first
+            parts = self._core.resolve_slots(start_slot, count)
+            span_bytes = 0
+            for key, index, run in parts or []:
+                records = self._core.chunk_records(key)
+                lease = self._core.pin_lease(key) if records is not None else None
+                if records is None or lease is None:
+                    parts = None
+                    break
+                leases.append(lease)
+                span_bytes += sum(records.record_sizes[index : index + run])
+                if L1 not in self._core.full_tiers(key):
+                    promote_keys.append(key)
+                nbytes += self._layout.extent_length(L1, records.record_sizes) * tp
+            if parts is None:
+                for taken in leases:
+                    self._core.unpin_lease(taken)
+                return {"chunks": payloads, "spans": [], "tier": None}
+            spans.append(
+                {"start_slot": start_slot, "num_slots": count, "nbytes": span_bytes}
+            )
         if not spans:
-            return {"chunks": self._chunk_payloads(chunks), "spans": []}
-        transfer = self._ensure_transfer()
-        tier = await transfer.classify_and_acquire_lease(lease_id, spans)
-        return {
-            "chunks": self._chunk_payloads(chunks),
-            "spans": spans,
-            "tier": tier,
-        }
+            return {"chunks": payloads, "spans": [], "tier": None}
+        if not promote_keys:
+            tier = "l1"
+        elif len(promote_keys) == len(leases):
+            tier = "l2"
+        else:
+            tier = "mixed"
+        self._leases[lease_id] = _LeaseState(
+            lease_id=lease_id,
+            leases=leases,
+            windows=[(span["start_slot"], span["num_slots"]) for span in spans],
+            promote_keys=promote_keys,
+            nbytes=nbytes,
+        )
+        return {"chunks": payloads, "spans": spans, "tier": tier}
 
     @staticmethod
     def _lookup_tokens(msg: dict[str, Any]) -> TokenSequence:
         """Decode the compact token representation used by scheduler lookup.
 
         Args:
-            msg: IPC request containing ``token_bytes`` or legacy ``tokens``.
+            msg: IPC request containing ``token_bytes`` or ``tokens``.
 
         Returns:
-            Token IDs as packed native-int bytes or a legacy list.
+            Token IDs as packed native-int bytes or a list.
 
         Raises:
             ValueError: if the packed representation is malformed.
@@ -574,35 +718,23 @@ class IPCServer:
     async def _lookup_core(
         self, tokens: TokenSequence, model_id: str
     ) -> list[ChunkInfo]:
-        """Run an immediate lookup against the committed retrieval index.
+        """Run a lookup against the committed retrieval index.
 
         Args:
             tokens: Prompt token IDs.
             model_id: Model identifier used for cache isolation.
 
         Returns:
-            Retrieval chunks returned by the server core.
+            Retrieval chunks returned by the server core; every one has a
+            tier copy valid on every rank.
 
         Async/thread-safety:
-            Runs on the IPC server event loop. Online stores are published to
-            the retrieval index only after their transfer commits; an
-            uncommitted record is therefore a safe miss and must not make the
-            request wait for a background writer. The compatibility fallback
-            is limited to test doubles or older public core implementations
-            that do not expose the keyword.
+            Runs on the IPC server event loop; waits for pending writers only
+            in compressed-online mode.
         """
-        try:
-            chunks = await self._core.lookup(
-                tokens,
-                model_id,
-                wait_for_pending=self._lookup_wait_pending,
-            )
-        except TypeError as exc:
-            if "wait_for_pending" not in str(exc):
-                raise
-            chunks = await self._core.lookup(tokens, model_id)
-        chunks = await self._memory_resident_chunks(chunks)
-        return chunks
+        return await self._core.lookup(
+            tokens, model_id, wait_for_pending=self._lookup_wait_pending
+        )
 
     async def _lookup_now(
         self,
@@ -627,50 +759,13 @@ class IPCServer:
 
         Async/thread-safety:
             Runs on the IPC server event loop without sleeping, so a
-            synchronous scheduler RPC is never held for a writer commit.
+            synchronous scheduler RPC never waits for a writer commit.
         """
         if defer:
-            chunks = await self._core.lookup_unless_pending(
+            return await self._core.lookup_unless_pending(
                 tokens, model_id, num_computed_tokens
             )
-            if chunks is None:
-                return None
-        else:
-            chunks = await self._core.lookup(tokens, model_id)
-        chunks = await self._memory_resident_chunks(chunks)
-        return chunks
-
-    async def _memory_resident_chunks(self, chunks: list[ChunkInfo]) -> list[ChunkInfo]:
-        """Trim a memory-only lookup to the chunks whose bytes are still in L1.
-
-        With ``skip_l2`` the index and L1 replacement are independent: pinned
-        pool pressure can evict a committed range that the index still lists,
-        and nothing can refill it. Advertising such a chunk makes the worker
-        load fail, so the match stops at the first chunk that left memory.
-
-        Args:
-            chunks: Lookup chunks covering the prompt prefix.
-
-        Returns:
-            The leading chunks that are fully L1-resident; all chunks when L2
-            is enabled.
-
-        Async/thread-safety:
-            Runs on the IPC server event loop. Residency is checked and
-            refreshed atomically in the transfer layer; a store racing the
-            later load can still evict a counted chunk.
-        """
-        if not chunks or not self._runtime_config.get("skip_l2", False):
-            return chunks
-        ordered = sorted(chunks, key=lambda item: int(item.target_token_start))
-        groups: list[list[dict[str, int]]] = []
-        for chunk in ordered:
-            spans = self._chunk_spans(chunk)
-            if not spans:
-                break
-            groups.append(spans)
-        resident = await self._ensure_transfer().resident_prefix(groups)
-        return ordered[:resident]
+        return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -712,25 +807,6 @@ class IPCServer:
         )
         return result.to_dict()
 
-    async def _op_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a single ``commit_chunk`` request."""
-        await self._core.commit_chunk(
-            msg["chunk_key"],
-            tp_rank=int(msg.get("tp_rank", 0)),
-            tp_size=int(msg.get("tp_size", 1)),
-        )
-        return {"ok": True}
-
-    async def _op_commit_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a batched ``commit_chunks`` request."""
-        for chunk_key in msg.get("chunk_keys", []):
-            await self._core.commit_chunk(
-                chunk_key,
-                tp_rank=int(msg.get("tp_rank", 0)),
-                tp_size=int(msg.get("tp_size", 1)),
-            )
-        return {"ok": True}
-
     async def _op_commit_stats(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``commit_stats`` request."""
         return {"commit_stats": await self._core.commit_stats()}
@@ -741,54 +817,10 @@ class IPCServer:
         return {"chunk_keys": live}
 
     async def _op_transfer_drain(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``transfer_drain`` request."""
-        transfer = self._transfer
-        if transfer is not None:
-            await transfer.drain()
+        """Handle a ``transfer_drain`` request (no-op before transfer init)."""
+        if self._transfer is not None:
+            await self.drain_transfer()
         return {"ok": True}
-
-    async def _transfer_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Promote storage spans into the server-owned host-memory tier.
-
-        Args:
-            msg: IPC request containing ``spans`` with file offsets and sizes.
-
-        Returns:
-            Requested, L1-resident, and L2-read byte counts.
-
-        Async/thread-safety:
-            Runs on the IPC event loop and delegates to the transfer layer's
-            asynchronous prefetch capability.
-        """
-        transfer = self._ensure_transfer()
-        lease_id = str(msg.get("lease_id", "")) or None
-        spans = list(msg.get("spans", []))
-        operations = self._metrics.counter(
-            "daser_prefetch_operations_total",
-            "Host-tier prefetch operations by result.",
-        )
-        try:
-            result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
-        except LeaseIncompleteError as exc:
-            # Expected when the looked-up chunk lost its slots before the
-            # prefetch ran; the connector releases the lease and looks again.
-            operations.inc(labels={"status": "incomplete"})
-            logger.warning("[IPC] transfer_prefetch: %s", exc)
-            return {"error": str(exc)}
-        operations.inc(labels={"status": "ok"})
-        bytes_counter = self._metrics.counter(
-            "daser_prefetch_bytes_total",
-            "Host-tier prefetch bytes by tier.",
-        )
-        bytes_counter.inc(result.requested_bytes, labels={"tier": "requested"})
-        bytes_counter.inc(result.l1_bytes, labels={"tier": "l1"})
-        bytes_counter.inc(result.l2_bytes, labels={"tier": "l2"})
-        return {
-            "ok": True,
-            "requested_bytes": result.requested_bytes,
-            "l1_bytes": result.l1_bytes,
-            "l2_bytes": result.l2_bytes,
-        }
 
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle an ``init_transfer`` request.
@@ -806,455 +838,340 @@ class IPCServer:
         return {"ok": True}
 
     async def _op_release_chunk_writer(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``release_chunk_writer`` request."""
+        """Handle a ``release_chunk_writer`` request.
+
+        Also forgets partial multi-request stores of the allocation; their
+        in-flight IO still releases its own pins.
+        """
+        chunk_key = str(msg["chunk_key"])
+        start_slot = int(msg["start_slot"])
         released = await self._core.release_chunk_writer(
-            chunk_key=str(msg["chunk_key"]),
-            start_slot=int(msg["start_slot"]),
+            chunk_key=chunk_key,
+            start_slot=start_slot,
             num_slots=int(msg["num_slots"]),
         )
+        for key in [
+            key
+            for key in self._chunk_stores
+            if key[0] == chunk_key and key[1] == start_slot
+        ]:
+            del self._chunk_stores[key]
         return {"released": released}
 
+    # ------------------------------------------------------------------
+    # Prefetch leases
+    # ------------------------------------------------------------------
+
+    async def _op_transfer_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Promote a lease's chunks into L1 and pin their L1 segments.
+
+        Args:
+            msg: IPC request with the ``lease_id`` of a ``lookup_prefetch``.
+
+        Returns:
+            ``{"ok", "requested_bytes", "l1_bytes", "l2_bytes"}`` (bytes over
+            all ranks; ``l2_bytes`` were promoted), or ``{"error"}`` when the
+            lease is gone or a chunk could not be brought into L1 (the
+            scheduler releases the lease and loads without it).
+
+        Async/thread-safety:
+            Waits for earlier leases while the lease budget is exhausted.
+        """
+        lease_id = str(msg.get("lease_id", ""))
+        operations = self._metrics.counter(
+            "daser_prefetch_operations_total",
+            "Host-tier prefetch operations by result.",
+        )
+        state = self._leases.get(lease_id)
+        if state is None:
+            operations.inc(labels={"status": "incomplete"})
+            return {"error": f"transfer lease {lease_id!r} is not active"}
+        try:
+            await asyncio.shield(self._lease_ready(state))
+        except (ChunkUnavailable, OSError, RuntimeError) as exc:
+            operations.inc(labels={"status": "incomplete"})
+            logger.warning("[IPC] transfer_prefetch lease=%s: %s", lease_id[:8], exc)
+            return {"error": str(exc)}
+        operations.inc(labels={"status": "ok"})
+        tp = self._layout.tensor_parallel_size
+        requested = tp * sum(seg.nbytes for seg in state.segments)
+        promoted = tp * sum(
+            seg.nbytes for seg in state.segments if seg.chunk_key in state.promote_keys
+        )
+        bytes_counter = self._metrics.counter(
+            "daser_prefetch_bytes_total",
+            "Host-tier prefetch bytes by tier.",
+        )
+        bytes_counter.inc(requested, labels={"tier": "requested"})
+        bytes_counter.inc(requested - promoted, labels={"tier": "l1"})
+        bytes_counter.inc(promoted, labels={"tier": "l2"})
+        return {
+            "ok": True,
+            "requested_bytes": requested,
+            "l1_bytes": requested - promoted,
+            "l2_bytes": promoted,
+        }
+
     async def _op_release_transfer_lease(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Idempotently release remaining host-tier bytes for one request."""
+        """Idempotently release the pins of one request lease."""
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("release_transfer_lease requires lease_id")
-        transfer = self._transfer
-        if transfer is not None:
-            await transfer.release_lease(lease_id)
+        self._release_lease(lease_id)
         return {"ok": True}
 
-    async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Store one or more spans through the server-owned transfer layer.
+    # ------------------------------------------------------------------
+    # Transfers
+    # ------------------------------------------------------------------
+
+    async def _op_transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Place and store whole or partial chunks from a worker buffer.
 
         Args:
-            msg: IPC request with ``payload`` and ``spans``.
+            msg: IPC request with ``payload``, ``tp_rank``, ``tp_size`` and
+                ``spans`` of ``{source_offset, nbytes, chunk_key, start_slot,
+                num_slots, slot_index, packed, mode}``. A raw span covers
+                ``nbytes / local_slot_size`` slots from ``slot_index``; a
+                packed span is one record, and a request carries every
+                record of its packed chunks.
 
         Returns:
-            Response dict with total bytes stored.
+            ``{"ok", "bytes", "chunk_keys"}`` once the buffer was consumed
+            (and, for chunks without an L1 copy, written to L2); stale
+            allocations are skipped and not listed.
+
+        Raises:
+            ValueError: For a malformed span or a TP size mismatch.
+            TierFull: If a tier cannot hold a chunk.
 
         Async/thread-safety:
-            Runs on the IPC event loop and awaits transfer-layer operations.
+            Runs on the IPC event loop. IO completion is reported to the
+            core by a background task that outlives the request.
         """
+        started = time.perf_counter()
         payload = msg.get("payload", {})
         spans = list(msg.get("spans", []))
-        started = time.perf_counter()
-        backend = str(self._runtime_config.get("transfer_mode", "gds"))
-        transfer = self._ensure_transfer()
-        total = 0
-        layout = self._core.packed_layout
-        chunk_manager = self._core.chunk_manager
-        stored_chunk_keys: list[str] = []
-        accepted_spans: list[dict[str, Any]] = []
-        place_ms = 0.0
-        reclaims = 0
         tp_rank = int(msg.get("tp_rank", 0))
         tp_size = int(msg.get("tp_size", 1))
-        # The worker may export a compact view whose reported length ends at
-        # its last record.  Preserve the IPC view's byte-addressable contract
-        # when source offsets are sparse or reordered by sizing the mapping
-        # through the furthest submitted source byte.  This does not transfer
-        # or retain extra data; it only prevents a valid span from being
-        # sliced beyond the mapped CUDA view.
-        if "cuda_ipc_handle" in payload and spans:
-            payload = dict(payload)
-            required_nbytes = max(
-                int(span.get("source_offset", 0)) + int(span["nbytes"])
-                for span in spans
-                if int(span["nbytes"]) > 0
+        if tp_size != self._layout.tensor_parallel_size or not 0 <= tp_rank < tp_size:
+            raise ValueError(
+                f"transfer rank {tp_rank}/{tp_size} does not match the server "
+                f"TP size {self._layout.tensor_parallel_size}"
             )
-            payload["nbytes"] = max(int(payload.get("nbytes", 0)), required_nbytes)
-        if "store_staging_buffer_index" in payload:
-            buffer_key = (
-                int(payload["producer_pid"]),
-                int(payload["store_staging_buffer_index"]),
-            )
-            try:
-                buffer = self._store_staging_buffers[buffer_key]
-            except KeyError as exc:
-                raise ValueError(
-                    f"store staging buffer is not registered: {buffer_key}"
-                ) from exc
-            for span in spans:
-                offset, nbytes = int(span.get("source_offset", 0)), int(span["nbytes"])
-                if offset < 0 or nbytes < 0 or offset + nbytes > buffer.nbytes:
-                    raise ValueError(
-                        "store source span exceeds registered staging buffer"
-                    )
-        elif "cuda_ipc_handle" in payload:
-            # Store mappings are one-shot views whose source extent can vary
-            # for every compacted batch.  Do not reuse a shorter cached view
-            # from an earlier batch of the same staging allocation.
-            buffer = self._open_cuda_ipc_payload(
-                payload=payload,
-                nbytes_key="nbytes",
-                cache_mapping=False,
-            )
-        else:
-            buffer = self._payload_buffer(payload)
-        write_hold: int | None = None
-        slot_hold: int | None = None
-        pinned: list[str] = []
+        transfer = self._ensure_transfer()
+        groups = self._store_groups(spans)
+        buffer, one_shot = self._store_buffer(payload, spans)
+        parts: list[_StorePart] = []
         try:
-            live_spans: list[dict[str, Any]] = []
-            for span in spans:
-                nbytes = int(span["nbytes"])
-                file_offset = int(span["file_offset"])
-                chunk_key = str(span.get("chunk_key", ""))
-                if chunk_key:
-                    live = self._core.is_current_allocation(
-                        chunk_key=chunk_key,
-                        start_slot=int(span.get("start_slot", -1)),
-                        num_slots=int(span.get("num_slots", 0)),
-                    )
-                    if not live:
-                        logger.debug(
-                            "[IPC] skip stale transfer_store key=%s offset=%d bytes=%d",
-                            chunk_key[:8],
-                            file_offset,
-                            nbytes,
-                        )
-                        continue
-                    stored_chunk_keys.append(chunk_key)
-                live_spans.append(span)
-            # Slots of a chunk removed while this write is in flight must not
-            # be handed to a new chunk before the write lands.
-            slot_hold = chunk_manager.hold_writes(stored_chunk_keys)
-
-            if self._runtime_config.get(
-                "storage_format"
-            ) == STORAGE_FORMAT_COMPRESSED_ONLINE and any(
-                bool(span.get("packed", False)) for span in live_spans
+            placements = await self._core.place_store(
+                [request for request, _spans, _slots in groups]
+            )
+            moves: list[Move] = []
+            stored_keys: list[str] = []
+            nbytes = 0
+            for (request, group_spans, slots), placement in zip(
+                groups, placements, strict=True
             ):
-                capacity = int(
-                    self._runtime_config.get(
-                        "l2_size_bytes",
-                        self._runtime_config.get("total_store_bytes", 0),
-                    )
-                )
-                if capacity <= 0:
-                    capacity = int(self._runtime_config.get("slot_size", 0)) * int(
-                        self._runtime_config.get("total_slots", 0)
-                    )
-                local_slot_size = int(
-                    self._runtime_config.get(
-                        "local_slot_size",
-                        int(self._runtime_config.get("slot_size", 0))
-                        // max(1, tp_size),
-                    )
-                )
-                rank_stride_bytes = int(
-                    self._runtime_config.get("rank_stride_bytes", 0)
-                )
-                # Logical slots are over-provisioned for compressed records,
-                # so the physical arena can fill first. Evict cold leaves
-                # (never the chunks being stored) until the reported deficit
-                # is freed, then retry placement.
-                rank_base = tp_rank * rank_stride_bytes
-                pinned = list(dict.fromkeys(stored_chunk_keys))
-                self._core.pin(pinned)
-                place_started = time.perf_counter()
-                while True:
-                    try:
-                        live_spans = layout.compact(
-                            live_spans,
-                            chunk_manager,
-                            local_slot_size=local_slot_size,
-                            rank_base=rank_base,
-                            arena_size=rank_stride_bytes or capacity // max(1, tp_size),
-                        )
-                        break
-                    except PackedArenaFull as exc:
-                        # Chunk removal releases placements inside the core,
-                        # so free space can be read directly.
-                        target = (
-                            layout.free_bytes(rank_base=rank_base) + exc.deficit_bytes
-                        )
-                        while layout.free_bytes(rank_base=rank_base) < target:
-                            if not await self._core.reclaim_packed(free_address=True):
-                                raise
-                            reclaims += 1
-                # Keep L2 within its budget; L1-resident victims stay indexed.
-                l2_budget = int(self._runtime_config.get("l2_budget_bytes", 0))
-                while (
-                    l2_budget
-                    and layout.charged_bytes(rank_base=rank_base) > l2_budget
-                    and await self._core.reclaim_packed()
-                ):
-                    reclaims += 1
-                self._core.unpin(pinned)
-                pinned = []
-                place_ms = (time.perf_counter() - place_started) * 1000
-                self._record_packed_ratios(live_spans, local_slot_size)
-                # Another store may evict these chunks while this one awaits
-                # its IO; keep their bytes from being placed again until the
-                # transfer layer has this write ordered.
-                write_hold = layout.begin_writes(live_spans, rank_base=rank_base)
-
-            for span in live_spans:
-                chunk_key = str(span.get("chunk_key", ""))
-                if not chunk_key:
+                if placement is None:
+                    logger.debug("[IPC] skip stale store key=%s", request.chunk_key[:8])
                     continue
-                accepted_spans.append(
-                    {
-                        "chunk_key": chunk_key,
-                        "file_offset": int(span["file_offset"]),
-                        "nbytes": int(span["nbytes"]),
-                        "start_slot": int(span.get("start_slot", -1)),
-                        "num_slots": int(span.get("num_slots", 0)),
-                        "logical_slot_start": int(span.get("logical_slot_start", -1)),
-                        "logical_slot_count": int(span.get("logical_slot_count", 0)),
-                        "packed": bool(span.get("packed", False)),
-                        "mode": str(span.get("mode", "compressed")),
-                    }
+                parts.append(
+                    _StorePart(
+                        key=(request.chunk_key, request.start_slot, tp_rank),
+                        num_slots=request.num_slots,
+                        slots=slots,
+                        placement=placement,
+                    )
                 )
-
-            if transfer.coalesce_store_spans:
-                store_spans = _coalesce_transfer_spans(
-                    live_spans,
-                    max_packed_bytes=min(
-                        _PACKED_STORE_COALESCE_BYTES,
-                        int(
-                            self._runtime_config.get(
-                                "l1_size_bytes", _PACKED_STORE_COALESCE_BYTES
-                            )
-                        ),
-                    ),
-                )
-            else:
-                store_spans = live_spans
-            io_started = time.perf_counter()
-            total = await transfer.store_bytes_grouped(buffer, store_spans)
-            logger.info(
-                "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d "
-                "place_ms=%.1f reclaims=%d io_ms=%.1f total_ms=%.1f",
-                len(live_spans),
-                sum(bool(span.get("packed", False)) for span in live_spans),
-                len(store_spans),
-                sum(int(span["nbytes"]) for span in store_spans),
-                place_ms,
-                reclaims,
-                (time.perf_counter() - io_started) * 1000,
-                (time.perf_counter() - started) * 1000,
-            )
-        finally:
-            if pinned:
-                self._core.unpin(pinned)
-            if write_hold is not None:
-                self._end_packed_writes(write_hold)
-            if slot_hold is not None:
-                chunk_manager.end_writes(slot_hold)
-            if (
-                isinstance(buffer, _UncachedCudaArray)
-                and "store_staging_buffer_index" not in payload
-            ):
+                stored_keys.append(request.chunk_key)
+                group_moves = self._store_moves(placement, group_spans, tp_rank)
+                moves.extend(group_moves)
+                nbytes += sum(move.nbytes for move in group_moves)
+            handle = await transfer.store(buffer, moves) if parts else None
+        except BaseException:
+            await self._abandon_store_parts(parts, tp_rank)
+            if one_shot:
                 buffer.close()
-        if accepted_spans:
-            configured_tp_size = int(
-                self._runtime_config.get("tensor_parallel_size", tp_size)
-            )
-            if configured_tp_size != tp_size:
-                raise ValueError(
-                    f"transfer TP size {tp_size} != configured {configured_tp_size}"
-                )
-            slot_size = int(self._runtime_config.get("slot_size", 0))
-            local_slot_size = int(
-                self._runtime_config.get(
-                    "local_slot_size", slot_size // max(1, tp_size)
-                )
-            )
-            rank_stride_bytes = int(self._runtime_config.get("rank_stride_bytes", 0))
-            await self._core.record_store_ranges(
-                accepted_spans,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                local_slot_size=local_slot_size,
-                rank_stride_bytes=rank_stride_bytes,
-            )
-        self._record_transfer_metrics(
-            op="store",
-            backend=backend,
-            status="ok",
-            nbytes=total,
-            elapsed_s=time.perf_counter() - started,
+            raise
+        if handle is None:
+            if one_shot:
+                buffer.close()
+            return {"ok": True, "bytes": 0, "chunk_keys": []}
+        reply: asyncio.Future[BaseException | None] = (
+            asyncio.get_running_loop().create_future()
         )
-        return {"ok": True, "bytes": total, "chunk_keys": stored_chunk_keys}
+        self._register_store_parts(parts, handle.staged, handle.persisted)
+        self._spawn(
+            self._finish_store(
+                parts,
+                handle.staged,
+                handle.persisted,
+                buffer if one_shot else None,
+                reply,
+                tp_rank,
+            )
+        )
+        error = await asyncio.shield(reply)
+        if error is not None:
+            raise error
+        self._record_packed_ratios(spans)
+        self._record_transfer_metrics("store", nbytes, time.perf_counter() - started)
+        return {"ok": True, "bytes": nbytes, "chunk_keys": stored_keys}
 
-    async def _transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Load one or more spans through the server-owned transfer layer.
+    async def _op_transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Read slot ranges from their tiers into a worker buffer.
 
         Args:
-            msg: IPC request with ``payload`` and ``spans``.
+            msg: IPC request with ``payload``, ``tp_rank`` and ``spans`` of
+                ``{target_offset, start_slot, num_slots, nbytes}``; a span
+                may start inside a chunk and cover adjacent chunks, and its
+                records land back to back from ``target_offset``.
 
         Returns:
-            Response dict with total bytes loaded and optional bytes data.
+            ``{"ok", "bytes", "l1_segments", "l2_segments", "transfer_ms",
+            "transfer_open_ms", "transfer_load_ms", "transfer_stats_delta"}``,
+            or ``{"ok", "bytes", "data"}`` for ``return_data`` payloads.
+
+        Raises:
+            ValueError: If a span's ``nbytes`` differs from its records.
+            ChunkUnavailable: If a slot has no committed chunk.
 
         Async/thread-safety:
-            Runs on the IPC event loop and awaits transfer-layer operations.
+            Runs on the IPC event loop. Whole L2-only chunks read here are
+            promoted into L1 by the same read (all ranks' lanes).
         """
+        started = time.perf_counter()
         payload = msg.get("payload", {})
         spans = list(msg.get("spans", []))
-        lease_id = str(msg.get("lease_id", "")) or None
-        started_total = time.perf_counter()
-        backend = str(self._runtime_config.get("transfer_mode", "gds"))
+        tp_rank = int(msg.get("tp_rank", 0))
+        if not 0 <= tp_rank < self._layout.tensor_parallel_size:
+            raise ValueError(f"invalid TP rank {tp_rank}")
         transfer = self._ensure_transfer()
-        total_size = self._payload_size(payload, spans)
         open_ms = 0.0
         if payload.get("return_data"):
-            buffer: Any = bytearray(total_size)
+            buffer: Any = bytearray(self._payload_size(payload, spans))
+            one_shot = False
         else:
-            open_start = time.perf_counter()
+            open_started = time.perf_counter()
             buffer = self._payload_buffer(payload)
-            open_ms = (time.perf_counter() - open_start) * 1000
-
-        total = 0
-        load_ms = 0.0
-        sync_ms = 0.0
-        close_ms = 0.0
-        close_one_shot_buffer = isinstance(buffer, _UncachedCudaArray) and (
-            "load_staging_buffer_index" not in payload
-        )
-        leased_load_started = False
+            open_ms = (time.perf_counter() - open_started) * 1000
+            # Registered staging mappings live until shutdown.
+            one_shot = isinstance(buffer, _UncachedCudaArray) and (
+                "load_staging_buffer_index" not in payload
+            )
+        segments: list[LoadSegment] = []
+        promotions: list[Promotion] = []
+        ok = False
         try:
+            planned = await self._plan_spans(spans)
+            resolved = time.perf_counter()
+            segments = [segment for _target, segment in planned]
+            promotions = await self._promote_on_read(segments)
             before = asdict(transfer.stats)
-            started = time.perf_counter()
-            load_start = time.perf_counter()
-            if lease_id is None:
-                total = await transfer.load_bytes_grouped(buffer, spans)
-            else:
-                total = await transfer.load_leased_bytes_grouped(
-                    buffer,
-                    spans,
-                    lease_id,
-                )
-                leased_load_started = True
-            load_ms = (time.perf_counter() - load_start) * 1000
-            synchronize = getattr(buffer, "synchronize", None)
-            if synchronize is not None:
-                sync_start = time.perf_counter()
-                # CUDA stream synchronization is a blocking runtime call.  It
-                # must finish before releasing a leased L1 range, but waiting
-                # on the IPC event loop would serialize unrelated load/store
-                # requests behind the slowest destination copy.
-                await asyncio.to_thread(synchronize)
-                sync_ms = (time.perf_counter() - sync_start) * 1000
-                self._metrics.counter(
-                    "daser_load_phase_seconds_total",
-                    "Grouped-load wall time by phase.",
-                ).inc(sync_ms / 1000, labels={"phase": "sync"})
-            if lease_id is not None:
-                await transfer.release_lease_ranges(lease_id, spans)
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            after = asdict(transfer.stats)
-            stats_delta = {
-                key: int(after.get(key, 0)) - int(before.get(key, 0))
-                for key in set(before) | set(after)
-            }
-            logger.debug(
-                "[IPC] transfer_load timing: spans=%d bytes=%d total_size=%d "
-                "open_ms=%.3f load_ms=%.3f sync_ms=%.3f elapsed_ms=%.3f "
-                "stats_delta=%s",
-                len(spans),
-                total,
-                total_size,
-                open_ms,
-                load_ms,
-                sync_ms,
-                elapsed_ms,
-                stats_delta,
-            )
-            response: dict[str, Any] = {"ok": True, "bytes": total}
-            if payload.get("return_data"):
-                response["data"] = bytes(buffer)
-            else:
-                response["transfer_ms"] = elapsed_ms
-                response["transfer_open_ms"] = open_ms
-                response["transfer_load_ms"] = load_ms
-                response["transfer_sync_ms"] = sync_ms
-                response["transfer_stats_delta"] = stats_delta
-            self._record_transfer_metrics(
-                op="load",
-                backend=backend,
-                status="ok",
-                nbytes=total,
-                elapsed_s=time.perf_counter() - started_total,
-            )
-            return response
-        except BaseException:
-            if lease_id is not None:
-                if leased_load_started:
-                    await transfer.release_lease_ranges(lease_id, [])
-                await transfer.release_lease(lease_id)
-            raise
+            await self._run_load(transfer, buffer, planned, promotions, tp_rank)
+            ok = True
         finally:
-            if close_one_shot_buffer:
-                close = getattr(buffer, "close", None)
-                close_start = time.perf_counter()
-                if close is not None:
-                    close()
-                close_ms = (time.perf_counter() - close_start) * 1000
-                logger.info(
-                    "[IPC] transfer_load close timing: bytes=%d close_ms=%.3f",
-                    total,
-                    close_ms,
-                )
+            for promotion in promotions:
+                self._core.finish_promotion(promotion, ok)
+            self._core.release_load(segments)
+            if one_shot:
+                buffer.close()
+        finished = time.perf_counter()
+        after = asdict(transfer.stats)
+        total = sum(segment.nbytes for segment in segments)
+        l1_segments = sum(segment.tier == L1 for segment in segments)
+        self._record_load_metrics(
+            l1_segments,
+            len(segments) - l1_segments,
+            resolve_s=resolved - started,
+            io_s=finished - resolved,
+        )
+        self._record_transfer_metrics("load", total, finished - started)
+        response: dict[str, Any] = {
+            "ok": True,
+            "bytes": total,
+            "l1_segments": l1_segments,
+            "l2_segments": len(segments) - l1_segments,
+        }
+        if payload.get("return_data"):
+            response["data"] = bytes(buffer)
+            return response
+        response["transfer_ms"] = (finished - started) * 1000
+        response["transfer_open_ms"] = open_ms
+        response["transfer_load_ms"] = (finished - resolved) * 1000
+        response["transfer_stats_delta"] = {
+            key: int(after[key]) - int(before[key]) for key in after
+        }
+        return response
 
-    async def _transfer_load_runs(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Copy a leased run table into a registered load staging buffer.
+    async def _op_transfer_load_runs(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Copy byte runs of a lease's L1 records into a registered buffer.
 
         Layer-wise delivery copies one plane group of every record of a
-        request per call. ``runs`` packs the group as one ``(3, n)`` int64
-        array (file offsets, target offsets, lengths) so the request costs
-        O(1) Python regardless of the record count.
+        request per call. ``runs`` packs ``(start_slots, intra_offsets,
+        targets, lengths)`` as one ``(4, n)`` int64 array: each run reads
+        ``lengths[i]`` bytes at ``intra_offsets[i]`` inside the record of slot
+        ``start_slots[i]``.
 
         Args:
             msg: IPC request with ``payload`` (registered staging buffer),
-                ``lease_id`` and ``runs`` bytes.
+                ``lease_id``, ``tp_rank`` and ``runs`` bytes.
 
         Returns:
-            ``{"ok": True, "bytes": n, "transfer_ms": ms}`` once the copies
-            completed on the device.
+            ``{"ok", "bytes", "transfer_ms"}`` once the copies completed on
+            the device.
 
         Raises:
-            ValueError: If the run table is malformed or the buffer unknown.
+            ValueError: If the run table is malformed, a slot is not leased
+                or a run leaves its record.
+            ChunkUnavailable: If the lease could not bring a chunk into L1.
 
         Async/thread-safety:
-            Runs on the IPC event loop. The lease is retained, not consumed;
-            the worker releases it with ``release_transfer_lease`` after the
-            last group, so concurrent groups on different staging buffers
-            overlap.
+            Runs on the IPC event loop. The first call of a lease pins its L1
+            segments (shared with ``transfer_prefetch``); the lease stays
+            until ``release_transfer_lease``.
         """
-        import numpy
-
         started = time.perf_counter()
         lease_id = str(msg.get("lease_id", ""))
         packed = msg.get("runs")
         payload = msg.get("payload", {})
-        if not lease_id:
-            raise ValueError("transfer_load_runs requires lease_id")
+        tp_rank = int(msg.get("tp_rank", 0))
         if "load_staging_buffer_index" not in payload:
             raise ValueError("transfer_load_runs requires a registered buffer")
-        if not isinstance(packed, bytes) or not packed or len(packed) % 24:
-            raise ValueError("transfer_load_runs runs must be (3, n) int64 bytes")
-        runs = numpy.frombuffer(packed, dtype=numpy.int64).reshape(3, -1)
-        total = await self._ensure_transfer().load_leased_runs(
-            self._payload_buffer(payload),
-            runs[0],
-            runs[1],
-            runs[2],
-            lease_id,
+        if not isinstance(packed, bytes) or not packed or len(packed) % 32:
+            raise ValueError("transfer_load_runs runs must be (4, n) int64 bytes")
+        state = self._leases.get(lease_id)
+        if state is None:
+            raise ValueError(f"transfer lease {lease_id!r} is not active")
+        await asyncio.shield(self._lease_ready(state))
+        slots, intra, targets, lengths = numpy.frombuffer(
+            packed, dtype=numpy.int64
+        ).reshape(4, -1)
+        assert state.slot_ids is not None and state.lane_offsets is not None
+        assert state.record_sizes is not None
+        index = numpy.searchsorted(state.slot_ids, slots)
+        if int(index.max()) >= len(state.slot_ids) or not numpy.array_equal(
+            state.slot_ids[index], slots
+        ):
+            raise ValueError("transfer_load_runs names a slot outside its lease")
+        if int(intra.min()) < 0 or bool(
+            numpy.any(intra + lengths > state.record_sizes[index])
+        ):
+            raise ValueError("transfer_load_runs run leaves its record")
+        offsets = (
+            self._layout.absolute_offset(L1, tp_rank, 0)
+            + state.lane_offsets[index]
+            + intra
         )
+        await self._ensure_transfer().load_runs(
+            self._payload_buffer(payload), offsets, targets, lengths
+        )
+        total = int(lengths.sum())
         elapsed_s = time.perf_counter() - started
-        self._record_transfer_metrics(
-            op="load",
-            backend=str(self._runtime_config.get("transfer_mode", "gds")),
-            status="ok",
-            nbytes=total,
-            elapsed_s=elapsed_s,
-        )
+        self._record_transfer_metrics("load", total, elapsed_s)
         return {"ok": True, "bytes": total, "transfer_ms": elapsed_s * 1000}
 
-    async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
+    async def _op_register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Register one fixed CUDA load staging buffer for indexed reuse.
 
         Args:
@@ -1271,9 +1188,742 @@ class IPCServer:
         """
         return self._register_staging(msg, self._load_staging_buffers)
 
-    async def _register_store_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
+    async def _op_register_store_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Map a fixed worker store buffer during startup, outside timed traffic."""
         return self._register_staging(msg, self._store_staging_buffers)
+
+    # ------------------------------------------------------------------
+    # Store helpers
+    # ------------------------------------------------------------------
+
+    def _store_groups(
+        self, spans: list[dict[str, Any]]
+    ) -> list[tuple[StoreRequest, list[dict[str, int]], frozenset[int]]]:
+        """Validate store spans and group them into per-chunk store requests.
+
+        Args:
+            spans: Request spans (see ``_op_transfer_store``).
+
+        Returns:
+            One ``(StoreRequest, spans, slots)`` per chunk allocation, with
+            spans as ``{source_offset, nbytes, slot_index}`` (one per record
+            for packed chunks, in slot order) and the slot indices they
+            write. Stale allocations are kept; the core skips them.
+
+        Raises:
+            ValueError: For a malformed span, a packed chunk whose records do
+                not cover every slot once, a raw span not made of whole
+                slots inside its allocation, or a raw span when the runtime
+                config has no ``local_slot_size``.
+        """
+        slot_size = self._local_slot_size
+        grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+        for span in spans:
+            key = str(span.get("chunk_key", ""))
+            if not key:
+                raise ValueError("store span requires chunk_key")
+            group = (key, int(span["start_slot"]), int(span["num_slots"]))
+            grouped.setdefault(group, []).append(span)
+        result: list[tuple[StoreRequest, list[dict[str, int]], frozenset[int]]] = []
+        for (key, start_slot, num_slots), members in grouped.items():
+            parsed = [
+                {
+                    "source_offset": int(span.get("source_offset", 0)),
+                    "nbytes": int(span["nbytes"]),
+                    "slot_index": int(span["slot_index"]),
+                }
+                for span in members
+            ]
+            if any(s["source_offset"] < 0 or s["nbytes"] <= 0 for s in parsed):
+                raise ValueError(f"store span of {key} has an empty or negative range")
+            packed = {bool(span.get("packed", False)) for span in members}
+            if len(packed) != 1:
+                raise ValueError(f"store spans of {key} mix packed and raw records")
+            if packed.pop():
+                parsed.sort(key=lambda s: s["slot_index"])
+                if [s["slot_index"] for s in parsed] != list(range(num_slots)):
+                    raise ValueError(
+                        f"packed store of {key} must carry each of its "
+                        f"{num_slots} records once"
+                    )
+                by_slot = sorted(members, key=lambda span: int(span["slot_index"]))
+                modes = tuple(str(span.get("mode", "")) for span in by_slot)
+                if any(mode not in _RECORD_MODES for mode in modes):
+                    raise ValueError(f"packed store of {key} has an unknown mode")
+                request = StoreRequest(
+                    key,
+                    start_slot,
+                    num_slots,
+                    tuple(s["nbytes"] for s in parsed),
+                    modes,
+                )
+                slots = frozenset(range(num_slots))
+            else:
+                if slot_size <= 0:
+                    raise ValueError(
+                        "raw store spans need runtime_config local_slot_size"
+                    )
+                covered: set[int] = set()
+                for s in parsed:
+                    count, rest = divmod(s["nbytes"], slot_size)
+                    if rest or not 0 <= s["slot_index"] <= num_slots - count:
+                        raise ValueError(
+                            f"raw store span of {key} is not whole slots of "
+                            "its allocation"
+                        )
+                    covered.update(range(s["slot_index"], s["slot_index"] + count))
+                request = StoreRequest(
+                    key, start_slot, num_slots, (slot_size,) * num_slots
+                )
+                slots = frozenset(covered)
+            result.append((request, parsed, slots))
+        return result
+
+    def _store_buffer(
+        self, payload: dict[str, Any], spans: list[dict[str, Any]]
+    ) -> tuple[Any, bool]:
+        """Open the source buffer of a store request.
+
+        Args:
+            payload: ``data``, a registered store buffer index, or a one-shot
+                CUDA IPC handle.
+            spans: Request spans, used to bound-check registered buffers and
+                size one-shot mappings.
+
+        Returns:
+            ``(buffer, one_shot)``; a one-shot mapping is closed by the
+            caller once the store consumed it.
+
+        Raises:
+            ValueError: For an unknown registered buffer or a span outside it.
+        """
+        if "store_staging_buffer_index" in payload:
+            buffer_key = (
+                int(payload["producer_pid"]),
+                int(payload["store_staging_buffer_index"]),
+            )
+            buffer = self._store_staging_buffers.get(buffer_key)
+            if buffer is None:
+                raise ValueError(
+                    f"store staging buffer is not registered: {buffer_key}"
+                )
+            for span in spans:
+                offset, nbytes = int(span.get("source_offset", 0)), int(span["nbytes"])
+                if offset < 0 or nbytes < 0 or offset + nbytes > buffer.nbytes:
+                    raise ValueError(
+                        "store source span exceeds registered staging buffer"
+                    )
+            return buffer, False
+        if "cuda_ipc_handle" in payload:
+            # The worker may export a compact view ending at its last record;
+            # map through the furthest submitted byte. Store mappings are
+            # one-shot because the source extent varies per batch.
+            payload = dict(payload)
+            payload["nbytes"] = max(
+                [int(payload.get("nbytes", 0))]
+                + [
+                    int(span.get("source_offset", 0)) + int(span["nbytes"])
+                    for span in spans
+                ]
+            )
+            return (
+                self._open_cuda_ipc_payload(
+                    payload=payload, nbytes_key="nbytes", cache_mapping=False
+                ),
+                True,
+            )
+        return self._payload_buffer(payload), False
+
+    def _store_moves(
+        self,
+        placement: StorePlacement,
+        spans: list[dict[str, int]],
+        tp_rank: int,
+    ) -> list[Move]:
+        """Return the moves writing one chunk's spans into its placement.
+
+        Args:
+            placement: Chunk placement.
+            spans: ``{source_offset, nbytes, slot_index}`` spans of the chunk.
+            tp_rank: Storing rank (selects the lane).
+        """
+        offsets = record_offsets(placement.record_sizes)
+        layout = self._layout
+        moves = []
+        for span in spans:
+            within = offsets[span["slot_index"]]
+            moves.append(
+                Move(
+                    buffer_offset=span["source_offset"],
+                    nbytes=span["nbytes"],
+                    l1_offset=(
+                        None
+                        if placement.l1 is None
+                        else layout.absolute_offset(
+                            L1, tp_rank, placement.l1.offset + within
+                        )
+                    ),
+                    l2_offset=(
+                        None
+                        if placement.l2 is None
+                        else layout.absolute_offset(
+                            L2, tp_rank, placement.l2.offset + within
+                        )
+                    ),
+                )
+            )
+        return moves
+
+    def _register_store_parts(
+        self,
+        parts: list[_StorePart],
+        staged: asyncio.Future[None],
+        persisted: asyncio.Future[None],
+    ) -> None:
+        """Add one request's IO to its chunks' trackers and pick reporters.
+
+        Args:
+            parts: The request's chunk parts.
+            staged: The request's ``StoreHandle.staged``.
+            persisted: The request's ``StoreHandle.persisted``.
+
+        Async/thread-safety:
+            Synchronous on the event loop right after ``TransferLayer.store``
+            returned, so the request completing a chunk's slot set sees the
+            IO of every earlier request of the chunk.
+        """
+        for part in parts:
+            tracker = self._chunk_stores.setdefault(
+                part.key, _ChunkStore(part.num_slots)
+            )
+            part.tracker = tracker
+            tracker.staged.append(staged)
+            tracker.persisted.append(persisted)
+            tracker.slots.update(part.slots)
+            if len(tracker.slots) == tracker.num_slots:
+                part.reporter = True
+                del self._chunk_stores[part.key]
+
+    async def _abandon_store_parts(self, parts: list[_StorePart], tp_rank: int) -> None:
+        """Undo placements of a store request whose IO was never submitted.
+
+        A chunk with earlier requests in flight only drops this request's
+        pins; otherwise the store is reported failed, so a placement nobody
+        writes does not linger.
+
+        Args:
+            parts: Placed parts of the request.
+            tp_rank: Storing rank.
+        """
+        tp = self._layout.tensor_parallel_size
+        for part in parts:
+            if part.key in self._chunk_stores:
+                self._core.release_placement(part.placement)
+            else:
+                await self._core.store_failed(part.placement, tp_rank, tp)
+
+    async def _finish_store(
+        self,
+        parts: list[_StorePart],
+        staged: asyncio.Future[None],
+        persisted: asyncio.Future[None],
+        one_shot: Any,
+        reply: asyncio.Future[BaseException | None],
+        tp_rank: int,
+    ) -> None:
+        """Report one store request's IO to the core and resolve its reply.
+
+        A reporter part reports the chunk's outcome over every request of
+        the chunk (``store_staged`` / ``store_persisted``, or
+        ``store_failed`` on any failure); other parts only release their
+        pins once this request's IO ended.
+
+        Args:
+            parts: The request's chunk parts.
+            staged: The request's ``StoreHandle.staged``.
+            persisted: The request's ``StoreHandle.persisted``.
+            one_shot: One-shot source mapping to close once staged, or None.
+            reply: Resolved with the request's error (or None) once the
+                buffer was consumed and chunks without an L1 copy persisted.
+            tp_rank: Storing rank.
+
+        Async/thread-safety:
+            Background task on the event loop; never cancelled by the request.
+        """
+        tp = self._layout.tensor_parallel_size
+        try:
+            staged_error = await _outcome([staged])
+            if one_shot is not None:
+                one_shot.close()
+            if staged_error is not None and not reply.done():
+                reply.set_result(staged_error)
+            waiting: list[_StorePart] = []
+            for part in parts:
+                placement = part.placement
+                if not part.reporter or placement.l1 is None:
+                    waiting.append(part)
+                    continue
+                assert part.tracker is not None
+                error = await _outcome(part.tracker.staged)
+                if error is not None:
+                    await self._core.store_failed(placement, tp_rank, tp)
+                    continue
+                await self._core.store_staged(placement, tp_rank, tp)
+                if placement.l2 is not None:
+                    waiting.append(part)
+            unstaged = any(p.reporter and p.placement.l1 is None for p in waiting)
+            if not unstaged and not reply.done():
+                reply.set_result(None)
+            await _outcome([persisted])
+            for part in waiting:
+                error = await self._finish_persisted(part, tp_rank)
+                if error is not None and part.placement.l1 is None:
+                    if not reply.done():
+                        reply.set_result(error)
+            if not reply.done():
+                reply.set_result(None)
+        except BaseException as exc:
+            if not reply.done():
+                reply.set_result(exc)
+            raise
+
+    async def _finish_persisted(
+        self, part: _StorePart, tp_rank: int
+    ) -> BaseException | None:
+        """End one chunk part once its request's L2 IO ended.
+
+        Args:
+            part: Chunk part of a request whose IO ended.
+            tp_rank: Storing rank.
+
+        Returns:
+            The chunk's store failure reported by a reporter, else None.
+        """
+        tp = self._layout.tensor_parallel_size
+        placement = part.placement
+        tracker = part.tracker
+        assert tracker is not None
+        if not part.reporter:
+            # The reporter (a later request) sees this request's failure
+            # through the shared futures; a stale allocation never gets one.
+            self._core.release_placement(placement)
+            if self._chunk_stores.get(
+                part.key
+            ) is tracker and not self._core.is_current_allocation(
+                part.key[0], part.key[1], part.num_slots
+            ):
+                del self._chunk_stores[part.key]
+            return None
+        futures = tracker.staged + tracker.persisted
+        error = await _outcome(futures)
+        if error is not None:
+            await self._core.store_failed(placement, tp_rank, tp)
+            if placement.l1 is not None:
+                logger.warning(
+                    "[IPC] L2 write of %s failed: %r", part.key[0][:8], error
+                )
+            return error
+        await self._core.store_persisted(placement, tp_rank, tp)
+        return None
+
+    # ------------------------------------------------------------------
+    # Load helpers
+    # ------------------------------------------------------------------
+
+    async def _plan_spans(
+        self, spans: list[dict[str, Any]]
+    ) -> list[tuple[int, LoadSegment]]:
+        """Resolve load spans to pinned segments with their buffer offsets.
+
+        Args:
+            spans: ``{target_offset, start_slot, num_slots, nbytes}`` spans.
+
+        Returns:
+            ``(buffer offset, segment)`` pairs in span order; release the
+            segments with ``ServerCore.release_load``.
+
+        Raises:
+            ValueError: If a span's ``nbytes`` differs from its records.
+            ChunkUnavailable: If a slot has no committed chunk.
+        """
+        planned: list[tuple[int, LoadSegment]] = []
+        try:
+            for span in spans:
+                target = int(span["target_offset"])
+                segments = await self._core.plan_load(
+                    int(span["start_slot"]), int(span["num_slots"])
+                )
+                planned.extend((target, segment) for segment in segments)
+                nbytes = 0
+                for index in range(len(planned) - len(segments), len(planned)):
+                    segment = planned[index][1]
+                    planned[index] = (target + nbytes, segment)
+                    nbytes += segment.nbytes
+                if nbytes != int(span["nbytes"]) or target < 0:
+                    raise ValueError(
+                        f"load span at slot {span['start_slot']} has {nbytes} "
+                        f"record bytes, not {span['nbytes']}"
+                    )
+        except BaseException:
+            self._core.release_load([segment for _target, segment in planned])
+            raise
+        return planned
+
+    async def _promote_on_read(self, segments: list[LoadSegment]) -> list[Promotion]:
+        """Admit the whole L2-only chunks of a load into L1.
+
+        Args:
+            segments: Planned load segments.
+
+        Returns:
+            Promotions begun (finish them after the read).
+        """
+        if not (self._layout.enabled(L1) and self._layout.enabled(L2)):
+            return []
+        keys = []
+        for segment in segments:
+            if segment.tier != L2 or segment.slot_index != 0:
+                continue
+            records = self._core.chunk_records(segment.chunk_key)
+            if records is not None and len(records.record_sizes) == len(
+                segment.record_sizes
+            ):
+                keys.append(segment.chunk_key)
+        if not keys:
+            return []
+        promotions = await self._core.begin_promotions(list(dict.fromkeys(keys)))
+        return [promotion for promotion in promotions if promotion is not None]
+
+    async def _run_load(
+        self,
+        transfer: TransferLayer,
+        buffer: Any,
+        planned: list[tuple[int, LoadSegment]],
+        promotions: list[Promotion],
+        tp_rank: int,
+    ) -> None:
+        """Issue one transfer load per source tier (and peer promotions).
+
+        Args:
+            transfer: Transfer layer.
+            buffer: Destination buffer.
+            planned: ``(buffer offset, segment)`` pairs.
+            promotions: Promotions of whole chunks read here; this rank's
+                lane is filled by the L2 read, other ranks' lanes by
+                ``promote``.
+            tp_rank: Loading rank.
+
+        Raises:
+            BaseException: The first transfer failure, after every call
+                ended.
+        """
+        layout = self._layout
+        targets = {promotion.chunk_key: promotion.target for promotion in promotions}
+        by_tier: dict[str, list[Move]] = {L1: [], L2: []}
+        for buffer_offset, segment in planned:
+            lane = segment.lane_offset
+            promoted = targets.get(segment.chunk_key) if segment.tier == L2 else None
+            by_tier[segment.tier].append(
+                Move(
+                    buffer_offset=buffer_offset,
+                    nbytes=segment.nbytes,
+                    l1_offset=(
+                        layout.absolute_offset(L1, tp_rank, lane)
+                        if segment.tier == L1
+                        else None
+                        if promoted is None
+                        else layout.absolute_offset(L1, tp_rank, promoted.offset)
+                    ),
+                    l2_offset=(
+                        layout.absolute_offset(L2, tp_rank, lane)
+                        if segment.tier == L2
+                        else None
+                    ),
+                )
+            )
+        calls: list[Coroutine[Any, Any, None]] = [
+            transfer.load(buffer, moves, tier)  # type: ignore[arg-type]
+            for tier, moves in by_tier.items()
+            if moves
+        ]
+        peer_ranks = [
+            rank for rank in range(layout.tensor_parallel_size) if rank != tp_rank
+        ]
+        peers = [
+            move
+            for promotion in promotions
+            for move in self._promotion_moves(promotion, peer_ranks)
+        ]
+        if peers:
+            calls.append(transfer.promote(peers))
+        tasks = [asyncio.ensure_future(call) for call in calls]
+        error = await _outcome(tasks)
+        if error is not None:
+            raise error
+
+    def _promotion_moves(
+        self, promotion: Promotion, ranks: Sequence[int] | None = None
+    ) -> list[Move]:
+        """Return the L2 -> L1 moves of a promotion on rank lanes.
+
+        Args:
+            promotion: Admitted promotion.
+            ranks: Lanes to fill; None means every rank.
+        """
+        nbytes = sum(promotion.record_sizes)
+        layout = self._layout
+        if ranks is None:
+            ranks = range(layout.tensor_parallel_size)
+        return [
+            Move(
+                buffer_offset=0,
+                nbytes=nbytes,
+                l1_offset=layout.absolute_offset(L1, rank, promotion.target.offset),
+                l2_offset=layout.absolute_offset(L2, rank, promotion.source.offset),
+            )
+            for rank in ranks
+        ]
+
+    async def _start_readahead(self, windows: list[tuple[ChunkInfo, int, int]]) -> None:
+        """Promote the L2-only chunks of a lookup's external window.
+
+        Bounded by ``readahead piece * window`` bytes in flight; chunks are
+        admitted in prompt order and promoted in groups of about one piece.
+
+        Args:
+            windows: ``_window_slots`` of the lookup.
+
+        Async/thread-safety:
+            Runs on the event loop; the promotions run as background tasks.
+            Loads of a promoting chunk wait for it.
+        """
+        tp = self._layout.tensor_parallel_size
+        keys: list[str] = []
+        cost: dict[str, int] = {}
+        budget = self._readahead_budget - self._readahead_inflight
+        candidates = [
+            key
+            for chunk, first, count in windows
+            for key, _index, _count in (
+                self._core.resolve_slots(int(chunk.start_slot) + first, count) or []
+            )
+        ]
+        for key in candidates:
+            records = self._core.chunk_records(key)
+            if records is None or self._core.full_tiers(key) != (L2,):
+                continue
+            nbytes = sum(records.record_sizes) * tp
+            if nbytes > budget:
+                break
+            budget -= nbytes
+            keys.append(key)
+            cost[key] = nbytes
+        if not keys:
+            return
+        group: list[Promotion] = []
+        group_bytes = 0
+        for promotion in await self._core.begin_promotions(keys):
+            if promotion is None:
+                continue
+            nbytes = cost[promotion.chunk_key]
+            if group and group_bytes + nbytes > self._readahead_piece:
+                self._spawn_readahead(group, group_bytes)
+                group, group_bytes = [], 0
+            group.append(promotion)
+            group_bytes += nbytes
+        if group:
+            self._spawn_readahead(group, group_bytes)
+
+    def _spawn_readahead(self, promotions: list[Promotion], nbytes: int) -> None:
+        """Start one readahead promotion group.
+
+        Args:
+            promotions: Admitted promotions.
+            nbytes: Their bytes over all ranks.
+        """
+        self._readahead_inflight += nbytes
+        self._spawn(self._run_readahead(promotions, nbytes))
+
+    async def _run_readahead(self, promotions: list[Promotion], nbytes: int) -> None:
+        """Read one readahead group into L1 and finish its promotions.
+
+        Args:
+            promotions: Admitted promotions.
+            nbytes: Their bytes over all ranks.
+        """
+        ok = False
+        try:
+            moves = [m for p in promotions for m in self._promotion_moves(p)]
+            await self._ensure_transfer().promote(moves)
+            ok = True
+        finally:
+            for promotion in promotions:
+                self._core.finish_promotion(promotion, ok)
+            self._readahead_inflight -= nbytes
+            self._metrics.counter(
+                "daser_readahead_bytes_total",
+                "Lookup readahead bytes by outcome.",
+            ).inc(nbytes, labels={"outcome": "read" if ok else "dropped"})
+
+    # ------------------------------------------------------------------
+    # Lease helpers
+    # ------------------------------------------------------------------
+
+    def _lease_ready(self, state: _LeaseState) -> asyncio.Task[None]:
+        """Return the task bringing a lease's chunks into pinned L1 segments.
+
+        Args:
+            state: Active lease.
+        """
+        if state.task is None:
+            state.task = asyncio.ensure_future(self._prepare_lease(state))
+            self._tasks.add(state.task)
+
+            def done(finished: asyncio.Task[None]) -> None:
+                self._tasks.discard(finished)
+                # Waiters report the failure; a shielded task whose waiter
+                # left must not log "exception was never retrieved".
+                if not finished.cancelled():
+                    finished.exception()
+
+            state.task.add_done_callback(done)
+        return state.task
+
+    async def _prepare_lease(self, state: _LeaseState) -> None:
+        """Promote a lease's L2-only chunks and pin its L1 segments.
+
+        Args:
+            state: Active lease.
+
+        Raises:
+            ChunkUnavailable: If the lease was released, a chunk left the
+                index, or a chunk could not be admitted into L1.
+        """
+        if state.promote_keys:
+            await self._admit_lease(state)
+            promotions = [
+                p
+                for p in await self._core.begin_promotions(state.promote_keys)
+                if p is not None
+            ]
+            ok = False
+            try:
+                if promotions:
+                    await self._ensure_transfer().promote(
+                        [m for p in promotions for m in self._promotion_moves(p)]
+                    )
+                ok = True
+            finally:
+                for promotion in promotions:
+                    self._core.finish_promotion(promotion, ok)
+        segments: list[LoadSegment] = []
+        slot_ids: list[int] = []
+        try:
+            for start_slot, num_slots in state.windows:
+                planned = await self._core.plan_load(start_slot, num_slots)
+                segments.extend(planned)
+                slot_ids.extend(range(start_slot, start_slot + num_slots))
+            if state.released:
+                raise ChunkUnavailable(f"lease {state.lease_id} was released")
+            if any(segment.tier != L1 for segment in segments):
+                raise ChunkUnavailable(
+                    f"lease {state.lease_id} could not bring every chunk into L1"
+                )
+        except BaseException:
+            self._core.release_load(segments)
+            raise
+        lanes = []
+        sizes = []
+        for segment in segments:
+            offsets = record_offsets(segment.record_sizes)
+            lanes.extend(segment.lane_offset + offset for offset in offsets)
+            sizes.extend(segment.record_sizes)
+        order = numpy.argsort(numpy.asarray(slot_ids, dtype=numpy.int64))
+        state.slot_ids = numpy.asarray(slot_ids, dtype=numpy.int64)[order]
+        state.lane_offsets = numpy.asarray(lanes, dtype=numpy.int64)[order]
+        state.record_sizes = numpy.asarray(sizes, dtype=numpy.int64)[order]
+        state.segments = segments
+
+    async def _admit_lease(self, state: _LeaseState) -> None:
+        """Wait until a lease fits the prefetch lease budget, then count it.
+
+        A lease is admitted alone when no other lease is counted, so an
+        oversized request still makes progress.
+
+        Args:
+            state: Lease whose chunks need promotion.
+
+        Raises:
+            ChunkUnavailable: If the lease is released while waiting.
+        """
+        while (
+            self._lease_budget
+            and self._leased_bytes
+            and self._leased_bytes + state.nbytes > self._lease_budget
+        ):
+            waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._lease_waiters.append(waiter)
+            try:
+                await waiter
+            finally:
+                if waiter in self._lease_waiters:
+                    self._lease_waiters.remove(waiter)
+            if state.released:
+                raise ChunkUnavailable(f"lease {state.lease_id} was released")
+        state.admitted = True
+        self._leased_bytes += state.nbytes
+
+    def _release_lease(self, lease_id: str) -> None:
+        """Drop a lease's pins and budget share; idempotent.
+
+        Args:
+            lease_id: Lease to release.
+
+        Async/thread-safety:
+            Synchronous on the event loop. A preparation still running sees
+            ``released`` and releases what it pinned itself.
+        """
+        state = self._leases.pop(lease_id, None)
+        if state is None:
+            return
+        state.released = True
+        for lease in state.leases:
+            self._core.unpin_lease(lease)
+        self._core.release_load(state.segments)
+        state.segments = []
+        if state.admitted:
+            self._leased_bytes -= state.nbytes
+            state.admitted = False
+        for waiter in self._lease_waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+        self._lease_waiters.clear()
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _spawn(self, body: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Run a background task tracked for ``drain_transfer``.
+
+        Args:
+            body: Coroutine to run.
+
+        Returns:
+            The task; its failure is logged.
+        """
+        task = asyncio.get_running_loop().create_task(body)
+        self._tasks.add(task)
+
+        def done(finished: asyncio.Task[Any]) -> None:
+            self._tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                logger.warning(
+                    "[IPC] background transfer task failed: %r", finished.exception()
+                )
+
+        task.add_done_callback(done)
+        return task
 
     def _register_staging(
         self,
@@ -1298,28 +1948,19 @@ class IPCServer:
             previous.close()
         return {"ok": True}
 
-    def _record_transfer_metrics(
-        self,
-        op: str,
-        backend: str,
-        status: str,
-        nbytes: int,
-        elapsed_s: float,
-    ) -> None:
-        """Record transfer operation metrics and GB/s log output.
+    def _record_transfer_metrics(self, op: str, nbytes: int, elapsed_s: float) -> None:
+        """Record one transfer operation and the backend's counters.
 
         Args:
             op: Transfer operation, ``load`` or ``store``.
-            backend: Configured transfer backend (used for logging only).
-            status: Operation status.
-            nbytes: Bytes transferred.
+            nbytes: Bytes transferred (one rank).
             elapsed_s: Operation latency in seconds.
         """
         labels = {"op": op}
         self._metrics.counter(
             "daser_transfer_operations_total",
             "Transfer operations by operation and status.",
-        ).inc(labels={**labels, "status": status})
+        ).inc(labels={**labels, "status": "ok"})
         self._metrics.counter(
             "daser_transfer_bytes_total",
             "Transfer bytes by operation.",
@@ -1348,85 +1989,91 @@ class IPCServer:
             "Transfer size per operation in bytes.",
             buckets=(65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456),
         ).observe(nbytes, labels=labels)
-        self._record_tier_metrics()
-        throughput_gbps = (nbytes / elapsed_s / 1_000_000_000) if elapsed_s > 0 else 0.0
-        logger.debug(
-            "[IPC] transfer_%s summary backend=%s status=%s bytes=%d "
-            "elapsed_ms=%.3f throughput_gbps=%.3f",
-            op,
-            backend,
-            status,
-            nbytes,
-            elapsed_s * 1000,
-            throughput_gbps,
-        )
+        self._record_backend_metrics()
 
-    def _record_packed_ratios(
-        self, spans: list[dict[str, Any]], local_slot_size: int
+    def _record_load_metrics(
+        self, l1_segments: int, l2_segments: int, *, resolve_s: float, io_s: float
     ) -> None:
-        """Observe each placed packed record's size relative to a raw slot.
+        """Count a load's tier hits and phase times.
 
         Args:
-            spans: Spans returned by packed placement for one store.
-            local_slot_size: Bytes of one raw rank-local slot.
+            l1_segments: Segments read from L1.
+            l2_segments: Segments read from L2.
+            resolve_s: Seconds resolving and pinning segments (includes
+                waits for in-flight promotions).
+            io_s: Seconds in transfer calls.
+        """
+        if l1_segments:
+            self._metrics.counter(
+                "daser_l1_hits_total", "Load segments read from L1."
+            ).inc(l1_segments)
+        if l2_segments:
+            self._metrics.counter(
+                "daser_l1_misses_total", "Load segments read from L2."
+            ).inc(l2_segments)
+        phases = self._metrics.counter(
+            "daser_load_phase_seconds_total", "Load wall time by phase."
+        )
+        phases.inc(resolve_s, labels={"phase": "resolve"})
+        phases.inc(io_s, labels={"phase": "io"})
+
+    def _record_packed_ratios(self, spans: list[dict[str, Any]]) -> None:
+        """Observe each stored packed record's size relative to a raw slot.
+
+        Args:
+            spans: Spans of one store request.
 
         Async/thread-safety:
             Call on the server event loop. A retried store observes its
             records again.
         """
+        packed = [span for span in spans if span.get("packed", False)]
+        if not packed or self._local_slot_size <= 0:
+            return
         histogram = self._metrics.histogram(
             "daser_packed_record_ratio",
-            "Stored bytes of each placed packed record over one raw slot, by mode.",
+            "Stored bytes of each packed record over one raw slot, by mode.",
             buckets=tuple(i / 100 for i in range(50, 101, 2)),
         )
-        for span in spans:
-            if span.get("packed", False):
-                histogram.observe(
-                    int(span["nbytes"]) / local_slot_size,
-                    labels={"mode": str(span.get("mode", "compressed"))},
-                )
+        for span in packed:
+            histogram.observe(
+                int(span["nbytes"]) / self._local_slot_size,
+                labels={"mode": str(span.get("mode", "compressed"))},
+            )
 
-    def _end_packed_writes(self, token: int) -> None:
-        """End one packed write hold and count bytes freed late by it."""
-        freed = self._core.packed_layout.end_writes(token)
-        if freed:
-            self._metrics.counter(
-                "daser_packed_deferred_free_bytes_total",
-                "Packed bytes freed when a store finished after its chunk left.",
-            ).inc(freed)
-
-    def _record_tier_metrics(self) -> None:
-        """Publish L1 cache metrics and the cumulative L2 read counter."""
+    def _record_backend_metrics(self) -> None:
+        """Publish deltas of the transfer backend's cumulative counters."""
         transfer = self._transfer
         if transfer is None:
             return
         stats = transfer.stats
-        current_hits = stats.l1_hits
-        current_misses = stats.l1_misses
-        current_l2_reads = stats.l2_reads
-        l2_write_bytes = stats.l2_write_bytes - getattr(self, "_prev_l2_write_bytes", 0)
-        if l2_write_bytes > 0:
+        delta = stats.l2_write_bytes - self._prev_l2_write_bytes
+        if delta > 0:
             self._metrics.counter(
                 "daser_l2_write_bytes_total", "Bytes written to the L2 storage tier."
-            ).inc(l2_write_bytes)
+            ).inc(delta)
         self._prev_l2_write_bytes = stats.l2_write_bytes
-        timing = getattr(transfer, "l2_timing_us", None) or {}
-        prev_timing = getattr(self, "_prev_l2_timing_us", {})
+        delta = stats.l2_reads - self._prev_l2_reads
+        if delta > 0:
+            self._metrics.counter(
+                "daser_l2_reads_total", "Reads served from the L2 storage tier."
+            ).inc(delta)
+        self._prev_l2_reads = stats.l2_reads
+        timing = dict(transfer.l2_timing_us)
         for key, current in timing.items():
-            delta = current - prev_timing.get(key, 0)
+            delta = current - self._prev_l2_timing_us.get(key, 0)
             if delta > 0:
-                kind, phase = key.split("_")
+                kind, phase = key.split("_", 1)
                 self._metrics.counter(
                     "daser_l2_executor_seconds_total",
                     "L2 executor queue wait and native IO time.",
                 ).inc(delta / 1_000_000, labels={"kind": kind, "phase": phase})
         self._prev_l2_timing_us = timing
-        contention = getattr(transfer, "l2_read_contention", None) or {}
-        prev_contention = getattr(self, "_prev_l2_read_contention", {})
+        contention = dict(transfer.l2_read_contention)
         for (bucket, writing), current in contention.items():
             labels = {"inflight": str(bucket), "write": str(writing).lower()}
-            prev = prev_contention.get((bucket, writing), (0, 0, 0))
-            for name, description, delta in (
+            prev = self._prev_l2_read_contention.get((bucket, writing), (0, 0, 0))
+            for name, description, value in (
                 (
                     "daser_l2_read_jobs_total",
                     "L2 read jobs by read concurrency and write activity at start.",
@@ -1443,56 +2090,9 @@ class IPCServer:
                     current[2] - prev[2],
                 ),
             ):
-                if delta > 0:
-                    self._metrics.counter(name, description).inc(delta, labels=labels)
+                if value > 0:
+                    self._metrics.counter(name, description).inc(value, labels=labels)
         self._prev_l2_read_contention = contention
-        for cause, current in (
-            ("l2_write", stats.promotion_wait_l2_write_us),
-            ("promotion", stats.promotion_wait_promotion_us),
-            ("pool", stats.promotion_wait_pool_us),
-        ):
-            delta = current - self._prev_promotion_wait_us.get(cause, 0)
-            if delta > 0:
-                self._metrics.counter(
-                    "daser_promotion_wait_seconds_total",
-                    "Time L2 promotions waited for L1 space, by what they waited on.",
-                ).inc(delta / 1e6, labels={"cause": cause})
-            self._prev_promotion_wait_us[cause] = current
-        for outcome, current in (
-            ("read", stats.readahead_read_bytes),
-            ("served", stats.readahead_served_bytes),
-            ("dropped", stats.readahead_dropped_bytes),
-            ("contended", stats.readahead_contended_bytes),
-            ("write_contended", stats.l2_write_contended_bytes),
-        ):
-            delta = current - self._prev_readahead_bytes.get(outcome, 0)
-            if delta > 0:
-                self._metrics.counter(
-                    "daser_readahead_bytes_total",
-                    "Lookup readahead bytes by outcome.",
-                ).inc(delta, labels={"outcome": outcome})
-            self._prev_readahead_bytes[outcome] = current
-        for phase in _LOAD_PHASES:
-            current = getattr(stats, f"load_{phase}_us")
-            delta = current - self._prev_load_phase_us.get(phase, 0)
-            if delta > 0:
-                self._metrics.counter(
-                    "daser_load_phase_seconds_total",
-                    "Grouped-load wall time by phase.",
-                ).inc(delta / 1_000_000, labels={"phase": phase})
-            self._prev_load_phase_us[phase] = current
-        for kind, current in (
-            ("all", stats.l1_evicted_bytes),
-            ("pinned", stats.l1_evicted_pinned_bytes),
-            ("unread", stats.l1_evicted_unread_bytes),
-        ):
-            delta = current - self._prev_l1_evicted.get(kind, 0)
-            if delta > 0:
-                self._metrics.counter(
-                    "daser_l1_evicted_bytes_total",
-                    "Bytes L1 replacement evicted: all, still pinned, never read.",
-                ).inc(delta, labels={"kind": kind})
-            self._prev_l1_evicted[kind] = current
         for unit, current in (
             ("copies", stats.dst_copies),
             ("runs", stats.dst_copy_runs),
@@ -1502,268 +2102,97 @@ class IPCServer:
             if delta > 0:
                 self._metrics.counter(
                     "daser_dst_copy_total",
-                    "L1-to-destination copy submissions, runs and bytes.",
+                    "Host-to-destination copy submissions, runs and bytes.",
                 ).inc(delta, labels={"unit": unit})
             self._prev_dst_copy[unit] = current
-        lease_wait_delta = stats.store_lease_wait_us - self._prev_store_lease_wait_us
-        if lease_wait_delta > 0:
-            self._metrics.counter(
-                "daser_store_lease_wait_seconds_total",
-                "Time stores waited for a request lease to retain their range.",
-            ).inc(lease_wait_delta / 1e6)
-        self._prev_store_lease_wait_us = stats.store_lease_wait_us
-        self._metrics.gauge(
-            "daser_store_lease_wait_max_seconds",
-            "Longest lease wait of a single store.",
-        ).set(stats.store_lease_wait_max_us / 1e6)
-        prev_hits = getattr(self, "_prev_l1_hits", 0)
-        prev_misses = getattr(self, "_prev_l1_misses", 0)
-        prev_l2_reads = getattr(self, "_prev_l2_reads", 0)
-        delta_hits = current_hits - prev_hits
-        delta_misses = current_misses - prev_misses
-        delta_l2_reads = current_l2_reads - prev_l2_reads
-        if delta_hits > 0:
-            self._metrics.counter("daser_l1_hits_total", "L1 memory cache hits.").inc(
-                delta_hits
-            )
-        if delta_misses > 0:
-            self._metrics.counter(
-                "daser_l1_misses_total", "L1 memory cache misses."
-            ).inc(delta_misses)
-        if delta_l2_reads > 0:
-            self._metrics.counter(
-                "daser_l2_reads_total", "Reads served from the L2 storage tier."
-            ).inc(delta_l2_reads)
-        self._prev_l1_hits = current_hits
-        self._prev_l1_misses = current_misses
-        self._prev_l2_reads = current_l2_reads
-        l1_used = transfer.l1_bytes_used
-        l1_capacity = int(self._runtime_config.get("l1_size_bytes", 0))
-        self._metrics.gauge("daser_l1_bytes_used", "L1 memory cache bytes in use.").set(
-            l1_used
-        )
-        self._metrics.gauge(
-            "daser_l1_bytes_capacity", "L1 memory cache total capacity."
-        ).set(l1_capacity)
-        if self._packed_tiers:
-            layout = self._core.packed_layout
-            self._metrics.gauge(
-                "daser_packed_l2_charged_bytes",
-                "Rank-0 packed bytes counted against the L2 budget.",
-            ).set(layout.charged_bytes())
-            self._metrics.gauge(
-                "daser_packed_l1_held_bytes",
-                "Packed bytes indexed only through L1 residency.",
-            ).set(layout.held_bytes)
-            self._metrics.gauge(
-                "daser_packed_arena_free_bytes",
-                "Unreserved bytes of the rank-0 packed arena lane.",
-            ).set(self._core.packed_layout.free_bytes())
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use.
 
-        Protected by a threading lock so that concurrent calls from the
-        eager ``initialize_transfer`` thread-pool path and the event-loop
-        IPC request path cannot create duplicate transfer layer instances.
+        The backend is sized from the core's tier layout: the L1 arena holds
+        every rank's L1 lane, L2 covers every rank's L2 lane.
+
+        Raises:
+            ValueError: For an unknown mode or a mode the tiers cannot use.
+
+        Async/thread-safety:
+            Protected by a threading lock so the eager ``initialize_transfer``
+            thread and the event loop never create two instances.
         """
         if self._transfer is not None:
             return self._transfer
         with self._transfer_lock:
             if self._transfer is not None:
                 return self._transfer
+            layout = self._layout
+            tp = layout.tensor_parallel_size
             mode = str(self._runtime_config.get("transfer_mode", "gds"))
             path = str(self._runtime_config.get("store_path", ""))
-            skip_l2 = bool(self._runtime_config.get("skip_l2", False))
             if mode == "gds":
-                if skip_l2:
-                    raise ValueError("skip_l2 is incompatible with gds transfer")
+                if layout.enabled(L1) or not layout.enabled(L2):
+                    raise ValueError("gds transfer needs L2 only (no L1 tier)")
                 from daser.transfer.gds import GDSTransferLayer
 
-                self._transfer = GDSTransferLayer(path)
-            elif mode == "iouring":
-                l2_bytes = int(
-                    self._runtime_config.get(
-                        "l2_size_bytes",
-                        self._runtime_config.get("total_store_bytes", 0),
-                    )
+                self._transfer = GDSTransferLayer(
+                    path, l2_bytes=layout.l2_lane_bytes * tp
                 )
-                if l2_bytes <= 0:
-                    slot_size = int(self._runtime_config.get("slot_size", 0))
-                    total_slots = int(self._runtime_config.get("total_slots", 0))
-                    l2_bytes = slot_size * total_slots
+            elif mode == "iouring":
+                if not layout.enabled(L1):
+                    raise ValueError("iouring transfer needs an L1 tier")
+                skip_l2 = not layout.enabled(L2)
                 self._transfer = TieredIOUringTransferLayer(
-                    path=path,
-                    l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
-                    l2_bytes=l2_bytes,
+                    path,
+                    l1_bytes=layout.l1_lane_bytes * tp,
+                    staging_bytes=int(self._runtime_config.get("staging_bytes", 0)),
+                    l2_bytes=layout.l2_lane_bytes * tp,
                     skip_l2=skip_l2,
-                    bip_enabled=bool(self._runtime_config.get("bip_enabled", False)),
-                    l1_accounting=str(
-                        self._runtime_config.get("l1_accounting", "stored")
-                    ),
-                    prefetch_lease_budget_bytes=int(
-                        self._runtime_config.get("prefetch_lease_budget_bytes", 0)
-                    ),
                     l2_read_stripe_bytes=int(
                         self._runtime_config.get("l2_read_stripe_bytes", 0)
                     ),
-                    readahead_piece_bytes=self._readahead_piece,
-                    readahead_window=int(
-                        os.environ.get(LOAD_READAHEAD_WINDOW_ENV, "4") or 4
-                    ),
                     l2_write_gate=os.environ.get(L2_WRITE_GATE_ENV) != "0",
-                    readahead_budget_fraction=float(
-                        os.environ.get(READAHEAD_BUDGET_FRACTION_ENV) or 0.5
-                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
-            if self._packed_tiers:
-                self._core.attach_l1_tier(
-                    self._transfer.hold_resident,
-                    self._transfer.discard_held,
-                    self._transfer.release_hold,
-                )
-                self._transfer.set_held_release_listener(self._core.release_held)
         return self._transfer
 
     def _chunk_payloads(self, chunks: list[ChunkInfo]) -> list[dict[str, Any]]:
-        """Serialize lookup chunks and attach published online packed slot refs."""
+        """Serialize lookup chunks; packed chunks carry ``compressed_slots``.
+
+        Args:
+            chunks: Lookup chunks.
+
+        Returns:
+            ``ChunkInfo.to_dict`` per chunk, plus ``compressed_slots`` of
+            ``{slot_id, mode, stored_length}`` (one per slot) for results
+            whose chunks all carry codec modes. A result may be a run of
+            several adjacent chunks.
+        """
         payloads: list[dict[str, Any]] = []
         for chunk in chunks:
             payload = chunk.to_dict()
-            if (
-                self._runtime_config.get("storage_format")
-                == STORAGE_FORMAT_COMPRESSED_ONLINE
-            ):
-                online_refs = self._core.packed_slot_refs(
-                    chunk.start_slot,
-                    chunk.num_slots,
-                )
-                if len(online_refs) == chunk.num_slots:
-                    payload["compressed_slots"] = online_refs
             payloads.append(payload)
-        return payloads
-
-    def _external_spans(
-        self,
-        chunks: list[ChunkInfo],
-        num_computed_tokens: int,
-        hits: int,
-    ) -> list[dict[str, int]]:
-        """Return the physical spans a worker load of ``hits`` tokens reads."""
-        block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        if self._runtime_config.get("storage_format") == (
-            STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
-            return self._online_compressed_prefetch_spans(
-                chunks,
-                external_start=num_computed_tokens,
-                external_tokens=hits,
-                block_tokens=block_tokens,
-            )
-        return _prefetch_spans_from_chunks(
-            chunks,
-            external_start=num_computed_tokens,
-            external_tokens=hits,
-            block_tokens=block_tokens,
-            slot_size=int(self._runtime_config.get("slot_size", 0)),
-            tensor_parallel_size=int(
-                self._runtime_config.get("tensor_parallel_size", 1)
-            ),
-            rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-        )
-
-    def _chunk_spans(self, chunk: ChunkInfo) -> list[dict[str, int]]:
-        """Return the physical spans that store one whole chunk."""
-        block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        window = {
-            "external_start": int(chunk.target_token_start),
-            "external_tokens": int(chunk.token_count),
-            "block_tokens": block_tokens,
-        }
-        if self._runtime_config.get("storage_format") == (
-            STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
-            return self._online_compressed_prefetch_spans([chunk], **window)
-        return _prefetch_spans_from_chunks(
-            [chunk],
-            **window,
-            slot_size=int(self._runtime_config.get("slot_size", 0)),
-            tensor_parallel_size=int(
-                self._runtime_config.get("tensor_parallel_size", 1)
-            ),
-            rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-        )
-
-    def _online_compressed_prefetch_spans(
-        self,
-        chunks: list[ChunkInfo],
-        *,
-        external_start: int,
-        external_tokens: int,
-        block_tokens: int,
-    ) -> list[dict[str, int]]:
-        """Translate an online packed window into exact physical read spans.
-
-        Args:
-            chunks: Committed lookup chunks covering the prompt prefix.
-            external_start: Token offset where external cache loading begins.
-            external_tokens: Number of externally admitted tokens.
-            block_tokens: Tokens stored in one logical cache slot.
-
-        Returns:
-            Packed file offsets and lengths for the aligned external window.
-            An empty list is returned when a committed chunk has not published
-            every packed slot yet; callers then skip lease-based prefetch until
-            the immutable online metadata is complete.
-
-        Async/thread-safety:
-            Runs on the server asyncio event loop and only reads control-plane
-            metadata. It performs no I/O or blocking operations.
-        """
-        if block_tokens <= 0:
-            raise ValueError("block_tokens must be positive for prefetch lookup")
-        local_slot_size = int(
-            self._runtime_config.get(
-                "local_slot_size",
-                int(self._runtime_config.get("slot_size", 0))
-                // max(
-                    1,
-                    int(self._runtime_config.get("tensor_parallel_size", 1)),
-                ),
-            )
-        )
-        if local_slot_size <= 0:
-            raise ValueError("local_slot_size must be positive for prefetch lookup")
-        if external_tokens <= 0 or external_start % block_tokens != 0:
-            return []
-        external_end = external_start + external_tokens
-        spans: list[dict[str, int]] = []
-        for chunk in sorted(chunks, key=lambda item: item.target_token_start):
-            target_start = int(chunk.target_token_start)
-            target_end = target_start + int(chunk.token_count)
-            load_start, load_end = _external_load_window(
-                target_start, target_end, external_start, external_end, block_tokens
-            )
-            if load_end <= load_start:
+            if not self._packed_format:
                 continue
-            start_slot = int(chunk.start_slot) + (
-                (load_start - target_start) // block_tokens
-            )
-            num_slots = (load_end - load_start) // block_tokens
-            refs = self._core.packed_slot_refs(start_slot, num_slots)
-            if len(refs) != num_slots:
-                return []
-            spans.extend(
-                {
-                    "file_offset": int(ref["file_offset"]),
-                    "nbytes": int(ref["stored_length"]),
-                    "accounted_nbytes": local_slot_size,
-                }
-                for ref in refs
-            )
-        return spans
+            start = int(chunk.start_slot)
+            slots: list[dict[str, Any]] = []
+            for key, first, count in (
+                self._core.resolve_slots(start, int(chunk.num_slots)) or []
+            ):
+                records = self._core.chunk_records(key)
+                if records is None or not records.record_modes:
+                    slots = []
+                    break
+                for index in range(first, first + count):
+                    slots.append(
+                        {
+                            "slot_id": start + len(slots),
+                            "mode": records.record_modes[index],
+                            "stored_length": records.record_sizes[index],
+                        }
+                    )
+            if slots:
+                payload["compressed_slots"] = slots
+        return payloads
 
     def _payload_buffer(self, payload: dict[str, Any]) -> Any:
         """Return a byte-addressable buffer for an IPC transfer payload."""
@@ -1799,7 +2228,7 @@ class IPCServer:
             nbytes_key: Payload field that identifies the mapping size.
             cache_mapping: If True, reuse the general CUDA IPC LRU cache. Fixed
                 registered staging buffers pass False because their lifetime is
-                owned by ``_load_staging_buffers`` and must not be LRU-evicted.
+                owned by the staging registries and must not be LRU-evicted.
 
         Returns:
             Cached or one-shot CUDA array wrapper for the mapped allocation.
@@ -1859,12 +2288,10 @@ class IPCServer:
 
     def _close_cuda_ipc_cache(self) -> None:
         """Close all cached CUDA IPC mappings."""
-        for cached in self._load_staging_buffers.values():
-            cached.close()
-        self._load_staging_buffers.clear()
-        for cached in self._store_staging_buffers.values():
-            cached.close()
-        self._store_staging_buffers.clear()
+        for registry in (self._load_staging_buffers, self._store_staging_buffers):
+            for cached in registry.values():
+                cached.close()
+            registry.clear()
         for cached in self._cuda_ipc_cache.values():
             cached.close()
         self._cuda_ipc_cache.clear()
@@ -1872,16 +2299,16 @@ class IPCServer:
     def _payload_size(
         self, payload: dict[str, Any], spans: list[dict[str, Any]]
     ) -> int:
-        """Return destination payload size for transfer_load."""
+        """Return the destination size of a ``return_data`` load."""
         if "nbytes" in payload:
             return int(payload["nbytes"])
-        max_end = 0
-        for span in spans:
-            max_end = max(
-                max_end,
-                int(span.get("target_offset", 0)) + int(span["nbytes"]),
-            )
-        return max_end
+        return max(
+            [0]
+            + [
+                int(span.get("target_offset", 0)) + int(span["nbytes"])
+                for span in spans
+            ]
+        )
 
 
 class _CachedCudaArray:
@@ -1894,17 +2321,6 @@ class _CachedCudaArray:
     def __getitem__(self, item: Any) -> Any:
         """Return a CuPy array slice."""
         return self._opened.array[item]
-
-    def synchronize(self) -> None:
-        """Synchronize CUDA writes issued through the opened array."""
-        import cupy
-        from cupy.cuda import runtime
-
-        with cupy.cuda.Device(int(self._opened.array.device.id)):
-            stream_ptr = (
-                int(self._copy_stream.ptr) if self._copy_stream is not None else 0
-            )
-            runtime.streamSynchronize(stream_ptr)
 
     @property
     def nbytes(self) -> int:

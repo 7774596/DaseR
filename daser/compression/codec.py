@@ -117,7 +117,9 @@ def encode_slot(
         CPU-bound synchronous operation using only local arrays.
     """
     _validate_codec_inputs(raw_slot, geometry, codebooks)
-    if slot_id < 0 or slot_id >= geometry.num_slots:
+    if slot_id < 0 or (
+        geometry.num_slots is not None and slot_id >= geometry.num_slots
+    ):
         raise ValueError("slot_id is outside the compressed store")
     raw_bytes = bytes(raw_slot)
     raw_hash = digest_bytes(raw_bytes)

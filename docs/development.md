@@ -56,17 +56,20 @@ and saves metadata to `<store-dir>/daser.index` on SIGTERM/SIGINT shutdown.
 The shutdown path is a fast consistent stop: DaseR stops accepting new HTTP and
 IPC work, snapshots the currently committed chunk metadata and registered
 documents, then closes transfer resources. It does not wait for connector-side
-pending writes that have not reached `commit_chunk`.
+pending writes whose chunks have not been published.
 
-Runtime values such as `store_path`, `slot_size`, `block_tokens`, and
-`model_id` are owned by DaseR and fetched by the connector over IPC.
-The exported L2 capacity is the slot-aligned store size, so the transfer layer
-does not resize `daser.store` back to the raw `--l2-size` value. If an older
-run left a larger raw-size store file, startup truncates it to the aligned
-capacity; smaller existing store files are rejected.
+Runtime values such as `store_path`, `slot_size`, `block_tokens`, `model_id`,
+`tier_grain`, and the per-tier lane sizes are owned by DaseR and fetched by the
+connector over IPC. The connector never computes L1 or L2 offsets: store spans
+name staging bytes and chunk slots, load spans name `(start_slot, num_slots)`,
+and the server resolves both (see
+[docs/design/tier-residency.md](design/tier-residency.md)). The exported L2
+capacity is the grain-aligned store size. If an older run left a larger store
+file, startup truncates it to the aligned capacity; smaller existing store
+files are rejected.
 
-`daser.index` includes the slot capacity, chunk metadata, and the document
-registry. Only documents whose `register_document` call completed are restored
+`daser.index` includes the chunk metadata with their L2 extents, the tier
+geometry, and the document registry. Only documents whose `register_document` call completed are restored
 by `/documents` after restart. Committed chunks that were not attached to a
 document are retained as ordinary cache entries; if the same document content is
 uploaded later, matching chunk keys can be reused. Uncommitted bytes in
@@ -87,20 +90,21 @@ python -m daser.server \
 | `--vllm-base-url` | required | Base URL for the vLLM OpenAI-compatible server |
 | `--model-path` | optional | Local HuggingFace model path; required when `/v1/models` returns an alias |
 | `--store-dir` | required | Directory for `daser.store` and `daser.index` |
-| `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
-| `--l1-size` | `min(1 GiB, --l2-size)` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
+| `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib`. The store file is exactly this size rounded down to `--tier-grain` per TP lane |
+| `--l1-size` | `min(1 GiB, --l2-size)` | Total pinned host memory for `--transfer-mode iouring`, including the staging pool; the L1 tier gets the remainder |
+| `--tier-grain` | `64 KiB` | Allocation grain for both tiers; must be a power of two and a multiple of 4 KiB |
 | `--transfer-mode` | `iouring` | `iouring` for the current pinned-memory L1 + SSD L2 path; `gds` remains an optional kvikio/cuFile compatibility backend and is not the current validation path |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
-| `--bip-enabled` / `--no-bip-enabled` | on | Enable or disable BIP replacement in the iouring L1 cache |
 
-BIP is a server startup setting exported in the immutable IPC runtime config as
-`bip_enabled`. It defaults to on for every storage format, so raw and
-compressed-online comparisons use the same transfer policy unless the flag is
-set explicitly. The iouring backend always merges physically adjacent L2 load
-misses into bounded reads; this is not configurable.
+The server places chunks in L1 and L2 and evicts each tier with its own
+leaf-first LRU, identically for raw and compressed-online (see
+[docs/design/tier-residency.md](design/tier-residency.md)). The iouring backend
+always merges physically adjacent L2 reads into bounded reads; this is not
+configurable. A new store file is created NOCOW and fallocated; failure to set
+NOCOW is logged and the server continues.
 
 ---
 

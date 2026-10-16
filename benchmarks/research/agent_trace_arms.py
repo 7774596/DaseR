@@ -542,11 +542,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DaseR --l2-read-stripe (0 = serial reads; DaseR arms only).",
     )
     parser.add_argument(
-        "--daser-l1-lru",
-        action="store_true",
-        help="Run DaseR L1 as plain LRU (--no-bip-enabled) instead of BIP.",
-    )
-    parser.add_argument(
         "--lmcache-eviction-watermark",
         type=float,
         default=None,
@@ -698,7 +693,6 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
             args.daser_l2_read_stripe if arm.startswith("daser") else 0
         ),
         daser_extra_kv_layers=_drafter_kv_layers(args.speculative_config),
-        daser_l1_lru=args.daser_l1_lru,
         gpu_kv_bytes=args.gpu_kv_size,
         vllm_port=args.vllm_port,
         daser_port=args.daser_port,

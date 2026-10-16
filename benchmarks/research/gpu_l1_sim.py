@@ -10,7 +10,7 @@ blocks (compressed or raw) under one of three policies:
 - ``inclusive``: every stored block enters L1 (current DaseR behaviour).
 - ``gpu-aware``: L1 evicts blocks that are currently GPU-resident first.
 - ``bip-*``: the same with BIP insertion (one in 32 new blocks at the MRU
-  end), DaseR's default L1 order.
+  end), a scan-resistant order DaseR's L1 no longer uses.
 - ``shadow``: what the server can implement: a block moves to the L1 LRU
   end when it becomes GPU-resident and to the MRU end when the GPU evicts it.
 - ``demote``: ``gpu-aware`` plus, when the GPU evicts a block that L1 no
@@ -70,7 +70,7 @@ def simulate(
         nonlocal inserts
         l1[block] = None
         inserts = (inserts + 1) % bip_interval
-        # BIP: most new blocks enter at the LRU end (DaseR's default L1).
+        # BIP: most new blocks enter at the LRU end.
         l1.move_to_end(block, last=not bip or inserts == 0)
         while len(l1) > l1_blocks:
             victim = None

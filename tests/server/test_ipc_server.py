@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+"""IPC server contract: lookup, server-placed stores and loads, leases."""
 
 # Standard
 import asyncio
+from collections.abc import Sequence
 import os
+from pathlib import Path
 import threading
-from types import SimpleNamespace
 from typing import Any
 
 # Third Party
@@ -13,25 +15,30 @@ import numpy as np
 import pytest
 
 # First Party
-from daser.config import DEFAULT_LOAD_READAHEAD_BYTES
-from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
-from daser.metrics import MetricsRegistry
-from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.prefix import PrefixHashIndex
-from daser.server.chunk_manager import ChunkManager
-from daser.server.core import ChunkInfo, ServerCore
-from daser.server.doc_registry import DocRegistry
-from daser.server.ipc import IPCServer
-from daser.server.ipc.server import (
-    _CachedCudaArray,
-    _coalesce_transfer_spans,
+from daser.connector.helpers import (
+    ROLLING_PREFIX_SEED,
+    rolling_prefix_key,
+    rolling_prefix_keys,
 )
-from daser.server.metadata_store import MetadataStore
-from daser.server.store_file import ensure_store_file
-from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
+from daser.metrics import MetricsRegistry
+from daser.server.core import ChunkInfo, ServerCore
+from daser.server.ipc import IPCServer
+from daser.server.ipc.server import _CachedCudaArray
+from daser.server.tiers import L1, L2
+from daser.transfer import Move, StoreHandle, TransferLayer, TransferStats
+from tests.server.core_helpers import (
+    BLOCK_TOKENS,
+    RECORD,
+    alloc_and_store,
+    ipc_runtime_config,
+    load_span,
+    make_core,
+    make_ipc_server,
+    make_layout,
+    raw_span,
+)
 
-SLOT_SIZE = 4096
-BLOCK_TOKENS = 4
+PRODUCER = 42
 
 
 def first_rolling_key(tokens: list[int]) -> str:
@@ -39,187 +46,21 @@ def first_rolling_key(tokens: list[int]) -> str:
     return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
 
 
-RUNTIME_CONFIG = {
-    "slot_size": SLOT_SIZE,
-    "block_tokens": BLOCK_TOKENS,
-    "model_id": "m",
-    "transfer_mode": "iouring",
-    "l1_size_bytes": 8192,
-    "l2_size_bytes": 8192,
-    "bip_enabled": False,
-}
-
-
-def make_runtime_config(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
-    """Create runtime config with a per-test store path.
-
-    As the server CLI does at startup, the L2 store file is created at the
-    configured ``l2_size_bytes`` unless the config disables L2.
-    """
-    runtime_config = dict(RUNTIME_CONFIG)
-    runtime_config["store_path"] = str(tmp_path / "daser.store")
-    runtime_config.update(overrides)
-    if not runtime_config.get("skip_l2"):
-        ensure_store_file(runtime_config["store_path"], runtime_config["l2_size_bytes"])
-    return runtime_config
-
-
-def make_core(total_slots: int = 64) -> ServerCore:
-    """Create a ServerCore for connector API tests."""
-    store = MetadataStore()
-    doc_registry = DocRegistry()
-    cm = ChunkManager(
-        total_slots=total_slots,
-        metadata_store=store,
-        doc_registry=doc_registry,
-    )
-    return ServerCore(
-        chunk_manager=cm,
-        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-        position_encoder=FixedOffsetEncoder(fixed_offset=0),
-        slot_size=SLOT_SIZE,
-        block_tokens=BLOCK_TOKENS,
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("storage_format", "expected"),
-    [("raw", False), ("compressed-online", True)],
-)
-async def test_ipc_lookup_waits_only_for_online_packed_store(
-    storage_format: str,
-    expected: bool,
-) -> None:
-    """Online packed lookup retries in-flight writers; raw lookups do not."""
-
-    class LookupCore:
-        def add_chunk_removal_listener(self, _listener: Any) -> None:
-            pass
-
-        def __init__(self) -> None:
-            self.wait_arguments: list[bool] = []
-
-        async def lookup(
-            self,
-            _tokens: list[int],
-            _model_id: str,
-            *,
-            wait_for_pending: bool = False,
-        ) -> list[ChunkInfo]:
-            self.wait_arguments.append(wait_for_pending)
-            return []
-
-    core = LookupCore()
-    server = IPCServer(
-        "unused.sock",
-        core,  # type: ignore[arg-type]
-        {**RUNTIME_CONFIG, "storage_format": storage_format},
-    )
-
-    assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
-    assert core.wait_arguments == [expected]
-
-
-@pytest.mark.asyncio
-async def test_ipc_lookup_defer_pending_answers_without_waiting() -> None:
-    """defer_pending replies pending at once, and False resolves immediately."""
-    core = make_core()
-    server = IPCServer(
-        "unused.sock",
-        core,
-        {**RUNTIME_CONFIG, "storage_format": "compressed-online"},
-    )
-    tokens = [1, 2, 3, 4]
-    key = first_rolling_key(tokens)
-    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
-    msg: dict[str, Any] = {"tokens": tokens, "model_id": "m"}
-
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-    deferred = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
-    immediate = await server._op_lookup({**msg, "defer_pending": False})  # noqa: SLF001
-    assert loop.time() - started < 0.02
-    assert deferred == {"chunks": [], "pending": True}
-    assert immediate == {"chunks": [], "index_epoch": 0}
-
-    await core.commit_chunk(key)
-    resolved = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
-    assert [chunk["chunk_key"] for chunk in resolved["chunks"]] == [key]
-    assert "pending" not in resolved
-
-
-def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
-    """Packed adjacency is capped without changing raw coalescing."""
-    packed = [
-        {
-            "source_offset": index * 4,
-            "file_offset": index * 4,
-            "nbytes": 4,
-            "packed": True,
-        }
-        for index in range(4)
-    ]
-    raw = [
-        {
-            "source_offset": index * 4,
-            "file_offset": index * 4,
-            "nbytes": 4,
-            "packed": False,
-        }
-        for index in range(4)
-    ]
-
-    assert [
-        span["nbytes"] for span in _coalesce_transfer_spans(packed, max_packed_bytes=8)
-    ] == [8, 8]
-    assert [
-        span["nbytes"] for span in _coalesce_transfer_spans(raw, max_packed_bytes=8)
-    ] == [16]
-
-
-def test_coalesce_transfer_spans_preserves_accounting_charge() -> None:
-    """Coalescing packed records sums their independent L1 capacity charges."""
-    spans = [
-        {
-            "source_offset": index * 4,
-            "file_offset": index * 4,
-            "nbytes": 4,
-            "accounted_nbytes": 16,
-            "packed": True,
-        }
-        for index in range(2)
-    ]
-
-    assert _coalesce_transfer_spans(spans) == [
-        {
-            "source_offset": 0,
-            "file_offset": 0,
-            "nbytes": 8,
-            "accounted_nbytes": 32,
-            "packed": True,
-        }
-    ]
+def pattern(seed: int, nbytes: int = RECORD) -> bytes:
+    """Return ``nbytes`` of a seed-dependent byte pattern."""
+    return bytes((seed * 31 + i) % 251 for i in range(nbytes))
 
 
 async def _send_recv(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Send one request and receive one response."""
-    reader, writer = await asyncio.open_unix_connection(socket_path)
-    data = msgpack.packb(payload, use_bin_type=True)
-    writer.write(len(data).to_bytes(4, "big") + data)
-    await writer.drain()
-    header = await reader.readexactly(4)
-    length = int.from_bytes(header, "big")
-    body = await reader.readexactly(length)
-    writer.close()
-    await writer.wait_closed()
-    return msgpack.unpackb(body, raw=False)
+    (response,) = await _send_recv_persistent(socket_path, [payload])
+    return response
 
 
 async def _send_recv_persistent(
     socket_path: str, payloads: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Send multiple requests on one connection."""
+    """Send several requests on one connection and return the responses."""
     reader, writer = await asyncio.open_unix_connection(socket_path)
     responses = []
     try:
@@ -227,8 +68,7 @@ async def _send_recv_persistent(
             data = msgpack.packb(payload, use_bin_type=True)
             writer.write(len(data).to_bytes(4, "big") + data)
             await writer.drain()
-            header = await reader.readexactly(4)
-            length = int.from_bytes(header, "big")
+            length = int.from_bytes(await reader.readexactly(4), "big")
             body = await reader.readexactly(length)
             responses.append(msgpack.unpackb(body, raw=False))
     finally:
@@ -237,165 +77,303 @@ async def _send_recv_persistent(
     return responses
 
 
-@pytest.mark.asyncio
-async def test_alloc_commit_lookup(tmp_path) -> None:
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-    await server.start()
-    try:
-        tokens = [1, 2, 3, 4]
-        key = first_rolling_key(tokens)
-        alloc = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": len(tokens),
-                "model_id": "m",
-            },
-        )
-        assert alloc["file_offset"] == alloc["start_slot"] * SLOT_SIZE
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "commit_chunk", "chunk_key": key},
-        )
-        lookup = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "lookup", "tokens": tokens, "model_id": "m"},
-        )
-        assert lookup["chunks"][0]["chunk_key"] == key
-    finally:
-        await server.stop()
+def sock(server_path: Path) -> str:
+    """Return the socket path ``make_ipc_server`` uses under ``tmp_path``."""
+    return str(server_path / "ipc.sock")
+
+
+async def alloc(
+    socket_path: str, key: str, token_count: int = BLOCK_TOKENS, parent: str = ""
+) -> dict[str, Any]:
+    """Allocate one chunk over IPC."""
+    return await _send_recv(
+        socket_path,
+        {
+            "op": "alloc_chunk",
+            "chunk_key": key,
+            "token_count": token_count,
+            "model_id": "m",
+            "parent_key": parent,
+        },
+    )
+
+
+async def store(
+    socket_path: str, spans: list[dict[str, Any]], data: bytes, **extra: Any
+) -> dict[str, Any]:
+    """Store spans from a bytes payload (rank 0 of 1)."""
+    return await _send_recv(
+        socket_path,
+        {
+            "op": "transfer_store",
+            "payload": {"data": data},
+            "spans": spans,
+            "tp_rank": 0,
+            "tp_size": 1,
+            **extra,
+        },
+    )
+
+
+async def load(socket_path: str, spans: list[dict[str, Any]]) -> dict[str, Any]:
+    """Load spans into a returned bytes buffer (rank 0)."""
+    return await _send_recv(
+        socket_path,
+        {
+            "op": "transfer_load",
+            "payload": {"return_data": True},
+            "spans": spans,
+            "tp_rank": 0,
+        },
+    )
+
+
+async def drain(socket_path: str) -> None:
+    """Wait for background store reports and transfer IO."""
+    assert await _send_recv(socket_path, {"op": "transfer_drain"}) == {"ok": True}
+
+
+async def store_raw_chunk(
+    socket_path: str, key: str, data: bytes, parent: str = ""
+) -> dict[str, Any]:
+    """Allocate and store one raw chunk of ``len(data)`` bytes, then drain."""
+    num_slots = len(data) // RECORD
+    allocation = await alloc(socket_path, key, num_slots * BLOCK_TOKENS, parent)
+    reply = await store(
+        socket_path, [raw_span(key, allocation["start_slot"], num_slots)], data
+    )
+    assert reply["chunk_keys"] == [key]
+    await drain(socket_path)
+    return allocation
+
+
+class FakeTransfer(TransferLayer):
+    """Transfer double recording moves; stores complete at once."""
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.events: list[str] = []
+        self.stored: list[tuple[Move, bytes]] = []
+        self.loads: list[tuple[Any, list[Move], str]] = []
+        self.runs: list[tuple[Any, list[int], list[int], list[int]]] = []
+        self.persist_error: BaseException | None = None
+        self._stats = TransferStats()
+
+    @property
+    def stats(self) -> TransferStats:
+        """Return the (static) counters."""
+        return self._stats
+
+    async def store(self, buffer: Any, moves: Sequence[Move]) -> StoreHandle:
+        """Record each move's source bytes and resolve the handle."""
+        for move in moves:
+            source = buffer[move.buffer_offset : move.buffer_offset + move.nbytes]
+            self.stored.append((move, bytes(source)))
+        loop = asyncio.get_running_loop()
+        staged: asyncio.Future[None] = loop.create_future()
+        persisted: asyncio.Future[None] = loop.create_future()
+        staged.set_result(None)
+        if self.persist_error is None:
+            persisted.set_result(None)
+        else:
+            persisted.set_exception(self.persist_error)
+        return StoreHandle(staged, persisted)
+
+    async def load(self, buffer: Any, moves: Sequence[Move], source: str) -> None:
+        """Record the load."""
+        self.loads.append((buffer, list(moves), source))
+
+    async def promote(self, moves: Sequence[Move]) -> None:
+        """Accept promotions."""
+
+    async def load_runs(
+        self, buffer: Any, l1_offsets: Any, targets: Any, lengths: Any
+    ) -> None:
+        """Record one run table."""
+        self.runs.append((buffer, list(l1_offsets), list(targets), list(lengths)))
+
+    async def drain(self) -> None:
+        """Record the drain."""
+        self.events.append("drain")
+
+    async def close(self) -> None:
+        """Record the close."""
+        self.events.append("close")
+
+
+class FakeOpened:
+    """Stand-in for an opened CUDA IPC mapping."""
+
+    def __init__(self, nbytes: int, marker: int = 0) -> None:
+        self.array = (np.arange(nbytes, dtype=np.uint32) ^ marker).astype(np.uint8)
+        self.closed = 0
+
+    def close(self) -> None:
+        """Count closes."""
+        self.closed += 1
+
+
+def staging_payload(index: int, nbytes: int, producer: int = PRODUCER) -> dict:
+    """Return a ``register_*_staging`` payload."""
+    return {
+        "buffer_index": index,
+        "producer_pid": producer,
+        "cuda_ipc_handle": b"h" * 64,
+        "allocation_bytes": nbytes,
+        "device_pci_bus_id": "0000:38:00.0",
+        "device_ptr": 4096,
+        "allocation_base_ptr": 4096,
+        "allocation_offset": 0,
+    }
+
+
+# ----------------------------------------------------------------------
+# Lookup, allocation and config
+# ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_lookup_reply_carries_index_epoch_until_a_removal(tmp_path) -> None:
-    core = make_core()
-    sock = str(tmp_path / "test.sock")
-    server = IPCServer(sock, core, make_runtime_config(tmp_path))
-    await server.start()
-    try:
-        tokens = [1, 2, 3, 4]
-        key = first_rolling_key(tokens)
-        await _send_recv(
-            sock,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": len(tokens),
-                "model_id": "m",
-            },
-        )
-        await _send_recv(sock, {"op": "commit_chunk", "chunk_key": key})
-        lookup = await _send_recv(
-            sock, {"op": "lookup", "tokens": tokens, "model_id": "m"}
-        )
-        epoch = lookup["index_epoch"]
-        assert lookup["chunks"][0]["chunk_key"] == key
-        # An insertion leaves earlier results valid.
-        other = first_rolling_key([9, 9, 9, 9])
-        await _send_recv(
-            sock,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": other,
-                "token_count": 4,
-                "model_id": "m",
-            },
-        )
-        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] == epoch
-        await core.evict_chunk(key)
-        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] > epoch
-    finally:
-        await server.stop()
+@pytest.mark.parametrize(
+    ("storage_format", "expected"),
+    [("raw", False), ("compressed-online", True)],
+)
+async def test_lookup_waits_only_for_online_packed_store(
+    tmp_path: Path, storage_format: str, expected: bool
+) -> None:
+    """Online packed lookups wait for pending writers; raw lookups do not."""
 
+    class LookupCore:
+        tier_layout = make_layout(l2_records=4)
+        index_epoch = 0
 
-@pytest.mark.asyncio
-async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-    await server.start()
-    try:
-        tokens = [1, 2, 3, 4, 5]
-        key = first_rolling_key(tokens)
-        responses = await _send_recv_persistent(
-            str(tmp_path / "test.sock"),
-            [
-                {
-                    "op": "match_and_alloc",
-                    "tokens": tokens,
-                    "chunk_key": key,
-                    "model_id": "m",
-                },
-                {
-                    "op": "match_and_alloc",
-                    "tokens": tokens,
-                    "chunk_key": key,
-                    "model_id": "m",
-                },
-            ],
-        )
-        assert responses[0]["alloc"]["chunk_key"] == key
-        assert responses[1]["alloc"]["chunk_key"] == key
-        assert (
-            responses[1]["alloc"]["start_slot"] == responses[0]["alloc"]["start_slot"]
-        )
-        assert responses[0]["alloc"]["skipped"] is False
-        assert responses[1]["alloc"]["skipped"] is True
-    finally:
-        await server.stop()
+        def __init__(self) -> None:
+            self.waits: list[bool] = []
 
+        async def lookup(
+            self, _tokens: Any, _model_id: str, *, wait_for_pending: bool = False
+        ) -> list[ChunkInfo]:
+            self.waits.append(wait_for_pending)
+            return []
 
-@pytest.mark.asyncio
-async def test_document_ops_are_not_ipc_server(tmp_path) -> None:
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-    await server.start()
-    try:
-        for op in ("register_doc", "list_docs", "get_doc", "evict_doc"):
-            resp = await _send_recv(str(tmp_path / "test.sock"), {"op": op})
-            assert resp == {"error": f"unknown op: {op}"}
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_get_runtime_config(tmp_path) -> None:
-    core = make_core()
-    runtime_config = make_runtime_config(tmp_path)
-    server = IPCServer(str(tmp_path / "test.sock"), core, runtime_config)
-    await server.start()
-    try:
-        resp = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "get_runtime_config"},
-        )
-        assert resp == {"runtime_config": runtime_config}
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
-    """IPC requests should record op counts and latencies."""
-    registry = MetricsRegistry()
-    core = make_core()
+    core = LookupCore()
     server = IPCServer(
-        str(tmp_path / "test.sock"),
+        sock(tmp_path),
         core,
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
+        {"storage_format": storage_format},  # type: ignore[arg-type]
     )
     await server.start()
     try:
-        resp = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "get_runtime_config"},
+        reply = await _send_recv(
+            sock(tmp_path), {"op": "lookup", "tokens": [1, 2, 3, 4], "model_id": "m"}
         )
-        assert "runtime_config" in resp
+    finally:
+        await server.stop()
+    assert reply == {"chunks": [], "index_epoch": 0}
+    assert core.waits == [expected]
+
+
+@pytest.mark.asyncio
+async def test_lookup_defer_pending_answers_without_waiting(tmp_path: Path) -> None:
+    """defer_pending replies pending at once; False resolves immediately."""
+    server = make_ipc_server(tmp_path, storage_format="compressed-online")
+    socket_path = sock(tmp_path)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    msg = {"op": "lookup", "tokens": tokens, "model_id": "m"}
+    await server.start()
+    try:
+        allocation = await alloc(socket_path, key)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deferred = await _send_recv(socket_path, {**msg, "defer_pending": True})
+        immediate = await _send_recv(socket_path, {**msg, "defer_pending": False})
+        assert loop.time() - started < 0.5
+        assert deferred == {"chunks": [], "pending": True}
+        assert immediate == {"chunks": [], "index_epoch": 0}
+
+        await store(
+            socket_path, [raw_span(key, allocation["start_slot"])], b"a" * RECORD
+        )
+        await drain(socket_path)
+        resolved = await _send_recv(socket_path, {**msg, "defer_pending": True})
+    finally:
+        await server.stop()
+    assert [chunk["chunk_key"] for chunk in resolved["chunks"]] == [key]
+    assert "pending" not in resolved
+
+
+@pytest.mark.asyncio
+async def test_lookup_reply_carries_index_epoch_until_a_removal(
+    tmp_path: Path,
+) -> None:
+    core = make_core(l2_records=64, l1_records=16)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await server.start()
+    try:
+        await store_raw_chunk(socket_path, key, pattern(1))
+        lookup = await _send_recv(
+            socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        epoch = lookup["index_epoch"]
+        assert lookup["chunks"][0]["chunk_key"] == key
+        assert "file_offset" not in lookup["chunks"][0]
+        # An insertion leaves earlier results valid; a removal does not.
+        await alloc(socket_path, first_rolling_key([9, 9, 9, 9]))
+        assert (await _send_recv(socket_path, {"op": "index_epoch"}))[
+            "index_epoch"
+        ] == epoch
+        await _send_recv(socket_path, {"op": "evict_chunk", "chunk_key": key})
+        assert (await _send_recv(socket_path, {"op": "index_epoch"}))[
+            "index_epoch"
+        ] > epoch
     finally:
         await server.stop()
 
+
+@pytest.mark.asyncio
+async def test_persistent_connection_match_and_alloc(tmp_path: Path) -> None:
+    server = make_ipc_server(tmp_path)
+    tokens = [1, 2, 3, 4, 5]
+    key = first_rolling_key(tokens)
+    request = {"op": "match_and_alloc", "tokens": tokens, "chunk_key": key}
+    await server.start()
+    try:
+        first, second = await _send_recv_persistent(
+            sock(tmp_path), [{**request, "model_id": "m"}, {**request, "model_id": "m"}]
+        )
+    finally:
+        await server.stop()
+    assert first["alloc"]["chunk_key"] == second["alloc"]["chunk_key"] == key
+    assert first["alloc"]["start_slot"] == second["alloc"]["start_slot"]
+    assert "file_offset" not in first["alloc"]
+    assert (first["alloc"]["skipped"], second["alloc"]["skipped"]) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_document_ops_are_not_ipc_ops(tmp_path: Path) -> None:
+    server = make_ipc_server(tmp_path)
+    await server.start()
+    try:
+        for op in ("register_doc", "list_docs", "get_doc", "evict_doc"):
+            reply = await _send_recv(sock(tmp_path), {"op": op})
+            assert reply == {"error": f"unknown op: {op}"}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_get_runtime_config_and_operation_metrics(tmp_path: Path) -> None:
+    registry = MetricsRegistry()
+    server = make_ipc_server(tmp_path, registry=registry)
+    expected = ipc_runtime_config(tmp_path, make_layout(64, 16))
+    await server.start()
+    try:
+        reply = await _send_recv(sock(tmp_path), {"op": "get_runtime_config"})
+    finally:
+        await server.stop()
+    assert reply == {"runtime_config": expected}
     rendered = registry.render_prometheus()
     assert (
         'daser_ipc_requests_total{op="get_runtime_config",status="ok"} 1.0' in rendered
@@ -406,1992 +384,883 @@ async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
     )
 
 
-def test_ipc_server_records_tier_counter_deltas(tmp_path) -> None:
-    """Tier metrics publish monotonic L1 and L2 deltas exactly once."""
-    registry = MetricsRegistry()
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        make_core(),
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
-    transfer = SimpleNamespace(
-        stats=TransferStats(l1_hits=2, l1_misses=3, l2_reads=4),
-        l1_bytes_used=1024,
-    )
-    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
-
-    server._record_tier_metrics()  # noqa: SLF001
-    server._record_tier_metrics()  # noqa: SLF001
-
-    rendered = registry.render_prometheus()
-    assert "daser_l1_hits_total 2.0" in rendered
-    assert "daser_l1_misses_total 3.0" in rendered
-    assert "daser_l2_reads_total 4.0" in rendered
-
-
 @pytest.mark.asyncio
-async def test_ipc_server_records_external_prefix_cache_metrics(tmp_path) -> None:
-    """IPC can publish vLLM-equivalent external prefix cache counters."""
+async def test_external_prefix_cache_metrics(tmp_path: Path) -> None:
+    """Lookups count vLLM-equivalent external prefix queries and hits."""
     registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        core,
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
+    server = make_ipc_server(tmp_path, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = [1, 2, 3, 4]
     await server.start()
     try:
-        resp = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "record_external_prefix_cache", "queries": 12, "hits": 8},
+        await store_raw_chunk(socket_path, first_rolling_key(tokens), pattern(1))
+        lookup = {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        partial = await _send_recv(
+            socket_path,
+            {**lookup, "external_prefix_queries": 8, "num_computed_tokens": 0},
         )
-        assert resp == {"ok": True}
+        # A full-prompt hit is capped at queries - 1, as vLLM does.
+        await _send_recv(
+            socket_path,
+            {**lookup, "external_prefix_queries": 4, "num_computed_tokens": 0},
+        )
+        standalone = await _send_recv(
+            socket_path, {"op": "record_external_prefix_cache", "queries": 2, "hits": 1}
+        )
     finally:
         await server.stop()
-
+    assert len(partial["chunks"]) == 1
+    assert standalone == {"ok": True}
     rendered = registry.render_prometheus()
-    assert "daser_external_prefix_cache_queries_total 12.0" in rendered
+    assert "daser_external_prefix_cache_queries_total 14.0" in rendered
     assert "daser_external_prefix_cache_hits_total 8.0" in rendered
 
 
-@pytest.mark.asyncio
-async def test_ipc_lookup_records_external_prefix_cache_metrics(tmp_path) -> None:
-    """Lookup RPC records vLLM-equivalent external prefix query and hit counters."""
-    registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        core,
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
-    await server.start()
-    try:
-        tokens = [1, 2, 3, 4]
-        key = first_rolling_key(tokens)
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": len(tokens),
-                "model_id": "m",
-            },
-        )
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "commit_chunk", "chunk_key": key},
-        )
-        resp = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "lookup",
-                "tokens": tokens,
-                "model_id": "m",
-                "external_prefix_queries": 8,
-                "num_computed_tokens": 0,
-            },
-        )
-        assert len(resp["chunks"]) == 1
-    finally:
-        await server.stop()
-
-    rendered = registry.render_prometheus()
-    assert "daser_external_prefix_cache_queries_total 8.0" in rendered
-    assert "daser_external_prefix_cache_hits_total 4.0" in rendered
+# ----------------------------------------------------------------------
+# Stores and loads (real io_uring transfer)
+# ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_ipc_lookup_caps_full_external_prefix_hit_like_vllm(tmp_path) -> None:
-    """Lookup metrics cap full-prompt external hits the same way as vLLM."""
-    registry = MetricsRegistry()
-    core = make_core()
-    core._metrics = registry  # noqa: SLF001
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        core,
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
-    await server.start()
-    try:
-        tokens = [1, 2, 3, 4]
-        key = first_rolling_key(tokens)
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": len(tokens),
-                "model_id": "m",
-            },
-        )
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "commit_chunk", "chunk_key": key},
-        )
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "lookup",
-                "tokens": tokens,
-                "model_id": "m",
-                "external_prefix_queries": 4,
-                "num_computed_tokens": 0,
-            },
-        )
-    finally:
-        await server.stop()
-
-    rendered = registry.render_prometheus()
-    assert "daser_external_prefix_cache_queries_total 4.0" in rendered
-    assert "daser_external_prefix_cache_hits_total 3.0" in rendered
-
-
-@pytest.mark.asyncio
-async def test_ipc_server_records_transfer_metrics_without_info_summary(
-    tmp_path,
-    caplog: pytest.LogCaptureFixture,
+async def test_store_and_load_roundtrip(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Transfer ops record metrics without hot-path INFO throughput logs."""
+    """A stored chunk is published, loadable from L1 and counted."""
     registry = MetricsRegistry()
-    core = make_core()
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        core,
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
+    server = make_ipc_server(tmp_path, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    key = first_rolling_key(tokens)
+    data = pattern(1) + pattern(2)
     await server.start()
     try:
-        store = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"a" * SLOT_SIZE},
-                "spans": [{"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
+        allocation = await alloc(socket_path, key, 8)
+        reply = await store(
+            socket_path, [raw_span(key, allocation["start_slot"], 2)], data
         )
-        assert store["bytes"] == SLOT_SIZE
+        assert reply == {"ok": True, "bytes": 2 * RECORD, "chunk_keys": [key]}
+        await drain(socket_path)
+        lookup = await _send_recv(
+            socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        assert [c["chunk_key"] for c in lookup["chunks"]] == [key]
+        assert "compressed_slots" not in lookup["chunks"][0]
+        loaded = await load(socket_path, [load_span(allocation["start_slot"], 2)])
+        stats = await _send_recv(socket_path, {"op": "commit_stats"})
     finally:
         await server.stop()
-
+    assert loaded == {
+        "ok": True,
+        "bytes": 2 * RECORD,
+        "l1_segments": 1,
+        "l2_segments": 0,
+        "data": data,
+    }
+    assert stats["commit_stats"]["commit_requests"] == 1
     rendered = registry.render_prometheus()
     assert 'daser_transfer_operations_total{op="store",status="ok"} 1.0' in rendered
-    assert f'daser_transfer_bytes_total{{op="store"}} {float(SLOT_SIZE)}' in rendered
-    assert 'daser_transfer_duration_seconds_count{op="store"} 1' in rendered
+    assert f'daser_transfer_bytes_total{{op="store"}} {float(2 * RECORD)}' in rendered
+    assert 'daser_transfer_duration_seconds_count{op="load"} 1' in rendered
+    assert "daser_l1_hits_total 1.0" in rendered
     assert "throughput_gbps=" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
-    """IPC transfer ops call the server-owned transfer layer."""
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+async def test_chunk_split_across_store_requests_publishes_once_complete(
+    tmp_path: Path,
+) -> None:
+    """Raw slots of one chunk may arrive in several requests (slot_index)."""
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    key = "split"
     await server.start()
     try:
-        store = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE},
-                "spans": [
-                    {"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
-                    {
-                        "source_offset": SLOT_SIZE,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": SLOT_SIZE,
-                    },
-                ],
-            },
+        start = (await alloc(socket_path, key, 3 * BLOCK_TOKENS))["start_slot"]
+        first = await store(
+            socket_path,
+            [raw_span(key, start, 3, slot_index=2, count=1)],
+            pattern(3),
         )
-        prefetch = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_prefetch",
-                "spans": [{"nbytes": SLOT_SIZE * 2, "file_offset": 0}],
-            },
+        await drain(socket_path)
+        assert first["chunk_keys"] == [key]
+        assert not core.is_chunk_committed(key)
+        second = await store(
+            socket_path,
+            [raw_span(key, start, 3, slot_index=0, count=2)],
+            pattern(1) + pattern(2),
         )
-        load = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [
-                    {"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
-                    {
-                        "target_offset": SLOT_SIZE,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": SLOT_SIZE,
-                    },
-                ],
-            },
-        )
-
-        assert store == {"ok": True, "bytes": SLOT_SIZE * 2, "chunk_keys": []}
-        assert prefetch == {
-            "ok": True,
-            "requested_bytes": SLOT_SIZE * 2,
-            "l1_bytes": SLOT_SIZE * 2,
-            "l2_bytes": 0,
-        }
-        assert load == {
-            "ok": True,
-            "bytes": SLOT_SIZE * 2,
-            "data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE,
-        }
+        await drain(socket_path)
+        assert second["chunk_keys"] == [key]
+        assert core.is_chunk_committed(key)
+        loaded = await load(socket_path, [load_span(start, 3)])
     finally:
         await server.stop()
+    assert loaded["data"] == pattern(1) + pattern(2) + pattern(3)
 
 
 @pytest.mark.asyncio
-async def test_incomplete_prefetch_lease_is_a_recoverable_error(
-    tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An incomplete lease returns an error reply without logging an ERROR."""
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return 0
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return 0
-
-        async def prefetch_bytes_grouped(
-            self,
-            spans: list[dict[str, int]],
-            lease_id: str | None = None,
-        ) -> Any:
-            raise LeaseIncompleteError(f"prefetch did not retain lease: {lease_id}")
-
-        def close(self) -> None:
-            pass
-
-    fake = FakeTransfer()
-    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _server: fake)
-    registry = MetricsRegistry()
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        make_core(),
-        make_runtime_config(tmp_path),
-        metrics_registry=registry,
-    )
+async def test_released_partial_store_is_skipped_as_stale(tmp_path: Path) -> None:
+    """After release_chunk_writer the rest of a split store is dropped."""
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    key = "partial"
     await server.start()
     try:
-        reply = await _send_recv(
-            str(tmp_path / "test.sock"),
+        start = (await alloc(socket_path, key, 2 * BLOCK_TOKENS))["start_slot"]
+        await store(
+            socket_path, [raw_span(key, start, 2, slot_index=0, count=1)], pattern(1)
+        )
+        await drain(socket_path)
+        released = await _send_recv(
+            socket_path,
             {
-                "op": "transfer_prefetch",
-                "lease_id": "req-1",
-                "spans": [{"nbytes": SLOT_SIZE, "file_offset": 0}],
+                "op": "release_chunk_writer",
+                "chunk_key": key,
+                "start_slot": start,
+                "num_slots": 2,
             },
+        )
+        late = await store(
+            socket_path, [raw_span(key, start, 2, slot_index=1, count=1)], pattern(2)
+        )
+        await drain(socket_path)
+    finally:
+        await server.stop()
+    assert released == {"released": True}
+    assert late == {"ok": True, "bytes": 0, "chunk_keys": []}
+    assert not core.is_chunk_committed(key)
+
+
+@pytest.mark.asyncio
+async def test_stale_store_span_is_skipped(tmp_path: Path) -> None:
+    server = make_ipc_server(tmp_path)
+    socket_path = sock(tmp_path)
+    key = first_rolling_key([1, 2, 3, 4])
+    await server.start()
+    try:
+        start = (await alloc(socket_path, key))["start_slot"]
+        wrong_slot = await store(socket_path, [raw_span(key, start + 7)], pattern(1))
+        await _send_recv(socket_path, {"op": "evict_chunk", "chunk_key": key})
+        evicted = await store(socket_path, [raw_span(key, start)], pattern(1))
+    finally:
+        await server.stop()
+    assert wrong_slot == {"ok": True, "bytes": 0, "chunk_keys": []}
+    assert evicted == {"ok": True, "bytes": 0, "chunk_keys": []}
+
+
+@pytest.mark.asyncio
+async def test_load_spans_mid_chunk_and_across_chunks(tmp_path: Path) -> None:
+    """A load span may start inside a chunk and cover the next one."""
+    server = make_ipc_server(tmp_path)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        a = await store_raw_chunk(socket_path, "a", pattern(1) + pattern(2))
+        b = await store_raw_chunk(socket_path, "b", pattern(3))
+        assert b["start_slot"] == a["start_slot"] + 2
+        loaded = await load(
+            socket_path,
+            [
+                load_span(a["start_slot"] + 1, 2, target_offset=0),
+                load_span(a["start_slot"], 1, target_offset=2 * RECORD),
+            ],
+        )
+        short = await load(
+            socket_path,
+            [{**load_span(a["start_slot"], 2), "nbytes": RECORD}],
+        )
+        unknown = await load(socket_path, [load_span(1000)])
+    finally:
+        await server.stop()
+    assert loaded["data"] == pattern(2) + pattern(3) + pattern(1)
+    assert loaded["l1_segments"] == 3
+    assert "error" in short
+    assert "error" in unknown
+
+
+@pytest.mark.asyncio
+async def test_l2_read_promotes_the_chunk_into_l1(tmp_path: Path) -> None:
+    """A whole L2-only chunk read once is served from L1 next time."""
+    core = make_core(64, 1)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        a = await store_raw_chunk(socket_path, "a", pattern(1))
+        await store_raw_chunk(socket_path, "b", pattern(2))
+        assert core.full_tiers("a") == (L2,)
+        first = await load(socket_path, [load_span(a["start_slot"])])
+        assert L1 in core.full_tiers("a")
+        second = await load(socket_path, [load_span(a["start_slot"])])
+    finally:
+        await server.stop()
+    assert (first["l1_segments"], first["l2_segments"]) == (0, 1)
+    assert (second["l1_segments"], second["l2_segments"]) == (1, 0)
+    assert first["data"] == second["data"] == pattern(1)
+
+
+@pytest.mark.asyncio
+async def test_packed_store_publishes_record_modes(tmp_path: Path) -> None:
+    """A packed chunk carries per-slot modes and stored lengths in lookups."""
+    registry = MetricsRegistry()
+    server = make_ipc_server(
+        tmp_path,
+        registry=registry,
+        storage_format="compressed-online",
+        local_slot_size=2 * RECORD,
+    )
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
+    data = pattern(1, 2 * RECORD) + pattern(2)
+    await server.start()
+    try:
+        start = (await alloc(socket_path, key, 8))["start_slot"]
+        packed = {"chunk_key": key, "start_slot": start, "num_slots": 2}
+        spans = [
+            {
+                **packed,
+                "source_offset": 0,
+                "nbytes": 2 * RECORD,
+                "slot_index": 0,
+                "packed": True,
+                "mode": "raw",
+            },
+            {
+                **packed,
+                "source_offset": 2 * RECORD,
+                "nbytes": RECORD,
+                "slot_index": 1,
+                "packed": True,
+                "mode": "compressed",
+            },
+        ]
+        missing = await store(socket_path, spans[:1], data)
+        unknown = await store(socket_path, [spans[0], {**spans[1], "mode": "x"}], data)
+        reply = await store(socket_path, spans, data)
+        await drain(socket_path)
+        lookup = await _send_recv(
+            socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        loaded = await load(
+            socket_path,
+            [
+                {
+                    "target_offset": 0,
+                    "start_slot": start,
+                    "num_slots": 2,
+                    "nbytes": 3 * RECORD,
+                }
+            ],
         )
     finally:
         await server.stop()
+    assert "error" in missing and "error" in unknown
+    assert reply["chunk_keys"] == [key]
+    assert lookup["chunks"][0]["compressed_slots"] == [
+        {"slot_id": start, "mode": "raw", "stored_length": 2 * RECORD},
+        {"slot_id": start + 1, "mode": "compressed", "stored_length": RECORD},
+    ]
+    assert loaded["data"] == data
+    assert 'daser_packed_record_ratio_count{mode="compressed"} 1' in (
+        registry.render_prometheus()
+    )
 
-    assert reply == {"error": "prefetch did not retain lease: req-1"}
+
+@pytest.mark.asyncio
+async def test_packed_lookup_run_lists_every_chunk_slot(tmp_path: Path) -> None:
+    """A lookup run merging adjacent packed chunks lists all of their slots."""
+    server = make_ipc_server(tmp_path, storage_format="compressed-online")
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    sizes = (RECORD, 2 * RECORD)
+    await server.start()
+    try:
+        starts = []
+        parent = ""
+        for key, nbytes in zip(keys, sizes, strict=True):
+            start = (await alloc(socket_path, key, parent=parent))["start_slot"]
+            starts.append(start)
+            span = {
+                "chunk_key": key,
+                "start_slot": start,
+                "num_slots": 1,
+                "source_offset": 0,
+                "nbytes": nbytes,
+                "slot_index": 0,
+                "packed": True,
+                "mode": "compressed",
+            }
+            await store(socket_path, [span], pattern(len(starts), nbytes))
+            parent = key
+        await drain(socket_path)
+        lookup = await _send_recv(
+            socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+    finally:
+        await server.stop()
+    (run,) = lookup["chunks"]
+    assert (run["start_slot"], run["num_slots"]) == (starts[0], 2)
+    assert [
+        (slot["slot_id"], slot["stored_length"]) for slot in run["compressed_slots"]
+    ] == [(starts[0], RECORD), (starts[1], 2 * RECORD)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"tp_size": 2},
+        {"tp_rank": 1},
+        {"spans": [{**raw_span("k", 0), "chunk_key": ""}]},
+        {"spans": [{**raw_span("k", 0), "nbytes": RECORD // 2}]},
+        {"spans": [{**raw_span("k", 0), "slot_index": 1}]},
+        {"spans": [{**raw_span("k", 0), "source_offset": -1}]},
+        {"spans": [raw_span("k", 0), {**raw_span("k", 0), "packed": True}]},
+    ],
+)
+async def test_malformed_store_requests_fail(
+    tmp_path: Path, bad: dict[str, Any]
+) -> None:
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        start = (await alloc(socket_path, "k"))["start_slot"]
+        assert start == 0
+        msg = {
+            "op": "transfer_store",
+            "payload": {"data": pattern(1)},
+            "spans": [raw_span("k", 0)],
+            "tp_rank": 0,
+            "tp_size": 1,
+            **bad,
+        }
+        reply = await _send_recv(socket_path, msg)
+    finally:
+        await server.stop()
+    assert "error" in reply
+    assert not core.is_chunk_committed("k")
+
+
+@pytest.mark.asyncio
+async def test_raw_store_without_local_slot_size_fails(tmp_path: Path) -> None:
+    """A server configured without a raw record size rejects raw stores."""
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core, local_slot_size=0)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        start = (await alloc(socket_path, "k"))["start_slot"]
+        reply = await store(socket_path, [raw_span("k", start)], pattern(1))
+    finally:
+        await server.stop()
+    assert "local_slot_size" in reply["error"]
+    assert not core.is_chunk_committed("k")
+
+
+@pytest.mark.asyncio
+async def test_failed_l2_write_of_l2_only_chunk_fails_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store without an L1 copy replies after L2 and reports its failure."""
+    fake = FakeTransfer()
+    fake.persist_error = OSError("disk gone")
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    core = make_core(64, 1)
+    server = make_ipc_server(tmp_path, l1_records=1, core=core)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        kept = await alloc_and_store(core, "kept")
+        lease = core.pin_lease(kept.chunk_key)  # L1 stays full of a lease
+        start = (await alloc(socket_path, "k"))["start_slot"]
+        reply = await store(socket_path, [raw_span("k", start)], pattern(1))
+        assert lease is not None
+        core.unpin_lease(lease)
+        retry = await alloc(socket_path, "k")
+    finally:
+        await server.stop()
+    assert "disk gone" in reply["error"]
+    assert not core.is_chunk_committed("k")
+    assert retry["skipped"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_l2_write_keeps_the_l1_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With an L1 copy the store succeeds; a failed L2 write only drops L2."""
+    fake = FakeTransfer()
+    fake.persist_error = OSError("disk gone")
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        start = (await alloc(socket_path, "k"))["start_slot"]
+        reply = await store(socket_path, [raw_span("k", start)], pattern(1))
+        drained = await _send_recv(socket_path, {"op": "transfer_drain"})
+    finally:
+        await server.stop()
+    assert reply["chunk_keys"] == ["k"]
+    assert drained == {"ok": True}
+    assert core.is_chunk_committed("k")
+    assert core.full_tiers("k") == (L1,)
+    assert "L2 write of" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# Readahead and prefetch leases
+# ----------------------------------------------------------------------
+
+
+async def evict_from_l1(
+    socket_path: str, core: ServerCore, keys: list[str], seed: int = 100
+) -> None:
+    """Store filler chunks until every key in ``keys`` is L2-only."""
+    while any(core.full_tiers(key) != (L2,) for key in keys):
+        seed += 1
+        await store_raw_chunk(socket_path, f"filler-{seed}", pattern(seed))
+
+
+async def store_chain(socket_path: str, tokens: list[int]) -> list[dict[str, Any]]:
+    """Store one single-block chunk per block of ``tokens``."""
+    allocations = []
+    parent = ""
+    for index, key in enumerate(rolling_prefix_keys(tokens, BLOCK_TOKENS)):
+        allocations.append(
+            await store_raw_chunk(socket_path, key, pattern(index + 1), parent)
+        )
+        parent = key
+    return allocations
+
+
+@pytest.mark.asyncio
+async def test_lookup_readahead_promotes_the_external_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lookup hits promote L2-only chunks of the window in pieces."""
+    monkeypatch.setenv("DASER_LOAD_READAHEAD", str(RECORD))
+    monkeypatch.setenv("DASER_LOAD_READAHEAD_WINDOW", "4")
+    registry = MetricsRegistry()
+    core = make_core(64, 2, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=2, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await server.start()
+    try:
+        await store_chain(socket_path, tokens)
+        await evict_from_l1(socket_path, core, keys)
+        reply = await _send_recv(
+            socket_path,
+            {
+                "op": "lookup",
+                "tokens": tokens + [99],
+                "model_id": "m",
+                "external_prefix_queries": 9,
+                "num_computed_tokens": 0,
+            },
+        )
+        await drain(socket_path)
+        tiers = [core.full_tiers(key) for key in keys]
+    finally:
+        await server.stop()
+    assert len(reply["chunks"]) == 1  # one run of two chunks
+    assert tiers == [(L1, L2), (L1, L2)]
+    rendered = registry.render_prometheus()
+    assert (
+        f'daser_readahead_bytes_total{{outcome="read"}} {float(2 * RECORD)}' in rendered
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefetch_lease_promotes_and_pins_its_window(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """lookup_prefetch pins every chunk; transfer_prefetch brings it to L1."""
+    registry = MetricsRegistry()
+    core = make_core(64, 2, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=2, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    query = {
+        "op": "lookup_prefetch",
+        "tokens": tokens + [99],
+        "model_id": "m",
+        "external_prefix_queries": 9,
+        "num_computed_tokens": 0,
+    }
+    await server.start()
+    try:
+        allocations = await store_chain(socket_path, tokens)
+        await evict_from_l1(socket_path, core, keys[:1])
+        start = allocations[0]["start_slot"]
+        assert allocations[1]["start_slot"] == start + 1
+        if core.full_tiers(keys[1]) == (L2,):
+            await load(socket_path, [load_span(start + 1)])  # promote block 1
+        assert L1 in core.full_tiers(keys[1])
+
+        leased = await _send_recv(socket_path, {**query, "lease_id": "req"})
+        prefetch = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
+        )
+        # The leased chunks survive L1 pressure until the release.
+        await store_raw_chunk(socket_path, "pressure", pattern(50))
+        tiers = [core.full_tiers(key) for key in keys]
+        loaded = await load(socket_path, [load_span(start, 2)])
+        released = await _send_recv(
+            socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
+        )
+        gone = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
+        )
+    finally:
+        await server.stop()
+    assert leased["tier"] == "mixed"
+    assert leased["spans"] == [
+        {"start_slot": start, "num_slots": 2, "nbytes": 2 * RECORD}
+    ]
+    assert prefetch == {
+        "ok": True,
+        "requested_bytes": 2 * RECORD,
+        "l1_bytes": RECORD,
+        "l2_bytes": RECORD,
+    }
+    assert all(L1 in tier for tier in tiers)
+    assert (loaded["l1_segments"], loaded["data"]) == (2, pattern(1) + pattern(2))
+    assert released == {"ok": True}
+    assert gone == {"error": "transfer lease 'req' is not active"}
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    rendered = registry.render_prometheus()
+    assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
+    assert 'daser_prefetch_operations_total{status="incomplete"} 1.0' in rendered
+
+
+@pytest.mark.asyncio
+async def test_prefetch_lease_waits_for_the_lease_budget(tmp_path: Path) -> None:
+    """A lease that does not fit the budget waits for an earlier release."""
+    core = make_core(64, 1)
+    server = make_ipc_server(
+        tmp_path, l1_records=1, core=core, prefetch_lease_budget_bytes=RECORD
+    )
+    socket_path = sock(tmp_path)
+    prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    keys = [first_rolling_key(tokens) for tokens in prompts]
+    await server.start()
+    try:
+        for index, key in enumerate(keys):
+            await store_raw_chunk(socket_path, key, pattern(index + 1))
+        await evict_from_l1(socket_path, core, keys)
+        for lease_id, tokens in zip(("a", "b"), prompts, strict=True):
+            leased = await _send_recv(
+                socket_path,
+                {
+                    "op": "lookup_prefetch",
+                    "lease_id": lease_id,
+                    "tokens": tokens + [99],
+                    "model_id": "m",
+                    "external_prefix_queries": 5,
+                    "num_computed_tokens": 0,
+                },
+            )
+            assert leased["tier"] == "l2"
+        first = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "a"}
+        )
+        waiting = asyncio.create_task(
+            _send_recv(socket_path, {"op": "transfer_prefetch", "lease_id": "b"})
+        )
+        await asyncio.sleep(0.1)
+        assert not waiting.done()
+        await _send_recv(socket_path, {"op": "release_transfer_lease", "lease_id": "a"})
+        second = await asyncio.wait_for(waiting, 5)
+        await _send_recv(socket_path, {"op": "release_transfer_lease", "lease_id": "b"})
+    finally:
+        await server.stop()
+    assert first["l2_bytes"] == RECORD
+    assert second["l2_bytes"] == RECORD
+    assert L1 in core.full_tiers(keys[1])
+
+
+@pytest.mark.asyncio
+async def test_prefetch_without_lookup_lease_is_a_recoverable_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = MetricsRegistry()
+    server = make_ipc_server(tmp_path, registry=registry)
+    await server.start()
+    try:
+        reply = await _send_recv(
+            sock(tmp_path), {"op": "transfer_prefetch", "lease_id": "req-1"}
+        )
+    finally:
+        await server.stop()
+    assert reply == {"error": "transfer lease 'req-1' is not active"}
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
     rendered = registry.render_prometheus()
     assert 'daser_prefetch_operations_total{status="incomplete"} 1.0' in rendered
 
 
-@pytest.mark.asyncio
-async def test_cuda_load_synchronization_is_offloaded(tmp_path, monkeypatch) -> None:
-    """Wait for CUDA destination completion without blocking the IPC loop."""
+async def leased_chain_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[IPCServer, ServerCore, FakeTransfer, list[int], FakeOpened]:
+    """Start a server with a fake transfer, a two-block chain leased as ``req``.
 
-    class FakeBuffer:
-        def __init__(self) -> None:
-            self.synchronized = False
-
-        def synchronize(self) -> None:
-            self.synchronized = True
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def load_bytes_grouped(
-            self,
-            _dst: Any,
-            spans: list[dict[str, int]],
-        ) -> int:
-            return sum(int(span["nbytes"]) for span in spans)
-
-        async def store_bytes(
-            self,
-            _src: Any,
-            _file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        def close(self) -> None:
-            pass
-
-    buffer = FakeBuffer()
-    offloaded: list[Any] = []
-
-    async def fake_to_thread(func: Any, *args: Any) -> Any:
-        offloaded.append(func)
-        return func(*args)
-
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
-    server = IPCServer(
-        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
-    )
-    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
-    monkeypatch.setattr(server, "_payload_buffer", lambda _payload: buffer)
-
-    response = await server._transfer_load(  # noqa: SLF001
-        {
-            "payload": {"nbytes": 8},
-            "spans": [{"target_offset": 0, "file_offset": 0, "nbytes": 8}],
-        }
-    )
-
-    assert response["ok"] is True
-    assert response["bytes"] == 8
-    assert buffer.synchronized is True
-    assert offloaded == [buffer.synchronize]
-
-
-@pytest.mark.asyncio
-async def test_cuda_load_synchronization_does_not_serialize_requests(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Concurrent load completions can enter CUDA sync from separate threads."""
-
-    class FakeBuffer:
-        def __init__(self, barrier: threading.Barrier) -> None:
-            self._barrier = barrier
-
-        def synchronize(self) -> None:
-            self._barrier.wait(timeout=2.0)
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def load_bytes_grouped(
-            self,
-            _dst: Any,
-            spans: list[dict[str, int]],
-        ) -> int:
-            return sum(int(span["nbytes"]) for span in spans)
-
-        async def store_bytes(
-            self,
-            _src: Any,
-            _file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        def close(self) -> None:
-            pass
-
-    barrier = threading.Barrier(2)
-    buffers = {
-        1: FakeBuffer(barrier),
-        2: FakeBuffer(barrier),
-    }
-    server = IPCServer(
-        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
-    )
-    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
+    Returns:
+        ``(server, core, transfer, chunk start slots, registered buffer)``.
+    """
+    fake = FakeTransfer()
+    opened = FakeOpened(4 * RECORD, marker=7)
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
     monkeypatch.setattr(
-        server,
-        "_payload_buffer",
-        lambda payload: buffers[payload["id"]],
+        "daser.server.ipc.server.open_cuda_ipc_buffer", lambda **_kwargs: opened
     )
-
-    async def load(buffer_id: int) -> dict[str, Any]:
-        return await server._transfer_load(  # noqa: SLF001
-            {
-                "payload": {"id": buffer_id, "nbytes": 8},
-                "spans": [{"target_offset": 0, "file_offset": 0, "nbytes": 8}],
-            }
-        )
-
-    responses = await asyncio.wait_for(asyncio.gather(load(1), load(2)), timeout=3.0)
-
-    assert [response["bytes"] for response in responses] == [8, 8]
-
-
-def test_cached_cuda_array_uses_private_copy_stream(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Load mappings isolate H2D completion from the CUDA default stream."""
-    # CPU CI installs an import-only cupy stub without the CUDA namespace.
-    pytest.importorskip("cupy.cuda")
-    import cupy
-
-    class FakeData:
-        ptr = 123
-
-    class FakeDevice:
-        id = 0
-
-    class FakeArray:
-        data = FakeData()
-        device = FakeDevice()
-
-    class FakeOpened:
-        array = FakeArray()
-
-        def close(self) -> None:
-            pass
-
-    class FakeStream:
-        ptr = 456
-
-    class FakeDeviceContext:
-        def __enter__(self) -> "FakeDeviceContext":
-            return self
-
-        def __exit__(self, *_args: Any) -> None:
-            return None
-
-    monkeypatch.setattr(cupy.cuda, "Stream", lambda **_kwargs: FakeStream())
-    monkeypatch.setattr(cupy.cuda, "Device", lambda _device: FakeDeviceContext())
-    synchronized: list[int] = []
-    monkeypatch.setattr(
-        cupy.cuda.runtime,
-        "streamSynchronize",
-        lambda stream: synchronized.append(int(stream)),
-    )
-
-    cached = _CachedCudaArray(FakeOpened())
-    assert cached.copy_stream_ptr == 456
-    cached.synchronize()
-    assert synchronized == [456]
-
-
-@pytest.mark.asyncio
-async def test_lookup_prefetch_classifies_and_loads_request_lease(tmp_path) -> None:
-    """Prefetch-aware lookup returns exact spans and a consumable all-L1 lease."""
-    core = make_core()
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    tokens = list(range(8))
+    starts = []
+    parent = ""
+    for key in rolling_prefix_keys(tokens, BLOCK_TOKENS):
+        starts.append((await alloc_and_store(core, key, parent_key=parent)).start_slot)
+        parent = key
     await server.start()
-    tokens = [1, 2, 3, 4, 5]
-    key = first_rolling_key(tokens)
-    try:
-        alloc = await _send_recv(
-            socket_path,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": BLOCK_TOKENS,
-                "model_id": "m",
-            },
-        )
-        await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"k" * SLOT_SIZE},
-                "spans": [
-                    {
-                        "source_offset": 0,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": int(alloc["file_offset"]),
-                    }
-                ],
-            },
-        )
-        await _send_recv(
-            socket_path,
-            {"op": "commit_chunk", "chunk_key": key},
-        )
-
-        lookup = await _send_recv(
-            socket_path,
-            {
-                "op": "lookup_prefetch",
-                "lease_id": "request-1",
-                "tokens": tokens,
-                "model_id": "m",
-                "external_prefix_queries": len(tokens),
-                "num_computed_tokens": 0,
-            },
-        )
-        assert lookup["tier"] == "l1"
-        assert lookup["spans"] == [
-            {"file_offset": int(alloc["file_offset"]), "nbytes": SLOT_SIZE}
-        ]
-
-        load = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "lease_id": "request-1",
-                "payload": {"return_data": True},
-                "spans": [
-                    {
-                        "target_offset": 0,
-                        "file_offset": int(alloc["file_offset"]),
-                        "nbytes": SLOT_SIZE,
-                    }
-                ],
-            },
-        )
-        assert load["data"] == b"k" * SLOT_SIZE
-        assert await _send_recv(
-            socket_path,
-            {"op": "release_transfer_lease", "lease_id": "request-1"},
-        ) == {"ok": True}
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
-    """Online packed lookup leases exact record lengths, not raw envelopes."""
-
-    class FakeCore:
-        def add_chunk_removal_listener(self, _listener: Any) -> None:
-            pass
-
-        async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
-            return [
-                ChunkInfo(
-                    chunk_key="chunk",
-                    start_slot=10,
-                    num_slots=2,
-                    token_count=8,
-                    pos_offset=0,
-                    model_id="m",
-                    file_offset=10 * SLOT_SIZE,
-                    target_token_start=0,
-                )
-            ]
-
-        async def record_external_prefix_cache(
-            self, *, queries: int, hits: int
-        ) -> None:
-            assert (queries, hits) == (9, 8)
-
-        def packed_slot_refs(
-            self, start_slot: int, num_slots: int
-        ) -> list[dict[str, int | str]]:
-            refs = {
-                10: {
-                    "slot_id": 10,
-                    "mode": "compressed",
-                    "file_offset": 10 * SLOT_SIZE,
-                    "stored_length": 6144,
-                },
-                11: {
-                    "slot_id": 11,
-                    "mode": "compressed",
-                    "file_offset": 11 * SLOT_SIZE,
-                    "stored_length": 8192,
-                },
-            }
-            selected = [refs.get(start_slot + index) for index in range(num_slots)]
-            return [ref for ref in selected if ref is not None]
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def store_bytes(
-            self,
-            _src: Any,
-            _file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        def close(self) -> None:
-            pass
-
-        async def classify_and_acquire_lease(
-            self, lease_id: str, spans: list[dict[str, int]]
-        ) -> str:
-            assert lease_id == "online-1"
-            assert spans == [
-                {
-                    "file_offset": 10 * SLOT_SIZE,
-                    "nbytes": 6144,
-                    "accounted_nbytes": SLOT_SIZE,
-                },
-                {
-                    "file_offset": 11 * SLOT_SIZE,
-                    "nbytes": 8192,
-                    "accounted_nbytes": SLOT_SIZE,
-                },
-            ]
-            return "l1"
-
-    server = IPCServer(
-        "unused.sock",
-        FakeCore(),  # type: ignore[arg-type]
-        {
-            **RUNTIME_CONFIG,
-            "storage_format": "compressed-online",
-            "bip_enabled": True,
-        },
+    registered = await _send_recv(
+        sock(tmp_path),
+        {"op": "register_load_staging", "payload": staging_payload(1, 4 * RECORD)},
     )
-    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
-
-    response = await server._op_lookup_prefetch(  # noqa: SLF001
+    assert registered == {"ok": True}
+    leased = await _send_recv(
+        sock(tmp_path),
         {
-            "lease_id": "online-1",
-            "tokens": list(range(9)),
+            "op": "lookup_prefetch",
+            "lease_id": "req",
+            "tokens": tokens + [99],
             "model_id": "m",
             "external_prefix_queries": 9,
             "num_computed_tokens": 0,
-        }
+        },
     )
+    assert leased["tier"] == "l1"
+    return server, core, fake, starts, opened
 
-    assert response["tier"] == "l1"
-    assert response["spans"] == [
-        {
-            "file_offset": 10 * SLOT_SIZE,
-            "nbytes": 6144,
-            "accounted_nbytes": SLOT_SIZE,
-        },
-        {
-            "file_offset": 11 * SLOT_SIZE,
-            "nbytes": 8192,
-            "accounted_nbytes": SLOT_SIZE,
-        },
-    ]
-    assert response["chunks"][0]["compressed_slots"][0]["stored_length"] == 6144
+
+def runs_bytes(
+    slots: list[int], intra: list[int], targets: list[int], lengths: list[int]
+) -> bytes:
+    """Pack a ``(4, n)`` int64 run table."""
+    return np.array([slots, intra, targets, lengths], dtype=np.int64).tobytes()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
-async def test_lookup_prefetch_leases_partially_admitted_final_block(
-    storage_format: str,
+async def test_load_runs_maps_slots_to_leased_l1_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fully cached prompt admits prompt_len - 1 tokens, yet the worker loads
-    the whole final block, so the lease must cover that block too."""
-    leased: list[list[dict[str, int]]] = []
-
-    class FakeCore:
-        def add_chunk_removal_listener(self, _listener: Any) -> None:
-            pass
-
-        async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
-            return [
-                ChunkInfo(
-                    chunk_key="chunk",
-                    start_slot=10,
-                    num_slots=2,
-                    token_count=2 * BLOCK_TOKENS,
-                    pos_offset=0,
-                    model_id="m",
-                    file_offset=10 * SLOT_SIZE,
-                    target_token_start=0,
-                )
-            ]
-
-        async def record_external_prefix_cache(
-            self, *, queries: int, hits: int
-        ) -> None:
-            assert (queries, hits) == (2 * BLOCK_TOKENS, 2 * BLOCK_TOKENS - 1)
-
-        def packed_slot_refs(
-            self, start_slot: int, num_slots: int
-        ) -> list[dict[str, int | str]]:
-            return [
-                {
-                    "slot_id": slot,
-                    "mode": "compressed",
-                    "file_offset": slot * SLOT_SIZE,
-                    "stored_length": 1024,
-                }
-                for slot in range(start_slot, start_slot + num_slots)
-            ]
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def store_bytes(
-            self,
-            _src: Any,
-            _file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        def close(self) -> None:
-            pass
-
-        async def classify_and_acquire_lease(
-            self, _lease_id: str, spans: list[dict[str, int]]
-        ) -> str:
-            leased.append(spans)
-            return "l1"
-
-    config: dict[str, Any] = dict(RUNTIME_CONFIG)
-    if storage_format == "compressed-online":
-        config.update(storage_format=storage_format, bip_enabled=True)
-    server = IPCServer("unused.sock", FakeCore(), config)  # type: ignore[arg-type]
-    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
-
-    response = await server._op_lookup_prefetch(  # noqa: SLF001
-        {
-            "lease_id": "full-hit",
-            "tokens": list(range(2 * BLOCK_TOKENS)),
-            "model_id": "m",
-            "external_prefix_queries": 2 * BLOCK_TOKENS,
-            "num_computed_tokens": 0,
-        }
+    """One run table becomes one load_runs call at the chunks' L1 offsets."""
+    server, core, fake, starts, opened = await leased_chain_server(
+        tmp_path, monkeypatch
     )
-
-    assert response["tier"] == "l1"
-    if storage_format == "compressed-online":
-        expected = [
-            {
-                "file_offset": slot * SLOT_SIZE,
-                "nbytes": 1024,
-                "accounted_nbytes": SLOT_SIZE,
-            }
-            for slot in (10, 11)
-        ]
-    else:
-        expected = [{"file_offset": 10 * SLOT_SIZE, "nbytes": 2 * SLOT_SIZE}]
-    assert leased == [expected]
-
-
-@pytest.mark.asyncio
-async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
-    """Online lookup does not lease a raw envelope before all refs publish."""
-
-    class IncompleteCore:
-        def add_chunk_removal_listener(self, _listener: Any) -> None:
-            pass
-
-        async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
-            return [
-                ChunkInfo(
-                    chunk_key="chunk",
-                    start_slot=10,
-                    num_slots=2,
-                    token_count=8,
-                    pos_offset=0,
-                    model_id="m",
-                    file_offset=10 * SLOT_SIZE,
-                    target_token_start=0,
-                )
-            ]
-
-        async def record_external_prefix_cache(
-            self, *, queries: int, hits: int
-        ) -> None:
-            assert (queries, hits) == (9, 8)
-
-        def packed_slot_refs(
-            self, _start_slot: int, _num_slots: int
-        ) -> list[dict[str, int | str]]:
-            return []
-
-    server = IPCServer(
-        "unused.sock",
-        IncompleteCore(),  # type: ignore[arg-type]
-        {
-            **RUNTIME_CONFIG,
-            "storage_format": "compressed-online",
-            "bip_enabled": True,
-        },
-    )
-
-    response = await server._op_lookup_prefetch(  # noqa: SLF001
-        {
-            "lease_id": "online-incomplete",
-            "tokens": list(range(9)),
-            "model_id": "m",
-            "external_prefix_queries": 9,
-            "num_computed_tokens": 0,
-        }
-    )
-
-    assert response["spans"] == []
-    assert "tier" not in response
-    assert "compressed_slots" not in response["chunks"][0]
-
-
-@pytest.mark.asyncio
-async def test_packed_store_coalescing_streams_through_l1(tmp_path: Any) -> None:
-    """IPC merges adjacent records without making a span larger than L1."""
-    socket_path = str(tmp_path / "s.sock")
-    config = make_runtime_config(tmp_path, l2_size_bytes=4 * SLOT_SIZE)
-    server = IPCServer(socket_path, make_core(), config)
-    await server.start()
-    source = b"a" * SLOT_SIZE + b"b" * SLOT_SIZE + b"c" * SLOT_SIZE
     try:
-        result = await asyncio.wait_for(
-            _send_recv(
-                socket_path,
-                {
-                    "op": "transfer_store",
-                    "payload": {"data": source},
-                    "spans": [
-                        {
-                            "source_offset": i * SLOT_SIZE,
-                            "file_offset": i * SLOT_SIZE,
-                            "nbytes": SLOT_SIZE,
-                            "packed": True,
-                        }
-                        for i in range(3)
-                    ],
-                },
-            ),
-            timeout=5,
-        )
-        assert result["bytes"] == len(source)
-        await server.drain_transfer()
-        for i in reversed(range(3)):
-            restored = await _send_recv(
-                socket_path,
-                {
-                    "op": "transfer_load",
-                    "payload": {"return_data": True},
-                    "spans": [
-                        {
-                            "file_offset": i * SLOT_SIZE,
-                            "nbytes": SLOT_SIZE,
-                            "target_offset": 0,
-                        }
-                    ],
-                },
-            )
-            assert restored["data"] == source[i * SLOT_SIZE : (i + 1) * SLOT_SIZE]
-    finally:
-        await server.close()
-
-
-@pytest.mark.asyncio
-async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
-    """The server commits a fully transferred chunk without worker RPC."""
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-    await server.start()
-    tokens = [1, 2, 3, 4]
-    key = first_rolling_key(tokens)
-    try:
-        alloc = await _send_recv(
-            str(tmp_path / "test.sock"),
+        planned = await core.plan_load(starts[0], 2)
+        lanes = [segment.lane_offset for segment in planned]
+        assert all(segment.tier == L1 for segment in planned)
+        core.release_load(planned)
+        reply = await _send_recv(
+            sock(tmp_path),
             {
-                "op": "alloc_chunk",
-                "chunk_key": key,
-                "token_count": len(tokens),
-                "model_id": "m",
+                "op": "transfer_load_runs",
+                "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
+                "lease_id": "req",
+                "tp_rank": 0,
+                "runs": runs_bytes(
+                    [starts[1], starts[0]], [64, 0], [0, 512], [256, 512]
+                ),
             },
         )
-        store = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"a" * SLOT_SIZE},
-                "spans": [
-                    {
-                        "source_offset": 0,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": alloc["file_offset"],
-                        "chunk_key": key,
-                        "start_slot": alloc["start_slot"],
-                        "num_slots": alloc["num_slots"],
-                    }
-                ],
-            },
-        )
-        assert store["chunk_keys"] == [key]
-        lookup = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {"op": "lookup", "tokens": tokens, "model_id": "m"},
-        )
-        assert [chunk["chunk_key"] for chunk in lookup["chunks"]] == [key]
     finally:
         await server.stop()
+    assert reply["ok"] is True and reply["bytes"] == 768
+    ((buffer, offsets, targets, lengths),) = fake.runs
+    layout = core.tier_layout
+    assert offsets == [
+        layout.absolute_offset(L1, 0, lanes[1] + 64),
+        layout.absolute_offset(L1, 0, lanes[0]),
+    ]
+    assert (targets, lengths) == ([0, 512], [256, 512])
+    assert bytes(buffer[:4]) == bytes(opened.array[:4])
+    assert opened.closed == 1
 
 
 @pytest.mark.asyncio
-async def test_memory_only_lookup_skips_chunks_evicted_from_l1(tmp_path) -> None:
-    """Without L2, a chunk L1 evicted is a miss even while the ring indexes it."""
-    runtime_config = make_runtime_config(
-        tmp_path, skip_l2=True, store_path="", l1_size_bytes=SLOT_SIZE
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"payload": {}},
+        {"runs": b""},
+        {"runs": b"\0" * 24},
+        {"lease_id": "other"},
+        {"slots": [999]},
+        {"intra": [RECORD - 8]},
+        {"intra": [-8]},
+    ],
+)
+async def test_load_runs_rejects_malformed_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: dict[str, Any]
+) -> None:
+    """Missing buffers or leases and runs outside their records fail."""
+    server, _core, fake, starts, _opened = await leased_chain_server(
+        tmp_path, monkeypatch
     )
-    core = make_core(total_slots=8)
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, runtime_config)
-    await server.start()
-    prompts = {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8]}
-    try:
-        for fill, tokens in prompts.items():
-            key = first_rolling_key(tokens)
-            alloc = await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": key,
-                    "token_count": len(tokens),
-                    "model_id": "m",
-                },
-            )
-            store = await _send_recv(
-                socket_path,
-                {
-                    "op": "transfer_store",
-                    "payload": {"data": fill.encode() * SLOT_SIZE},
-                    "spans": [
-                        {
-                            "source_offset": 0,
-                            "nbytes": SLOT_SIZE,
-                            "file_offset": alloc["file_offset"],
-                            "chunk_key": key,
-                            "start_slot": alloc["start_slot"],
-                            "num_slots": alloc["num_slots"],
-                        }
-                    ],
-                },
-            )
-            assert store["chunk_keys"] == [key]
-        # The one-slot L1 kept only "b"; the eight-slot ring still has "a".
-        assert core.chunk_manager.store.get(first_rolling_key(prompts["a"]))
-        lookups = {
-            fill: await _send_recv(
-                socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
-            )
-            for fill, tokens in prompts.items()
-        }
-        assert lookups["a"]["chunks"] == []
-        (chunk,) = lookups["b"]["chunks"]
-        load = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [
-                    {
-                        "target_offset": 0,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": chunk["file_offset"],
-                    }
-                ],
-            },
-        )
-        assert load["data"] == b"b" * SLOT_SIZE
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
-    """IPC publishes relocated references and restores them byte-exactly."""
-    local_slot_size = 4 * SLOT_SIZE
-    core = ServerCore(
-        ChunkManager(8, MetadataStore()),
-        PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-        FixedOffsetEncoder(fixed_offset=0),
-        slot_size=local_slot_size,
-        block_tokens=BLOCK_TOKENS,
-    )
-    config = make_runtime_config(
-        tmp_path,
-        slot_size=local_slot_size,
-        storage_format="compressed-online",
-        bip_enabled=True,
-        l1_size_bytes=local_slot_size,
-        l2_size_bytes=8 * local_slot_size,
-    )
-    socket_path = str(tmp_path / "tail.sock")
-    server = IPCServer(socket_path, core, config)
-    await server.start()
-    try:
-        spans = []
-        for i in range(3):
-            allocation = await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": str(i),
-                    "token_count": BLOCK_TOKENS,
-                    "model_id": "m",
-                },
-            )
-            spans.append(
-                {
-                    "source_offset": i * SLOT_SIZE,
-                    "file_offset": allocation["file_offset"],
-                    "nbytes": SLOT_SIZE,
-                    "chunk_key": str(i),
-                    "start_slot": allocation["start_slot"],
-                    "num_slots": 1,
-                    "logical_slot_start": i,
-                    "logical_slot_count": 1,
-                    "packed": True,
-                    "mode": "compressed",
-                }
-            )
-        stored = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {
-                    "data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE + b"c" * SLOT_SIZE
-                },
-                "spans": spans,
-            },
-        )
-        assert stored["bytes"] == 3 * SLOT_SIZE
-        refs = core.packed_slot_refs(0, 3)
-        assert [ref["file_offset"] for ref in refs] == [i * SLOT_SIZE for i in range(3)]
-        await server.drain_transfer()
-        retry = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"b" * SLOT_SIZE},
-                "spans": [{**spans[1], "source_offset": 0}],
-            },
-        )
-        assert retry["bytes"] == SLOT_SIZE
-        assert core.packed_slot_refs(0, 3) == refs
-        # A full-slot write exceeds the remaining L1 capacity and evicts the
-        # original records, so the following reversed restore exercises L2.
-        pressure = await _send_recv(
-            socket_path,
-            {
-                "op": "alloc_chunk",
-                "chunk_key": "pressure",
-                "token_count": BLOCK_TOKENS,
-                "model_id": "m",
-            },
-        )
-        await server.drain_transfer()
-        evicted = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"z" * local_slot_size},
-                "spans": [
-                    {
-                        **spans[0],
-                        "chunk_key": "pressure",
-                        "file_offset": pressure["file_offset"],
-                        "start_slot": pressure["start_slot"],
-                        "logical_slot_start": 0,
-                        "nbytes": local_slot_size,
-                        "mode": "raw",
-                    }
-                ],
-            },
-        )
-        assert evicted["bytes"] == local_slot_size
-        await server.drain_transfer()
-        loaded = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [
-                    {
-                        "file_offset": ref["file_offset"],
-                        "nbytes": ref["stored_length"],
-                        "target_offset": i * SLOT_SIZE,
-                    }
-                    for i, ref in enumerate(reversed(refs))
-                ],
-            },
-        )
-        assert loaded["data"] == b"c" * SLOT_SIZE + b"b" * SLOT_SIZE + b"a" * SLOT_SIZE
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-def _online_arena_server(
-    tmp_path: Any,
-    logical_slots: int,
-    arena_slots: int,
-    metrics_registry: MetricsRegistry | None = None,
-    l1_slots: int = 1,
-    skip_l2: bool = False,
-    bip_enabled: bool = True,
-) -> tuple[ServerCore, IPCServer, str, int]:
-    """Build a compressed-online server whose arena is smaller than its ring.
-
-    ``arena_slots`` is the L2 budget; as ``--l2-size`` configures, the arena
-    addresses that budget plus L1. With ``skip_l2`` the arena addresses L1
-    only and has no budget.
-    """
-    local_slot_size = 4 * SLOT_SIZE
-    core = ServerCore(
-        ChunkManager(logical_slots, MetadataStore()),
-        PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-        FixedOffsetEncoder(fixed_offset=0),
-        slot_size=local_slot_size,
-        block_tokens=BLOCK_TOKENS,
-    )
-    overrides: dict[str, Any] = {
-        "slot_size": local_slot_size,
-        "storage_format": "compressed-online",
-        "bip_enabled": bip_enabled,
-        "l1_size_bytes": l1_slots * local_slot_size,
-        "l2_size_bytes": (arena_slots + l1_slots) * local_slot_size,
-        "l2_budget_bytes": arena_slots * local_slot_size,
+    slots = bad.pop("slots", [starts[0]])
+    intra = bad.pop("intra", [0])
+    msg = {
+        "op": "transfer_load_runs",
+        "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
+        "lease_id": "req",
+        "tp_rank": 0,
+        "runs": runs_bytes(slots, intra, [0], [16]),
+        **bad,
     }
-    if skip_l2:
-        overrides.update(
-            skip_l2=True,
-            store_path="",
-            l1_size_bytes=arena_slots * local_slot_size,
-            l2_size_bytes=arena_slots * local_slot_size,
-            l2_budget_bytes=0,
-        )
-    config = make_runtime_config(tmp_path, **overrides)
-    socket_path = str(tmp_path / "arena.sock")
-    server = IPCServer(socket_path, core, config, metrics_registry=metrics_registry)
-    return core, server, socket_path, local_slot_size
+    try:
+        reply = await _send_recv(sock(tmp_path), msg)
+    finally:
+        await server.stop()
+    assert "error" in reply
+    assert fake.runs == []
 
 
-async def _store_online_record(
-    socket_path: str,
-    chunk_key: str,
-    nbytes: int,
-    fill: bytes = b"x",
-    mode: str = "raw",
-) -> dict[str, Any]:
-    """Allocate one single-slot chunk and store one ``fill`` record for it."""
-    allocation = await _send_recv(
-        socket_path,
-        {
-            "op": "alloc_chunk",
-            "chunk_key": chunk_key,
-            "token_count": BLOCK_TOKENS,
-            "model_id": "m",
-        },
-    )
-    return await _send_recv(
-        socket_path,
-        {
-            "op": "transfer_store",
-            "payload": {"data": fill * nbytes},
-            "spans": [
-                {
-                    "source_offset": 0,
-                    "file_offset": allocation["file_offset"],
-                    "nbytes": nbytes,
-                    "chunk_key": chunk_key,
-                    "start_slot": allocation["start_slot"],
-                    "num_slots": 1,
-                    "logical_slot_start": 0,
-                    "logical_slot_count": 1,
-                    "packed": True,
-                    "mode": mode,
-                }
-            ],
-        },
-    )
+# ----------------------------------------------------------------------
+# Transfer backend selection and lifecycle
+# ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_online_store_observes_packed_record_ratios(tmp_path) -> None:
-    """Each placed packed record is observed as stored bytes over a raw slot."""
-    registry = MetricsRegistry()
-    _core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path, logical_slots=8, arena_slots=4, metrics_registry=registry
-    )
+async def test_skip_l2_stores_and_loads_through_l1_only(tmp_path: Path) -> None:
+    """Without L2 the io_uring layer keeps chunks in L1 only."""
+    core = make_core(layout=make_layout(l2_records=0, l1_records=8))
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
     await server.start()
     try:
-        stored = await _store_online_record(
-            socket_path, "a", local_slot_size * 3 // 4, mode="compressed"
-        )
-        assert "error" not in stored
-        assert "error" not in await _store_online_record(
-            socket_path, "b", local_slot_size
-        )
-        await server.drain_transfer()
-        lines = set(registry.render_prometheus().splitlines())
-        name = "daser_packed_record_ratio"
-        assert f'{name}_bucket{{mode="compressed",le="0.74"}} 0' in lines
-        assert f'{name}_bucket{{mode="compressed",le="0.76"}} 1' in lines
-        assert f'{name}_sum{{mode="compressed"}} 0.75' in lines
-        assert f'{name}_bucket{{mode="raw",le="0.98"}} 0' in lines
-        assert f'{name}_count{{mode="raw"}} 1' in lines
+        a = await store_raw_chunk(socket_path, "a", pattern(1))
+        loaded = await load(socket_path, [load_span(a["start_slot"])])
     finally:
-        await server.drain_transfer()
         await server.stop()
+    assert core.full_tiers("a") == (L1,)
+    assert loaded["data"] == pattern(1)
+    assert not (tmp_path / "daser.store").exists()
 
 
 @pytest.mark.asyncio
-async def test_online_store_evicts_oldest_when_packed_arena_is_full(tmp_path) -> None:
-    """Raw-size records overflow over-provisioned slots; LRU eviction frees bytes."""
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path, logical_slots=8, arena_slots=2
-    )
-    await server.start()
-    try:
-        for key in ("a", "b", "c"):
-            stored = await _store_online_record(socket_path, key, local_slot_size)
-            assert "error" not in stored
-            assert stored["bytes"] == local_slot_size
-            await server.drain_transfer()
-        assert core.chunk_manager.store.get("a") is None
-        assert core.chunk_manager.store.get("b") is not None
-        assert core.chunk_manager.store.get("c") is not None
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-def _metric_value(registry: MetricsRegistry, name: str) -> float:
-    """Return one rendered unlabelled metric value (0 if absent)."""
-    for line in registry.render_prometheus().splitlines():
-        if line.startswith(f"{name} "):
-            return float(line.split()[1])
-    return 0.0
-
-
-def _l2_write_bytes(registry: MetricsRegistry) -> float:
-    """Return the rendered ``daser_l2_write_bytes_total`` value (0 if absent)."""
-    return _metric_value(registry, "daser_l2_write_bytes_total")
-
-
-async def _store_records(socket_path: str, keys: str, nbytes: int) -> None:
-    """Store one raw record per key, one store call each."""
-    for key in keys:
-        assert "error" not in await _store_online_record(socket_path, key, nbytes)
-
-
-async def _refresh_tier_metrics(server: IPCServer, socket_path: str) -> None:
-    """Drain pending IO, then publish tier metrics with an empty store."""
-    await server.drain_transfer()
-    empty = {"op": "transfer_store", "payload": {"data": b""}, "spans": []}
-    assert "error" not in await _send_recv(socket_path, empty)
-
-
-@pytest.mark.asyncio
-async def test_l2_budget_victims_resident_in_l1_stay_indexed(tmp_path) -> None:
-    """An L2 budget victim still held by L1 stays indexed; it leaves only L2."""
-    registry = MetricsRegistry()
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path,
-        logical_slots=8,
-        arena_slots=2,
-        metrics_registry=registry,
-        l1_slots=4,
-        bip_enabled=False,
-    )
-    await server.start()
-    try:
-        await _store_records(socket_path, "abcd", local_slot_size)
-        await _refresh_tier_metrics(server, socket_path)
-        present = [k for k in "abcd" if core.chunk_manager.store.get(k) is not None]
-        assert present == list("abcd")
-        # Write-through: every record reached L2 once.
-        assert _l2_write_bytes(registry) == 4 * local_slot_size
-        assert core.packed_layout.charged_bytes() == 2 * local_slot_size
-        assert core.packed_layout.held_bytes == 2 * local_slot_size
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_l1_eviction_of_held_records_removes_their_chunks(tmp_path) -> None:
-    """Records held past the L2 budget leave the index once L1 evicts them."""
-    registry = MetricsRegistry()
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path,
-        logical_slots=8,
-        arena_slots=2,
-        metrics_registry=registry,
-        l1_slots=2,
-        bip_enabled=False,
-    )
-    await server.start()
-    try:
-        await _store_records(socket_path, "abcd", local_slot_size)
-        await _refresh_tier_metrics(server, socket_path)
-        # Let scheduled held-release removals run.
-        for _ in range(3):
-            await asyncio.sleep(0)
-        present = "".join(k for k in "abcd" if core.chunk_manager.store.get(k))
-        assert present == "cd"
-        # Write-through: every record reached L2 exactly once.
-        assert _l2_write_bytes(registry) == 4 * local_slot_size
-        assert core.packed_layout.held_bytes == 0
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_store_removed_mid_write_keeps_its_successor(
-    tmp_path, monkeypatch
+async def test_iouring_transfer_is_sized_from_the_tier_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A store removed mid-write keeps the record reusing its bytes.
+    created: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    Store "a" is paused after its write, before it records its ranges.
-    Stores "b" and "c" then reclaim "z" and "a" from the two-record arena.
-    Whatever survives must load back its own bytes.
-    """
-    registry = MetricsRegistry()
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path,
-        logical_slots=8,
-        arena_slots=1,
-        metrics_registry=registry,
-        l1_slots=1,
-    )
-    entered, gate = asyncio.Event(), asyncio.Event()
-    record_store_ranges = core.record_store_ranges
+    class Recorder(FakeTransfer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            created.append((args, kwargs))
 
-    async def paused_record(spans: list[dict[str, Any]], **kwargs: Any) -> list[str]:
-        if any(span.get("chunk_key") == "a" for span in spans):
-            entered.set()
-            await gate.wait()
-        return await record_store_ranges(spans, **kwargs)
-
-    monkeypatch.setattr(core, "record_store_ranges", paused_record)
-    await server.start()
-    try:
-        await _store_online_record(socket_path, "z", local_slot_size, b"z")
-        await server.drain_transfer()
-        first = asyncio.create_task(
-            _store_online_record(socket_path, "a", local_slot_size, b"a")
-        )
-        await asyncio.wait_for(entered.wait(), 10)
-        for key in "bc":
-            await _store_online_record(socket_path, key, local_slot_size, key.encode())
-        gate.set()
-        await first
-        await server.drain_transfer()
-        present = [k for k in "zabc" if core.chunk_manager.store.get(k) is not None]
-        assert present
-        for key in present:
-            record = core.chunk_manager.store.get(key)
-            assert record is not None
-            (ref,) = core.packed_slot_refs(record.start_slot, 1)
-            load = await _send_recv(
-                socket_path,
-                {
-                    "op": "transfer_load",
-                    "payload": {"return_data": True},
-                    "spans": [
-                        {
-                            "target_offset": 0,
-                            "file_offset": int(ref["file_offset"]),
-                            "nbytes": int(ref["stored_length"]),
-                        }
-                    ],
-                },
-            )
-            assert load["data"] == key.encode() * local_slot_size
-        # Each survivor's L1 copy is its own; no held entry of "a" aliases it.
-        assert core.packed_layout.held_bytes <= local_slot_size
-    finally:
-        gate.set()
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_memory_only_online_store_keeps_packed_records_in_l1(tmp_path) -> None:
-    """Without L2 the packed arena spans L1: records load back, none reach SSD."""
-    registry = MetricsRegistry()
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path,
-        logical_slots=8,
-        arena_slots=2,
-        metrics_registry=registry,
-        skip_l2=True,
-    )
-    await server.start()
-    try:
-        for key in ("a", "b", "c"):
-            assert "error" not in await _store_online_record(
-                socket_path, key, local_slot_size
-            )
-            await server.drain_transfer()
-        present = [k for k in "abc" if core.chunk_manager.store.get(k) is not None]
-        assert present == ["b", "c"]
-        record = core.chunk_manager.store.get("c")
-        assert record is not None
-        (ref,) = core.packed_slot_refs(record.start_slot, 1)
-        load = await _send_recv(
-            socket_path,
+    monkeypatch.setattr("daser.server.ipc.server.TieredIOUringTransferLayer", Recorder)
+    monkeypatch.setenv("DASER_L2_WRITE_GATE", "0")
+    server = make_ipc_server(tmp_path, 64, 16, l2_read_stripe_bytes=8192)
+    await server.initialize_transfer()
+    await server.close()
+    assert created == [
+        (
+            (str(tmp_path / "daser.store"),),
             {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [
-                    {
-                        "target_offset": 0,
-                        "file_offset": int(ref["file_offset"]),
-                        "nbytes": int(ref["stored_length"]),
-                    }
-                ],
+                "l1_bytes": 16 * RECORD,
+                "staging_bytes": 4 * RECORD,
+                "l2_bytes": 64 * RECORD,
+                "skip_l2": False,
+                "l2_read_stripe_bytes": 8192,
+                "l2_write_gate": False,
             },
         )
-        assert load["data"] == b"x" * local_slot_size
-        assert _l2_write_bytes(registry) == 0
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_online_store_never_evicts_chunks_in_the_same_batch(tmp_path) -> None:
-    """A batch larger than the L1+L2 arena fails instead of evicting itself."""
-    core, server, socket_path, local_slot_size = _online_arena_server(
-        tmp_path, logical_slots=8, arena_slots=1
-    )
-    await server.start()
-    try:
-        spans = []
-        for i, key in enumerate("abc"):
-            allocation = await _send_recv(
-                socket_path,
-                {
-                    "op": "alloc_chunk",
-                    "chunk_key": key,
-                    "token_count": BLOCK_TOKENS,
-                    "model_id": "m",
-                },
-            )
-            spans.append(
-                {
-                    "source_offset": i * local_slot_size,
-                    "file_offset": allocation["file_offset"],
-                    "nbytes": local_slot_size,
-                    "chunk_key": key,
-                    "start_slot": allocation["start_slot"],
-                    "num_slots": 1,
-                    "logical_slot_start": 0,
-                    "logical_slot_count": 1,
-                    "packed": True,
-                    "mode": "raw",
-                }
-            )
-        response = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"x" * (3 * local_slot_size)},
-                "spans": spans,
-            },
-        )
-        assert "packed arena exhausted" in response["error"]
-        assert all(core.chunk_manager.store.get(key) is not None for key in "abc")
-    finally:
-        await server.drain_transfer()
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
-    """IPC store ignores delayed spans whose chunk allocation was evicted."""
-    core = make_core()
-    runtime_config = make_runtime_config(tmp_path)
-    server = IPCServer(str(tmp_path / "test.sock"), core, runtime_config)
-    await server.start()
-    try:
-        store = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"a" * SLOT_SIZE},
-                "spans": [
-                    {
-                        "source_offset": 0,
-                        "nbytes": SLOT_SIZE,
-                        "file_offset": 0,
-                        "chunk_key": "evicted",
-                        "start_slot": 0,
-                        "num_slots": 1,
-                    }
-                ],
-            },
-        )
-        load = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
-        )
-
-        assert store == {"ok": True, "bytes": 0, "chunk_keys": []}
-        assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"\0" * SLOT_SIZE}
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_cuda_ipc_payload_buffer_reuses_open_handle(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Repeated CUDA IPC payloads for the same staging allocation reuse a handle."""
-
-    class FakeOpened:
-        def __init__(self) -> None:
-            self.array = bytearray(1024)
-            self.closed = 0
-
-        def close(self) -> None:
-            self.closed += 1
-
-    opened_buffers: list[FakeOpened] = []
-    open_calls: list[dict[str, Any]] = []
-
-    def fake_open_cuda_ipc_buffer(**kwargs: Any) -> FakeOpened:
-        open_calls.append(kwargs)
-        opened = FakeOpened()
-        opened_buffers.append(opened)
-        return opened
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return 0
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return 0
-
-        async def load_bytes_grouped(
-            self,
-            _dst: Any,
-            _spans: list[dict[str, int]],
-        ) -> int:
-            return 0
-
-        def close(self) -> None:
-            pass
-
-    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
-        return FakeTransfer()
-
-    monkeypatch.setattr(
-        "daser.server.ipc.server.open_cuda_ipc_buffer",
-        fake_open_cuda_ipc_buffer,
-    )
-    monkeypatch.setattr(
-        "daser.server.ipc.server._CachedCudaArray.synchronize",
-        lambda _self: None,
-    )
-    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
-
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-    payload = {
-        "cuda_ipc_handle": b"h" * 64,
-        "nbytes": 1024,
-        "device_pci_bus_id": "0000:38:00.0",
-        "device_ptr": 123456,
-        "allocation_base_ptr": 122880,
-        "allocation_offset": 576,
-        "producer_pid": 42,
-    }
-
-    await server.start()
-    try:
-        request = {
-            "op": "transfer_load",
-            "payload": payload,
-            "spans": [],
-        }
-        first = await _send_recv(str(tmp_path / "test.sock"), request)
-        second = await _send_recv(str(tmp_path / "test.sock"), dict(request))
-    finally:
-        await server.stop()
-
-    assert first["ok"] is True
-    assert second["ok"] is True
-    assert len(opened_buffers) == 1
-    assert open_calls == [
-        {
-            "handle": b"h" * 64,
-            "nbytes": 1024,
-            "pci_bus_id": "0000:38:00.0",
-            "local_ptr": None,
-            "allocation_offset": 576,
-        }
     ]
-    assert opened_buffers[0].closed == 1
 
 
 @pytest.mark.asyncio
-async def test_registered_load_staging_is_scoped_by_producer(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_transfer_mode_must_match_the_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Equal worker-local indexes resolve to each producer's CUDA mapping."""
+    """gds needs L2 only; iouring needs an L1 tier."""
+    created: list[tuple[Any, ...]] = []
 
-    class FakeOpened:
-        def __init__(self, marker: int) -> None:
-            self.array = bytearray([marker]) * 1024
-            self.closed = 0
+    class Recorder(FakeTransfer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            created.append((*args, kwargs))
 
-        def close(self) -> None:
-            self.closed += 1
-
-    opened_buffers: list[FakeOpened] = []
-    open_calls: list[dict[str, Any]] = []
-    loaded_buffers: list[Any] = []
-
-    def fake_open_cuda_ipc_buffer(**kwargs: Any) -> FakeOpened:
-        open_calls.append(kwargs)
-        opened = FakeOpened(len(opened_buffers) + 1)
-        opened_buffers.append(opened)
-        return opened
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return 0
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return 0
-
-        async def load_bytes_grouped(
-            self,
-            dst: Any,
-            spans: list[dict[str, int]],
-        ) -> int:
-            loaded_buffers.append(dst)
-            return sum(int(span["nbytes"]) for span in spans)
-
-        def close(self) -> None:
-            pass
-
-    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
-        return FakeTransfer()
-
-    monkeypatch.setattr(
-        "daser.server.ipc.server.open_cuda_ipc_buffer",
-        fake_open_cuda_ipc_buffer,
-    )
-    monkeypatch.setattr(
-        "daser.server.ipc.server._CachedCudaArray.synchronize",
-        lambda _self: None,
-    )
-    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
-
-    core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
-
-    await server.start()
-    try:
-        registered = []
-        loaded = []
-        for producer_pid in (42, 43):
-            registered.append(
-                await _send_recv(
-                    str(tmp_path / "test.sock"),
-                    {
-                        "op": "register_load_staging",
-                        "payload": {
-                            "buffer_index": 1,
-                            "cuda_ipc_handle": b"h" * 64,
-                            "allocation_bytes": 1024,
-                            "device_pci_bus_id": "0000:38:00.0",
-                            "device_ptr": 123456,
-                            "allocation_base_ptr": 122880,
-                            "allocation_offset": 576,
-                            "producer_pid": producer_pid,
-                        },
-                    },
-                )
-            )
-        for producer_pid in (42, 43):
-            loaded.append(
-                await _send_recv(
-                    str(tmp_path / "test.sock"),
-                    {
-                        "op": "transfer_load",
-                        "payload": {
-                            "load_staging_buffer_index": 1,
-                            "producer_pid": producer_pid,
-                            "nbytes": 128,
-                        },
-                        "spans": [
-                            {"target_offset": 0, "nbytes": 128, "file_offset": 0}
-                        ],
-                    },
-                )
-            )
-    finally:
-        await server.stop()
-
-    assert registered == [{"ok": True}, {"ok": True}]
-    assert [response["bytes"] for response in loaded] == [128, 128]
-    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"]
-    assert open_calls == 2 * [
-        {
-            "handle": b"h" * 64,
-            "nbytes": 1024,
-            "pci_bus_id": "0000:38:00.0",
-            "local_ptr": None,
-            "allocation_offset": 576,
-        }
-    ]
-    assert [opened.closed for opened in opened_buffers] == [1, 1]
-
-
-@pytest.mark.asyncio
-async def test_registered_store_staging_reuses_regions_until_shutdown(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Store mappings isolate workers, validate bounds, and outlive region IO."""
-
-    class FakeOpened:
-        def __init__(self, marker: int) -> None:
-            self.array = np.arange(256, dtype=np.uint8) ^ marker
-            self.closed = 0
-
-        def close(self) -> None:
-            self.closed += 1
-
-    opened: list[FakeOpened] = []
-    stored: list[tuple[int, bytes]] = []
-
-    def open_buffer(**kwargs: Any) -> FakeOpened:
-        assert kwargs["nbytes"] == 256
-        mapping = FakeOpened(len(opened))
-        opened.append(mapping)
-        return mapping
-
-    class FakeTransfer(TransferLayer):
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            assert all(mapping.closed == 0 for mapping in opened)
-            stored.append((file_offset, bytes(src[:nbytes])))
-            return nbytes
-
-        def close(self) -> None:
-            pass
-
-    transfer = FakeTransfer()
-    monkeypatch.setattr("daser.server.ipc.server.open_cuda_ipc_buffer", open_buffer)
-    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda self: transfer)
-    socket = str(tmp_path / "test.sock")
-    server = IPCServer(socket, make_core(), make_runtime_config(tmp_path))
-    await server.start()
-    try:
-        for producer_pid in (42, 43):
-            response = await _send_recv(
-                socket,
-                {
-                    "op": "register_store_staging",
-                    "payload": {
-                        "buffer_index": 0,
-                        "producer_pid": producer_pid,
-                        "cuda_ipc_handle": b"h" * 64,
-                        "allocation_bytes": 256,
-                        "device_pci_bus_id": "0000:38:00.0",
-                        "device_ptr": 4096,
-                        "allocation_base_ptr": 4096,
-                        "allocation_offset": 0,
-                    },
-                },
-            )
-            assert response == {"ok": True}
-        for producer_pid, offset, length in ((42, 192, 64), (43, 16, 32), (42, 0, 8)):
-            response = await _send_recv(
-                socket,
-                {
-                    "op": "transfer_store",
-                    "payload": {
-                        "store_staging_buffer_index": 0,
-                        "producer_pid": producer_pid,
-                    },
-                    "spans": [
-                        {"source_offset": offset, "nbytes": length, "file_offset": 4096}
-                    ],
-                },
-            )
-            assert response == {"ok": True, "bytes": length, "chunk_keys": []}
-        for producer_pid, offset, length in (
-            (42, -1, 1),
-            (42, 255, 2),
-            (42, 0, -1),
-            (44, 0, 1),
-        ):
-            response = await _send_recv(
-                socket,
-                {
-                    "op": "transfer_store",
-                    "payload": {
-                        "store_staging_buffer_index": 0,
-                        "producer_pid": producer_pid,
-                    },
-                    "spans": [
-                        {"source_offset": offset, "nbytes": length, "file_offset": 4096}
-                    ],
-                },
-            )
-            assert "error" in response
-        assert len(opened) == 2
-        assert [mapping.closed for mapping in opened] == [0, 0]
-        assert stored == [
-            (4096, bytes(opened[0].array[192:256])),
-            (4096, bytes(opened[1].array[16:48])),
-            (4096, bytes(opened[0].array[:8])),
-        ]
-    finally:
-        await server.stop()
-    assert [mapping.closed for mapping in opened] == [1, 1]
+    monkeypatch.setattr("daser.transfer.gds.GDSTransferLayer", Recorder)
+    gds_with_l1 = make_ipc_server(tmp_path / "a", transfer_mode="gds")
+    gds = make_ipc_server(tmp_path / "b", l1_records=0, transfer_mode="gds")
+    iouring_without_l1 = make_ipc_server(tmp_path / "c", l1_records=0)
+    with pytest.raises(ValueError, match="gds"):
+        await gds_with_l1.initialize_transfer()
+    with pytest.raises(ValueError, match="L1"):
+        await iouring_without_l1.initialize_transfer()
+    await gds.initialize_transfer()
+    await gds.close()
+    assert created == [(str(tmp_path / "b" / "daser.store"), {"l2_bytes": 64 * RECORD})]
 
 
 @pytest.mark.asyncio
 async def test_stop_accepting_closes_listener_before_transfer(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    events: list[str] = []
-
-    class FakeTransfer(TransferLayer):
-        def __init__(self, **_kwargs: Any) -> None:
-            events.append("ensure_transfer")
-
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        async def drain(self) -> None:
-            events.append("drain")
-
-        def close(self) -> None:
-            events.append("transfer_close")
-
+    fake = FakeTransfer()
     monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        FakeTransfer,
+        "daser.server.ipc.server.TieredIOUringTransferLayer", lambda *a, **k: fake
     )
-
-    core = make_core()
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    server = make_ipc_server(tmp_path)
     await server.start()
-
-    init = await _send_recv(socket_path, {"op": "init_transfer"})
-    assert init == {"ok": True}
-    assert events == ["ensure_transfer"]
-
+    assert await _send_recv(sock(tmp_path), {"op": "init_transfer"}) == {"ok": True}
     await server.stop_accepting()
-
-    assert not os.path.exists(socket_path)
-    assert events == ["ensure_transfer"]
-
+    assert not os.path.exists(sock(tmp_path))
+    assert fake.events == []
     await server.close()
-
-    assert events == ["ensure_transfer", "drain", "transfer_close"]
+    assert fake.events == ["drain", "close"]
 
 
 @pytest.mark.asyncio
 async def test_init_transfer_request_does_not_block_other_clients(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slow transfer initialization keeps serving other clients' requests."""
+    """A slow transfer initialization keeps serving other requests."""
     release = threading.Event()
 
-    class SlowTransfer(TransferLayer):
-        def __init__(self, **_kwargs: Any) -> None:
+    class SlowTransfer(FakeTransfer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             assert release.wait(timeout=10.0)
-
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        async def drain(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
+            super().__init__()
 
     monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        SlowTransfer,
+        "daser.server.ipc.server.TieredIOUringTransferLayer", SlowTransfer
     )
-
-    core = make_core()
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    server = make_ipc_server(tmp_path)
     await server.start()
     try:
         eager = asyncio.create_task(server.initialize_transfer())
         await asyncio.sleep(0.05)
-        init = asyncio.create_task(_send_recv(socket_path, {"op": "init_transfer"}))
+        init = asyncio.create_task(_send_recv(sock(tmp_path), {"op": "init_transfer"}))
         await asyncio.sleep(0.05)
-
         config = await asyncio.wait_for(
-            _send_recv(socket_path, {"op": "get_runtime_config"}), timeout=2.0
+            _send_recv(sock(tmp_path), {"op": "get_runtime_config"}), timeout=2.0
         )
         assert "error" not in config
         assert not init.done()
-
         release.set()
         assert await asyncio.wait_for(init, timeout=5.0) == {"ok": True}
         await asyncio.wait_for(eager, timeout=5.0)
@@ -2401,380 +1270,231 @@ async def test_init_transfer_request_does_not_block_other_clients(
 
 
 @pytest.mark.asyncio
-async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_eager_transfer_initialization_creates_one_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Eagerly initializing the transfer layer creates it before any request."""
-    init_events: list[str] = []
+    created: list[FakeTransfer] = []
 
-    class FakeTransfer(TransferLayer):
-        def __init__(self, **_kwargs: Any) -> None:
-            init_events.append("transfer_created")
+    def factory(*args: Any, **kwargs: Any) -> FakeTransfer:
+        created.append(FakeTransfer())
+        return created[-1]
 
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return nbytes
-
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return nbytes
-
-        async def drain(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        FakeTransfer,
-    )
-
-    core = make_core()
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    monkeypatch.setattr("daser.server.ipc.server.TieredIOUringTransferLayer", factory)
+    server = make_ipc_server(tmp_path)
     await server.start()
+    try:
+        await server.initialize_transfer()
+        reply = await load(sock(tmp_path), [])
+    finally:
+        await server.stop()
+    assert reply["ok"] is True
+    assert len(created) == 1
 
-    # Eagerly initialize — must create the transfer before any request
-    await server.initialize_transfer()
-    assert init_events == ["transfer_created"]
 
-    # First transfer_load must NOT trigger a second construction
-    load = await _send_recv(
-        socket_path,
-        {
-            "op": "transfer_load",
-            "payload": {"return_data": True},
-            "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
-        },
-    )
-    assert load["ok"] is True
-    assert init_events == ["transfer_created"]  # no second construction
-
-    await server.stop()
+# ----------------------------------------------------------------------
+# CUDA IPC payloads and registered staging buffers
+# ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_skip_l2_selects_iouring_transfer_without_store_path(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_cuda_ipc_load_payload_reuses_open_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """skip_l2 should wire IPC transfer ops to iouring with its L2 tier disabled."""
-    init_kwargs: list[dict[str, Any]] = []
+    opened: list[FakeOpened] = []
+    calls: list[dict[str, Any]] = []
 
-    class FakeTieredIOUringTransfer(TransferLayer):
-        coalesce_store_spans = True
+    def open_buffer(**kwargs: Any) -> FakeOpened:
+        calls.append(kwargs)
+        opened.append(FakeOpened(1024))
+        return opened[-1]
 
-        def __init__(self, **kwargs: Any) -> None:
-            init_kwargs.append(kwargs)
-
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            return await self.load_bytes_grouped(
-                dst,
-                [{"target_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
-            )
-
-        async def store_bytes(
-            self,
-            src: Any,
-            file_offset: int,
-            nbytes: int,
-            *,
-            accounted_nbytes: int | None = None,
-        ) -> int:
-            return await self.store_bytes_grouped(
-                src,
-                [{"source_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
-            )
-
-        async def store_bytes_grouped(
-            self,
-            src: Any,
-            spans: list[dict[str, Any]],
-        ) -> int:
-            total = 0
-            for span in spans:
-                source_offset = int(span.get("source_offset", 0))
-                nbytes = int(span["nbytes"])
-                assert int(span["file_offset"]) == 0
-                assert bytes(src[source_offset : source_offset + nbytes]) == (
-                    b"a" * nbytes
-                )
-                total += nbytes
-            return total
-
-        async def load_bytes_grouped(
-            self,
-            dst: Any,
-            spans: list[dict[str, Any]],
-        ) -> int:
-            total = 0
-            for span in spans:
-                target_offset = int(span.get("target_offset", 0))
-                nbytes = int(span["nbytes"])
-                assert int(span["file_offset"]) == 0
-                memoryview(dst).cast("B")[target_offset : target_offset + nbytes] = (
-                    b"a" * nbytes
-                )
-                total += nbytes
-            return total
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        FakeTieredIOUringTransfer,
-    )
-
-    runtime_config = make_runtime_config(tmp_path, skip_l2=True, store_path="")
-    core = make_core()
-    socket_path = str(tmp_path / "test.sock")
-    server = IPCServer(socket_path, core, runtime_config)
+    fake = FakeTransfer()
+    monkeypatch.setattr("daser.server.ipc.server.open_cuda_ipc_buffer", open_buffer)
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    server = make_ipc_server(tmp_path)
+    request = {
+        "op": "transfer_load",
+        "payload": {
+            "cuda_ipc_handle": b"h" * 64,
+            "nbytes": 1024,
+            "device_pci_bus_id": "0000:38:00.0",
+            "device_ptr": 123456,
+            "allocation_base_ptr": 122880,
+            "allocation_offset": 576,
+            "producer_pid": PRODUCER,
+        },
+        "spans": [],
+        "tp_rank": 0,
+    }
     await server.start()
     try:
-        store = await _send_recv(
-            socket_path,
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"a" * SLOT_SIZE},
-                "spans": [{"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
-            },
-        )
-        load = await _send_recv(
-            socket_path,
+        first = await _send_recv(sock(tmp_path), request)
+        second = await _send_recv(sock(tmp_path), request)
+    finally:
+        await server.stop()
+    assert first["ok"] is True and second["ok"] is True
+    assert first["transfer_stats_delta"]["l2_reads"] == 0
+    assert calls == [
+        {
+            "handle": b"h" * 64,
+            "nbytes": 1024,
+            "pci_bus_id": "0000:38:00.0",
+            "local_ptr": None,
+            "allocation_offset": 576,
+        }
+    ]
+    assert opened[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_load_staging_is_scoped_by_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Equal worker-local indexes resolve to each producer's mapping."""
+    opened: list[FakeOpened] = []
+
+    def open_buffer(**kwargs: Any) -> FakeOpened:
+        opened.append(FakeOpened(kwargs["nbytes"], marker=len(opened) + 1))
+        return opened[-1]
+
+    fake = FakeTransfer()
+    monkeypatch.setattr("daser.server.ipc.server.open_cuda_ipc_buffer", open_buffer)
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    core = make_core(64, 16)
+    server = make_ipc_server(tmp_path, core=core)
+    chunk = await alloc_and_store(core, "a")
+    await server.start()
+    try:
+        for producer in (42, 43):
+            assert await _send_recv(
+                sock(tmp_path),
+                {
+                    "op": "register_load_staging",
+                    "payload": staging_payload(1, RECORD, producer),
+                },
+            ) == {"ok": True}
+        replies = [
+            await _send_recv(
+                sock(tmp_path),
+                {
+                    "op": "transfer_load",
+                    "payload": {
+                        "load_staging_buffer_index": 1,
+                        "producer_pid": producer,
+                    },
+                    "spans": [load_span(chunk.start_slot)],
+                    "tp_rank": 0,
+                },
+            )
+            for producer in (42, 43)
+        ]
+        unknown = await _send_recv(
+            sock(tmp_path),
             {
                 "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+                "payload": {"load_staging_buffer_index": 1, "producer_pid": 44},
+                "spans": [load_span(chunk.start_slot)],
+                "tp_rank": 0,
             },
         )
     finally:
         await server.stop()
-
-    assert init_kwargs == [
-        {
-            "path": "",
-            "l1_bytes": 8192,
-            "l2_bytes": 8192,
-            "skip_l2": True,
-            "bip_enabled": False,
-            "l1_accounting": "stored",
-            "prefetch_lease_budget_bytes": 0,
-            "l2_read_stripe_bytes": 0,
-            "readahead_piece_bytes": DEFAULT_LOAD_READAHEAD_BYTES,
-            "readahead_window": 4,
-            "l2_write_gate": True,
-            "readahead_budget_fraction": 0.5,
-        }
+    assert [reply["bytes"] for reply in replies] == [RECORD, RECORD]
+    assert [(source, len(moves)) for _buf, moves, source in fake.loads] == [
+        ("l1", 1),
+        ("l1", 1),
     ]
-    assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
-    assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"a" * SLOT_SIZE}
+    assert [bytes(buf[0:1]) for buf, _moves, _source in fake.loads] == [
+        bytes(opened[0].array[0:1]),
+        bytes(opened[1].array[0:1]),
+    ]
+    assert "error" in unknown
+    assert [mapping.closed for mapping in opened] == [1, 1]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bip_enabled", [False, True])
-async def test_bip_setting_is_forwarded(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-    bip_enabled: bool,
+async def test_registered_store_staging_reuses_regions_until_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """IPC forwards the BIP runtime setting to the transfer layer."""
-    init_kwargs: list[dict[str, Any]] = []
+    """Store mappings isolate workers, validate bounds and outlive the IO."""
+    opened: list[FakeOpened] = []
 
-    class FakeTransfer:
-        def __init__(self, **kwargs: Any) -> None:
-            init_kwargs.append(kwargs)
+    def open_buffer(**kwargs: Any) -> FakeOpened:
+        opened.append(FakeOpened(kwargs["nbytes"], marker=len(opened)))
+        return opened[-1]
 
-        async def drain(self) -> None:
-            pass
+    fake = FakeTransfer()
+    monkeypatch.setattr("daser.server.ipc.server.open_cuda_ipc_buffer", open_buffer)
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    server = make_ipc_server(tmp_path)
+    socket_path = sock(tmp_path)
+
+    def staged_store(key: str, start: int, producer: int, offset: int) -> dict:
+        return {
+            "op": "transfer_store",
+            "payload": {"store_staging_buffer_index": 0, "producer_pid": producer},
+            "spans": [raw_span(key, start, source_offset=offset)],
+            "tp_rank": 0,
+            "tp_size": 1,
+        }
+
+    await server.start()
+    try:
+        for producer in (42, 43):
+            assert await _send_recv(
+                socket_path,
+                {
+                    "op": "register_store_staging",
+                    "payload": staging_payload(0, 2 * RECORD, producer),
+                },
+            ) == {"ok": True}
+        starts = [(await alloc(socket_path, key))["start_slot"] for key in "abc"]
+        good = [
+            await _send_recv(socket_path, staged_store("a", starts[0], 42, RECORD)),
+            await _send_recv(socket_path, staged_store("b", starts[1], 43, 0)),
+        ]
+        bad = [
+            await _send_recv(socket_path, staged_store("c", starts[2], 42, RECORD + 1)),
+            await _send_recv(socket_path, staged_store("c", starts[2], 44, 0)),
+        ]
+    finally:
+        await server.stop()
+    assert [reply["chunk_keys"] for reply in good] == [["a"], ["b"]]
+    assert all("error" in reply for reply in bad)
+    assert [data for _move, data in fake.stored] == [
+        bytes(opened[0].array[RECORD : 2 * RECORD]),
+        bytes(opened[1].array[:RECORD]),
+    ]
+    assert [mapping.closed for mapping in opened] == [1, 1]
+
+
+def test_cached_cuda_array_uses_private_copy_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load mappings copy on a private stream, not the default stream."""
+    # CPU CI installs an import-only cupy stub without the CUDA namespace.
+    pytest.importorskip("cupy.cuda")
+    import cupy
+
+    class FakeArray:
+        data = type("Data", (), {"ptr": 123})()
+        device = type("Device", (), {"id": 0})()
+
+    class Opened:
+        array = FakeArray()
 
         def close(self) -> None:
             pass
 
-        def hold_resident(self, file_offset: int, nbytes: int) -> bool:
-            return False
+    class DeviceContext:
+        def __enter__(self) -> "DeviceContext":
+            return self
 
-        def discard_held(self, file_offset: int, nbytes: int) -> None:
-            pass
-
-        def release_hold(self, file_offset: int, nbytes: int) -> None:
-            pass
-
-        def set_held_release_listener(self, listener: Any) -> None:
-            pass
+        def __exit__(self, *_args: Any) -> None:
+            return None
 
     monkeypatch.setattr(
-        "daser.server.ipc.server.TieredIOUringTransferLayer",
-        FakeTransfer,
+        cupy.cuda, "Stream", lambda **_kwargs: type("S", (), {"ptr": 456})()
     )
-
-    runtime_config = make_runtime_config(tmp_path)
-    runtime_config["storage_format"] = "compressed-online"
-    runtime_config["bip_enabled"] = bip_enabled
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        make_core(),
-        runtime_config,
-    )
-    await server.initialize_transfer()
-    await server.close()
-
-    assert init_kwargs == [
-        {
-            "path": str(tmp_path / "daser.store"),
-            "l1_bytes": 8192,
-            "l2_bytes": 8192,
-            "skip_l2": False,
-            "bip_enabled": bip_enabled,
-            "l1_accounting": "stored",
-            "prefetch_lease_budget_bytes": 0,
-            "l2_read_stripe_bytes": 0,
-            "readahead_piece_bytes": DEFAULT_LOAD_READAHEAD_BYTES,
-            "readahead_window": 4,
-            "l2_write_gate": True,
-            "readahead_budget_fraction": 0.5,
-        }
-    ]
-
-
-class _RunsTransfer(TransferLayer):
-    """Transfer double recording leased run tables."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[Any, list[int], list[int], list[int], str, str]] = []
-
-    async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
-        return nbytes
-
-    async def store_bytes(
-        self,
-        _src: Any,
-        _file_offset: int,
-        nbytes: int,
-        *,
-        accounted_nbytes: int | None = None,
-    ) -> int:
-        return nbytes
-
-    async def load_leased_runs(
-        self,
-        dst: Any,
-        file_offsets: Any,
-        target_offsets: Any,
-        nbytes: Any,
-        lease_id: str,
-    ) -> int:
-        self.calls.append(
-            (
-                dst,
-                list(file_offsets),
-                list(target_offsets),
-                list(nbytes),
-                lease_id,
-            )
-        )
-        return int(sum(nbytes))
-
-    def close(self) -> None:
-        pass
-
-
-@pytest.mark.asyncio
-async def test_transfer_load_runs_decodes_run_table_into_registered_buffer(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One packed (3, n) table becomes one leased-runs copy into the buffer."""
-    server = IPCServer(
-        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
-    )
-    transfer = _RunsTransfer()
-    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
-    buffers = {(7, 1): "staging-1"}
-    monkeypatch.setattr(
-        server,
-        "_payload_buffer",
-        lambda payload: buffers[
-            (payload["producer_pid"], payload["load_staging_buffer_index"])
-        ],
-    )
-    runs = np.array([[4096, 90112], [0, 8192], [512, 1024]], dtype=np.int64)
-
-    response = await server._transfer_load_runs(  # noqa: SLF001
-        {
-            "payload": {"load_staging_buffer_index": 1, "producer_pid": 7},
-            "lease_id": "req",
-            "runs": runs.tobytes(),
-        }
-    )
-
-    assert response["ok"] is True
-    assert response["bytes"] == 1536
-    assert transfer.calls == [
-        ("staging-1", [4096, 90112], [0, 8192], [512, 1024], "req"),
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "msg",
-    [
-        {"lease_id": "req", "runs": b"\0" * 24},
-        {"payload": {"load_staging_buffer_index": 0}, "runs": b"\0" * 24},
-        {"payload": {"load_staging_buffer_index": 0}, "lease_id": "req"},
-        {
-            "payload": {"load_staging_buffer_index": 0},
-            "lease_id": "req",
-            "runs": b"\0" * 20,
-        },
-    ],
-)
-async def test_transfer_load_runs_rejects_malformed_requests(
-    tmp_path, msg: dict[str, Any]
-) -> None:
-    """Missing buffers, leases or a non-(3, n) table fail before copying."""
-    server = IPCServer(
-        str(tmp_path / "test.sock"), make_core(), make_runtime_config(tmp_path)
-    )
-    transfer = _RunsTransfer()
-    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
-
-    with pytest.raises(ValueError):
-        await server._transfer_load_runs(msg)  # noqa: SLF001
-    assert transfer.calls == []
-
-
-class _ReadaheadRecordingTransfer(TransferLayer):
-    """Transfer stub that records readahead spans instead of reading."""
-
-    readaheads: list[list[dict[str, int]]] = []
-
-    def __init__(self, **kwargs: Any) -> None:
-        del kwargs
-
-    async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-        raise AssertionError("readahead hints must not load")
-
-    async def store_bytes(
-        self,
-        src: Any,
-        file_offset: int,
-        nbytes: int,
-        *,
-        accounted_nbytes: int | None = None,
-    ) -> int:
-        raise AssertionError("readahead hints must not store")
-
-    async def start_readahead(self, spans: list[dict[str, int]]) -> bool:
-        type(self).readaheads.append(spans)
-        return True
-
-    def close(self) -> None:
-        pass
+    monkeypatch.setattr(cupy.cuda, "Device", lambda _device: DeviceContext())
+    assert _CachedCudaArray(Opened()).copy_stream_ptr == 456

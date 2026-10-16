@@ -97,7 +97,6 @@ def test_preemption_without_forward_releases_store_without_completing_request(
         server_tp_size=1,
         slot_size=4096,
         store_path="",
-        rank_stride_bytes=4096,
         rope_base=10000.0,
         rope_rotary_dim=0,
         rope_is_neox_style=True,

@@ -8,7 +8,6 @@ import time
 from types import SimpleNamespace
 
 # Third Party
-import cupy
 import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -156,24 +155,23 @@ def test_scheduler_pipelines_l1_hit_past_bounded_l2_prefetch(monkeypatch) -> Non
                         "chunk_key": f"cached-{index}",
                         "start_slot": index * 2,
                         "num_slots": 2,
-                        "file_offset": index * 64,
                         "token_count": 8,
                         "target_token_start": 0,
                         "pos_offset": 0,
                     }
                 ],
-                spans=[{"file_offset": index * 64, "nbytes": 64}],
+                spans=[{"start_slot": index * 2, "num_slots": 2, "nbytes": 64}],
                 tier=tier,
             )
 
         def release_transfer_lease(self, lease_id: str) -> None:
             self.released.append(lease_id)
 
-    prefetch_calls: list[tuple[str, str, list[dict[str, int]]]] = []
+    prefetch_calls: list[tuple[str, str]] = []
     release_prefetch = threading.Event()
 
-    def fake_prefetch(socket_path, lease_id, spans):
-        prefetch_calls.append((socket_path, lease_id, spans))
+    def fake_prefetch(socket_path, lease_id):
+        prefetch_calls.append((socket_path, lease_id))
         release_prefetch.wait(timeout=5.0)
         return {"requested_bytes": 64, "l1_bytes": 0, "l2_bytes": 64}
 
@@ -248,24 +246,29 @@ def test_scheduler_relooks_up_when_local_prefix_moves_after_prefetch(
                         "chunk_key": "cached",
                         "start_slot": 0,
                         "num_slots": 2,
-                        "file_offset": 0,
                         "token_count": 8,
                         "target_token_start": 0,
                         "pos_offset": 0,
                     }
                 ],
-                spans=[{"file_offset": start * 8, "nbytes": (8 - start) * 8}],
+                spans=[
+                    {
+                        "start_slot": start // 4,
+                        "num_slots": 2 - start // 4,
+                        "nbytes": (8 - start) * 8,
+                    }
+                ],
                 tier="l2",
             )
 
         def release_transfer_lease(self, lease_id: str) -> None:
             self.released.append(lease_id)
 
-    prefetched: list[list[dict[str, int]]] = []
+    prefetched: list[str] = []
 
-    def fake_prefetch(socket_path, lease_id, spans):
-        del socket_path, lease_id
-        prefetched.append(spans)
+    def fake_prefetch(socket_path, lease_id):
+        del socket_path
+        prefetched.append(lease_id)
         return {"requested_bytes": 64, "l1_bytes": 0, "l2_bytes": 64}
 
     monkeypatch.setattr(
@@ -304,7 +307,9 @@ def test_scheduler_relooks_up_when_local_prefix_moves_after_prefetch(
         deadline = time.monotonic() + 1.0
         while len(prefetched) < 2 and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert prefetched[-1] == [{"file_offset": 0, "nbytes": 64}]
+        # The re-lookup's window (slots 0-1) changed the signature, so the
+        # new lease is prefetched again.
+        assert prefetched == ["req", "req"]
     finally:
         lifecycle.shutdown()
 
@@ -358,7 +363,6 @@ class _AllocatingSchedulerProbe(RequestLifecycle):
         self.alloc_calls.append((chunk_key, token_count, model_id))
         return {
             "start_slot": 5,
-            "file_offset": 160,
             "pos_offset": 0,
         }
 
@@ -369,7 +373,6 @@ class _AllocatingSchedulerProbe(RequestLifecycle):
             {
                 "chunk_key": str(chunk["chunk_key"]),
                 "start_slot": 20 + idx,
-                "file_offset": (20 + idx) * self._slot_size,
                 "pos_offset": 0,
             }
             for idx, chunk in enumerate(chunks)
@@ -426,7 +429,6 @@ class _AllocatingSchedulerProbe(RequestLifecycle):
             "start_slot": spec.start_slot,
             "num_slots": spec.num_slots,
             "block_ids": spec.block_ids,
-            "file_offset": spec.file_offset,
             "token_count": spec.token_count,
         }
 
@@ -485,8 +487,8 @@ class _AllocChunkOnlyIPC:
 
 def test_dataclasses_instantiate():
     """DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec all instantiate cleanly."""
-    spec_load = ReqLoadSpec("k", 0, 1, [0], 0, 16, 0, 0)
-    spec_store = ReqStoreSpec("k", 0, 1, [0], 0, 16)
+    spec_load = ReqLoadSpec("k", 0, 1, [0], 16, 0, 0)
+    spec_store = ReqStoreSpec("k", 0, 1, [0], 16)
     meta = DaserConnectorMeta(
         reqs_to_load={"r": spec_load}, reqs_to_store={"r2": spec_store}
     )
@@ -633,7 +635,6 @@ def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     connector._tp_size = 1  # noqa: SLF001
     connector._server_tp_size = 1  # noqa: SLF001
     connector._tp_rank = 0  # noqa: SLF001
-    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "iouring"  # noqa: SLF001
     connector._skip_l2 = True  # noqa: SLF001
     connector._refresh_runtime_config = lambda: None  # noqa: SLF001
@@ -668,7 +669,6 @@ def test_worker_transfer_ready_names_a_layer_count_mismatch() -> None:
     connector._tp_size = 1  # noqa: SLF001
     connector._server_tp_size = 1  # noqa: SLF001
     connector._tp_rank = 0  # noqa: SLF001
-    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "iouring"  # noqa: SLF001
     connector._skip_l2 = False  # noqa: SLF001
     connector._refresh_runtime_config = lambda: None  # noqa: SLF001
@@ -705,22 +705,20 @@ def test_worker_transfer_ready_propagates_refreshed_tp_geometry() -> None:
     connector._tp_size = 2  # noqa: SLF001
     connector._server_tp_size = 1  # noqa: SLF001
     connector._tp_rank = 1  # noqa: SLF001
-    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "iouring"  # noqa: SLF001
     connector._skip_l2 = True  # noqa: SLF001
 
     def refresh() -> None:
         connector._slot_size = 1024  # noqa: SLF001
         connector._server_tp_size = 2  # noqa: SLF001
-        connector._rank_stride_bytes = 8192  # noqa: SLF001
 
     connector._refresh_runtime_config = refresh  # noqa: SLF001
     connector._load_pipeline = Pipeline()  # noqa: SLF001
     connector._store_pipeline = Pipeline()  # noqa: SLF001
 
     assert connector._ensure_transfer_ready() is True  # noqa: SLF001
-    assert connector._load_pipeline.geometry == (8192, 1)  # noqa: SLF001
-    assert connector._store_pipeline.geometry == (8192, 1, 2)  # noqa: SLF001
+    assert connector._load_pipeline.geometry == (1,)  # noqa: SLF001
+    assert connector._store_pipeline.geometry == (1, 2)  # noqa: SLF001
     assert connector._load_pipeline.initialized is True  # noqa: SLF001
     assert connector._store_pipeline.initialized is True  # noqa: SLF001
 
@@ -765,7 +763,6 @@ def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
                 "store_path": "",
                 "slot_size": 1024,
                 "tensor_parallel_size": 2,
-                "rank_stride_bytes": 512,
                 "transfer_mode": "iouring",
                 "skip_l2": True,
             }
@@ -782,7 +779,6 @@ def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
     connector._store_path = ""  # noqa: SLF001
     connector._slot_size = 0  # noqa: SLF001
     connector._server_tp_size = 1  # noqa: SLF001
-    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "gds"  # noqa: SLF001
     connector._skip_l2 = False  # noqa: SLF001
 
@@ -790,7 +786,6 @@ def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
 
     assert connector._slot_size == 1024  # noqa: SLF001
     assert connector._server_tp_size == 2  # noqa: SLF001
-    assert connector._rank_stride_bytes == 512  # noqa: SLF001
     assert connector._transfer_mode == "iouring"  # noqa: SLF001
     assert connector._skip_l2 is True  # noqa: SLF001
 
@@ -1062,7 +1057,6 @@ def test_scheduler_still_loads_from_daser_when_vllm_prefix_cache_is_enabled():
                     "chunk_key": "hit",
                     "start_slot": 0,
                     "num_slots": 2,
-                    "file_offset": 0,
                     "token_count": 32,
                     "target_token_start": 0,
                     "pos_offset": 0,
@@ -1099,7 +1093,6 @@ def test_scheduler_reports_async_load_without_vllm_prefix_cache():
                     "chunk_key": "hit",
                     "start_slot": 0,
                     "num_slots": 2,
-                    "file_offset": 0,
                     "token_count": 32,
                     "target_token_start": 0,
                     "pos_offset": 0,
@@ -1185,7 +1178,6 @@ def test_trim_chunk_to_external_window_skips_local_prefix_slots():
         "chunk_key": "k0",
         "start_slot": 100,
         "num_slots": 4,
-        "file_offset": 3200,
         "token_count": 16,
         "target_token_start": 0,
     }
@@ -1196,12 +1188,10 @@ def test_trim_chunk_to_external_window_skips_local_prefix_slots():
         external_start=4,
         num_external_tokens=8,
         block_tokens=4,
-        slot_size=32,
     )
 
     assert ok
     assert chunk["start_slot"] == 101
-    assert chunk["file_offset"] == 3232
     assert chunk["num_slots"] == 2
     assert chunk["token_count"] == 8
     assert chunk["target_token_start"] == 4
@@ -1214,7 +1204,6 @@ def test_trim_chunk_to_external_window_trims_compressed_slots():
         {
             "slot_id": 100 + index,
             "mode": "compressed",
-            "file_offset": 4096 * (7 + index),
             "stored_length": 1000 + index,
         }
         for index in range(4)
@@ -1223,7 +1212,6 @@ def test_trim_chunk_to_external_window_trims_compressed_slots():
         "chunk_key": "k0",
         "start_slot": 100,
         "num_slots": 4,
-        "file_offset": 3200,
         "token_count": 16,
         "target_token_start": 0,
         "compressed_slots": compressed_slots,
@@ -1235,12 +1223,10 @@ def test_trim_chunk_to_external_window_trims_compressed_slots():
         external_start=4,
         num_external_tokens=8,
         block_tokens=4,
-        slot_size=32,
     )
 
     assert ok
     assert chunk["compressed_slots"] == compressed_slots[1:3]
-    assert chunk["file_offset"] == compressed_slots[1]["file_offset"]
     spec = _load_spec_from_chunk(chunk)
     assert len(spec.compressed_slots) == len(spec.block_ids) == 2
 
@@ -1257,7 +1243,6 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
                     "chunk_key": "k0",
                     "start_slot": 100,
                     "num_slots": 4,
-                    "file_offset": 3200,
                     "token_count": 16,
                     "target_token_start": 0,
                     "num_computed_tokens": 4,
@@ -1290,7 +1275,6 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
 
     chunk = connector.pending_loads["req"]
     assert chunk["start_slot"] == 101
-    assert chunk["file_offset"] == 3232
     assert chunk["num_slots"] == 2
     assert chunk["block_ids"] == [11, 12]
 
@@ -1323,7 +1307,6 @@ def test_lookup_sends_external_prefix_query_metric_hint():
                     "chunk_key": "k0",
                     "start_slot": 100,
                     "num_slots": 3,
-                    "file_offset": 3200,
                     "token_count": 12,
                     "target_token_start": 0,
                     "pos_offset": 0,
@@ -1342,7 +1325,6 @@ def test_lookup_sends_external_prefix_query_metric_hint():
                     "chunk_key": "k0",
                     "start_slot": 100,
                     "num_slots": 3,
-                    "file_offset": 3200,
                     "token_count": 12,
                     "target_token_start": 0,
                     "num_computed_tokens": 4,
@@ -1381,7 +1363,6 @@ def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window(
                         "chunk_key": "a",
                         "start_slot": 100,
                         "num_slots": 2,
-                        "file_offset": 3200,
                         "token_count": 8,
                         "target_token_start": 0,
                         "num_computed_tokens": 4,
@@ -1390,7 +1371,6 @@ def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window(
                         "chunk_key": "b",
                         "start_slot": 200,
                         "num_slots": 2,
-                        "file_offset": 6400,
                         "token_count": 8,
                         "target_token_start": 8,
                         "num_computed_tokens": 4,
@@ -1451,7 +1431,6 @@ def test_single_non_prefix_chunk_does_not_credit_missing_prefix():
                     "chunk_key": "doc",
                     "start_slot": 5,
                     "num_slots": 1,
-                    "file_offset": 160,
                     "token_count": 4,
                     "target_token_start": 4,
                     "pos_offset": 4,
@@ -1889,7 +1868,6 @@ class _RegistrationProbe(WorkerRuntime):
         self._tp_size = 1
         self._server_tp_size = 1
         self._tp_rank = 0
-        self._rank_stride_bytes = 0
         self._rope_rotary_dim = 8
         self._rope_base = 10000.0
         self._rope_is_neox_style = True
@@ -1957,7 +1935,6 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
                         "chunk_key": "a",
                         "start_slot": 0,
                         "num_slots": 1,
-                        "file_offset": 0,
                         "token_count": 4,
                         "target_token_start": 0,
                     },
@@ -1965,7 +1942,6 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
                         "chunk_key": "b",
                         "start_slot": 1,
                         "num_slots": 1,
-                        "file_offset": 32,
                         "token_count": 4,
                         "target_token_start": 4,
                     },
@@ -1973,7 +1949,6 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
                         "chunk_key": "c",
                         "start_slot": 2,
                         "num_slots": 1,
-                        "file_offset": 64,
                         "token_count": 4,
                         "target_token_start": 8,
                     },
@@ -2041,7 +2016,6 @@ def test_chunk_store_allocation_skips_committed_duplicate() -> None:
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": 5,
-                "file_offset": 160,
                 "pos_offset": 0,
                 "skipped": True,
             }
@@ -2075,7 +2049,6 @@ def test_prefix_mode_stores_computed_blocks_as_individual_slots():
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": slot,
-                "file_offset": slot * self._slot_size,
                 "pos_offset": 0,
             }
 
@@ -2119,14 +2092,13 @@ def test_prefix_mode_allocates_contiguous_slots_in_one_batch():
         (
             pending_stores[f"req:store:{slot_i}"]["chunk_key"],
             pending_stores[f"req:store:{slot_i}"]["start_slot"],
-            pending_stores[f"req:store:{slot_i}"]["file_offset"],
             pending_stores[f"req:store:{slot_i}"]["block_ids"],
         )
         for slot_i in range(3)
     ] == [
-        (keys[0], 20, 20 * BLOCK_TOKENS * 8, [10]),
-        (keys[1], 21, 21 * BLOCK_TOKENS * 8, [11]),
-        (keys[2], 22, 22 * BLOCK_TOKENS * 8, [12]),
+        (keys[0], 20, [10]),
+        (keys[1], 21, [11]),
+        (keys[2], 22, [12]),
     ]
 
 
@@ -2146,7 +2118,6 @@ def test_prefix_mode_allocates_slots_incrementally_before_full_prompt_ready():
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": slot,
-                "file_offset": slot * self._slot_size,
                 "pos_offset": 0,
             }
 
@@ -2233,7 +2204,6 @@ def test_request_finished_keeps_request_until_store_finishes() -> None:
             start_slot=0,
             num_slots=2,
             block_ids=[10, 11],
-            file_offset=0,
             token_count=8,
         ),
     )
@@ -2264,7 +2234,6 @@ def test_request_finished_keeps_prefix_store_request_until_store_finishes() -> N
             start_slot=0,
             num_slots=1,
             block_ids=[10],
-            file_offset=0,
             token_count=4,
         ),
     )
@@ -2275,7 +2244,6 @@ def test_request_finished_keeps_prefix_store_request_until_store_finishes() -> N
             start_slot=1,
             num_slots=1,
             block_ids=[11],
-            file_offset=32,
             token_count=4,
         ),
     )
@@ -2310,7 +2278,6 @@ def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": 20 + slot,
-                "file_offset": (20 + slot) * self._slot_size,
                 "pos_offset": 0,
                 "skipped": slot == 0,
             }
@@ -2344,7 +2311,6 @@ def test_prefix_store_batch_allocation_skips_committed_duplicate_slot() -> None:
                 {
                     "chunk_key": str(chunk["chunk_key"]),
                     "start_slot": 20 + idx,
-                    "file_offset": (20 + idx) * self._slot_size,
                     "pos_offset": 0,
                     "skipped": idx == 0,
                 }
@@ -2372,12 +2338,8 @@ def test_prefix_mode_builds_one_store_spec_per_slot():
     connector = _AllocatingSchedulerProbe()
     connector.use_prefix_reuse_strategy()
     specs = {
-        "req:store:0": ReqStoreSpec(
-            "live-a", 20, 1, [10], 640, 4, logical_slot_start=0
-        ),
-        "req:store:1": ReqStoreSpec(
-            "live-b", 21, 1, [11], 672, 4, logical_slot_start=1
-        ),
+        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 4, logical_slot_start=0),
+        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 4, logical_slot_start=1),
     }
     for req_id, spec in specs.items():
         connector.seed_pending_store_spec(req_id, spec)
@@ -2403,7 +2365,6 @@ def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
                 "start_slot": 20,
                 "num_slots": 1,
                 "block_ids": [10],
-                "file_offset": 640,
                 "token_count": BLOCK_TOKENS,
                 "target_token_start": 0,
                 "pos_offset": 0,
@@ -2413,7 +2374,6 @@ def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
                 "start_slot": 21,
                 "num_slots": 1,
                 "block_ids": [11],
-                "file_offset": 672,
                 "token_count": BLOCK_TOKENS,
                 "target_token_start": BLOCK_TOKENS,
                 "pos_offset": 0,
@@ -2423,7 +2383,6 @@ def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
                 "start_slot": 22,
                 "num_slots": 1,
                 "block_ids": [12],
-                "file_offset": 704,
                 "token_count": BLOCK_TOKENS,
                 "target_token_start": 2 * BLOCK_TOKENS,
                 "pos_offset": 0,
@@ -2444,7 +2403,6 @@ def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
         start_slot=20,
         num_slots=3,
         block_ids=[10, 11, 12],
-        file_offset=640,
         token_count=12,
         target_token_start=0,
         pos_offset=0,
@@ -2462,7 +2420,6 @@ def test_prefix_mode_uses_base_request_load_ids_for_split_load_specs() -> None:
                 "start_slot": 20,
                 "num_slots": 1,
                 "block_ids": [10],
-                "file_offset": 640,
                 "token_count": BLOCK_TOKENS,
                 "target_token_start": 0,
                 "pos_offset": 0,
@@ -2472,7 +2429,6 @@ def test_prefix_mode_uses_base_request_load_ids_for_split_load_specs() -> None:
                 "start_slot": 22,
                 "num_slots": 1,
                 "block_ids": [12],
-                "file_offset": 704,
                 "token_count": BLOCK_TOKENS,
                 "target_token_start": 2 * BLOCK_TOKENS,
                 "pos_offset": 0,
@@ -2499,7 +2455,6 @@ def test_build_connector_meta_includes_waiting_async_loads() -> None:
             "start_slot": 20,
             "num_slots": 1,
             "block_ids": [10],
-            "file_offset": 640,
             "token_count": BLOCK_TOKENS,
             "target_token_start": 0,
             "pos_offset": 0,
@@ -2524,9 +2479,9 @@ def test_prefix_mode_defers_uncomputed_slot_store_specs():
     connector = _AllocatingSchedulerProbe()
     connector.use_prefix_reuse_strategy()
     specs = {
-        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 640, 4),
-        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 672, 4),
-        "req:store:2": ReqStoreSpec("live-c", 22, 1, [12], 704, 4),
+        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 4),
+        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 4),
+        "req:store:2": ReqStoreSpec("live-c", 22, 1, [12], 4),
     }
     for req_id, spec in specs.items():
         connector.seed_pending_store_spec(req_id, spec)
@@ -2563,11 +2518,11 @@ def test_build_connector_meta_drops_preempted_pending_store_state():
     )
     connector.seed_pending_store_spec(
         "req",
-        ReqStoreSpec("live-whole", 20, 1, [10], 640, 4),
+        ReqStoreSpec("live-whole", 20, 1, [10], 4),
     )
     connector.seed_pending_store_spec(
         "req:store:0",
-        ReqStoreSpec("live-slot", 21, 1, [10], 672, 4),
+        ReqStoreSpec("live-slot", 21, 1, [10], 4),
     )
 
     class Output:
@@ -2587,7 +2542,7 @@ def test_build_connector_meta_releases_preempted_pending_store_writer():
     connector = _AllocatingSchedulerProbe()
     connector.seed_pending_store_spec(
         "req",
-        ReqStoreSpec("k0", 10, 2, [4, 5], 320, 8),
+        ReqStoreSpec("k0", 10, 2, [4, 5], 8),
     )
 
     class Output:
@@ -2605,7 +2560,7 @@ def test_published_store_preemption_is_forwarded_before_scheduler_hold_drops() -
     """Published worker specs need explicit cancellation after scheduler removal."""
     connector = _AllocatingSchedulerProbe()
     connector.use_prefix_reuse_strategy()
-    spec = ReqStoreSpec("live-slot", 21, 1, [10], 672, 4)
+    spec = ReqStoreSpec("live-slot", 21, 1, [10], 4)
     connector.seed_pending_store_spec("req:store:0", spec)
 
     class Output:
@@ -2637,7 +2592,6 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
                     "chunk_key": "hit-0",
                     "start_slot": 100,
                     "num_slots": 1,
-                    "file_offset": 3200,
                     "token_count": 4,
                     "target_token_start": 0,
                     "pos_offset": 0,
@@ -2692,7 +2646,6 @@ def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
                     "chunk_key": "hit-0",
                     "start_slot": 100,
                     "num_slots": 1,
-                    "file_offset": 3200,
                     "token_count": BLOCK_TOKENS,
                     "target_token_start": 0,
                     "num_computed_tokens": 0,
@@ -2706,7 +2659,6 @@ def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
             self.alloc_calls.append((chunk_key, token_count, model_id))
             return {
                 "start_slot": slot,
-                "file_offset": slot * self._slot_size,
                 "pos_offset": 0,
             }
 
@@ -2759,7 +2711,6 @@ def test_finished_recving_keeps_pending_suffix_stores() -> None:
             start_slot=1,
             num_slots=1,
             block_ids=[11],
-            file_offset=32,
             token_count=8,
         ),
     )
@@ -2767,7 +2718,6 @@ def test_finished_recving_keeps_pending_suffix_stores() -> None:
         "chunk_key": "hit",
         "start_slot": 0,
         "num_slots": 1,
-        "file_offset": 0,
         "token_count": 4,
     }
 
@@ -2866,8 +2816,8 @@ def test_filter_live_store_specs_drops_stale_allocations():
     """Scheduler drops store specs whose server allocation was already reused."""
     connector = _AllocatingSchedulerProbe()
     specs = {
-        "a": ReqStoreSpec("live-key", 0, 1, [1], 0, 4),
-        "b": ReqStoreSpec("stale-key", 1, 1, [2], 32, 4),
+        "a": ReqStoreSpec("live-key", 0, 1, [1], 4),
+        "b": ReqStoreSpec("stale-key", 1, 1, [2], 4),
     }
     for req_id, spec in specs.items():
         connector.seed_pending_store_spec(req_id, spec)
@@ -2887,7 +2837,7 @@ def test_stale_filtered_store_does_not_hold_finished_request() -> None:
     connector.seed_tokens("req", [1] * 4)
     connector.seed_pending_store_spec(
         "req",
-        ReqStoreSpec("stale-key", 0, 1, [10], 0, 4),
+        ReqStoreSpec("stale-key", 0, 1, [10], 4),
     )
 
     class Output:
@@ -3200,8 +3150,8 @@ def test_copy_staging_to_cross_layer_kv_cache_raises_failed_fused_restore(
 def test_build_staging_store_batches_caps_gpu_staging_bytes():
     """Store batches preserve chunk metadata while bounding staging size."""
     reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 3, [5, 1, 7], 320, 12),
-        "r1": ReqStoreSpec("k1", 20, 1, [8], 640, 4),
+        "r0": ReqStoreSpec("k0", 10, 3, [5, 1, 7], 12),
+        "r1": ReqStoreSpec("k1", 20, 1, [8], 4),
     }
 
     batches = _build_staging_store_batches(
@@ -3217,7 +3167,7 @@ def test_build_staging_store_batches_caps_gpu_staging_bytes():
                 span.chunk_key,
                 span.source_offset,
                 span.nbytes,
-                span.file_offset,
+                span.slot_index,
                 span.start_slot,
                 span.num_slots,
             )
@@ -3225,26 +3175,8 @@ def test_build_staging_store_batches_caps_gpu_staging_bytes():
         ]
         for _, spans in batches
     ] == [
-        [("k0", 0, 64, 320, 10, 3)],
-        [("k0", 0, 32, 384, 10, 3), ("k1", 32, 32, 640, 20, 1)],
-    ]
-
-
-def test_build_staging_store_batches_uses_spec_file_offset():
-    """Store spans honor server-provided file offsets instead of recomputing."""
-    reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 2, [5, 6], 2048, 8),
-    }
-
-    batches = _build_staging_store_batches(
-        reqs_to_store=reqs_to_store,
-        slot_size=32,
-        max_batch_bytes=32,
-    )
-
-    assert [[span.file_offset for span in spans] for _block_ids, spans in batches] == [
-        [2048],
-        [2080],
+        [("k0", 0, 64, 0, 10, 3)],
+        [("k0", 0, 32, 2, 10, 3), ("k1", 32, 32, 0, 20, 1)],
     ]
 
 
@@ -3279,7 +3211,7 @@ async def test_store_cuda_export_selects_staged_buffer_device(
     )
     staged = StagedStoreBatch(
         buffer=buffer,
-        spans=[StoreWriteSpan(0, 12, 0, packed=True)],
+        spans=[StoreWriteSpan(0, 12, 0, "k0", 3, 1, packed=True)],
         lease=SimpleNamespace(tensor=SimpleNamespace(data_ptr=lambda: 4096)),
     )
     cupy_buffer = object()
@@ -3303,33 +3235,20 @@ async def test_store_cuda_export_selects_staged_buffer_device(
     if registered:
         assert transferred[0]["buffer_index"] == 0
         assert transferred[0]["spans"][0]["source_offset"] == 0
-        assert transferred[0]["spans"][0]["file_offset"] == 0
+        assert transferred[0]["spans"][0]["slot_index"] == 0
+        assert transferred[0]["spans"][0]["start_slot"] == 3
     else:
         assert transferred[0]["device_pci_bus_id"] == "0000:3C:00.0"
         assert transferred[0]["nbytes"] == 12
 
 
-def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
-    """Each TP rank maps a logical slot run into its own contiguous lane."""
-    local_slot_size = 32
-    rank_stride = 10 * local_slot_size
-    start_slot = 3
-
-    rank_0 = start_slot * local_slot_size
-    rank_1 = rank_stride + start_slot * local_slot_size
-
-    assert rank_0 == 3 * local_slot_size
-    assert rank_1 == rank_stride + 3 * local_slot_size
-    assert rank_0 + 2 * local_slot_size <= rank_1
-
-
 def test_store_payload_nbytes_compacts_only_packed_staging() -> None:
     """Packed mappings stop at their final source byte; raw keeps capacity."""
     packed = [
-        StoreWriteSpan(source_offset=0, nbytes=12, file_offset=0, packed=True),
-        StoreWriteSpan(source_offset=16, nbytes=8, file_offset=12, packed=True),
+        StoreWriteSpan(source_offset=0, nbytes=12, slot_index=0, packed=True),
+        StoreWriteSpan(source_offset=16, nbytes=8, slot_index=1, packed=True),
     ]
-    raw = [StoreWriteSpan(source_offset=0, nbytes=20, file_offset=0)]
+    raw = [StoreWriteSpan(source_offset=0, nbytes=20, slot_index=0)]
 
     assert _store_payload_nbytes(64, packed) == 24
     assert _store_payload_nbytes(64, raw) == 64
@@ -3340,7 +3259,7 @@ def test_store_payload_nbytes_rejects_out_of_range_span() -> None:
     with pytest.raises(ValueError, match="exceeds staging buffer"):
         _store_payload_nbytes(
             16,
-            [StoreWriteSpan(source_offset=8, nbytes=9, file_offset=0, packed=True)],
+            [StoreWriteSpan(source_offset=8, nbytes=9, slot_index=0, packed=True)],
         )
 
 
@@ -3422,8 +3341,8 @@ def test_store_cuda_staging_pool_reuses_preallocated_buffer():
 def test_build_load_read_batches_splits_large_steps_by_staging_cap():
     """Load staging plans are bounded without changing block order."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 3, [4, 5, 6], 320, 12),
-        "r1": ReqLoadSpec("k1", 20, 1, [7], 640, 4),
+        "r0": ReqLoadSpec("k0", 10, 3, [4, 5, 6], 12),
+        "r1": ReqLoadSpec("k1", 20, 1, [7], 4),
     }
 
     batches = _build_load_read_batches(
@@ -3436,27 +3355,12 @@ def test_build_load_read_batches_splits_large_steps_by_staging_cap():
     assert [
         [spec.block_ids for _, _, spec in per_req] for _, _, per_req in batches
     ] == [[[4, 5]], [[6], [7]]]
-    assert [[span["file_offset"] for span in spans] for _, spans, _ in batches] == [
-        [320],
-        [384, 640],
-    ]
-
-
-def test_build_load_read_batches_uses_spec_file_offset():
-    """Load spans honor server-provided file offsets instead of recomputing."""
-    reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 4096, 8),
-    }
-
-    batches = _build_load_read_batches(
-        reqs_to_load=reqs_to_load,
-        slot_size=32,
-        max_batch_bytes=32,
-    )
-
-    assert [[span["file_offset"] for span in spans] for _, spans, _ in batches] == [
-        [4096],
-        [4128],
+    assert [
+        [(span["start_slot"], span["num_slots"]) for span in spans]
+        for _, spans, _ in batches
+    ] == [
+        [(10, 2)],
+        [(12, 1), (20, 1)],
     ]
 
 
@@ -3482,6 +3386,7 @@ def test_record_cuda_event_skips_cpu_tensor(monkeypatch):
     assert _record_cuda_event(torch.empty(4)) is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_record_cuda_event_uses_current_producer_stream(monkeypatch):
     """Deferred saves record the producer thread's current CUDA stream."""
     tensor = torch.empty(4, device="cuda")
@@ -3498,26 +3403,16 @@ def test_record_cuda_event_uses_current_producer_stream(monkeypatch):
 def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
     """Load spans target one combined staging tensor while preserving req ranges."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 320, 8),
-        "r1": ReqLoadSpec("k1", 20, 1, [6], 640, 4),
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 8),
+        "r1": ReqLoadSpec("k1", 20, 1, [6], 4),
     }
 
     total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
 
     assert total_bytes == 96
     assert spans == [
-        {
-            "target_offset": 0,
-            "nbytes": 64,
-            "file_offset": 320,
-            "accounted_nbytes": 64,
-        },
-        {
-            "target_offset": 64,
-            "nbytes": 32,
-            "file_offset": 640,
-            "accounted_nbytes": 32,
-        },
+        {"target_offset": 0, "start_slot": 10, "num_slots": 2, "nbytes": 64},
+        {"target_offset": 64, "start_slot": 20, "num_slots": 1, "nbytes": 32},
     ]
     assert [(start, end, spec.chunk_key) for start, end, spec in per_req] == [
         (0, 64, "k0"),
@@ -3528,20 +3423,15 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
 def test_build_load_read_plan_deduplicates_identical_source_reads():
     """Multiple requests for the same source chunk should share one read span."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 320, 8, pos_offset=0),
-        "r1": ReqLoadSpec("k0", 10, 2, [8, 9], 320, 8, pos_offset=0),
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 8, pos_offset=0),
+        "r1": ReqLoadSpec("k0", 10, 2, [8, 9], 8, pos_offset=0),
     }
 
     total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
 
     assert total_bytes == 64
     assert spans == [
-        {
-            "target_offset": 0,
-            "nbytes": 64,
-            "file_offset": 320,
-            "accounted_nbytes": 64,
-        }
+        {"target_offset": 0, "start_slot": 10, "num_slots": 2, "nbytes": 64}
     ]
     assert [(start, end, spec.block_ids) for start, end, spec in per_req] == [
         (0, 64, [4, 5]),
@@ -3552,8 +3442,8 @@ def test_build_load_read_plan_deduplicates_identical_source_reads():
 def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
     """Multiple store specs for one allocation should produce one write span."""
     reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 320, 8),
-        "r1": ReqStoreSpec("k0", 10, 2, [8, 9], 320, 8),
+        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 8),
+        "r1": ReqStoreSpec("k0", 10, 2, [8, 9], 8),
     }
 
     batches = _build_staging_store_batches(
@@ -3569,7 +3459,7 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
         StoreWriteSpan(
             0,
             64,
-            320,
+            0,
             "k0",
             10,
             2,
@@ -3582,9 +3472,9 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
 def test_build_load_copy_runs_merges_same_transform_ranges():
     """Load copy runs merge adjacent requests only when transforms match."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 0, 8, pos_offset=0),
-        "r1": ReqLoadSpec("k1", 20, 1, [6], 0, 4, pos_offset=0),
-        "r2": ReqLoadSpec("k2", 30, 1, [7], 0, 4, pos_offset=16),
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 8, pos_offset=0),
+        "r1": ReqLoadSpec("k1", 20, 1, [6], 4, pos_offset=0),
+        "r2": ReqLoadSpec("k2", 30, 1, [7], 4, pos_offset=16),
     }
     _, _, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
 
@@ -3594,31 +3484,6 @@ def test_build_load_copy_runs_merges_same_transform_ranges():
         (0, 96, [4, 5, 6], 0),
         (96, 128, [7], 16),
     ]
-
-
-@pytest.mark.asyncio
-async def test_gds_roundtrip_with_kv_tensor(tmp_path):
-    """Write a KV tensor to NVMe via GDS, read it back, verify equality."""
-    store_path = str(tmp_path / "test.store")
-    kv = torch.randint(
-        0, 256, (2, 4, BLOCK_TOKENS, 8), dtype=torch.uint8, device="cuda"
-    )
-    size = 4 * 1024 * 1024
-    with open(store_path, "wb") as f:
-        f.write(b"\x00" * size)
-
-    from daser.transfer.gds import GDSTransferLayer
-
-    gds = GDSTransferLayer(store_path)
-    data = kv[:, 0].contiguous()
-    cp = cupy.asarray(data)
-    await gds.write_async(cp, file_offset=0)
-
-    recv = torch.zeros_like(kv[:, 0])
-    cp_recv = cupy.asarray(recv)
-    await gds.read_into_async(cp_recv, file_offset=0)
-    assert torch.equal(kv[:, 0], recv)
-    gds.close()
 
 
 def test_failed_parked_prefetch_is_logged_and_released_when_window_moves(
@@ -3639,13 +3504,18 @@ def test_failed_parked_prefetch_is_logged_and_released_when_window_moves(
                         "chunk_key": "cached",
                         "start_slot": 0,
                         "num_slots": 3,
-                        "file_offset": 0,
                         "token_count": 12,
                         "target_token_start": 0,
                         "pos_offset": 0,
                     }
                 ],
-                spans=[{"file_offset": start * 8, "nbytes": (12 - start) * 8}],
+                spans=[
+                    {
+                        "start_slot": start // 4,
+                        "num_slots": 3 - start // 4,
+                        "nbytes": (12 - start) * 8,
+                    }
+                ],
                 tier="l2",
             )
 
@@ -3654,8 +3524,8 @@ def test_failed_parked_prefetch_is_logged_and_released_when_window_moves(
 
     attempts: list[int] = []
 
-    def failing_prefetch(socket_path, lease_id, spans):
-        del socket_path, spans
+    def failing_prefetch(socket_path, lease_id):
+        del socket_path
         attempts.append(1)
         raise RuntimeError(f"prefetch did not retain complete lease: {lease_id}")
 
@@ -3732,7 +3602,6 @@ def test_worker_refresh_rebinds_calibrated_codebooks_after_prewarm(
     connector._store_path = ""  # noqa: SLF001
     connector._slot_size = 0  # noqa: SLF001
     connector._server_tp_size = 1  # noqa: SLF001
-    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "iouring"  # noqa: SLF001
     connector._skip_l2 = True  # noqa: SLF001
     connector._declared_storage_format = None  # noqa: SLF001

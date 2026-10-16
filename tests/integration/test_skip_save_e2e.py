@@ -136,8 +136,8 @@ def test_skip_save_blocks_chunk_alloc(daser_server: tuple[str, str, int]) -> Non
         logger.info("[SKIP-SAVE] Phase 1: default sampling -> expect STORE")
         llm.generate([PROMPT_DEFAULT], params_default)
 
-        # commit_chunk runs on the connector's background asyncio loop;
-        # give it a brief window to land before querying the index.
+        # The server publishes a chunk after its store finishes; give it a
+        # brief window to land before querying the index.
         _wait_until_present(ipc, aligned_default, MODEL_ID, timeout=10.0)
 
         hits = ipc.lookup(aligned_default, MODEL_ID)

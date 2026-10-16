@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chunk commit/eviction/ownership state for the DaseR control plane."""
+"""Chunk commit/ownership state for the DaseR control plane."""
 
 # Standard
 import asyncio
@@ -8,12 +8,12 @@ import time
 
 
 class ChunkLifecycle:
-    """Track commit, write-ownership, eviction, and commit-waiter state.
+    """Track commit, write-ownership, and commit-waiter state.
 
-    ServerCore keeps several parallel sets in lockstep: which chunk keys are
-    committed and visible to lookup, which have an active store writer, and
-    which were evicted. This class owns those sets and the commit-waiter
-    futures so the transitions stay consistent in one place.
+    ServerCore keeps parallel sets in lockstep: which chunk keys are committed
+    and visible to lookup, and which have an active store writer. This class
+    owns those sets and the commit-waiter futures so the transitions stay
+    consistent in one place.
 
     Async/thread-safety:
         All methods run on the server asyncio event loop. Commit waiters are
@@ -23,14 +23,9 @@ class ChunkLifecycle:
     def __init__(self) -> None:
         self._committed: set[str] = set()
         self._write_owners: set[str] = set()
-        self._evicted: set[str] = set()
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
         self._commit_shards: dict[str, tuple[int, set[int]]] = {}
         self._publishing: set[str] = set()
-        self._written_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
-        self._write_expectations: dict[tuple[str, int], tuple[int, int]] = {}
-        self._complete_write_ranks: set[tuple[str, int]] = set()
-        self._written_slots: dict[tuple[str, int], set[int]] = {}
         # Publication timing: when a writer claimed each pending key, and when
         # a lookup first found that key still pending (monotonic seconds).
         self._owner_since: dict[str, float] = {}
@@ -39,10 +34,6 @@ class ChunkLifecycle:
     def is_committed(self, chunk_key: str) -> bool:
         """Return whether ``chunk_key`` is committed and visible to lookup."""
         return chunk_key in self._committed
-
-    def is_evicted(self, chunk_key: str) -> bool:
-        """Return whether ``chunk_key`` was evicted."""
-        return chunk_key in self._evicted
 
     @property
     def write_owners(self) -> set[str]:
@@ -104,75 +95,12 @@ class ChunkLifecycle:
         self._write_owners.add(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
-        self._clear_written_ranges(chunk_key)
+        self._clear_timing(chunk_key)
         self._notify_commit_waiters(chunk_key)
         return (
             None if since is None else now - since,
             None if overlap is None else now - overlap,
         )
-
-    def record_written_range(
-        self,
-        chunk_key: str,
-        tp_rank: int,
-        expected_start: int,
-        expected_end: int,
-        range_start: int,
-        range_end: int,
-    ) -> bool:
-        """Record an accepted transfer range and report complete coverage.
-
-        Args:
-            chunk_key: Cache key whose bytes were transferred.
-            tp_rank: Tensor-parallel rank owning the range.
-            expected_start: First file byte required for this rank's chunk.
-            expected_end: Exclusive file byte after this rank's chunk.
-            range_start: First file byte accepted by the transfer.
-            range_end: Exclusive file byte accepted by the transfer.
-
-        Returns:
-            True once, when this rank has covered the complete expected range.
-
-        Raises:
-            ValueError: if the range is invalid or the expected range changes.
-
-        Async/thread-safety:
-            Runs on the server event loop. Ranges are merged in memory and do
-            not perform blocking I/O.
-        """
-        if expected_start < 0 or expected_end <= expected_start:
-            raise ValueError("invalid expected write range")
-        if range_start < expected_start or range_end > expected_end:
-            raise ValueError("write range exceeds the allocated chunk")
-        if range_end <= range_start:
-            raise ValueError("write range must be non-empty")
-        identity = (chunk_key, tp_rank)
-        expected = self._write_expectations.setdefault(
-            identity, (expected_start, expected_end)
-        )
-        if expected != (expected_start, expected_end):
-            raise ValueError("inconsistent expected write range")
-        if identity in self._complete_write_ranks:
-            return False
-
-        ranges = self._written_ranges.setdefault(identity, [])
-        ranges.append((range_start, range_end))
-        ranges.sort()
-        merged: list[tuple[int, int]] = []
-        for start, end in ranges:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-        self._written_ranges[identity] = merged
-        if (
-            len(merged) == 1
-            and merged[0][0] <= expected_start
-            and merged[0][1] >= expected_end
-        ):
-            self._complete_write_ranks.add(identity)
-            return True
-        return False
 
     def record_commit_shard(self, chunk_key: str, tp_rank: int, tp_size: int) -> bool:
         """Record one TP rank and return whether this call should publish.
@@ -209,84 +137,24 @@ class ChunkLifecycle:
         self._publishing.add(chunk_key)
         return True
 
-    def record_written_slot(
-        self,
-        chunk_key: str,
-        tp_rank: int,
-        slot_index: int,
-        expected_slots: int,
-    ) -> bool:
-        """Record one packed logical slot and report rank completion.
-
-        Packed records occupy variable byte lengths inside fixed allocation
-        envelopes, so byte-range coverage cannot express completion. This
-        logical-slot counter keeps publication atomic without pretending that
-        unused envelope tails were transferred.
-
-        Args:
-            chunk_key: Allocated chunk whose slot was transferred.
-            tp_rank: Tensor-parallel rank owning the slot.
-            slot_index: Zero-based slot offset within the chunk.
-            expected_slots: Number of slots required for this rank.
-
-        Returns:
-            True exactly once after every expected logical slot arrived.
-
-        Raises:
-            ValueError: If slot metadata is invalid or changes mid-write.
-        """
-        if expected_slots <= 0 or slot_index < 0 or slot_index >= expected_slots:
-            raise ValueError("invalid packed slot coverage")
-        identity = (chunk_key, tp_rank)
-        slots = self._written_slots.setdefault(identity, set())
-        slots.add(slot_index)
-        if len(slots) == expected_slots:
-            self._complete_write_ranks.add(identity)
-            return True
-        return False
-
     def abort_publish(self, chunk_key: str) -> None:
         """Allow a failed retrieval-index publish to be retried."""
         self._publishing.discard(chunk_key)
 
-    def mark_evicted(self, chunk_key: str) -> None:
-        """Drop committed/owner state for ``chunk_key`` and record eviction."""
-        self._committed.discard(chunk_key)
-        self._write_owners.discard(chunk_key)
-        self._commit_shards.pop(chunk_key, None)
-        self._publishing.discard(chunk_key)
-        self._clear_written_ranges(chunk_key)
-        self._evicted.add(chunk_key)
-
     def discard_owner(self, chunk_key: str) -> None:
-        """Release a store-writer claim without committing or evicting."""
+        """Release a store-writer claim without committing the chunk."""
         self._write_owners.discard(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
-        self._clear_written_ranges(chunk_key)
+        self._clear_timing(chunk_key)
 
     def discard(self, chunk_key: str) -> None:
-        """Drop committed and write-owner state without recording eviction."""
+        """Drop committed and write-owner state of a chunk that left the index."""
         self._committed.discard(chunk_key)
         self._write_owners.discard(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
-        self._clear_written_ranges(chunk_key)
-
-    def _clear_written_ranges(self, chunk_key: str) -> None:
-        """Remove transfer coverage and publication-timing state for a chunk."""
-        self._owner_since.pop(chunk_key, None)
-        self._first_overlap.pop(chunk_key, None)
-        identities = [
-            identity
-            for identity in self._write_expectations
-            if identity[0] == chunk_key
-        ]
-        for identity in identities:
-            self._write_expectations.pop(identity, None)
-            self._written_ranges.pop(identity, None)
-            self._complete_write_ranks.discard(identity)
-            self._written_slots.pop(identity, None)
+        self._clear_timing(chunk_key)
 
     async def wait_for_committed(
         self,
@@ -330,6 +198,11 @@ class ChunkLifecycle:
                 waiters.discard(future)
                 if not waiters:
                     self._commit_waiters.pop(key, None)
+
+    def _clear_timing(self, chunk_key: str) -> None:
+        """Drop publication-timing state for a chunk."""
+        self._owner_since.pop(chunk_key, None)
+        self._first_overlap.pop(chunk_key, None)
 
     def _notify_commit_waiters(self, chunk_key: str) -> None:
         """Complete and clear any commit waiters for ``chunk_key``."""

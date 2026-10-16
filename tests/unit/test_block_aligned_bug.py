@@ -69,7 +69,6 @@ class TestGetNumNewMatchedTokensBug:
                         "chunk_key": hash_tokens(prefix),
                         "start_slot": 0,
                         "num_slots": 1,
-                        "file_offset": 0,
                         "token_count": len(prefix),
                     }
                 ]
@@ -117,7 +116,6 @@ class TestGetNumNewMatchedTokensBug:
                         "chunk_key": hash_tokens(prefix),
                         "start_slot": 0,
                         "num_slots": 1,
-                        "file_offset": 0,
                         "token_count": len(prefix),
                     }
                 ]
@@ -164,7 +162,6 @@ class TestGetNumNewMatchedTokensBug:
                 return {
                     "start_slot": 39,
                     "num_slots": token_count // BLOCK_TOKENS,
-                    "file_offset": 39 * 2359296,
                     "pos_offset": 0,
                 }
 
@@ -225,7 +222,6 @@ class TestGetNumNewMatchedTokensBug:
                 return {
                     "start_slot": 39,
                     "num_slots": token_count // BLOCK_TOKENS,
-                    "file_offset": 39 * 2359296,
                     "pos_offset": 0,
                 }
 
@@ -293,7 +289,6 @@ class TestGetNumNewMatchedTokensBug:
                 return {
                     "start_slot": 39,
                     "num_slots": token_count // BLOCK_TOKENS,
-                    "file_offset": 39 * 2359296,
                     "pos_offset": 0,
                 }
 
@@ -396,7 +391,6 @@ class TestGetNumNewMatchedTokensBug:
                         "chunk_key": hash_tokens(prefix),
                         "start_slot": 0,
                         "num_slots": 2,
-                        "file_offset": 0,
                         "token_count": len(prefix),
                     }
                 ]
@@ -436,7 +430,6 @@ class TestGetNumNewMatchedTokensBug:
             "chunk_key": "k",
             "start_slot": 0,
             "num_slots": 2,
-            "file_offset": 0,
             "token_count": 32,
             "target_token_start": 0,
         }
@@ -447,7 +440,6 @@ class TestGetNumNewMatchedTokensBug:
             external_start=0,
             num_external_tokens=31,
             block_tokens=16,
-            slot_size=100,
         )
 
         assert ok

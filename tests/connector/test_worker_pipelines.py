@@ -122,7 +122,6 @@ def test_packed_store_groups_finished_requests_by_staging_capacity() -> None:
     pipeline._kv_caches = {}  # noqa: SLF001
     pipeline._staging_pool = SimpleNamespace(depth=1)  # noqa: SLF001
     pipeline._local_slot_size = 16  # noqa: SLF001
-    pipeline._rank_stride_bytes = 0  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._staging_bytes = 64  # noqa: SLF001
     pipeline._online_pack_batch_slots = 85  # noqa: SLF001
@@ -361,7 +360,6 @@ def test_store_pipeline_streams_request_larger_than_pool_depth() -> None:
     pipeline._store_semaphore = None  # noqa: SLF001
     pipeline._kv_caches = {"layer": torch.empty(1)}  # noqa: SLF001
     pipeline._local_slot_size = 16  # noqa: SLF001
-    pipeline._rank_stride_bytes = 0  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._tp_size = 1  # noqa: SLF001
     pipeline._staging_bytes = 32  # noqa: SLF001
@@ -459,16 +457,22 @@ async def test_packed_store_overlaps_next_stage_with_transfer() -> None:
     assert released == [0, 1]
 
 
+def _span_offset(kwargs: dict[str, Any]) -> int:
+    """Return the 16-byte-slot byte offset of a load call's first span."""
+    return int(kwargs["spans"][0]["start_slot"]) * 16
+
+
 class _LoadClient:
     def __init__(self, fail_offset: int | None = None) -> None:
         self.calls: list[int] = []
-        self.lease_ids: list[str | None] = []
+        self.tp_ranks: list[int] = []
         self.fail_offset = fail_offset
 
     async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
-        offset = int(kwargs["spans"][0]["file_offset"])
+        assert "lease_id" not in kwargs
+        offset = _span_offset(kwargs)
         self.calls.append(offset)
-        self.lease_ids.append(kwargs.get("lease_id"))
+        self.tp_ranks.append(int(kwargs["tp_rank"]))
         if offset == self.fail_offset:
             raise RuntimeError("load failed")
         return {
@@ -483,7 +487,13 @@ class _LoadClient:
 
 
 def _load_spec(key: str, blocks: list[int], offset: int = 0) -> ReqLoadSpec:
-    return ReqLoadSpec(key, offset // 16, len(blocks), blocks, offset, len(blocks))
+    return ReqLoadSpec(
+        chunk_key=key,
+        start_slot=offset // 16,
+        num_slots=len(blocks),
+        block_ids=blocks,
+        token_count=len(blocks),
+    )
 
 
 def _packed_load_spec(
@@ -499,7 +509,6 @@ def _packed_load_spec(
         start_slot=offset // 16,
         num_slots=len(blocks),
         block_ids=blocks,
-        file_offset=offset,
         token_count=len(blocks),
         pos_offset=pos_offset,
         lease_id=lease_id,
@@ -507,7 +516,6 @@ def _packed_load_spec(
             CompressedLoadSlot(
                 slot_id=offset // 16 + index,
                 mode="compressed",
-                file_offset=offset + index * 8,
                 stored_length=8,
             )
             for index in range(len(blocks))
@@ -530,7 +538,6 @@ def _load_pipeline(
         kv_caches={"layer": torch.empty(1)},
         layer_names=["layer"],
         local_slot_size=16,
-        rank_stride_bytes=0,
         tp_rank=0,
         staging_pool=staging_pool or FixedCudaStagingPool(torch.device("cpu"), 32, 2),
         load_key_scale=1.0,
@@ -572,7 +579,7 @@ def test_load_pipeline_handles_empty_and_multibatch_requests(
         )
         assert _wait_finished(pipeline, {"empty", "large"}) == {"empty", "large"}
         assert client.calls == [0, 32, 64]
-        assert client.lease_ids == ["large", "large", "large"]
+        assert client.tp_ranks == [0, 0, 0]
     finally:
         pipeline.shutdown()
 
@@ -630,7 +637,7 @@ def test_lookahead_failure_waits_for_sibling_before_invalidation(
 
     class Client(_LoadClient):
         async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
-            offset = int(kwargs["spans"][0]["file_offset"])
+            offset = _span_offset(kwargs)
             if offset == 32:
                 while not sibling_started.is_set():
                     await asyncio.sleep(0.001)
@@ -749,7 +756,7 @@ def test_delayed_load_failure_keeps_other_requests_progressing(
 
     class DelayedClient(_LoadClient):
         async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
-            submissions.append(int(kwargs["spans"][0]["file_offset"]))
+            submissions.append(_span_offset(kwargs))
             first_started.set()
             if len(submissions) >= 2:
                 second_started.set()
@@ -903,7 +910,6 @@ def test_online_pack_batch_is_capped_by_config_and_staging_buffer(
             kv_caches={"layer": torch.empty(1)},
             layer_names=["layer"],
             local_slot_size=16,
-            rank_stride_bytes=0,
             tp_rank=0,
             tp_size=1,
             staging_bytes=64,

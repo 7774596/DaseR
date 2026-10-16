@@ -2,21 +2,31 @@
 
 """Stateless copy/marshalling helpers for the io_uring transfer layer.
 
-These functions move bytes between CPU buffers, CuPy device arrays, and the
-pinned host slices used by the L1 tier. They hold no tiering state and take no
-locks, so they are safe to call from either the event loop or executor threads
-as long as the caller owns the buffers passed in.
+These functions move bytes between CPU buffers, CuPy device arrays, and pinned
+host memory (the L1 arena and staging slices). They hold no tiering state and
+take no locks, so they are safe to call from either the event loop or executor
+threads as long as the caller owns the buffers passed in.
 """
 
 # Standard
 import ctypes
-from typing import Any
+from typing import Any, Protocol
 
-# First Party
-from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 
-#: One grouped copy chunk: (target_offset, source_slice, source_offset, nbytes).
-CopyChunk = tuple[int, PinnedMemorySlice, int, int]
+class HostMemory(Protocol):
+    """Pinned host memory addressable by byte offset (arena or pool slice)."""
+
+    def view(self) -> memoryview:
+        """Return a writable byte memoryview over the whole memory."""
+        ...
+
+    def ptr_at(self, offset: int = 0) -> int:
+        """Return the host pointer of byte ``offset``."""
+        ...
+
+
+#: One grouped copy chunk: (target_offset, source, source_offset, nbytes).
+CopyChunk = tuple[int, HostMemory, int, int]
 
 
 def _merge_cuda_runs(dst: Any, chunks: list[CopyChunk]) -> list[tuple[int, int, int]]:
@@ -304,7 +314,7 @@ def slice_src(src: Any, offset: int, nbytes: int) -> Any:
 
 def copy_src_to_pinned(
     src: Any,
-    pinned: PinnedMemorySlice,
+    pinned: HostMemory,
     target_offset: int,
     nbytes: int,
 ) -> None:
@@ -312,9 +322,13 @@ def copy_src_to_pinned(
 
     Args:
         src: readable byte buffer or CuPy ndarray.
-        pinned: destination slice leased from the L1 pool.
+        pinned: destination arena or staging slice.
         target_offset: byte offset into ``pinned`` to write at.
         nbytes: number of bytes to copy.
+
+    Async/thread-safety:
+        A CUDA source is copied with a blocking ``cudaMemcpy``; run it off the
+        event loop.
     """
     if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
         import cupy
@@ -365,7 +379,7 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> int:
 
     Args:
         dst: CuPy ndarray destination.
-        chunks: grouped copy chunks from the L1 tier.
+        chunks: grouped copy chunks with pinned host sources.
 
     Returns:
         Number of merged runs copied.
@@ -379,15 +393,7 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> int:
     runs = _merge_cuda_runs(dst, chunks)
     stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
     device_id = int(slice_dst(dst, 0, 0).device.id)
-    # Device-resident sources (the device stash) copy device-to-device.
-    on_device = any(getattr(chunk[1], "on_device", False) for chunk in chunks)
     with cupy.cuda.Device(device_id):
-        if on_device:
-            for dst_ptr, source_ptr, nbytes in runs:
-                runtime.memcpyAsync(
-                    dst_ptr, source_ptr, nbytes, runtime.memcpyDefault, stream_ptr
-                )
-            return len(runs)
         for dst_ptr, source_ptr, nbytes in runs:
             runtime.memcpyAsync(
                 dst_ptr, source_ptr, nbytes, runtime.memcpyHostToDevice, stream_ptr
@@ -400,7 +406,7 @@ def copy_grouped_to_dst(dst: Any, chunks: list[CopyChunk]) -> int:
 
     Args:
         dst: writable buffer or CuPy ndarray destination.
-        chunks: grouped copy chunks from the L1 tier.
+        chunks: grouped copy chunks with pinned host sources.
 
     Returns:
         Number of merged runs copied into a CUDA destination, else 0.

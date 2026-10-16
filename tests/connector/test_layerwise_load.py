@@ -37,7 +37,6 @@ class _LookupIPC:
             {
                 "slot_id": 10 + index,
                 "mode": mode,
-                "file_offset": (10 + index) * SLOT_SIZE,
                 "stored_length": SLOT_SIZE,
             }
             for index, mode in enumerate(self.modes)
@@ -48,7 +47,6 @@ class _LookupIPC:
                     "chunk_key": "cached",
                     "start_slot": 10,
                     "num_slots": len(slots),
-                    "file_offset": 10 * SLOT_SIZE,
                     "token_count": len(slots) * BLOCK_TOKENS,
                     "target_token_start": 0,
                     "pos_offset": self.pos_offset,

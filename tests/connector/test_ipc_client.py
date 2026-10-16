@@ -15,17 +15,14 @@ import pytest
 from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.ipc_protocol import pack_frame, recv_frame
-from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.prefix import PrefixHashIndex
-from daser.server.chunk_manager import ChunkManager
-from daser.server.core import ServerCore
-from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
-from daser.server.metadata_store import MetadataStore
-from daser.server.store_file import ensure_store_file
-
-SLOT_SIZE = 1024
-BLOCK_TOKENS = 4
+from tests.server.core_helpers import (
+    BLOCK_TOKENS,
+    RECORD,
+    load_span,
+    make_ipc_server,
+    raw_span,
+)
 
 
 def first_rolling_key(tokens: list[int]) -> str:
@@ -33,42 +30,29 @@ def first_rolling_key(tokens: list[int]) -> str:
     return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
 
 
-def make_core() -> ServerCore:
-    """Create a ServerCore for IPC client tests."""
-    store = MetadataStore()
-    doc_registry = DocRegistry()
-    cm = ChunkManager(
-        total_slots=64,
-        metadata_store=store,
-        doc_registry=doc_registry,
-    )
-    return ServerCore(
-        chunk_manager=cm,
-        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-        position_encoder=FixedOffsetEncoder(fixed_offset=0),
-        slot_size=SLOT_SIZE,
-        block_tokens=BLOCK_TOKENS,
-    )
-
-
 def make_server(tmp_path) -> IPCServer:
-    """Create an IPC server, and its L2 store file, for client tests."""
-    socket_path = str(tmp_path / "ipc.sock")
-    store_path = str(tmp_path / "daser.store")
-    ensure_store_file(store_path, 8192)
-    return IPCServer(
-        socket_path=socket_path,
-        core=make_core(),
-        runtime_config={
-            "store_path": store_path,
-            "slot_size": SLOT_SIZE,
-            "block_tokens": BLOCK_TOKENS,
-            "model_id": "m",
-            "transfer_mode": "iouring",
-            "l1_size_bytes": 4096,
-            "l2_size_bytes": 8192,
-        },
+    """Create an IPC server with both tiers for client tests."""
+    return make_ipc_server(tmp_path)
+
+
+async def store_chunk(
+    client: IPCClientAsync, key: str, alloc: dict, data: bytes | None = None
+) -> bytes:
+    """Store one record per slot of ``key``'s allocation and publish it."""
+    nbytes = int(alloc["num_slots"]) * RECORD
+    data = data if data is not None else bytes(range(256)) * (nbytes // 256)
+    await client.transfer_store_bytes(
+        data=data,
+        spans=[
+            raw_span(
+                key,
+                int(alloc["start_slot"]),
+                int(alloc["num_slots"]),
+            )
+        ],
     )
+    await client.transfer_drain()
+    return data
 
 
 @pytest.mark.asyncio
@@ -94,7 +78,7 @@ def test_sync_client_validates_prefetch_lookup_contract(
         assert "tokens" not in payload
         return {
             "chunks": [{"chunk_key": "cached"}],
-            "spans": [{"file_offset": 4096, "nbytes": 8192, "accounted_nbytes": 16384}],
+            "spans": [{"start_slot": 3, "num_slots": 2, "nbytes": 8192, "extra": 1}],
             "tier": "mixed",
         }
 
@@ -109,9 +93,27 @@ def test_sync_client_validates_prefetch_lookup_contract(
     )
 
     assert result.tier == "mixed"
-    assert result.spans == [
-        {"file_offset": 4096, "nbytes": 8192, "accounted_nbytes": 16384}
-    ]
+    assert result.spans == [{"start_slot": 3, "num_slots": 2, "nbytes": 8192}]
+
+
+def test_sync_client_rejects_prefetch_spans_without_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lookup_prefetch span must name its slot range."""
+
+    def fake_call(self, payload: dict) -> dict:
+        del self, payload
+        return {
+            "chunks": [{"chunk_key": "cached"}],
+            "spans": [{"nbytes": 8192}],
+            "tier": "l2",
+        }
+
+    monkeypatch.setattr(IPCClientSync, "call", fake_call)
+    client = IPCClientSync("unused.sock")
+
+    with pytest.raises(RuntimeError, match="spans"):
+        client.lookup_with_prefetch("request-1", [1, 2, 3, 4], "m", 4)
 
 
 @pytest.mark.asyncio
@@ -122,7 +124,7 @@ async def test_sync_client_get_runtime_config(tmp_path):
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, client.get_runtime_config)
     assert result["store_path"] == str(tmp_path / "daser.store")
-    assert result["slot_size"] == SLOT_SIZE
+    assert result["local_slot_size"] == RECORD
     assert result["block_tokens"] == BLOCK_TOKENS
     assert result["model_id"] == "m"
     await server.stop()
@@ -165,11 +167,16 @@ async def test_sync_client_alloc_and_commit(tmp_path):
         None, lambda: client.alloc_chunk(key, token_count=4, model_id="m")
     )
     assert "start_slot" in alloc
-    await loop.run_in_executor(None, client.commit_chunk, key)
-    chunks = await loop.run_in_executor(None, client.lookup, tokens, "m")
+    writer = IPCClientAsync(sock)
+    try:
+        await store_chunk(writer, key, alloc)
+        chunks = await loop.run_in_executor(None, client.lookup, tokens, "m")
+    finally:
+        await writer.close()
+        client.close()
+        await server.stop()
     assert len(chunks) == 1
     assert chunks[0]["chunk_key"] == key
-    await server.stop()
 
 
 @pytest.mark.asyncio
@@ -198,31 +205,18 @@ async def test_sync_client_alloc_chunks(tmp_path):
 
     assert [alloc["chunk_key"] for alloc in allocs] == [key_a, key_b]
     assert [alloc["start_slot"] for alloc in allocs] == [0, 1]
-    await loop.run_in_executor(None, client.commit_chunk, key_a)
-    await loop.run_in_executor(None, client.commit_chunk, key_b)
-    assert len(await loop.run_in_executor(None, client.lookup, tokens_a, "m")) == 1
-    assert len(await loop.run_in_executor(None, client.lookup, tokens_b, "m")) == 1
-    await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_async_client_commit(tmp_path):
-    server = make_server(tmp_path)
-    await server.start()
-    sock = str(tmp_path / "ipc.sock")
-    sync_client = IPCClientSync(sock)
-    tokens = [1, 2, 3, 4]
-    key = first_rolling_key(tokens)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
-    )
-
-    async_client = IPCClientAsync(sock)
-    await async_client.commit_chunk(key)
-    chunks = await loop.run_in_executor(None, sync_client.lookup, tokens, "m")
-    assert len(chunks) == 1
-    await server.stop()
+    writer = IPCClientAsync(sock)
+    try:
+        for alloc in allocs:
+            await store_chunk(writer, alloc["chunk_key"], alloc)
+        hits_a = await loop.run_in_executor(None, client.lookup, tokens_a, "m")
+        hits_b = await loop.run_in_executor(None, client.lookup, tokens_b, "m")
+    finally:
+        await writer.close()
+        client.close()
+        await server.stop()
+    assert len(hits_a) == 1
+    assert len(hits_b) == 1
 
 
 @pytest.mark.asyncio
@@ -319,53 +313,31 @@ async def test_async_client_retries_when_stale_socket_close_breaks(
 
 
 @pytest.mark.asyncio
-async def test_async_client_commit_chunks(tmp_path):
-    """Async client can batch chunk commits in one RPC."""
-    server = make_server(tmp_path)
-    await server.start()
-    sock = str(tmp_path / "ipc.sock")
-    sync_client = IPCClientSync(sock)
-    tokens_a = [1, 2, 3, 4]
-    tokens_b = [5, 6, 7, 8]
-    key_a = first_rolling_key(tokens_a)
-    key_b = first_rolling_key(tokens_b)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, lambda: sync_client.alloc_chunk(key_a, token_count=4, model_id="m")
-    )
-    await loop.run_in_executor(
-        None, lambda: sync_client.alloc_chunk(key_b, token_count=4, model_id="m")
-    )
-
-    async_client = IPCClientAsync(sock)
-    await async_client.commit_chunks([key_a, key_b])
-
-    chunks_a = await loop.run_in_executor(None, sync_client.lookup, tokens_a, "m")
-    chunks_b = await loop.run_in_executor(None, sync_client.lookup, tokens_b, "m")
-    assert len(chunks_a) == 1
-    assert len(chunks_b) == 1
-    await async_client.close()
-    await server.stop()
-
-
-@pytest.mark.asyncio
 async def test_async_client_transfer_store_and_load_bytes(tmp_path):
-    """Async client exposes server-owned transfer store/load operations."""
+    """Async client stores a chunk's records and loads them by slot range."""
     server = make_server(tmp_path)
     await server.start()
     client = IPCClientAsync(str(tmp_path / "ipc.sock"))
-    data = b"abcdefgh" * 512
     try:
-        await client.transfer_store_bytes(
-            data=data,
-            spans=[{"source_offset": 0, "nbytes": len(data), "file_offset": 0}],
+        key = hash_tokens([1] * 8)
+        alloc = await client.call(
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": 2 * BLOCK_TOKENS,
+                "model_id": "m",
+                "parent_key": "",
+            }
         )
-        payload = await client.transfer_load_bytes(
-            spans=[{"target_offset": 0, "nbytes": len(data), "file_offset": 0}],
-        )
-        assert payload == data
+        data = await store_chunk(client, key, alloc)
+        start = int(alloc["start_slot"])
+        whole = await client.transfer_load_bytes(spans=[load_span(start, 2)])
+        tail = await client.transfer_load_bytes(spans=[load_span(start + 1, 1)])
     finally:
+        await client.close()
         await server.stop()
+    assert whole == data
+    assert tail == data[RECORD:]
 
 
 @pytest.mark.asyncio
@@ -392,7 +364,7 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
         allocation_base_ptr=122880,
         allocation_offset=576,
         producer_pid=42,
-        spans=[{"source_offset": 0, "nbytes": 1024, "file_offset": 0}],
+        spans=[raw_span("k", 0)],
     )
     await client.transfer_load_cuda(
         cuda_ipc_handle=b"h" * 64,
@@ -402,15 +374,16 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
         allocation_base_ptr=221184,
         allocation_offset=2272,
         producer_pid=43,
-        spans=[{"target_offset": 0, "nbytes": 2048, "file_offset": 0}],
-        lease_id="request-cuda",
+        spans=[load_span(0)],
+        tp_rank=1,
     )
 
     assert recorded[0]["payload"]["allocation_base_ptr"] == 122880
     assert recorded[0]["payload"]["allocation_offset"] == 576
     assert recorded[1]["payload"]["allocation_base_ptr"] == 221184
     assert recorded[1]["payload"]["allocation_offset"] == 2272
-    assert recorded[1]["lease_id"] == "request-cuda"
+    assert recorded[1]["tp_rank"] == 1
+    assert "lease_id" not in recorded[1]
 
 
 @pytest.mark.asyncio
@@ -447,15 +420,15 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
             buffer_index=1,
             producer_pid=43,
             nbytes=16,
-            spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
-            lease_id="request-registered",
+            spans=[load_span(0)],
+            tp_rank=1,
         )
         assert response == {"ok": True, "bytes": 16, "chunk_keys": ["accepted"]}
     else:
         keys = await client.transfer_store_registered_cuda(
             buffer_index=1,
             producer_pid=43,
-            spans=[{"source_offset": 2048, "nbytes": 16, "file_offset": 0}],
+            spans=[raw_span("k", 0, source_offset=2048)],
             tp_rank=1,
             tp_size=2,
         )
@@ -481,15 +454,15 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
                 "producer_pid": 43,
                 "nbytes": 16,
             },
-            "spans": [{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
-            "lease_id": "request-registered",
+            "spans": [load_span(0)],
+            "tp_rank": 1,
         },
     ]
     if direction == "store":
         expected[1] = {
             "op": "transfer_store",
             "payload": {"store_staging_buffer_index": 1, "producer_pid": 43},
-            "spans": [{"source_offset": 2048, "nbytes": 16, "file_offset": 0}],
+            "spans": [raw_span("k", 0, source_offset=2048)],
             "tp_rank": 1,
             "tp_size": 2,
         }
@@ -500,7 +473,7 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
 async def test_async_client_packs_leased_runs_as_one_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Leased runs travel as one (3, n) int64 table, not per-span dicts."""
+    """Leased runs travel as one (4, n) int64 table, not per-span dicts."""
 
     recorded: list[dict] = []
 
@@ -515,10 +488,12 @@ async def test_async_client_packs_leased_runs_as_one_table(
     response = await client.transfer_load_runs(
         buffer_index=1,
         producer_pid=43,
-        file_offsets=[4096, 8192],
+        start_slots=[3, 7],
+        intra_offsets=[0, 64],
         target_offsets=[0, 32],
         nbytes=[16, 32],
         lease_id="request-runs",
+        tp_rank=1,
     )
 
     assert response == {"ok": True, "bytes": 48}
@@ -527,7 +502,8 @@ async def test_async_client_packs_leased_runs_as_one_table(
             "op": "transfer_load_runs",
             "payload": {"load_staging_buffer_index": 1, "producer_pid": 43},
             "lease_id": "request-runs",
-            "runs": array.array("q", [4096, 8192, 0, 32, 16, 32]).tobytes(),
+            "tp_rank": 1,
+            "runs": array.array("q", [3, 7, 0, 64, 0, 32, 16, 32]).tobytes(),
         }
     ]
 
@@ -541,11 +517,14 @@ async def test_clients_transfer_drain(tmp_path):
     sync_client = IPCClientSync(sock)
     async_client = IPCClientAsync(sock)
     loop = asyncio.get_running_loop()
-    data = b"abcdefgh" * 512
+    key = hash_tokens([1, 2, 3, 4])
     try:
+        alloc = await loop.run_in_executor(
+            None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
+        )
         await async_client.transfer_store_bytes(
-            data=data,
-            spans=[{"source_offset": 0, "nbytes": len(data), "file_offset": 0}],
+            data=bytes(RECORD),
+            spans=[raw_span(key, int(alloc["start_slot"]))],
         )
         await async_client.transfer_drain()
         await loop.run_in_executor(None, sync_client.transfer_drain)
@@ -565,15 +544,17 @@ async def test_sync_client_commit_stats(tmp_path):
     tokens = [1, 2, 3, 4]
     key = hash_tokens(tokens)
     loop = asyncio.get_running_loop()
+    async_client = IPCClientAsync(sock)
     try:
-        await loop.run_in_executor(
+        alloc = await loop.run_in_executor(
             None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
         )
-        await loop.run_in_executor(None, sync_client.commit_chunk, key)
+        await store_chunk(async_client, key, alloc)
         stats = await loop.run_in_executor(None, sync_client.commit_stats)
         assert stats["commit_requests"] == 1
         assert stats["late_evicted_commits"] == 0
     finally:
+        await async_client.close()
         sync_client.close()
         await server.stop()
 

@@ -62,7 +62,6 @@ def test_ci_runs_all_non_integration_tests() -> None:
     assert '-m "not integration"' in workflow
     assert "--ignore=tests/integration" in workflow
     assert "--ignore=tests/connector/test_daser_connector.py" in workflow
-    assert "--ignore=tests/connector/test_gds_transfer.py" in workflow
     assert "tests/" in workflow
     old_explicit_targets = [
         "          tests/test_config.py",
@@ -75,7 +74,7 @@ def test_ci_runs_all_non_integration_tests() -> None:
 
 
 def test_hardware_connector_tests_are_marked_integration() -> None:
-    """GPU/GDS connector tests must not run in the CPU unit-test job.
+    """GPU connector tests must not run in the CPU unit-test job.
 
     Args:
         None.
@@ -89,7 +88,6 @@ def test_hardware_connector_tests_are_marked_integration() -> None:
     """
     hardware_test_paths = [
         REPO_ROOT / "tests" / "connector" / "test_daser_connector.py",
-        REPO_ROOT / "tests" / "connector" / "test_gds_transfer.py",
     ]
 
     for path in hardware_test_paths:

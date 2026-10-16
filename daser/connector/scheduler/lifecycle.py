@@ -64,24 +64,27 @@ def _prefix_digest(tokens: list[int], end: int) -> int:
     return hash(tuple(tokens[:end]))
 
 
-def _prefetch_external_spans(
-    socket_path: str,
-    lease_id: str,
-    spans: list[dict[str, int]],
-) -> dict[str, int]:
-    """Prefetch storage spans over a dedicated synchronous IPC connection.
+def _prefetch_external_spans(socket_path: str, lease_id: str) -> dict[str, int]:
+    """Bring a lease's chunks into L1 over a dedicated synchronous connection.
 
-    The RPC can legitimately wait for other leases to free L1 space, which
-    lasts as long as those requests run. The connection therefore has no
-    socket timeout: a client-side timeout would abandon (and, via the retry,
-    resend) a prefetch the server is still executing under this lease.
-    The scheduler only polls the returned future, so it never blocks here.
+    The RPC can legitimately wait for the lease budget, which lasts as long
+    as earlier leased requests run. The connection therefore has no socket
+    timeout: a client-side timeout would abandon (and, via the retry, resend)
+    a prefetch the server is still executing under this lease. The scheduler
+    only polls the returned future, so it never blocks here.
+
+    Args:
+        socket_path: DaseR IPC socket path.
+        lease_id: Lease taken by ``lookup_with_prefetch``.
+
+    Returns:
+        The ``transfer_prefetch`` byte counts.
     """
     from daser.connector.ipc_client import IPCClientSync
 
     client = IPCClientSync(socket_path, timeout=None)
     try:
-        return client.transfer_prefetch(spans, lease_id=lease_id)
+        return client.transfer_prefetch(lease_id)
     finally:
         client.close()
 
@@ -400,7 +403,7 @@ class RequestLifecycle:
             spans = prefetch_lookup_result.spans
             signature = tuple(
                 sorted(
-                    (int(span["file_offset"]), int(span["nbytes"])) for span in spans
+                    (int(span["start_slot"]), int(span["num_slots"])) for span in spans
                 )
             )
             signatures = getattr(self, "_prefetch_signatures", {})
@@ -429,7 +432,6 @@ class RequestLifecycle:
                     _prefetch_external_spans,
                     socket_path,
                     request.request_id,
-                    spans,
                 )
                 self._prefetch_futures = prefetch_futures
                 self.last_defer_reason = "prefetch"
@@ -567,7 +569,6 @@ class RequestLifecycle:
                     external_start=int(chunk.get("num_computed_tokens", 0)),
                     num_external_tokens=num_external_tokens,
                     block_tokens=self._block_tokens,
-                    slot_size=self._slot_size,
                 ):
                     del self._pending_loads[req_id]
                     self._release_transfer_lease(req_id)
@@ -587,7 +588,6 @@ class RequestLifecycle:
                     external_start=int(chunk.get("num_computed_tokens", 0)),
                     num_external_tokens=num_external_tokens,
                     block_tokens=self._block_tokens,
-                    slot_size=self._slot_size,
                 ):
                     logger.debug(
                         "[CONNECTOR] skip load req=%s key=%s target=%d slots=%d",
@@ -651,7 +651,7 @@ class RequestLifecycle:
                     ready = False
                     continue
                 load_specs.append(_load_spec_from_chunk(chunk))
-            merged_specs = _merge_adjacent_load_specs(load_specs, self._slot_size)
+            merged_specs = _merge_adjacent_load_specs(load_specs)
             for idx, spec in enumerate(merged_specs):
                 load_id = req_id if len(merged_specs) == 1 else f"{req_id}:load:{idx}"
                 meta.reqs_to_load[load_id] = spec
@@ -686,7 +686,6 @@ class RequestLifecycle:
                     start_slot=alloc["start_slot"],
                     num_slots=alloc["num_slots"],
                     block_ids=alloc["block_ids"],
-                    file_offset=alloc["file_offset"],
                     token_count=alloc["token_count"],
                     logical_slot_start=(
                         logical_slot_start if logical_slot_start is not None else 0
@@ -1099,7 +1098,7 @@ class RequestLifecycle:
         specs = [
             _load_spec_from_chunk(chunk) for chunk in pending if "block_ids" in chunk
         ]
-        merged = _merge_adjacent_load_specs(specs, self._slot_size)
+        merged = _merge_adjacent_load_specs(specs)
         for idx, spec in enumerate(merged):
             load_id = req_id if len(merged) == 1 else f"{req_id}:load:{idx}"
             meta.reqs_to_load[load_id] = spec
@@ -1180,7 +1179,6 @@ class RequestLifecycle:
             return
         self._slot_size = int(config.get("slot_size", self._slot_size))
         self._tensor_parallel_size = int(config.get("tensor_parallel_size", 1))
-        self._rank_stride_bytes = int(config.get("rank_stride_bytes", 0))
         server_storage_format = str(config.get("storage_format", STORAGE_FORMAT_RAW))
         if (
             getattr(self, "_declared_storage_format", None) is not None

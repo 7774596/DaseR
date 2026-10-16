@@ -33,26 +33,6 @@ class _CpuPinnedMemoryBuffer:
         self._size = size
         self._data = bytearray(size)
 
-    @classmethod
-    def from_bytes(
-        cls, data: bytes | bytearray | memoryview
-    ) -> "_CpuPinnedMemoryBuffer":
-        """Create a test buffer initialized from bytes.
-
-        Args:
-            data: Source byte data.
-
-        Returns:
-            Test buffer containing a copy of ``data``.
-
-        Async/thread-safety:
-            Allocates a new independent buffer.
-        """
-        view = memoryview(data).cast("B")
-        buf = cls(len(view))
-        buf.view()[:] = view
-        return buf
-
     def view(self) -> memoryview:
         """Return a byte memoryview over the test buffer.
 
@@ -184,16 +164,16 @@ def _patch_pinned_memory_for_cpu_cupy(monkeypatch: pytest.MonkeyPatch) -> None:
     try:
         import cupy
 
-        alloc_pinned_memory = cupy.cuda.alloc_pinned_memory
+        pinned_memory_type = cupy.cuda.PinnedMemory
         # A CUDA-enabled CuPy still cannot pin host memory without a device.
         cupy.cuda.runtime.getDeviceCount()
     except (ImportError, AttributeError, RuntimeError):
-        alloc_pinned_memory = None
+        pinned_memory_type = None
     except Exception as exc:  # cupy.cuda.runtime.CUDARuntimeError
         if "cudaErrorNoDevice" not in str(exc):
             raise
-        alloc_pinned_memory = None
-    if alloc_pinned_memory is not None:
+        pinned_memory_type = None
+    if pinned_memory_type is not None:
         return
 
     import daser.transfer.iouring.pinned_pool as pinned_memory

@@ -13,4 +13,4 @@ IO，在 DaseR server 进程内维护 HTTP server、IPC server 和控制面状�
 | [数据流程](flows.md) | 文档上传、推理、KV store 和 KV load 的完整流程 |
 | [可观测性指标优化](metrics-optimization.md) | Prometheus 指标精简、L1/vLLM 集成、Dashboard 重设计 |
 | [在途 load 合并](inflight-load-coalescing.md) | 同前缀在途外部 load 时后到请求等待并复用本地前缀命中（`coalesce_loads`，默认关） |
-| [槽位分配、叶子优先淘汰与 L1/L2 驻留](tier-residency.md) | 空闲区间分配器、前缀链叶子优先 LRU 淘汰树、compressed-online 的 packed arena、L2 预算与 L1 held 驻留 |
+| [独立 L1/L2 分层与叶子优先淘汰](tier-residency.md) | server 索引的逐层 chunk 副本、TLSF 分配器、每层叶子优先 LRU 与对称候选规则、write-through 与 L1 接纳、promotion/readahead、prefetch lease、NOCOW store 文件 |

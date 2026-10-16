@@ -149,9 +149,11 @@ def _trim_chunk_to_external_window(
     external_start: int,
     num_external_tokens: int,
     block_tokens: int,
-    slot_size: int,
 ) -> bool:
     """Trim chunk metadata to the external token interval vLLM requested.
+
+    The trimmed chunk names its first loaded slot id (``start_slot`` advanced
+    by the skipped slots); the server resolves slot ids to tier bytes.
 
     Args:
         chunk: Mutable chunk metadata returned by the server.
@@ -159,7 +161,6 @@ def _trim_chunk_to_external_window(
         external_start: Token offset where external KV loading begins.
         num_external_tokens: Number of tokens accepted from the connector.
         block_tokens: Tokens per vLLM block.
-        slot_size: Bytes per DaseR slot.
 
     Returns:
         True when the chunk still covers at least one whole KV block.
@@ -187,13 +188,12 @@ def _trim_chunk_to_external_window(
         return False
 
     chunk["start_slot"] = int(chunk["start_slot"]) + skip_slots
-    chunk["file_offset"] = int(chunk["file_offset"]) + skip_slots * slot_size
     compressed_slots = chunk.get("compressed_slots")
     if compressed_slots:
         # Packed refs are per slot; keep them aligned with the trimmed window.
-        compressed_slots = compressed_slots[skip_slots : skip_slots + num_slots]
-        chunk["compressed_slots"] = compressed_slots
-        chunk["file_offset"] = int(compressed_slots[0]["file_offset"])
+        chunk["compressed_slots"] = compressed_slots[
+            skip_slots : skip_slots + num_slots
+        ]
     chunk["num_slots"] = num_slots
     chunk["token_count"] = num_slots * block_tokens
     chunk["target_token_start"] = load_start
@@ -247,7 +247,6 @@ def _load_spec_from_chunk(chunk: dict[str, Any]) -> ReqLoadSpec:
         start_slot=int(chunk["start_slot"]),
         num_slots=int(chunk["num_slots"]),
         block_ids=list(chunk["block_ids"]),
-        file_offset=int(chunk["file_offset"]),
         token_count=int(chunk["token_count"]),
         target_token_start=int(chunk.get("target_token_start", 0)),
         pos_offset=int(chunk.get("pos_offset", 0)),
@@ -259,19 +258,16 @@ def _load_spec_from_chunk(chunk: dict[str, Any]) -> ReqLoadSpec:
     )
 
 
-def _merge_adjacent_load_specs(
-    specs: list[ReqLoadSpec],
-    slot_size: int,
-) -> list[ReqLoadSpec]:
-    """Merge adjacent load specs that describe one continuous KV byte range.
+def _merge_adjacent_load_specs(specs: list[ReqLoadSpec]) -> list[ReqLoadSpec]:
+    """Merge adjacent load specs that describe one continuous slot-id range.
 
     Args:
         specs: Load specs for one request in prompt order.
-        slot_size: Bytes represented by one DaseR KV slot.
 
     Returns:
         Coalesced load specs. Chunk keys from the first spec in a run are kept
-        only as diagnostics; the worker load path addresses data by byte range.
+        only as diagnostics; the worker load path addresses data by slot id,
+        and the server resolves a range that spans adjacent chunks.
 
     Async/thread-safety:
         Pure scheduler-thread helper; it does not mutate connector state.
@@ -289,7 +285,6 @@ def _merge_adjacent_load_specs(
             prev.pos_offset == spec.pos_offset
             and prev.lease_id == spec.lease_id
             and prev.start_slot + prev_slots == spec.start_slot
-            and prev.file_offset + prev_slots * slot_size == spec.file_offset
             and prev.target_token_start + prev.token_count == spec.target_token_start
             and bool(prev.compressed_slots) == bool(spec.compressed_slots)
         )
@@ -301,7 +296,6 @@ def _merge_adjacent_load_specs(
             start_slot=prev.start_slot,
             num_slots=prev_slots + len(spec.block_ids),
             block_ids=[*prev.block_ids, *spec.block_ids],
-            file_offset=prev.file_offset,
             token_count=prev.token_count + spec.token_count,
             target_token_start=prev.target_token_start,
             pos_offset=prev.pos_offset,

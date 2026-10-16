@@ -5,10 +5,14 @@ from dataclasses import dataclass, replace
 import json
 import os
 
-from daser.compression.format import ONLINE_TILE_SCALARS, CompressedStoreGeometry
-
 BLOCK_TOKENS = 16
 DEFAULT_IOURING_L1_BYTES = 1024 * 1024 * 1024
+DEFAULT_L2_BYTES = 10 * 1024 * 1024 * 1024
+#: Allocation unit of both tiers (``--tier-grain``).
+DEFAULT_TIER_GRAIN = 64 * 1024
+#: Upper bound of the pinned staging pool carved out of the L1 budget.
+MAX_STAGING_BYTES = 256 * 1024 * 1024
+_IO_ALIGNMENT = 4096
 
 #: Cache reuse mode selecting the retrieval index + position encoder pair.
 CACHE_REUSE_PREFIX = "prefix"
@@ -42,9 +46,6 @@ LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
 #: L2 writes run on their own executor in 16 MiB pieces that pause (bounded)
 #: while any L2 read is in native IO (default on; ``0`` disables).
 L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
-#: Research switch: share of L1 that readahead leases may retain at once
-#: (default 0.5).
-READAHEAD_BUDGET_FRACTION_ENV = "DASER_READAHEAD_BUDGET_FRACTION"
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,11 @@ def _dtype_bytes(dtype: object) -> int:
     return 2
 
 
+def _round_down(value: int, alignment: int) -> int:
+    """Return ``value`` rounded down to a multiple of ``alignment``."""
+    return value // alignment * alignment
+
+
 def _dtype_name(dtype: object) -> str:
     """Return a normalized HuggingFace scalar dtype name.
 
@@ -222,12 +228,9 @@ class DaserConfig:
         model_path: HuggingFace model path used by vLLM and tokenizer loading.
         vllm_model_id: model identifier served by vLLM's OpenAI API.
         store_dir: directory containing DaseR data files.
-        total_store_bytes: total KV store capacity. Compressed-online with
-            an L2 tier addresses ``l2_budget_bytes`` plus L1 here, because
-            records kept by L1 alone hold arena addresses but no SSD budget.
-        l2_budget_bytes: live packed SSD bytes allowed by compressed-online
-            tiering (0 = no budget beyond the arena).
-        total_slots: number of fixed-size slots in the store.
+        l2_size_bytes: requested SSD-tier capacity across all TP ranks; the
+            store file holds ``l2_lane_bytes * tensor_parallel_size`` bytes.
+            Ignored when ``skip_l2`` is set.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
         log_level: log level string passed to init_logger.
         block_tokens: tokens per vLLM block (default 16).
@@ -235,14 +238,16 @@ class DaserConfig:
                   cross-model cache reuse.
         cache_reuse_mode: retrieval/position strategy selected at startup.
         transfer_mode: server-owned transfer layer selected at startup.
-        l1_size_bytes: memory-tier capacity for iouring mode.
+        l1_size_bytes: pinned-memory budget for iouring mode (L1 lanes plus
+            the staging pool); 0 or gds disables L1.
         skip_l2: when True, keep all transfer bytes in volatile L1 memory and
             do not allocate or persist SSD-tier store files.
+        tier_grain: allocation unit of both tiers in bytes; a power of two
+            and a multiple of 4096.
         tensor_parallel_size: vLLM tensor-parallel rank count used by the
             physical KV store layout.
         storage_format: startup-immutable raw or experimental compressed mode.
-        bip_enabled: whether the L1 cache uses BIP replacement.
-        prefetch_lease_budget_bytes: cap on accounted bytes retained by
+        prefetch_lease_budget_bytes: cap on L1 bytes pinned by
             in-flight scheduler prefetch leases in iouring mode (0 = no cap).
         l2_read_stripe_bytes: part size for splitting one large iouring L2
             read into concurrently submitted IOs (0 = one serial read).
@@ -254,8 +259,7 @@ class DaserConfig:
     model_path: str = ""
     vllm_model_id: str = ""
     store_dir: str = "/mnt/xfs/daser"
-    total_store_bytes: int = 10 * 1024 * 1024 * 1024
-    l2_budget_bytes: int = 0
+    l2_size_bytes: int = DEFAULT_L2_BYTES
     ipc_socket_path: str = "/tmp/daser.sock"
     log_level: str = "INFO"
 
@@ -264,9 +268,9 @@ class DaserConfig:
     transfer_mode: str = "iouring"
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
     skip_l2: bool = False
+    tier_grain: int = DEFAULT_TIER_GRAIN
     tensor_parallel_size: int = 1
     storage_format: str = STORAGE_FORMAT_RAW
-    bip_enabled: bool = True
     l1_accounting: str = L1_ACCOUNTING_STORED
     prefetch_lease_budget_bytes: int = 0
     l2_read_stripe_bytes: int = 0
@@ -284,6 +288,16 @@ class DaserConfig:
             raise ValueError("l2_read_stripe_bytes must be non-negative")
         if self.extra_kv_layers < 0:
             raise ValueError("extra_kv_layers must be non-negative")
+        grain = self.tier_grain
+        if grain <= 0 or grain & (grain - 1) or grain % _IO_ALIGNMENT:
+            raise ValueError(
+                f"tier_grain must be a power of two multiple of {_IO_ALIGNMENT}, "
+                f"got {grain}"
+            )
+        if self.l1_size_bytes < 0 or self.l2_size_bytes < 0:
+            raise ValueError("tier sizes must be non-negative")
+        if self.tensor_parallel_size <= 0:
+            raise ValueError("tensor_parallel_size must be positive")
 
     @property
     def store_path(self) -> str:
@@ -299,9 +313,9 @@ class DaserConfig:
     def persists_index(self) -> bool:
         """Whether ``daser.index`` describes the store across restarts.
 
-        Memory-only mode has no durable bytes. Online packed slot records live
-        only in server memory and overwrite raw slot envelopes, so a snapshot
-        cannot describe a compressed-online store after restart.
+        Memory-only mode has no durable bytes. Compressed-online records carry
+        per-slot codec metadata that lives only in server memory, so only raw
+        chunks with an L2 copy are persisted.
         """
         return not self.skip_l2 and self.storage_format == STORAGE_FORMAT_RAW
 
@@ -314,49 +328,72 @@ class DaserConfig:
         return f"{model_id}::tp{self.tensor_parallel_size}"
 
     @property
-    def total_slots(self) -> int:
-        """Return logical slots available to the selected storage format."""
-        physical_slots = self.physical_total_slots
-        if self.storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
-            return physical_slots
-        packed_size = self.resolved_online_packed_slot_size()
-        local_bytes = self.resolved_local_slot_size()
-        logical_bytes = physical_slots * local_bytes
-        return max(physical_slots, logical_bytes // packed_size)
+    def l1_enabled(self) -> bool:
+        """Whether the pinned-memory L1 tier exists (iouring with a budget)."""
+        return self.transfer_mode == "iouring" and self.l1_size_bytes > 0
 
     @property
-    def physical_total_slots(self) -> int:
-        """Return raw-envelope slots represented by the on-disk L2 file."""
-        return self.total_store_bytes // self.resolved_slot_size()
+    def l2_enabled(self) -> bool:
+        """Whether the SSD L2 tier exists (not ``skip_l2``)."""
+        return not self.skip_l2
 
     @property
-    def aligned_store_bytes(self) -> int:
-        """Return store capacity rounded down to a whole number of slots."""
-        return self.physical_total_slots * self.resolved_slot_size()
+    def staging_bytes(self) -> int:
+        """Return the pinned staging pool size carved out of the L1 budget.
 
-    def resolved_online_packed_slot_size(self) -> int:
-        """Return the minimum aligned size used for logical packed capacity.
-
-        Returns:
-            Minimum aligned bytes representable by one compressed-online
-            rank-local KV record. Physical extents are allocated from each
-            record's actual packed length.
-
-        Raises:
-            ValueError: If the model geometry cannot fit the online envelope.
+        Stores not admitted to L1 and loads not promoted to L1 stage through
+        this pool, so it exists only when both tiers do.
         """
-        geometry = self.model_geometry()
-        local_slot_size = self.resolved_local_slot_size()
-        return CompressedStoreGeometry(
-            num_slots=self.physical_total_slots,
-            slot_size=local_slot_size,
-            block_tokens=self.block_tokens,
-            num_layers=geometry.num_layers,
-            num_kv_heads=max(1, geometry.num_kv_heads // self.tensor_parallel_size),
-            head_dim=geometry.head_dim,
-            dtype_bytes=geometry.dtype_bytes,
-            tile_scalars=ONLINE_TILE_SCALARS,
-        ).online_min_stored_length
+        if not (self.l1_enabled and self.l2_enabled):
+            return 0
+        grain = self.tier_grain
+        return max(
+            grain,
+            _round_down(min(MAX_STAGING_BYTES, self.l1_size_bytes // 8), grain),
+        )
+
+    @property
+    def l1_lane_bytes(self) -> int:
+        """Return each TP rank's L1 lane bytes (0 when L1 is disabled)."""
+        if not self.l1_enabled:
+            return 0
+        budget = max(0, self.l1_size_bytes - self.staging_bytes)
+        return _round_down(budget // self.tensor_parallel_size, self.tier_grain)
+
+    @property
+    def l2_lane_bytes(self) -> int:
+        """Return each TP rank's L2 lane bytes (0 when L2 is disabled)."""
+        if not self.l2_enabled:
+            return 0
+        return _round_down(
+            self.l2_size_bytes // self.tensor_parallel_size, self.tier_grain
+        )
+
+    @property
+    def store_file_bytes(self) -> int:
+        """Return the store file size: one L2 lane per TP rank."""
+        return self.l2_lane_bytes * self.tensor_parallel_size
+
+    @property
+    def l1_arena_bytes(self) -> int:
+        """Return the pinned L1 arena size: one L1 lane per TP rank."""
+        return self.l1_lane_bytes * self.tensor_parallel_size
+
+    @property
+    def l1_record_bytes(self) -> int:
+        """Return the minimum bytes charged per L1 record.
+
+        Raw L1 accounting of compressed-online records charges every record
+        its 4 KiB-aligned raw slot size; otherwise records are charged their
+        stored size (0).
+        """
+        if (
+            self.storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE
+            or self.l1_accounting != L1_ACCOUNTING_RAW
+        ):
+            return 0
+        local = self.resolved_local_slot_size()
+        return -(-local // _IO_ALIGNMENT) * _IO_ALIGNMENT
 
     def model_geometry(self) -> ModelGeometry:
         """Return the KV geometry of every layer the worker registers.
@@ -367,11 +404,6 @@ class DaserConfig:
         """
         geometry = model_geometry_from_path(self.model_path)
         return replace(geometry, num_layers=geometry.num_layers + self.extra_kv_layers)
-
-    @property
-    def l2_size_bytes(self) -> int:
-        """Return SSD-tier capacity in bytes."""
-        return self.aligned_store_bytes
 
     def resolved_slot_size(self) -> int:
         """Return bytes per KV slot derived from the model config.
@@ -405,20 +437,20 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "local_slot_size": self.resolved_local_slot_size(),
             "tensor_parallel_size": self.tensor_parallel_size,
-            "rank_stride_bytes": self.physical_total_slots
-            * self.resolved_local_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
             "cache_reuse_mode": self.cache_reuse_mode,
             "transfer_mode": self.transfer_mode,
             "l1_size_bytes": self.l1_size_bytes,
-            "l2_size_bytes": self.l2_size_bytes,
-            "total_slots": self.total_slots,
-            "total_store_bytes": self.l2_size_bytes,
-            "l2_budget_bytes": self.l2_budget_bytes,
+            "l2_size_bytes": self.store_file_bytes,
+            "l1_enabled": self.l1_enabled,
+            "l2_enabled": self.l2_enabled,
+            "tier_grain": self.tier_grain,
+            "l1_lane_bytes": self.l1_lane_bytes,
+            "l2_lane_bytes": self.l2_lane_bytes,
+            "staging_bytes": self.staging_bytes,
             "skip_l2": self.skip_l2,
             "storage_format": self.storage_format,
-            "bip_enabled": self.bip_enabled,
             "l1_accounting": self.l1_accounting,
             "prefetch_lease_budget_bytes": self.prefetch_lease_budget_bytes,
             "l2_read_stripe_bytes": self.l2_read_stripe_bytes,

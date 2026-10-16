@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 import time
 from typing import Optional
-
-# Third Party
-import msgpack
 
 # First Party
 from daser.logging import init_logger
@@ -52,8 +49,7 @@ class ChunkMeta:
 class MetadataStore:
     """In-memory chunk index: chunk_key -> ChunkMeta.
 
-    Can be serialized to / deserialized from a msgpack file. Slot occupancy
-    is owned by ``ChunkManager``, which rebuilds it from this index.
+    Slot occupancy and persistence are owned by ``ChunkManager``.
     """
 
     def __init__(self) -> None:
@@ -138,32 +134,3 @@ class MetadataStore:
             Iterator over ChunkMeta values.
         """
         return iter(self._chunk_index.values())
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    def to_bytes(self) -> bytes:
-        """Serialize the index to msgpack bytes.
-
-        Returns:
-            Encoded chunk index.
-        """
-        payload = {
-            "chunk_index": {k: asdict(v) for k, v in self._chunk_index.items()},
-        }
-        return msgpack.packb(payload, use_bin_type=True)
-
-    def load_bytes(self, data: bytes) -> None:
-        """Replace the index with one decoded by :meth:`to_bytes`.
-
-        Args:
-            data: Encoded chunk index.
-        """
-        payload = msgpack.unpackb(data, raw=False)
-        # Every previously returned lookup result is invalid after a reload.
-        self._removals += 1
-        self._chunk_index = {
-            k: ChunkMeta(**v) for k, v in payload["chunk_index"].items()
-        }
-        logger.info("[INDEX] loaded %d chunks", len(self._chunk_index))

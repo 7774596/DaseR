@@ -20,33 +20,30 @@ def test_shared_source_is_read_once_across_batches(capacity: int, packed: bool) 
     requests: dict[str, ReqLoadSpec] = {}
     expected: dict[int, bytes] = {}
     lengths = [8, 12, 16, 8] if packed else [16] * 4
-    store = bytearray(256)
+    # Server-side records by slot id; a span reads its slots back to back.
+    store: dict[int, bytes] = {}
     for alias in range(3):
         for source in range(2):
-            cursor = source * 128
             records = []
             blocks = []
             for index, length in enumerate(lengths):
                 block = alias * 8 + source * 4 + index
                 payload = bytes([source * 4 + index + 1]) * length
-                store[cursor : cursor + length] = payload
+                store[source * 4 + index] = payload
                 blocks.append(block)
                 expected[block] = payload
                 records.append(
                     CompressedLoadSlot(
                         slot_id=source * 4 + index,
                         mode="raw" if length == 16 else "compressed",
-                        file_offset=cursor,
                         stored_length=length,
                     )
                 )
-                cursor += length
             requests[f"request{alias}:source{source}"] = ReqLoadSpec(
                 chunk_key=f"source{source}",
                 start_slot=source * 4,
                 num_slots=4,
                 block_ids=blocks,
-                file_offset=source * 128,
                 token_count=512,
                 target_token_start=alias * 128,
                 pos_offset=alias,
@@ -60,12 +57,13 @@ def test_shared_source_is_read_once_across_batches(capacity: int, packed: bool) 
         assert 0 < size <= capacity
         staging = bytearray(size)
         for span in spans:
-            start, offset, length = (
-                span["target_offset"],
-                span["file_offset"],
-                span["nbytes"],
+            first = span["start_slot"]
+            data = b"".join(
+                store[slot] for slot in range(first, first + span["num_slots"])
             )
-            staging[start : start + length] = store[offset : offset + length]
+            assert len(data) == span["nbytes"]
+            start = span["target_offset"]
+            staging[start : start + len(data)] = data
         for start, end, req_id, spec in ranges:
             identity = req_id.split("#")[0]
             assert spec.pos_offset == original[identity].pos_offset

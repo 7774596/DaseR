@@ -37,7 +37,7 @@ def test_remove_returns_meta() -> None:
     assert len(store) == 0
 
 
-def test_removals_count_every_removal_and_reload() -> None:
+def test_removals_count_every_removal() -> None:
     store = MetadataStore()
     store.insert(make_meta("abc", start=0, num=2))
     assert store.removals == 0
@@ -46,8 +46,6 @@ def test_removals_count_every_removal_and_reload() -> None:
     with pytest.raises(KeyError):
         store.remove("abc")
     assert store.removals == 1
-    store.load_bytes(store.to_bytes())
-    assert store.removals == 2
 
 
 def test_remove_nonexistent_raises() -> None:
@@ -61,20 +59,3 @@ def test_insert_duplicate_raises() -> None:
     store.insert(make_meta("abc", start=0, num=2))
     with pytest.raises(ValueError):
         store.insert(make_meta("abc", start=2, num=2))
-
-
-def test_bytes_round_trip_keeps_parent_key() -> None:
-    store = MetadataStore()
-    store.insert(make_meta("abc", start=0, num=3))
-    child = make_meta("def", start=3, num=2)
-    child.parent_key = "abc"
-    store.insert(child)
-
-    store2 = MetadataStore()
-    store2.load_bytes(store.to_bytes())
-    assert len(store2) == 2
-    assert store2.get("abc") == store.get("abc")
-    restored = store2.get("def")
-    assert restored is not None
-    assert restored.parent_key == "abc"
-    assert restored.start_slot == 3

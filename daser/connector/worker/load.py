@@ -73,12 +73,11 @@ def _compressed_request_identity(
             spec.chunk_key,
             spec.start_slot,
             spec.num_slots,
-            spec.file_offset,
             spec.token_count,
             spec.target_token_start,
             spec.pos_offset,
             tuple(
-                (slot.slot_id, slot.mode, slot.file_offset, slot.stored_length)
+                (slot.slot_id, slot.mode, slot.stored_length)
                 for slot in spec.compressed_slots
             ),
         )
@@ -172,7 +171,7 @@ def _load_source_descriptor(
         if len(spec.compressed_slots) != num_slots:
             raise ValueError("compressed slot metadata does not match block IDs")
         physical = tuple(
-            (slot.slot_id, slot.file_offset, slot.stored_length, slot.mode)
+            (slot.slot_id, slot.stored_length, slot.mode)
             for slot in spec.compressed_slots
         )
         return (
@@ -185,7 +184,6 @@ def _load_source_descriptor(
             spec.chunk_key,
             spec.start_slot,
             spec.num_slots,
-            spec.file_offset,
             nbytes,
         ),
         nbytes,
@@ -194,17 +192,15 @@ def _load_source_descriptor(
 
 def _layerwise_records(
     specs: dict[str, ReqLoadSpec],
-    slot_size: int,
 ) -> tuple[np.ndarray, list[int], str, bool]:
     """Flatten one step's layer-wise loads into packed or raw records.
 
     Args:
         specs: Synchronously scheduled load specs of this step.
-        slot_size: Raw bytes of one slot, used to address raw records.
 
     Returns:
-        Record file offsets, matching destination blocks, the single request
-        lease that retains every record in L1, and whether the records are
+        Record slot ids, matching destination blocks, the single request
+        lease that pins every record in L1, and whether the records are
         packed (otherwise every record is a raw slot-major slot).
 
     Raises:
@@ -215,7 +211,7 @@ def _layerwise_records(
     Async/thread-safety:
         Pure planning on the load thread.
     """
-    offsets: list[int] = []
+    slots: list[int] = []
     block_ids: list[int] = []
     formats: set[bool] = set()
     leases = {spec.lease_id for spec in specs.values()}
@@ -229,21 +225,20 @@ def _layerwise_records(
                 slot.mode != "compressed" for slot in spec.compressed_slots
             ):
                 raise ValueError("layer-wise load requires packed records only")
-            offsets.extend(slot.file_offset for slot in spec.compressed_slots)
+            slots.extend(slot.slot_id for slot in spec.compressed_slots)
         else:
             if spec.pos_offset:
                 raise ValueError("raw layer-wise load requires zero position offset")
-            offsets.extend(
-                spec.file_offset + index * slot_size
-                for index in range(len(spec.block_ids))
+            slots.extend(
+                spec.start_slot + index for index in range(len(spec.block_ids))
             )
         block_ids.extend(int(block) for block in spec.block_ids)
     if len(formats) != 1:
         raise ValueError("layer-wise load cannot mix packed and raw records")
-    if not offsets or len(set(block_ids)) != len(block_ids):
+    if not slots or len(set(block_ids)) != len(block_ids):
         raise ValueError("layer-wise load destinations must be distinct")
     return (
-        np.asarray(offsets, dtype=np.int64),
+        np.asarray(slots, dtype=np.int64),
         block_ids,
         leases.pop(),
         formats.pop(),
@@ -415,7 +410,6 @@ class LoadPipeline:
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._local_slot_size = 0
-        self._rank_stride_bytes = 0
         self._tp_rank = 0
         self._load_key_scale = 1.0
         self._load_value_scale = 1.0
@@ -451,7 +445,6 @@ class LoadPipeline:
         kv_caches: dict[str, torch.Tensor],
         layer_names: list[str],
         local_slot_size: int,
-        rank_stride_bytes: int,
         tp_rank: int,
         staging_pool: FixedCudaStagingPool,
         load_key_scale: float,
@@ -467,7 +460,6 @@ class LoadPipeline:
             kv_caches: Registered vLLM KV tensors.
             layer_names: Stable storage layer order.
             local_slot_size: Bytes stored per slot by this TP rank.
-            rank_stride_bytes: Byte distance between rank lanes.
             tp_rank: Current tensor-parallel rank.
             staging_pool: Fixed load staging buffers.
             load_key_scale: Load-time key scaling factor.
@@ -482,7 +474,6 @@ class LoadPipeline:
         self._kv_caches = kv_caches
         self._layer_names = list(layer_names)
         self._local_slot_size = local_slot_size
-        self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
         self._staging_pool = staging_pool
         self._staging_registered = False
@@ -543,18 +534,16 @@ class LoadPipeline:
             max_slots_per_buffer=max_destination_slots,
         )
 
-    def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:
-        """Apply server-finalized tensor-parallel lane geometry.
+    def configure_rank_geometry(self, tp_rank: int) -> None:
+        """Apply the server-finalized tensor-parallel rank.
 
         Args:
-            rank_stride_bytes: Byte distance between server-owned rank lanes.
-            tp_rank: Current tensor-parallel rank.
+            tp_rank: Current tensor-parallel rank; the server reads its lane.
 
         Async/thread-safety:
             Called on the worker thread after runtime-config refresh and before
             any load is submitted.
         """
-        self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
 
     def begin_step(self, expect_loads: bool) -> None:
@@ -1074,23 +1063,9 @@ class LoadPipeline:
     ) -> _InflightRequestLoad:
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
-        specs = {
-            spec_id: (
-                spec
-                if spec.compressed_slots
-                else replace(
-                    spec,
-                    file_offset=(
-                        self._tp_rank * self._rank_stride_bytes
-                        + spec.start_slot * self._local_slot_size
-                    ),
-                )
-            )
-            for spec_id, spec in request.specs.items()
-        }
         batches = deque(
             build_load_read_batches(
-                specs,
+                request.specs,
                 self._local_slot_size,
                 max_batch_bytes=self._staging_pool.buffer_bytes,
                 include_req_ids=True,
@@ -1133,16 +1108,13 @@ class LoadPipeline:
         # The dispatcher must know the lease before metadata preparation or
         # CUDA IPC export can fail. Owning those operations in the batch Task
         # gives their partial GPU work the same failure drain as the transfer.
-        state.future = asyncio.create_task(
-            self._transfer_batch(state, spans, request.lease_id)
-        )
+        state.future = asyncio.create_task(self._transfer_batch(state, spans))
         return state
 
     async def _transfer_batch(
         self,
         state: _InflightLoadBatch,
         spans: list[dict[str, int]],
-        lease_id: str | None,
     ) -> dict[str, Any]:
         """Prepare metadata and await IO under an already-owned staging lease."""
         staging = state.staging_lease.view
@@ -1172,7 +1144,7 @@ class LoadPipeline:
                 producer_pid=os.getpid(),
                 nbytes=state.total_bytes,
                 spans=spans,
-                lease_id=lease_id,
+                tp_rank=self._tp_rank,
             )
         else:
             if staging.device.type == "cuda":
@@ -1194,7 +1166,7 @@ class LoadPipeline:
                 allocation_offset=allocation_offset,
                 producer_pid=os.getpid(),
                 spans=spans,
-                lease_id=lease_id,
+                tp_rank=self._tp_rank,
             )
         return await transfer
 
@@ -1383,8 +1355,8 @@ class LoadPipeline:
                 transfer_open_ms=float(payload.get("transfer_open_ms", 0.0)),
                 transfer_load_ms=float(payload.get("transfer_load_ms", 0.0)),
                 transfer_sync_ms=float(payload.get("transfer_sync_ms", 0.0)),
-                l1_hits=int(stats.get("l1_hits", 0)),
-                l1_misses=int(stats.get("l1_misses", 0)),
+                l1_hits=int(payload.get("l1_segments", 0)),
+                l1_misses=int(payload.get("l2_segments", 0)),
                 l2_reads=int(stats.get("l2_reads", 0)),
             )
         finally:
@@ -1487,9 +1459,7 @@ class LoadPipeline:
         tasks: list[asyncio.Task[dict[str, Any]]] = []
         stream: torch.cuda.Stream | None = None
         try:
-            files, block_ids, lease_id, packed = _layerwise_records(
-                specs, self._local_slot_size
-            )
+            slots, block_ids, lease_id, packed = _layerwise_records(specs)
             self._ensure_cuda_streams()
             pool = self._staging_pool
             if pool is None:
@@ -1499,7 +1469,7 @@ class LoadPipeline:
             leases = [pool.acquire_index(index, pool.buffer_bytes) for index in (0, 1)]
             buffers = [lease.view for lease in leases]
             pid = os.getpid()
-            records = len(files)
+            records = len(slots)
             layers = len(state.ready)
 
             def carve(need: int) -> list[torch.Tensor]:
@@ -1509,11 +1479,11 @@ class LoadPipeline:
 
             if packed:
                 stream, plan_group, restore_group = await self._packed_layer_groups(
-                    state, files, block_ids, lease_id, buffers, carve
+                    state, slots, block_ids, lease_id, buffers, carve
                 )
             else:
                 stream, plan_group, restore_group = self._raw_layer_groups(
-                    files, block_ids, layers, carve
+                    slots, block_ids, layers, carve
                 )
             state.records = records
             state.header_ms = (time.perf_counter() - state.started_at) * 1000
@@ -1521,17 +1491,19 @@ class LoadPipeline:
                 stream.wait_event(state.ready_after)
 
             async def transfer(group: int) -> dict[str, Any]:
-                group_files, targets, sizes = plan_group(group)
+                intra, targets, sizes = plan_group(group)
                 lane = group % 2
                 begin = time.perf_counter()
                 try:
                     return await self._clients[lane].transfer_load_runs(
                         lane,
                         pid,
-                        group_files,
+                        slots,
+                        intra,
                         targets,
                         sizes,
                         lease_id,
+                        tp_rank=self._tp_rank,
                     )
                 finally:
                     spans.append((begin, time.perf_counter()))
@@ -1596,7 +1568,7 @@ class LoadPipeline:
     async def _packed_layer_groups(
         self,
         state: _LayerwiseLoad,
-        files: np.ndarray,
+        slots: np.ndarray,
         block_ids: list[int],
         lease_id: str,
         buffers: list[torch.Tensor],
@@ -1612,12 +1584,18 @@ class LoadPipeline:
         the host and placed at every record's offset in both lanes.
 
         Args:
+            state: Shared step state.
+            slots: Slot id of every record.
+            block_ids: Destination block of every record.
+            lease_id: Request lease pinning the records in L1.
+            buffers: The two staging lanes.
             carve: Returns a view of the given bytes at the head of each
                 staging buffer (one lane each).
 
         Returns:
             The decode stream, a function giving one layer group's
-            ``(file offsets, lane offsets, lengths)`` runs, and a function
+            ``(offsets inside each record, lane offsets, lengths)`` runs for
+            ``slots``, and a function
             that patches that group's descriptors in a lane and decodes it on
             the current stream.
         """
@@ -1627,7 +1605,7 @@ class LoadPipeline:
             raise RuntimeError("packed layer-wise load requires the compressed decoder")
         pool = self._staging_pool
         assert pool is not None
-        records = len(files)
+        records = len(slots)
         layers = len(state.ready)
         # Deep models spill the descriptor table past one 4 KiB page.
         record_header = slot_header_bytes(2 * layers)
@@ -1639,10 +1617,12 @@ class LoadPipeline:
         await self._clients[1].transfer_load_runs(
             1,
             os.getpid(),
-            files,
+            slots,
+            np.zeros(records, dtype=np.int64),
             tail + np.arange(records, dtype=np.int64) * record_header,
             np.full(records, record_header, dtype=np.int64),
             lease_id,
+            tp_rank=self._tp_rank,
         )
         host = self._header_host
         if host is None or host.numel() < header_bytes:
@@ -1697,7 +1677,7 @@ class LoadPipeline:
             skew = plan.source_begin % 16
             begin = plan.source_begin - skew
             end = (plan.source_end + 15) // 16 * 16
-            return files + begin, plan.data_offsets - skew, end - begin
+            return begin, plan.data_offsets - skew, end - begin
 
         def restore_group(group: int, lane: int) -> None:
             first, last = int(bounds[group]), int(bounds[group + 1])
@@ -1708,7 +1688,7 @@ class LoadPipeline:
 
     def _raw_layer_groups(
         self,
-        files: np.ndarray,
+        slots: np.ndarray,
         block_ids: list[int],
         layers: int,
         carve: Callable[[int], list[torch.Tensor]],
@@ -1726,12 +1706,16 @@ class LoadPipeline:
         copy; no decoder or header pages are involved.
 
         Args:
+            slots: Slot id of every record.
+            block_ids: Destination block of every record.
+            layers: Model layers.
             carve: Returns a view of the given bytes at the head of each
                 staging buffer (one lane each).
 
         Returns:
             The copy stream, a function giving one layer's
-            ``(file offsets, lane offsets, lengths)`` runs, and a function
+            ``(offsets inside each record, lane offsets, lengths)`` runs for
+            ``slots``, and a function
             that copies that layer from a lane into the KV cache on the
             current stream.
 
@@ -1741,7 +1725,7 @@ class LoadPipeline:
         kv_cache = self._kv_caches[CROSS_LAYER_KV_CACHE_KEY]
         if self._load_key_scale != 1.0 or self._load_value_scale != 1.0:
             raise ValueError("raw layer-wise load does not apply load scales")
-        records = len(files)
+        records = len(slots)
         layer_bytes = self._local_slot_size // layers
         views = carve(records * layer_bytes)
         if self._raw_layerwise_stream is None:
@@ -1755,7 +1739,7 @@ class LoadPipeline:
         shape = (records, *kv_cache.shape[2:])
 
         def plan_group(group: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            return files + group * layer_bytes, targets, sizes
+            return np.full(records, group * layer_bytes, dtype=np.int64), targets, sizes
 
         def restore_group(group: int, lane: int) -> None:
             src = views[lane].view(kv_cache.dtype)
@@ -1881,8 +1865,9 @@ def build_load_read_plan(
         include_req_ids: Include request IDs in restore ranges when true.
 
     Returns:
-        Total bytes, server read spans, and ranges mapping staging back to
-        request specifications.
+        Total bytes, server read spans ``{target_offset, start_slot,
+        num_slots, nbytes}``, and ranges mapping staging back to request
+        specifications.
 
     Async/thread-safety:
         Pure CPU planning; safe to call from worker or load-loop threads.
@@ -1898,27 +1883,38 @@ def build_load_read_plan(
         source_key, nbytes = _load_source_descriptor(spec, slot_size)
         existing = source_ranges.get(source_key)
         if existing is None:
+            first_span = len(spans)
             start = total_bytes
             end = start + nbytes
             if spec.compressed_slots:
+                # One span per run of consecutive slot ids; the server lands
+                # their records back to back.
                 target_offset = start
                 for slot in spec.compressed_slots:
-                    spans.append(
-                        {
-                            "target_offset": target_offset,
-                            "nbytes": slot.stored_length,
-                            "file_offset": slot.file_offset,
-                            "accounted_nbytes": slot_size,
-                        }
-                    )
+                    last = spans[-1] if spans and len(spans) > first_span else None
+                    if (
+                        last is not None
+                        and last["start_slot"] + last["num_slots"] == slot.slot_id
+                    ):
+                        last["num_slots"] += 1
+                        last["nbytes"] += slot.stored_length
+                    else:
+                        spans.append(
+                            {
+                                "target_offset": target_offset,
+                                "start_slot": slot.slot_id,
+                                "num_slots": 1,
+                                "nbytes": slot.stored_length,
+                            }
+                        )
                     target_offset += slot.stored_length
             else:
                 spans.append(
                     {
                         "target_offset": start,
+                        "start_slot": spec.start_slot,
+                        "num_slots": num_slots,
                         "nbytes": nbytes,
-                        "file_offset": spec.file_offset,
-                        "accounted_nbytes": nbytes,
                     }
                 )
             source_ranges[source_key] = (start, end)
@@ -2013,11 +2009,6 @@ def build_load_read_batches(
                     start_slot=spec.start_slot + cursor,
                     num_slots=take,
                     block_ids=spec.block_ids[cursor : cursor + take],
-                    file_offset=(
-                        compressed_slots[0].file_offset
-                        if compressed_slots
-                        else spec.file_offset + cursor * slot_size
-                    ),
                     compressed_slots=compressed_slots,
                 )
                 key = (

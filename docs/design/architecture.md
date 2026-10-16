@@ -17,7 +17,9 @@ graph TB
         IPC["IPC server<br/>Unix socket + msgpack"]
         subgraph core_owner["ServerCore control plane"]
             CORE["ServerCore<br/>共享控制面核心"]
-            CM["ChunkManager<br/>free-extent slot allocator"]
+            CM["ChunkManager<br/>monotonic slot ids"]
+            TI["TierIndex<br/>L1/L2 TLSF + placement"]
+            ET["EvictionTree<br/>per-tier leaf-first LRU"]
             MS["MetadataStore<br/>chunk_index"]
             DR["DocRegistry"]
             RI["RetrievalIndex"]
@@ -28,6 +30,8 @@ graph TB
             CPE["ChunkPositionEncoder"]
 
             CORE --> CM
+            CORE --> TI
+            TI --> ET
             CORE --> DR
             CORE --> RI
             CORE --> PE
@@ -39,18 +43,16 @@ graph TB
         end
 
         subgraph transfer_owner["Server-owned transfer orchestration"]
-            TL["TransferLayer<br/>server-owned orchestration"]
-            GDS["Optional backend<br/>GDS/kvikio"]
+            TL["TransferLayer<br/>data mover"]
+            GDS["Optional backend<br/>GDS/kvikio, L2 only"]
             IOR["iouring backend<br/>O_DIRECT"]
             SKIP["skip_l2<br/>disable L2"]
-            L1["Pinned host memory<br/>L1 LRU pool"]
-            RP["ReplacementPolicy<br/>LRU"]
+            L1["Pinned host memory<br/>L1 arena + staging pool"]
 
             TL --> GDS
             TL --> IOR
             IOR --> L1
             IOR --> SKIP
-            RP --> L1
         end
 
         HTTP --> CORE
@@ -110,24 +112,20 @@ SSD、L1/L2 容量和替换策略。GDS 只作为可选兼容 backend 保留，�
 默认或验证路径。
 
 iouring 图里的 `iouring backend` 表示 transfer 执行引擎，逻辑存储层级则是
-L1 pinned host memory 到 NVMe 上的 L2 `daser.store` byte ranges。图上用
+L1 pinned host memory 和 NVMe 上的 L2 `daser.store` 两个独立层。图上用
 `L1 -> NVMe` 表示这条 L1/L2 层级关系，不把 L2 单独画成 server 内部组件，
-避免和外部 `NVMe` 节点重复。store 路径先把 bytes 放入 L1 并立即对 load
-可见，再由 iouring transfer 异步持久化到 NVMe L2；load 路径先查 L1，miss
-时由 iouring transfer 从 NVMe L2 读入并 promote 回 L1。L1 的驻留范围和
-LRU 状态只存在于 `TieredIOUringTransferLayer` 内存中，由
-`ReplacementPolicy` 管理；`MetadataStore` 只记录 L2 级别的 `chunk_index`，
-不保存 L1 状态。
+避免和外部 `NVMe` 节点重复。两层各有自己的分配器和容量，chunk 在每层最多
+一个副本，驻留和淘汰都由 server 的 `TierIndex` 与 `EvictionTree` 决定；
+iouring transfer 只按 server 给出的 L1 arena 偏移和 L2 文件偏移搬运字节。
+store 对 L2 write-through，L1 能接纳时保留 L1 副本；load 从 L1 副本读，没有
+时从 L2 读并在可接纳时 promote 进 L1。见
+[独立 L1/L2 分层与叶子优先淘汰](tier-residency.md)。
 
-`--skip-l2` 选择同一 IPC/control-plane 流程下的 L1-only transfer。server
-仍然用 `ChunkManager` 分配逻辑 slot 和 `file_offset`，lookup/store 仍然经由
+`--skip-l2` 关闭 L2，其余 IPC/control-plane 流程不变：lookup/store 仍然经由
 `ServerCore`、`RetrievalIndex` 和 `transfer_store`/`transfer_load` IPC op，
 但 KV bytes 只进入 pinned host L1，不创建 `daser.store`，不做 L2 写入，也不在
-关机时保存 `daser.index`。L1 淘汰后的范围不可从 L2 恢复，重启后总是冷启动。
-chunk 索引和 L1 替换彼此独立（pinned pool 压力可能先淘汰仍被索引的 chunk），
-所以 lookup 在该模式下只返回字节仍全部驻留 L1 的前缀 chunk，遇到第一个已被
-淘汰的 chunk 就截断，并刷新命中 chunk 的 LRU；lookup 之后、load 之前的并发
-淘汰仍可能让 load 失败。
+关机时保存 `daser.index`。store 必须被 L1 接纳，否则失败；chunk 的 L1 副本被
+淘汰即离开索引，lookup 只返回仍存在的前缀，重启后总是冷启动。
 该模式和 `gds` 冲突，因为 GDS 需要一个可打开的 L2 store file。
 
 ---
@@ -161,7 +159,8 @@ python -m daser.server \
 1. 通过 vLLM `/v1/models` 读取 served model id。
 2. 从本地模型 `config.json` 推导 KV geometry 和 slot size；如果 served
    model id 不是本地目录，需要显式传 `--model-path`。
-3. 创建或校验 `<store-dir>/daser.store`，容量按完整 slot 向下取整。
+3. 创建或校验 `<store-dir>/daser.store`，容量按 `--tier-grain` 与 TP lane 向下
+   取整。
 4. 从 `<store-dir>/daser.index` 恢复 metadata，并重建 `RetrievalIndex`。
 5. 在同一进程中启动 HTTP server 和 IPC server。
 
@@ -170,14 +169,13 @@ python -m daser.server \
 `--transfer-mode gds` 同时使用会在配置阶段报错。
 
 `store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
-`l1_size_bytes`、`l2_size_bytes`、`skip_l2` 等运行时配置由 DaseR server 持有。
-其中 `l2_size_bytes` 是按完整 slot 对齐后的实际 store 容量，而不是原始
-`--l2-size` 请求值。启动时如果发现旧版本留下的更大 `daser.store`，server 会
+`l1_size_bytes`、`l2_size_bytes`、`tier_grain`、`skip_l2` 等运行时配置由 DaseR
+server 持有。其中 `l2_size_bytes` 是按粒度与 TP lane 对齐后的实际 store 容量，
+而不是原始 `--l2-size` 请求值。启动时如果发现更大的 `daser.store`，server 会
 截断到对齐容量；小于对齐容量的文件会被拒绝。
 vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，避免 vLLM
-参数和 DaseR 参数重复传递后不一致。
-在 `skip_l2=true` 时，`store_path` 为空字符串，`l2_size_bytes` 仍作为
-逻辑 slot 容量暴露给 connector。
+参数和 DaseR 参数重复传递后不一致。connector 不用这些容量计算任何位置。
+在 `skip_l2=true` 时，`store_path` 为空字符串，`l2_enabled` 为 false。
 
 ---
 
@@ -206,13 +204,18 @@ IPC server 面向 vLLM `DaserConnector`：
 | op | 请求字段 | 响应字段 |
 |----|----------|----------|
 | `get_runtime_config` | - | `runtime_config` |
-| `lookup` | `tokens`, `model_id` | `chunks` |
+| `lookup` | `tokens`, `model_id` | `chunks`, `index_epoch` |
+| `lookup_prefetch` / `transfer_prefetch` / `release_transfer_lease` | `lease_id`（`lookup_prefetch` 另带 lookup 字段） | lease 的 `spans`/`tier`、promote 字节、`ok` |
 | `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
-| `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
-| `transfer_store` | `payload`, `spans` | `ok`, `bytes` |
-| `transfer_load` | `payload`, `spans` | `ok`, `bytes` |
-| `commit_chunk` | `chunk_key` | `ok` |
+| `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `pos_offset` |
+| `transfer_store` | `payload`, `spans`, `tp_rank`, `tp_size` | `ok`, `bytes`, `chunk_keys` |
+| `transfer_load` | `payload`, `spans`, `tp_rank` | `ok`, `bytes`, `l1_segments`, `l2_segments` |
+| `transfer_load_runs` | `payload`, `lease_id`, `tp_rank`, `runs` | `ok`, `bytes` |
 | `evict_chunk` | `chunk_key` | `ok` |
+
+完整 op 列表见 [components.md](components.md)，span 与 run 字段见
+[tier-residency.md](tier-residency.md)。chunk 在 server 观察到所有 rank 的 store
+结束后发布，没有单独的 commit op。
 
 IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server 和
 `ServerCore`。
@@ -230,9 +233,9 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 ### 两阶段提交
 
 `alloc_chunk` 只预留 slot 和 metadata，不把 chunk 插入 `RetrievalIndex`。
-worker transfer 完成后由 DaseR server 检查完整的 L1 range coverage，并调用
-现有的 `commit_chunk` 路径，chunk 才对 lookup 可见。这避免了部分写入的
-数据被其他请求读到，同时避免 worker 发起重复 commit。
+每个 TP rank 的 store 结束后 server 记一次报告；所有 rank 都报告且某层副本在
+所有 rank 上有效时，server 发布 chunk，之后才对 lookup 可见。这避免了部分写入的
+数据被其他请求读到，同时 worker 不需要单独的 commit op。
 
 ### Worker 侧 staging，server 侧 transfer
 
@@ -242,8 +245,8 @@ store 路径不再每层单独发一次写 IO。Worker 在 `wait_for_save` 中�
 个任务释放 buffer 后自动推进下一个任务；不依赖后续 vLLM connector step。
 它构造一个或多个 slot-major staging view，把待保存 blocks 的每层 KV 拷入
 staging，导出 CUDA IPC handle，并通过 IPC 请求 server 执行 transfer。DaseR
-server 在完整 L1 coverage 后负责 `commit_chunk`，而不是由 worker 发起第二个
-commit 路径。staging 由 worker 侧小型 `CudaStagingPool` 复用，初始化时预分配
+server 放置 chunk、搬运字节并在所有 rank 报告后发布，worker 不发起 commit。
+staging 由 worker 侧小型 `CudaStagingPool` 复用，初始化时预分配
 bounded buffer；单批和未完成后台 batch 的字节上限会根据 vLLM 分配 KV cache
 后的当前可用显存推导，避免固定挤占显存。
 
@@ -277,12 +280,13 @@ system，之后不做运行时切换：
 
 | Mode | 数据路径 |
 |------|---------|
-| `iouring` | 当前主路径：server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
+| `iouring` | 当前主路径：server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，两层由 server 放置和淘汰（每层叶子优先 LRU）；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
 | `gds` | 可选兼容路径：server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA；当前环境不可用，不作为默认验证路径 |
 
 `--skip-l2` 是 `iouring` 的 memory-only 开关：server 仍初始化
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
-路径；store 只写 L1，load 只查 L1。
+路径；store 只写 L1，load 只查 L1。`gds` 没有 L1：不分配 pinned arena，prefetch
+lease、readahead 和 layerwise load 不可用。
 
 ### 在线压缩存储
 
@@ -290,39 +294,33 @@ system，之后不做运行时切换：
 `compressed-online`。后者对 BF16 KV 做严格无损压缩，只支持
 `iouring + prefix + TP=1 + BF16 + block_tokens=128`；不满足条件时
 启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
-与 `--skip-l2` 同开时 packed arena 只寻址 L1（`--l1-size`），压缩后的 record
-只驻留 pinned memory，容量收益直接作用于 memory-only 缓存；L2 预算和
-held 状态在这种模式下不生效。
+与 `--skip-l2` 同开时压缩后的 record 只驻留 pinned memory，容量收益直接作用于
+memory-only 缓存。
 
 store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
 record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，默认使用模型无关的
-generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。`ChunkManager` 的逻辑槽位
-按最小 packed 长度超额供给，只负责 slot 身份和元数据；server 在 L1+L2
-大小的 packed arena 中为每个 record 分配稳定地址，相邻 record 合并成一个 DMA
-span。L1 只为实际写入的字节分配 pinned memory，这是容量收益的来源。L2 预算
-（`--l2-size`）超出时按叶子优先 LRU 回收，整段驻留在 L1 的 record 转为 held 保留
-在索引中，因此 L2 预算不会淘汰 L1 的热数据；store 始终 write-through，见
-[槽位分配、叶子优先淘汰与 L1/L2 驻留](tier-residency.md)。
+generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。server 按 record 的
+`stored_length` 在每层为 chunk 分配一段连续 extent（L1 在 pinned arena，L2 在
+`daser.store`），同一批 store 尽量连续放置，相邻 record 合并成一个 DMA。两层只
+为实际写入的字节分配空间，这是容量收益的来源。store 始终 write-through，见
+[独立 L1/L2 分层与叶子优先淘汰](tier-residency.md)。
 
-server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、
-stored length），lookup 命中后把有序 record 以 `compressed_slots` 附在 load
+server 在 store 时记录每个 chunk 的 record mode 与 stored length，lookup 命中后把
+有序 record 以 `compressed_slots`（`{slot_id, mode, stored_length}`）附在 load
 spec 上。scheduler 保留逻辑 slot 到 vLLM block 的对应关系，worker 按压缩字节
-而不是 raw slot 数拆 staging batch。server 收到的 transfer 请求仍只是普通
-`(target_offset, file_offset, nbytes)` spans；`TransferLayer` 不解析 codec。
+而不是 raw slot 数拆 staging batch。worker 的 load span 只指名
+`(target_offset, start_slot, num_slots, nbytes)`，server 解析出 L1/L2 位置；
+`TransferLayer` 不解析 codec。
 io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker 在固定 CUDA stream
 上用 fused decoder 解析 slot 内 descriptor table，直接写入真实 fragmented vLLM
 KV blocks，不物化完整 decoded staging；`raw` mode slot 走既有 restore。prefix
 mode 的 `pos_offset` 必须为 0，decoder 暂不融合 RoPE。
 
-packed record 引用只存在于 server 内存，且不按 raw slot 寻址，所以该
-模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
+该模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
 snapshot，避免之后的 raw 重启把 packed bytes 当作 raw 读。
 
-io_uring transfer 的 BIP 替换是 server 启动开关，由 `bip_enabled` 传播到
-transfer layer，默认开启，与 storage format 无关，保证 raw 和 compressed-online
-使用同一 transfer 策略；显式 server 参数可以关闭。BIP 的大多数新 allocation 插在
-LRU 端，每 32 个插入一个到 MRU 端，以抵抗一次性扫描。L2 miss 合并读始终开启：
-物理相邻的记录读在有界范围内合并成一次 io_uring 读。
+raw 与 compressed-online 共用同一放置与淘汰路径（每层叶子优先 LRU）。物理相邻
+的 L2 读在有界范围内合并成一次 io_uring 读。
 
 vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
 `kv_connector_extra_config.storage_format` 可以声明期望的格式；server 返回的

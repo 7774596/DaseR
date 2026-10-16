@@ -5,7 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import math
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 # First Party
 from daser.connector.helpers import TokenSequence
@@ -15,11 +15,23 @@ from daser.metrics import REGISTRY, MetricsRegistry
 from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_lifecycle import ChunkLifecycle
-from daser.server.chunk_manager import ChunkManager, SlotsExhausted
+from daser.server.chunk_manager import ChunkManager, IndexSnapshot
 from daser.server.doc_registry import DocEntry, DocRegistry
-from daser.server.eviction import EvictionTree
 from daser.server.metadata_store import ChunkMeta
-from daser.server.packed_layout import OnlinePackedLayout
+from daser.server.tiers import (
+    L2,
+    TIERS,
+    ChunkUnavailable,
+    Lease,
+    Promotion,
+    StorePlacement,
+    TierCopy,
+    TierFull,
+    TierIndex,
+    TierLayout,
+    TierStats,
+    record_offsets,
+)
 
 logger = init_logger(__name__)
 
@@ -59,7 +71,6 @@ class ChunkInfo:
         target_token_start: token offset in the current prompt where this
             chunk should be loaded.
         model_id: model identifier used for reuse isolation.
-        file_offset: byte offset in the KV store file.
     """
 
     chunk_key: str
@@ -68,7 +79,6 @@ class ChunkInfo:
     token_count: int
     pos_offset: int
     model_id: str
-    file_offset: int
     target_token_start: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,7 +94,6 @@ class ChunkInfo:
             "token_count": self.token_count,
             "pos_offset": self.pos_offset,
             "model_id": self.model_id,
-            "file_offset": self.file_offset,
             "target_token_start": self.target_token_start,
         }
 
@@ -97,7 +106,6 @@ class Allocation:
         chunk_key: cache key for the allocated chunk.
         start_slot: first allocated slot.
         num_slots: number of allocated slots.
-        file_offset: byte offset in the KV store file.
         pos_offset: position offset assigned by the position encoder.
         token_count: number of tokens covered by this allocation.
         skipped: True when the connector should not write KV: the chunk is
@@ -107,7 +115,6 @@ class Allocation:
     chunk_key: str
     start_slot: int
     num_slots: int
-    file_offset: int
     pos_offset: int
     token_count: int
     skipped: bool = False
@@ -124,7 +131,6 @@ class Allocation:
         payload: dict[str, Any] = {
             "start_slot": self.start_slot,
             "num_slots": self.num_slots,
-            "file_offset": self.file_offset,
             "pos_offset": self.pos_offset,
             "skipped": self.skipped,
         }
@@ -219,24 +225,101 @@ class DeleteDocumentResult:
     chunks_evicted: int
 
 
+@dataclass(frozen=True)
+class StoreRequest:
+    """One chunk a rank is about to store.
+
+    Attributes:
+        chunk_key: Allocated chunk.
+        start_slot: First slot id of the allocation the writer was given.
+        num_slots: Slot count of that allocation.
+        record_sizes: Per-slot record bytes on this rank, in slot order
+            (``local_slot_size`` for raw slots, the codec's stored length for
+            compressed ones); positive 4 KiB multiples, one per slot.
+        record_modes: Per-slot codec mode (``raw`` or ``compressed``) of a
+            packed chunk, one per slot; empty for the raw storage format.
+    """
+
+    chunk_key: str
+    start_slot: int
+    num_slots: int
+    record_sizes: tuple[int, ...]
+    record_modes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChunkRecords:
+    """Record layout of a stored chunk, identical on every rank.
+
+    Attributes:
+        record_sizes: Per-slot record bytes.
+        record_modes: Per-slot codec mode of a packed chunk; empty for raw.
+    """
+
+    record_sizes: tuple[int, ...]
+    record_modes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LoadSegment:
+    """A run of one chunk's slots read from one tier copy.
+
+    Attributes:
+        chunk_key: Chunk owning the slots.
+        slot_index: First slot of the run, relative to the chunk start.
+        record_sizes: Record bytes of each slot in the run.
+        lane_offset: Lane-relative byte offset of the run's first record.
+        copy: Copy the run is read from; it carries one io pin until
+            ``ServerCore.release_load``.
+    """
+
+    chunk_key: str
+    slot_index: int
+    record_sizes: tuple[int, ...]
+    lane_offset: int
+    copy: TierCopy
+
+    @property
+    def tier(self) -> str:
+        """Return the tier the run is read from."""
+        return self.copy.tier
+
+    @property
+    def nbytes(self) -> int:
+        """Return the bytes of the run on one rank."""
+        return sum(self.record_sizes)
+
+
 class ServerCore:
     """Shared control-plane core for DaseR server APIs.
 
-    The core owns all mutable server-side cache and document state. The
-    HTTP server calls document-level methods directly, while the IPC server
-    calls connector cache methods.
+    The core owns all mutable server-side cache and document state: chunk
+    ids and metadata (``ChunkManager``), commit/writer state
+    (``ChunkLifecycle``), and tier residency (``TierIndex``). The HTTP
+    server calls document-level methods directly, while the IPC server calls
+    connector cache, store and load methods.
+
+    A chunk is visible to lookup once every TP rank stored it into some tier
+    copy and one tier copy is valid on every rank. Tier eviction that drops a
+    chunk's last copy removes the chunk (``daser_cache_evicted_chunks_total``
+    with ``reason="capacity"``).
 
     Args:
-        chunk_manager: slot allocator and persistence coordinator.
+        chunk_manager: chunk id allocator and persistence coordinator; must
+            not index any chunk yet (use ``load_index`` to restore).
         retrieval_index: cache lookup index.
         position_encoder: position-offset policy.
-        slot_size: bytes per KV slot.
+        tier_layout: L1/L2 tier geometry.
         block_tokens: tokens per vLLM block.
+        metrics_registry: registry for cache and tier metrics.
+
+    Raises:
+        ValueError: if ``chunk_manager`` already indexes chunks.
 
     Async/thread-safety:
         Intended to run on the DaseR server asyncio event loop. Methods do
-        not perform blocking I/O. Callers should serialize access through
-        the single event loop.
+        not perform blocking I/O (except ``save_index``). Callers should
+        serialize access through the single event loop.
     """
 
     def __init__(
@@ -244,14 +327,15 @@ class ServerCore:
         chunk_manager: ChunkManager,
         retrieval_index: RetrievalIndex,
         position_encoder: PositionEncoder,
-        slot_size: int,
+        tier_layout: TierLayout,
         block_tokens: int = 16,
         metrics_registry: MetricsRegistry | None = None,
     ) -> None:
+        if len(chunk_manager.store) or chunk_manager.next_slot:
+            raise ValueError("ServerCore needs an empty chunk manager; use load_index")
         self._cm = chunk_manager
         self._ri = retrieval_index
         self._pe = position_encoder
-        self._slot_size = slot_size
         self._block_tokens = block_tokens
         self._metrics = metrics_registry or REGISTRY
         self._lifecycle = ChunkLifecycle()
@@ -259,28 +343,29 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
-        # Online packed records live in one layout; removal reclaims them.
-        # The memory-tier hooks are attached once the transfer layer exists.
-        self._packed_layout = OnlinePackedLayout(on_held_drop=self._discard_held)
-        self._hold_resident: Callable[[int, int], bool] | None = None
-        self._discard_held_range: Callable[[int, int], None] | None = None
-        self._release_hold: Callable[[int, int], None] | None = None
-        self._removal_listeners: list[Callable[[str], None]] = []
         self._publish_probe = os.environ.get(PUBLISH_PROBE_ENV) == "1"
-        # Leaf-first eviction order over prefix-chain parent links; every
-        # indexed chunk is a node. Pinned keys (a store's placement phase)
-        # and uncommitted writers are never chosen.
-        self._tree = EvictionTree()
-        for meta in chunk_manager.store.iter_chunks():
-            self._tree.add(meta.chunk_key, meta.parent_key)
-        self._pins: dict[str, int] = {}
-        self._held_removals: set[asyncio.Task[None]] = set()
-        self._record_capacity_metrics()
+        # Keys whose last tier copy was evicted; their retrieval entries are
+        # dropped by ``_flush_lost`` right after the evicting operation.
+        self._lost: list[str] = []
+        # Codec modes of packed chunks with tier state (raw chunks have none).
+        self._record_modes: dict[str, tuple[str, ...]] = {}
+        self._tiers = TierIndex(
+            tier_layout,
+            blocked=self._has_pending_writer,
+            on_lost=self._on_lost,
+            metrics_registry=self._metrics,
+        )
+        self._tiers.publish_metrics()
 
     @property
     def chunk_manager(self) -> ChunkManager:
         """Return the owned ChunkManager."""
         return self._cm
+
+    @property
+    def tier_layout(self) -> TierLayout:
+        """Return the L1/L2 tier geometry."""
+        return self._tiers.layout
 
     @property
     def index_epoch(self) -> int:
@@ -290,29 +375,6 @@ class ServerCore:
             Read on the owning server event loop.
         """
         return self._cm.store.removals
-
-    def add_chunk_removal_listener(self, listener: Callable[[str], None]) -> None:
-        """Register a callback for chunks that leave the metadata store.
-
-        Args:
-            listener: Called with the chunk key after the chunk is removed by
-                capacity eviction, explicit eviction or document deletion.
-
-        Async/thread-safety:
-            Listeners run synchronously on the server event loop and must not
-            block or re-enter the core.
-        """
-        self._removal_listeners.append(listener)
-
-    async def rebuild_retrieval_index(self) -> None:
-        """Reinsert restored chunks into the retrieval index.
-
-        Async/thread-safety:
-            Run during startup before serving requests.
-        """
-        for meta in list(self._cm.store.iter_chunks()):
-            await self._ri.insert(meta)
-            self._lifecycle.mark_committed(meta.chunk_key)
 
     async def lookup(
         self,
@@ -410,98 +472,6 @@ class ServerCore:
             return None
         return self._record_lookup(tokens, matches)
 
-    def _record_lookup(
-        self, tokens: TokenSequence, matches: list[Any]
-    ) -> list[ChunkInfo]:
-        """Count a resolved lookup and convert its matches to chunk info.
-
-        Args:
-            tokens: Prompt token IDs used for the lookup.
-            matches: Retrieval matches the lookup resolved to.
-
-        Returns:
-            Chunk info for ``matches``.
-        """
-        self._lookup_requests += 1
-        if matches:
-            self._lookup_hits += 1
-        chunks = [self._chunk_info(match) for match in matches]
-        # A merged prefix hit is keyed by its last block; touch the chain.
-        for chunk in chunks:
-            self._tree.touch_path(chunk.chunk_key)
-        self._metrics.counter(
-            "daser_cache_lookup_total",
-            "Cache lookup requests by result.",
-        ).inc(labels={"result": "hit" if chunks else "miss"})
-        self._metrics.counter(
-            "daser_cache_requested_tokens_total",
-            "Prompt tokens checked for cache reuse.",
-        ).inc(count_tokens(tokens))
-        self._metrics.counter(
-            "daser_cache_matched_tokens_total",
-            "Prompt tokens matched by cache lookup.",
-        ).inc(sum(chunk.token_count for chunk in chunks))
-        if chunks:
-            self._metrics.histogram(
-                "daser_cache_prefix_reuse_tokens",
-                "Tokens reused per cache hit.",
-                buckets=(16, 64, 128, 256, 512, 1024, 2048, 4096),
-            ).observe(sum(chunk.token_count for chunk in chunks))
-        self._record_capacity_metrics()
-        return chunks
-
-    def _lookup_needs_pending_retry(
-        self,
-        tokens: TokenSequence,
-        matches: list[Any],
-        candidate_keys: set[str] | None = None,
-        *,
-        num_computed_tokens: int = 0,
-    ) -> bool:
-        """Return whether an incomplete lookup may be completed by a writer.
-
-        Args:
-            tokens: Prompt token IDs used for the lookup.
-            matches: Retrieval matches returned for the current lookup.
-            candidate_keys: Precomputed candidates for ``tokens``. If omitted,
-                candidates are generated for this check.
-            num_computed_tokens: Tokens the caller already holds locally. A
-                writer of a block inside them cannot add external hits.
-
-        Returns:
-            True when the contiguous matches stop before the block-aligned
-            prompt length and a pending writer holds a key that could extend
-            them past ``num_computed_tokens``.
-        """
-        pending_keys = self._lifecycle.pending_write_keys
-        if not pending_keys:
-            return False
-        if candidate_keys is None:
-            candidate_keys = self._ri.candidate_keys(tokens, "")
-        if not candidate_keys.intersection(pending_keys):
-            return False
-        aligned = (count_tokens(tokens) // self._block_tokens) * self._block_tokens
-        if aligned <= 0:
-            return False
-        covered = 0
-        for match in matches:
-            target_start = int(getattr(match, "target_token_start", 0))
-            token_count = int(getattr(match.meta, "token_count", 0))
-            if target_start > covered:
-                break
-            covered = max(covered, target_start + token_count)
-            if covered >= aligned:
-                return False
-        # A writer of a later block cannot fill a gap left by an evicted one,
-        # and one inside the caller's local prefix adds no external hit.
-        local = (max(0, int(num_computed_tokens)) // self._block_tokens) * (
-            self._block_tokens
-        )
-        blockers = self._ri.continuation_keys(tokens, max(covered, local), "")
-        if blockers is None:
-            blockers = candidate_keys
-        return bool(blockers.intersection(pending_keys))
-
     async def record_external_prefix_cache(self, queries: int, hits: int) -> None:
         """Record vLLM-equivalent external prefix cache token counters.
 
@@ -575,10 +545,6 @@ class ServerCore:
         Returns:
             Allocation metadata in the same order as ``chunks``.
 
-        Raises:
-            SlotsExhausted: if no slots can be freed without evicting a
-                pending writer; earlier chunks of the batch stay allocated.
-
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
@@ -588,7 +554,7 @@ class ServerCore:
             token_count = int(chunk["token_count"])
             num_slots = self._slots_for(token_count)
             should_write = not self._has_store_owner(chunk_key, token_count, model_id)
-            meta = await self._alloc_or_get_chunk(
+            meta = self._alloc_or_get_chunk(
                 chunk_key=chunk_key,
                 token_count=token_count,
                 num_slots=num_slots,
@@ -633,7 +599,7 @@ class ServerCore:
             return MatchAndAllocResult(chunks=[], alloc=None)
         num_slots = self._slots_for(aligned)
         should_write = not self._has_store_owner(chunk_key, aligned, model_id)
-        meta = await self._alloc_or_get_chunk(
+        meta = self._alloc_or_get_chunk(
             chunk_key=chunk_key,
             token_count=aligned,
             num_slots=num_slots,
@@ -651,205 +617,378 @@ class ServerCore:
             ),
         )
 
-    async def commit_chunk(
-        self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1
-    ) -> None:
-        """Mark a chunk as committed and visible to lookup.
+    async def place_store(
+        self, requests: list[StoreRequest]
+    ) -> list[StorePlacement | None]:
+        """Place one rank's chunk stores in the tiers and pin the copies.
+
+        Placement is per chunk and idempotent: every TP rank and every
+        writer retry of one allocation gets the same copies (see
+        ``TierIndex.place_store``). Evicts tier candidates as needed; when
+        only in-flight IO blocks the space, waits for it and retries.
 
         Args:
-            chunk_key: cache key for the chunk.
-            tp_rank: tensor-parallel rank whose shard finished storing.
-            tp_size: total tensor-parallel ranks required before publication.
+            requests: Chunks to store, each from a writer allocation.
+
+        Returns:
+            One entry per request: the placement (every copy carries one io
+            pin, released by ``store_staged`` / ``store_persisted`` /
+            ``store_failed``), or None for an allocation that no longer
+            exists (the write must be dropped).
 
         Raises:
-            ValueError: if the chunk was not allocated.
+            ValueError: if record sizes do not match the allocation or a
+                chunk appears twice.
+            TierFull: if a tier cannot fit a chunk once IO is idle.
 
         Async/thread-safety:
-            Performs in-memory mutation on the server event loop.
+            Runs on the server event loop; may await ``io_released``.
         """
-        meta = self._cm.store.get(chunk_key)
-        if meta is None:
-            if self._lifecycle.is_evicted(chunk_key):
-                self._commit_requests += 1
-                self._late_evicted_commits += 1
-                self._metrics.counter(
-                    "daser_cache_late_evicted_commits_total",
-                    "Commit requests ignored because the allocation was evicted.",
-                ).inc()
-                logger.debug(
-                    "[CORE] ignore late commit for evicted key=%s",
-                    chunk_key[:8],
+        while True:
+            live = []
+            for index, request in enumerate(requests):
+                if not self.is_current_allocation(
+                    request.chunk_key, request.start_slot, request.num_slots
+                ):
+                    continue
+                if len(request.record_sizes) != request.num_slots:
+                    raise ValueError(
+                        f"chunk {request.chunk_key} has {request.num_slots} slots "
+                        f"but {len(request.record_sizes)} record sizes"
+                    )
+                self._check_record_modes(request)
+                live.append((index, request))
+            try:
+                placements = self._tiers.place_store(
+                    [(r.chunk_key, tuple(r.record_sizes)) for _i, r in live]
                 )
-                return
-            raise ValueError(f"chunk_key not found: {chunk_key}")
-        self._commit_requests += 1
-        if not self._lifecycle.record_commit_shard(chunk_key, tp_rank, tp_size):
-            return
+            except TierFull as exc:
+                await self._after_tier_change()
+                if not exc.io_blocked:
+                    raise
+                await self._tiers.io_released(exc.tier)
+                continue
+            for _index, request in live:
+                if request.record_modes:
+                    self._record_modes[request.chunk_key] = tuple(request.record_modes)
+            await self._after_tier_change()
+            result: list[StorePlacement | None] = [None] * len(requests)
+            for (index, _request), placement in zip(live, placements, strict=True):
+                result[index] = placement
+            return result
+
+    def release_placement(self, placement: StorePlacement) -> None:
+        """Release a placement's io pins without reporting a store outcome.
+
+        For a duplicate placement of the same chunk and rank (a chunk whose
+        records arrived in several store requests): the request that reports
+        the outcome uses ``store_staged`` / ``store_persisted`` /
+        ``store_failed``; every other request releases its pins here once its
+        IO finished.
+
+        Args:
+            placement: Placement from ``place_store``.
+
+        Async/thread-safety:
+            Runs on the server event loop.
+        """
+        for copy in (placement.l1, placement.l2):
+            if copy is not None:
+                self._tiers.unpin_io(copy)
+
+    async def store_staged(
+        self, placement: StorePlacement, tp_rank: int, tp_size: int
+    ) -> None:
+        """Record that ``tp_rank``'s bytes reached the L1 copy.
+
+        Without an L2 copy this ends the rank's store: the L1 pin is released
+        and the rank counts as one commit request. With L2 the chunk may
+        already publish (it is present once L1 is valid on every rank).
+
+        Args:
+            placement: Placement from ``place_store``.
+            tp_rank: Rank whose device-to-host copy finished.
+            tp_size: Server TP size.
+
+        Raises:
+            ValueError: if the rank is invalid or the placement has no L1
+                copy.
+
+        Async/thread-safety:
+            Runs on the server event loop; may await the retrieval insert.
+        """
+        self._check_rank(tp_rank, tp_size)
+        if placement.l1 is None:
+            raise ValueError(f"store of {placement.chunk_key} has no L1 copy")
+        valid = self._tiers.mark_valid(placement.l1, tp_rank)
+        if placement.l2 is None:
+            self._tiers.unpin_io(placement.l1)
+            await self._finish_rank(placement.chunk_key, valid, tp_rank, tp_size)
+        elif valid:
+            await self._maybe_publish(placement.chunk_key, tp_rank, tp_size)
+
+    async def store_persisted(
+        self, placement: StorePlacement, tp_rank: int, tp_size: int
+    ) -> None:
+        """Record that ``tp_rank``'s bytes reached the L2 copy; end its store.
+
+        Releases the rank's pins of both copies and counts one commit
+        request; the chunk publishes once every rank reported and a copy is
+        valid on every rank.
+
+        Args:
+            placement: Placement from ``place_store`` with an L2 copy.
+            tp_rank: Rank whose L2 write finished.
+            tp_size: Server TP size.
+
+        Raises:
+            ValueError: if the rank is invalid or the placement has no L2
+                copy.
+
+        Async/thread-safety:
+            Runs on the server event loop; may await the retrieval insert.
+        """
+        self._check_rank(tp_rank, tp_size)
+        if placement.l2 is None:
+            raise ValueError(f"store of {placement.chunk_key} has no L2 copy")
+        valid = self._tiers.mark_valid(placement.l2, tp_rank)
+        l1 = placement.l1
+        valid = valid or (l1 is not None and l1.attached and l1.is_valid(tp_rank))
+        self._tiers.unpin_io(placement.l2)
+        if l1 is not None:
+            self._tiers.unpin_io(l1)
+        await self._finish_rank(placement.chunk_key, valid, tp_rank, tp_size)
+
+    async def store_failed(
+        self, placement: StorePlacement, tp_rank: int, tp_size: int
+    ) -> None:
+        """Release a rank's store that failed before it ended.
+
+        Copies not valid on every rank are dropped; an uncommitted chunk left
+        without copies is removed (``reason="store_failed"``), so a retry
+        allocates it again. Call instead of ``store_persisted`` (or, without
+        L2, instead of ``store_staged``).
+
+        Args:
+            placement: Placement from ``place_store``.
+            tp_rank: Rank whose store failed.
+            tp_size: Server TP size.
+
+        Raises:
+            ValueError: if the rank is invalid.
+
+        Async/thread-safety:
+            Runs on the server event loop.
+        """
+        self._check_rank(tp_rank, tp_size)
+        key = placement.chunk_key
+        copies = [c for c in (placement.l1, placement.l2) if c is not None]
+        live = any(copy.attached for copy in copies)
+        remains = self._tiers.discard_incomplete(placement)
+        for copy in copies:
+            self._tiers.unpin_io(copy)
+        if self._tiers.chunk(key) is None:
+            self._record_modes.pop(key, None)
+        if live and not remains and not self._lifecycle.is_committed(key):
+            await self._remove_chunk(key, reason="store_failed")
+        await self._after_tier_change()
+
+    async def plan_load(self, start_slot: int, num_slots: int) -> list[LoadSegment]:
+        """Resolve a committed slot range to tier reads and pin them.
+
+        The range may start inside a chunk and span adjacent chunks. Each
+        chunk is read from its L1 copy when valid, after an in-flight
+        promotion, else from L2.
+
+        Args:
+            start_slot: First slot id.
+            num_slots: Number of slots.
+
+        Returns:
+            Segments in slot order; release with ``release_load``.
+
+        Raises:
+            ValueError: if ``num_slots < 1``.
+            ChunkUnavailable: if a slot belongs to no committed chunk or the
+                chunk left the index meanwhile (no pins are kept).
+
+        Async/thread-safety:
+            Runs on the server event loop; may await promotions.
+        """
+        if num_slots < 1:
+            raise ValueError("num_slots must be positive")
+        segments: list[LoadSegment] = []
+        slot = start_slot
+        end = start_slot + num_slots
         try:
-            await self._ri.insert(meta)
+            while slot < end:
+                owner = self._cm.resolve_slot(slot)
+                if owner is None or not self._lifecycle.is_committed(
+                    owner[0].chunk_key
+                ):
+                    raise ChunkUnavailable(f"slot {slot} has no committed chunk")
+                meta, index = owner
+                copy = await self._tiers.read_plan(meta.chunk_key)
+                chunk = self._tiers.chunk(meta.chunk_key)
+                if self._cm.store.get(meta.chunk_key) is not meta or chunk is None:
+                    self._tiers.unpin_io(copy)
+                    raise ChunkUnavailable(f"chunk {meta.chunk_key} left the index")
+                count = min(meta.num_slots - index, end - slot)
+                sizes = chunk.record_sizes
+                segments.append(
+                    LoadSegment(
+                        chunk_key=meta.chunk_key,
+                        slot_index=index,
+                        record_sizes=sizes[index : index + count],
+                        lane_offset=copy.offset + record_offsets(sizes)[index],
+                        copy=copy,
+                    )
+                )
+                slot += count
         except BaseException:
-            self._lifecycle.abort_publish(chunk_key)
+            self.release_load(segments)
             raise
-        publish_s, overlap_wait_s = self._lifecycle.mark_committed(chunk_key)
-        self._tree.touch([chunk_key])
-        self._metrics.counter(
-            "daser_cache_committed_chunks_total",
-            "Chunks committed and published to the retrieval index.",
-        ).inc()
-        if publish_s is not None:
-            self._metrics.histogram(
-                "daser_cache_publish_seconds",
-                "Seconds from store-writer claim to retrieval publication.",
-                buckets=_PUBLISH_BUCKETS,
-            ).observe(publish_s)
-        if overlap_wait_s is not None:
-            self._metrics.histogram(
-                "daser_cache_pending_overlap_seconds",
-                "Seconds from the first lookup that needed a pending chunk to "
-                "its publication.",
-                buckets=_PUBLISH_BUCKETS,
-            ).observe(overlap_wait_s)
-        self._record_capacity_metrics()
-        logger.debug(
-            "[CORE] commit_chunk key=%s tp_rank=%d tp_size=%d",
-            chunk_key[:8],
-            tp_rank,
-            tp_size,
+        return segments
+
+    def resolve_slots(
+        self, start_slot: int, num_slots: int
+    ) -> list[tuple[str, int, int]] | None:
+        """Return the committed chunks covering a slot range, without pins.
+
+        A lookup result may merge adjacent chunks into one run; this splits
+        such a range back into its chunks.
+
+        Args:
+            start_slot: First slot id.
+            num_slots: Number of slots (positive).
+
+        Returns:
+            ``(chunk_key, first slot index in the chunk, slot count)`` per
+            chunk in slot order, or None when a slot has no committed chunk.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop; O(chunks).
+        """
+        parts: list[tuple[str, int, int]] = []
+        slot = start_slot
+        end = start_slot + num_slots
+        while slot < end:
+            owner = self._cm.resolve_slot(slot)
+            if owner is None or not self._lifecycle.is_committed(owner[0].chunk_key):
+                return None
+            meta, index = owner
+            count = min(meta.num_slots - index, end - slot)
+            parts.append((meta.chunk_key, index, count))
+            slot += count
+        return parts
+
+    def release_load(self, segments: list[LoadSegment]) -> None:
+        """Release the io pins of segments from ``plan_load``.
+
+        Args:
+            segments: Segments whose reads finished or were abandoned.
+        """
+        for segment in segments:
+            self._tiers.unpin_io(segment.copy)
+
+    def finish_promotion(self, promotion: Promotion, ok: bool) -> None:
+        """Complete a promotion started by ``begin_promotions``.
+
+        Args:
+            promotion: The promotion.
+            ok: Whether the L2 -> L1 read succeeded on every rank.
+        """
+        self._tiers.finish_promotion(promotion, ok)
+        self._tiers.publish_metrics()
+
+    def pin_lease(self, chunk_key: str) -> Lease | None:
+        """Keep a chunk's L1 copy from eviction until ``unpin_lease``.
+
+        Args:
+            chunk_key: Chunk key.
+
+        Returns:
+            The lease, or None when the chunk has no tier copy.
+        """
+        return self._tiers.pin_lease(chunk_key)
+
+    def unpin_lease(self, lease: Lease) -> None:
+        """Release a lease from ``pin_lease``.
+
+        Args:
+            lease: The lease; releasing one of a removed chunk is a no-op.
+        """
+        self._tiers.unpin_lease(lease)
+
+    async def begin_promotions(self, chunk_keys: list[str]) -> list[Promotion | None]:
+        """Admit committed L2-only chunks into L1 for L2 -> L1 reads.
+
+        One metrics and lost-chunk flush covers the batch.
+
+        Args:
+            chunk_keys: Chunk keys, in admission order.
+
+        Returns:
+            One entry per key: the promotion (both copies io pinned until
+            ``finish_promotion``), or None when the chunk is not committed,
+            already has an L1 copy, or L1 cannot admit it.
+
+        Async/thread-safety:
+            Runs on the server event loop; loads of a promoted chunk wait
+            for its promotion.
+        """
+        promotions = [
+            self._tiers.begin_promotion(key)
+            if self._lifecycle.is_committed(key)
+            else None
+            for key in chunk_keys
+        ]
+        await self._after_tier_change()
+        return promotions
+
+    def chunk_records(self, chunk_key: str) -> ChunkRecords | None:
+        """Return the record layout of a chunk with tier state.
+
+        Args:
+            chunk_key: Chunk key.
+
+        Returns:
+            Record sizes and (packed) modes, or None when the chunk has no
+            tier copy.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop.
+        """
+        chunk = self._tiers.chunk(chunk_key)
+        if chunk is None:
+            return None
+        return ChunkRecords(
+            record_sizes=chunk.record_sizes,
+            record_modes=self._record_modes.get(chunk_key, ()),
         )
 
-    async def record_store_ranges(
-        self,
-        spans: list[dict[str, Any]],
-        tp_rank: int,
-        tp_size: int,
-        local_slot_size: int,
-        rank_stride_bytes: int,
-    ) -> list[str]:
-        """Record completed transfer ranges and publish fully written chunks.
+    def full_tiers(self, chunk_key: str) -> tuple[str, ...]:
+        """Return the tiers holding a copy of the chunk valid on every rank.
 
         Args:
-            spans: Accepted store spans with chunk allocation metadata.
-            tp_rank: Tensor-parallel rank that completed the transfer.
-            tp_size: Total tensor-parallel ranks required for publication.
-            local_slot_size: Bytes occupied by one rank-local KV slot.
-            rank_stride_bytes: File-byte distance between TP rank lanes.
+            chunk_key: Chunk key.
 
         Returns:
-            Chunk keys whose rank shard became completely written and whose
-            existing commit path was invoked.
-
-        Raises:
-            ValueError: if transfer geometry or packed span metadata is invalid.
+            Subset of ``(L1, L2)`` in tier order; empty when none.
 
         Async/thread-safety:
-            Runs on the server event loop. It only updates control-plane state
-            and awaits the existing retrieval-index commit operation. Spans
-            whose chunk was evicted or re-allocated since the write started
-            are skipped.
+            Reads in-memory state on the server event loop.
         """
-        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
-            raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
-        if local_slot_size <= 0:
-            raise ValueError("local_slot_size must be positive")
-        if tp_size > 1 and rank_stride_bytes <= 0:
-            raise ValueError("rank_stride_bytes must be positive for TP stores")
+        chunk = self._tiers.chunk(chunk_key)
+        if chunk is None:
+            return ()
+        return tuple(tier for tier in TIERS if self._tiers.is_full(chunk.copy(tier)))
 
-        ready: list[str] = []
-        ready_set: set[str] = set()
-        for span in spans:
-            chunk_key = str(span.get("chunk_key", ""))
-            if not chunk_key:
-                continue
-            start_slot = int(span.get("start_slot", -1))
-            num_slots = int(span.get("num_slots", 0))
-            # Eviction can remove a chunk while its store is in flight, and a
-            # later request may allocate the same key elsewhere before this
-            # write reports. Such a write belongs to no live allocation.
-            if not self.is_current_allocation(chunk_key, start_slot, num_slots):
-                logger.debug(
-                    "[CORE] drop store range of stale allocation key=%s slot=%d",
-                    chunk_key[:8],
-                    start_slot,
-                )
-                continue
-            expected_start = tp_rank * rank_stride_bytes + start_slot * local_slot_size
-            expected_end = expected_start + num_slots * local_slot_size
-            range_start = int(span["file_offset"])
-            range_end = range_start + int(span["nbytes"])
-            if bool(span.get("packed", False)):
-                logical_start = int(span.get("logical_slot_start", -1))
-                logical_count = int(span.get("logical_slot_count", 0))
-                if logical_count != 1:
-                    raise ValueError("packed store spans must describe one slot")
-                slot_index = 0 if num_slots == 1 else logical_start
-                # The layout placed this record; a write whose placement was
-                # released meanwhile wrote bytes no lookup may reference.
-                if not self._packed_layout.mark_written(
-                    chunk_key,
-                    start_slot + slot_index,
-                    range_start,
-                    rank_base=tp_rank * rank_stride_bytes,
-                ):
-                    logger.debug(
-                        "[CORE] drop packed record without placement key=%s",
-                        chunk_key[:8],
-                    )
-                    continue
-                complete = self._lifecycle.record_written_slot(
-                    chunk_key,
-                    tp_rank,
-                    slot_index,
-                    num_slots,
-                )
-            else:
-                complete = self._lifecycle.record_written_range(
-                    chunk_key,
-                    tp_rank,
-                    expected_start,
-                    expected_end,
-                    range_start,
-                    range_end,
-                )
-            if complete and chunk_key not in ready_set:
-                ready.append(chunk_key)
-                ready_set.add(chunk_key)
-
-        for chunk_key in ready:
-            await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
-        return ready
-
-    @property
-    def packed_layout(self) -> OnlinePackedLayout:
-        """Online packed placement, the one chunk -> physical record index.
-
-        Async/thread-safety:
-            Owned by the server event loop; chunk removal releases placements
-            before removal listeners run.
-        """
-        return self._packed_layout
-
-    def packed_slot_refs(
-        self, start_slot: int, num_slots: int
-    ) -> list[dict[str, int | str]]:
-        """Return online packed records for a logical slot interval.
-
-        Args:
-            start_slot: First logical store slot.
-            num_slots: Number of slots requested.
-
-        Returns:
-            Ordered record metadata, or an empty list until every record has
-            been written and its owner chunk committed.
-
-        Async/thread-safety:
-            Pure lookup on the server event loop.
-        """
-        records = self._packed_layout.written_records(start_slot, num_slots, self._cm)
-        if records is None:
-            return []
-        if not all(self._lifecycle.is_committed(r.chunk_key) for r in records):
-            return []
-        return [record.to_ref() for record in records]
+    def tier_stats(self) -> dict[str, TierStats]:
+        """Return the state of every enabled tier, keyed by tier name."""
+        return {
+            tier: self._tiers.stats(tier) for tier in TIERS if self._tiers.enabled(tier)
+        }
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.
@@ -858,7 +997,7 @@ class ServerCore:
             chunk_key: cache key to check.
 
         Returns:
-            True after ``commit_chunk`` has published the chunk and before it is
+            True after the last rank's store published the chunk and before it is
             evicted or removed.
 
         Async/thread-safety:
@@ -909,7 +1048,7 @@ class ServerCore:
 
         Async/thread-safety:
             Must run on the server event loop. Waiters are completed by
-            ``commit_chunk`` on the same event loop.
+            store reports on the same event loop.
         """
         await self._lifecycle.wait_for_committed(chunk_keys, timeout_s)
 
@@ -1007,6 +1146,9 @@ class ServerCore:
     ) -> bool:
         """Release an uncommitted writer claim for a canceled store.
 
+        A chunk without a copy valid on every rank is removed (nothing could
+        ever publish it); otherwise only the claim is dropped.
+
         Args:
             chunk_key: chunk key associated with the canceled store.
             start_slot: first slot the connector was told to write.
@@ -1023,157 +1165,123 @@ class ServerCore:
             return False
         if not self.is_current_allocation(chunk_key, start_slot, num_slots):
             return False
-        self._packed_layout.clear_written(chunk_key)
-        self._lifecycle.discard_owner(chunk_key)
-        self._tree.refresh(chunk_key)
+        if self._tiers.is_present(chunk_key):
+            self._lifecycle.discard_owner(chunk_key)
+            self._tiers.refresh(chunk_key)
+        else:
+            await self._remove_chunk(chunk_key, reason="writer_released")
         return True
 
     async def evict_chunk(self, chunk_key: str) -> None:
-        """Evict a chunk from retrieval and metadata state.
+        """Evict a chunk from retrieval, metadata and tier state.
 
         Args:
             chunk_key: cache key for the chunk.
 
         Async/thread-safety:
-            Performs in-memory mutation on the server event loop.
+            Performs in-memory mutation on the server event loop. In-flight
+            IO keeps the chunk's extents until it releases them.
         """
         await self._remove_chunk(chunk_key, reason="explicit")
 
-    def attach_l1_tier(
-        self,
-        hold_resident: Callable[[int, int], bool],
-        discard_held: Callable[[int, int], None],
-        release_hold: Callable[[int, int], None],
-    ) -> None:
-        """Let packed reclaim keep L1-resident records indexed.
+    def save_index(self, path: str, cache_reuse_mode: str | None = None) -> None:
+        """Persist the committed chunks that have an L2 copy.
+
+        L1-only and uncommitted chunks are not saved; documents keep their
+        references and see those chunks as evicted after a restore.
 
         Args:
-            hold_resident: ``TransferLayer.hold_resident``; marks a whole
-                resident record held and returns whether it did.
-            discard_held: ``TransferLayer.discard_held``; drops the L1 copy of
-                a held record whose placement is released.
-            release_hold: ``TransferLayer.release_hold``; keeps a held record
-                in L1 as an ordinary entry once it is charged again.
+            path: absolute file path to write.
+            cache_reuse_mode: cache reuse mode that produced the chunks.
 
-        The memory tier reports evicted held records via ``release_held``.
+        Raises:
+            ValueError: if L2 is disabled.
 
         Async/thread-safety:
-            Call once before the first packed store. Both callables run
-            synchronously on the server event loop.
+            Blocking file IO with fsync; call at shutdown after transfers
+            drained.
         """
-        self._hold_resident = hold_resident
-        self._discard_held_range = discard_held
-        self._release_hold = release_hold
-
-    def pin(self, chunk_keys: list[str]) -> None:
-        """Keep chunks from being chosen for eviction until ``unpin``.
-
-        Args:
-            chunk_keys: Keys to pin; pins nest.
-
-        Async/thread-safety:
-            Call on the server event loop, e.g. around a store's placement.
-        """
-        for key in chunk_keys:
-            self._pins[key] = self._pins.get(key, 0) + 1
-
-    def unpin(self, chunk_keys: list[str]) -> None:
-        """Release pins taken by ``pin``.
-
-        Args:
-            chunk_keys: The keys passed to ``pin``.
-
-        Async/thread-safety:
-            Call on the server event loop.
-        """
-        for key in chunk_keys:
-            count = self._pins.get(key, 0) - 1
-            if count > 0:
-                self._pins[key] = count
-                continue
-            self._pins.pop(key, None)
-            self._tree.refresh(key)
-
-    async def reclaim_packed(self, *, free_address: bool = False) -> bool:
-        """Reclaim one chunk's packed records from the L2 budget or arena.
-
-        For the L2 budget the victim is the least recently used evictable
-        node of the charged frontier (not held, every child held). When the
-        attached memory tier holds all its charged records whole they become
-        held and the chunk stays indexed; otherwise it is removed with the
-        held subtree below it. With ``free_address`` (the arena has no room)
-        the victim is the least recently used evictable leaf and is removed.
-        See ``docs/design/tier-residency.md``.
-
-        Args:
-            free_address: Free arena bytes instead of L2 budget.
-
-        Returns:
-            Whether a chunk was reclaimed; False when every candidate is
-            pinned or has a pending writer.
-
-        Async/thread-safety:
-            Performs in-memory mutation on the server event loop.
-        """
-        if free_address:
-            victim = self._tree.pop_victim(self._unevictable)
-            if victim is None:
-                return False
-            self._count_reclaim("removed")
-            await self._remove_chunk(victim, reason="capacity")
-            return True
-        victim = self._tree.pop_victim(self._unevictable, charged_only=True)
-        if victim is None:
-            return False
-        layout = self._packed_layout
-        records = layout.charged_records(victim)
-        held = []
-        if self._hold_resident is not None:
-            for record in records:
-                if not self._hold_resident(record.file_offset, record.stored_length):
-                    break
-                held.append(record)
-        if not records or len(held) < len(records):
-            # The chunk is removed; drop the L1 copies this pass already held.
-            for record in held:
-                self._discard_held(record.file_offset, record.stored_length)
-            self._count_reclaim("removed")
-            # Everything below a charged-frontier victim is held and becomes
-            # unreachable; remove it too (deepest first).
-            for key in self._tree.descendants(victim):
-                if not self._unevictable(key):
-                    await self._remove_chunk(key, reason="orphan")
-            await self._remove_chunk(victim, reason="capacity")
-            return True
-        for record in held:
-            layout.hold(record.file_offset)
-        self._tree.mark_held(victim)
-        self._count_reclaim("held")
-        return True
-
-    def release_held(self, file_offset: int, nbytes: int) -> None:
-        """Handle a held record the memory tier evicted.
-
-        A leaf chunk leaves the index; a chunk with children is charged to
-        the L2 budget again (see ``docs/design/tier-residency.md``).
-
-        Args:
-            file_offset: Start of the released L1 range.
-            nbytes: Its length.
-
-        Async/thread-safety:
-            Called synchronously from the transfer layer's L1 eviction on the
-            server event loop. Removal is scheduled as a task so it cannot
-            re-enter the caller; until it runs the placement stays reserved
-            and the SSD copy stays valid, so concurrent loads are correct.
-        """
-        if self._packed_layout.held_owner(file_offset, nbytes) is None:
-            return
-        task = asyncio.get_running_loop().create_task(
-            self._remove_released_held(file_offset, nbytes)
+        if not self._tiers.enabled(L2):
+            raise ValueError("cannot persist an index without an L2 tier")
+        committed = [
+            meta.chunk_key
+            for meta in self._cm.store.iter_chunks()
+            if self._lifecycle.is_committed(meta.chunk_key)
+        ]
+        placements = self._tiers.snapshot_l2(committed)
+        metas = []
+        for placement in placements:
+            meta = self._cm.store.get(placement.chunk_key)
+            assert meta is not None
+            metas.append(meta)
+        registry = self._cm.doc_registry
+        layout = self._tiers.layout
+        self._cm.save(
+            path,
+            IndexSnapshot(
+                cache_reuse_mode=cache_reuse_mode,
+                next_slot=self._cm.next_slot,
+                tier_grain=layout.grain,
+                l2_lane_bytes=layout.l2_lane_bytes,
+                tensor_parallel_size=layout.tensor_parallel_size,
+                metas=metas,
+                l2=placements,
+                docs=registry.to_dict() if registry is not None else {},
+            ),
         )
-        self._held_removals.add(task)
-        task.add_done_callback(self._held_removals.discard)
+
+    async def load_index(
+        self, path: str, expected_cache_reuse_mode: str | None = None
+    ) -> None:
+        """Restore chunks saved by ``save_index`` as committed L2 copies.
+
+        Args:
+            path: absolute file path to read.
+            expected_cache_reuse_mode: When set, an index from another mode is
+                rejected.
+
+        Raises:
+            ValueError: if the index format, reuse mode, tier grain, L2 lane
+                size or TP size differ, the core already holds chunks, or the
+                saved chunks are inconsistent. Nothing changes on error.
+            OSError: if the file cannot be read.
+
+        Async/thread-safety:
+            Blocking file read; call at startup before serving requests.
+        """
+        snapshot = ChunkManager.read_snapshot(path, expected_cache_reuse_mode)
+        layout = self._tiers.layout
+        saved = (
+            snapshot.tier_grain,
+            snapshot.l2_lane_bytes,
+            snapshot.tensor_parallel_size,
+        )
+        current = (layout.grain, layout.l2_lane_bytes, layout.tensor_parallel_size)
+        if saved != current:
+            raise ValueError(
+                f"tier layout mismatch: index has (grain, l2_lane, tp)={saved}, "
+                f"server has {current}"
+            )
+        sizes = {p.chunk_key: p.record_sizes for p in snapshot.l2}
+        if len(sizes) != len(snapshot.l2) or set(sizes) != {
+            meta.chunk_key for meta in snapshot.metas
+        }:
+            raise ValueError("index chunks and L2 placements differ")
+        for meta in snapshot.metas:
+            if len(sizes[meta.chunk_key]) != meta.num_slots:
+                raise ValueError(f"record count mismatch for chunk: {meta.chunk_key}")
+            if meta.parent_key == meta.chunk_key:
+                raise ValueError(f"chunk is its own parent: {meta.chunk_key}")
+        self._tiers.validate_l2_placements(snapshot.l2)
+        self._cm.restore(snapshot)
+        for meta in snapshot.metas:
+            self._tiers.add_chunk(meta.chunk_key, meta.parent_key)
+        self._tiers.restore_l2(snapshot.l2)
+        for meta in snapshot.metas:
+            await self._ri.insert(meta)
+            self._lifecycle.mark_committed(meta.chunk_key)
+        self._tiers.publish_metrics()
+        logger.info("[CORE] restored %d chunks from %s", len(snapshot.metas), path)
 
     async def register_document(
         self,
@@ -1308,29 +1416,14 @@ class ServerCore:
             if self._detach_doc_from_chunk(doc_id, key):
                 await self._ri.remove(key)
                 chunks_evicted += 1
+        if chunks_evicted:
+            self._tiers.publish_metrics()
         logger.info(
             "[CORE] delete_document doc_id=%s chunks_evicted=%d",
             doc_id,
             chunks_evicted,
         )
         return DeleteDocumentResult(chunks_evicted=chunks_evicted)
-
-    def _record_capacity_metrics(self) -> None:
-        """Publish current byte capacity gauges."""
-        total_slots = self._cm.physical_slots
-        used_slots = min(total_slots, self._cm.total_slots - self._cm.free_slots)
-        self._metrics.gauge(
-            "daser_store_free_slot_holes",
-            "Disjoint free slot ranges (allocator fragmentation).",
-        ).set(self._cm.free_holes)
-        self._metrics.gauge(
-            "daser_store_l2_bytes_capacity",
-            "Total L2 store capacity in bytes.",
-        ).set(total_slots * self._slot_size)
-        self._metrics.gauge(
-            "daser_store_l2_bytes_used",
-            "Currently used L2 store bytes.",
-        ).set(used_slots * self._slot_size)
 
     def _require_doc_registry(self) -> DocRegistry:
         """Return the attached DocRegistry or raise a public operation error."""
@@ -1370,24 +1463,13 @@ class ServerCore:
         if meta.doc_ids:
             return False
         self._cm.remove(chunk_key)
-        self._tree.remove(chunk_key)
+        self._tiers.remove(chunk_key)
+        self._record_modes.pop(chunk_key, None)
         self._lifecycle.discard(chunk_key)
-        self._notify_chunk_removed(chunk_key)
         return True
 
-    def _discard_held(self, file_offset: int, nbytes: int) -> None:
-        """Drop the L1 copy of a released held placement."""
-        if self._discard_held_range is not None:
-            self._discard_held_range(file_offset, nbytes)
-
-    def _notify_chunk_removed(self, chunk_key: str) -> None:
-        """Release a removed chunk's packed bytes, then tell listeners."""
-        self._packed_layout.release(chunk_key, self._cm)
-        for listener in self._removal_listeners:
-            listener(chunk_key)
-
     async def _remove_chunk(self, chunk_key: str, *, reason: str) -> None:
-        """Remove one chunk from retrieval, metadata and lifecycle state.
+        """Remove one chunk from retrieval, metadata, tier and lifecycle state.
 
         Args:
             chunk_key: cache key for the chunk.
@@ -1401,71 +1483,238 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.remove(chunk_key)
-            self._tree.remove(chunk_key)
-            self._notify_chunk_removed(chunk_key)
-        self._lifecycle.mark_evicted(chunk_key)
+            self._tiers.remove(chunk_key)
+            self._record_modes.pop(chunk_key, None)
+        self._lifecycle.discard(chunk_key)
+        self._count_eviction(reason)
+        self._tiers.publish_metrics()
+        logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
+
+    def _on_lost(self, chunk_key: str) -> None:
+        """Drop a chunk whose last tier copy was evicted (``TierIndex`` hook).
+
+        Runs synchronously inside the evicting tier call; the retrieval entry
+        is removed by ``_flush_lost`` before the core yields.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is not None:
+            self._mark_chunk_evicted_in_docs(meta)
+            self._cm.remove(chunk_key)
+        self._record_modes.pop(chunk_key, None)
+        self._lifecycle.discard(chunk_key)
+        self._count_eviction("capacity")
+        self._lost.append(chunk_key)
+
+    async def _flush_lost(self) -> None:
+        """Remove the retrieval entries of chunks lost to tier eviction."""
+        while self._lost:
+            chunk_key = self._lost.pop()
+            # A chunk allocated again under the key owns the entry now.
+            if self._cm.store.get(chunk_key) is None:
+                await self._ri.remove(chunk_key)
+
+    async def _after_tier_change(self) -> None:
+        """Finish an operation that may have evicted tier copies."""
+        await self._flush_lost()
+        self._tiers.publish_metrics()
+
+    def _count_eviction(self, reason: str) -> None:
+        """Count one chunk that left the index."""
         self._metrics.counter(
             "daser_cache_evicted_chunks_total",
             "Chunks evicted from cache metadata.",
         ).inc(labels={"reason": reason})
-        self._record_capacity_metrics()
-        logger.debug("[CORE] remove chunk key=%s reason=%s", chunk_key[:8], reason)
 
-    async def _remove_released_held(self, file_offset: int, nbytes: int) -> None:
-        """Handle a held record L1 evicted, if it is still held.
+    async def _finish_rank(
+        self, chunk_key: str, valid: bool, tp_rank: int, tp_size: int
+    ) -> None:
+        """Count a rank's ended store and publish the chunk if it can.
 
-        A chunk with children is charged again instead of removed, so L1
-        replacement never cuts a chain in the middle; only a leaf leaves.
+        Args:
+            chunk_key: Stored chunk.
+            valid: Whether the rank's bytes landed in a copy still attached
+                to the chunk (False for a write to a removed allocation).
+            tp_rank: Rank whose store ended.
+            tp_size: Server TP size.
         """
-        chunk_key = self._packed_layout.held_owner(file_offset, nbytes)
-        if chunk_key is None:
+        self._commit_requests += 1
+        if not valid:
+            self._late_evicted_commits += 1
+            self._metrics.counter(
+                "daser_cache_late_evicted_commits_total",
+                "Commit requests ignored because the allocation was evicted.",
+            ).inc()
+            logger.debug("[CORE] ignore late store of evicted key=%s", chunk_key[:8])
             return
-        if self._tree.is_leaf(chunk_key):
-            await self._remove_chunk(chunk_key, reason="l1_release")
-            return
-        self._recharge_path(chunk_key)
-        self._count_reclaim("recharged")
+        await self._maybe_publish(chunk_key, tp_rank, tp_size)
 
-    def _recharge_path(self, chunk_key: str) -> None:
-        """Charge ``chunk_key`` and its held ancestors to the L2 budget again.
+    async def _maybe_publish(self, chunk_key: str, tp_rank: int, tp_size: int) -> None:
+        """Record a rank's valid store and publish once the chunk is present.
 
-        Keeps the held closure (descendants of a held chunk are held) before
-        a chunk gains a child or is recharged. SSD copies of held records
-        stay valid, so this is bookkeeping only; the next store's budget
-        reclaim takes back any excess from the charged frontier.
+        The TP quorum (``ChunkLifecycle.record_commit_shard``) counts ranks
+        whose bytes reached a tier copy; the chunk publishes when every rank
+        arrived and some copy is valid on every rank. A quorum reached before
+        that is re-checked on the next rank event.
         """
-        for key in self._tree.held_path(chunk_key):
-            for record in self._packed_layout.held_records(key):
-                if self._release_hold is not None:
-                    self._release_hold(record.file_offset, record.stored_length)
-                self._packed_layout.recharge(record.file_offset)
-            self._tree.mark_charged(key)
-
-    def _unevictable(self, chunk_key: str) -> bool:
-        """Return whether a chunk is pinned or has an uncommitted writer."""
-        return chunk_key in self._pins or (
-            chunk_key in self._lifecycle.write_owners
-            and not self._lifecycle.is_committed(chunk_key)
+        if not self._lifecycle.record_commit_shard(chunk_key, tp_rank, tp_size):
+            return
+        meta = self._cm.store.get(chunk_key)
+        if meta is None or not self._tiers.is_present(chunk_key):
+            self._lifecycle.abort_publish(chunk_key)
+            return
+        try:
+            await self._ri.insert(meta)
+        except BaseException:
+            self._lifecycle.abort_publish(chunk_key)
+            raise
+        publish_s, overlap_wait_s = self._lifecycle.mark_committed(chunk_key)
+        self._tiers.touch([chunk_key])
+        self._metrics.counter(
+            "daser_cache_committed_chunks_total",
+            "Chunks committed and published to the retrieval index.",
+        ).inc()
+        if publish_s is not None:
+            self._metrics.histogram(
+                "daser_cache_publish_seconds",
+                "Seconds from store-writer claim to retrieval publication.",
+                buckets=_PUBLISH_BUCKETS,
+            ).observe(publish_s)
+        if overlap_wait_s is not None:
+            self._metrics.histogram(
+                "daser_cache_pending_overlap_seconds",
+                "Seconds from the first lookup that needed a pending chunk to "
+                "its publication.",
+                buckets=_PUBLISH_BUCKETS,
+            ).observe(overlap_wait_s)
+        logger.debug(
+            "[CORE] commit key=%s tp_rank=%d tp_size=%d",
+            chunk_key[:8],
+            tp_rank,
+            tp_size,
         )
 
-    async def _evict_one(self) -> bool:
-        """Remove the least recently used evictable leaf chunk.
+    def _has_pending_writer(self, chunk_key: str) -> bool:
+        """Return whether a chunk has an uncommitted store writer."""
+        return chunk_key in self._lifecycle.write_owners and not (
+            self._lifecycle.is_committed(chunk_key)
+        )
+
+    def _check_record_modes(self, request: StoreRequest) -> None:
+        """Reject packed record modes that are malformed or changed.
+
+        Raises:
+            ValueError: if the modes do not match the slot count, name an
+                unknown mode, or differ from the chunk's stored modes.
+        """
+        modes = tuple(request.record_modes)
+        if modes and (
+            len(modes) != request.num_slots
+            or any(mode not in ("raw", "compressed") for mode in modes)
+        ):
+            raise ValueError(f"invalid record modes for chunk {request.chunk_key}")
+        if self._tiers.chunk(request.chunk_key) is not None and modes != (
+            self._record_modes.get(request.chunk_key, ())
+        ):
+            raise ValueError(f"record modes changed for chunk: {request.chunk_key}")
+
+    def _check_rank(self, tp_rank: int, tp_size: int) -> None:
+        """Reject a rank outside the server's TP geometry."""
+        expected = self._tiers.layout.tensor_parallel_size
+        if tp_size != expected or not 0 <= tp_rank < tp_size:
+            raise ValueError(
+                f"invalid TP rank {tp_rank} for size {tp_size} (server tp={expected})"
+            )
+
+    def _record_lookup(
+        self, tokens: TokenSequence, matches: list[Any]
+    ) -> list[ChunkInfo]:
+        """Count a resolved lookup and convert its matches to chunk info.
+
+        Args:
+            tokens: Prompt token IDs used for the lookup.
+            matches: Retrieval matches the lookup resolved to.
 
         Returns:
-            False when every chunk is pinned or has a pending writer.
+            Chunk info for ``matches``.
         """
-        victim = self._tree.pop_victim(self._unevictable)
-        if victim is None:
-            return False
-        await self._remove_chunk(victim, reason="capacity")
-        return True
-
-    def _count_reclaim(self, outcome: str) -> None:
-        """Count one packed reclaim by whether L1 kept the chunk indexed."""
+        self._lookup_requests += 1
+        if matches:
+            self._lookup_hits += 1
+        chunks = [self._chunk_info(match) for match in matches]
+        # A merged prefix hit is keyed by its last block; touch the chain.
+        for chunk in chunks:
+            self._tiers.touch_path(chunk.chunk_key)
         self._metrics.counter(
-            "daser_packed_reclaims_total",
-            "Packed records reclaimed, by whether L1 kept them indexed.",
-        ).inc(labels={"outcome": outcome})
+            "daser_cache_lookup_total",
+            "Cache lookup requests by result.",
+        ).inc(labels={"result": "hit" if chunks else "miss"})
+        self._metrics.counter(
+            "daser_cache_requested_tokens_total",
+            "Prompt tokens checked for cache reuse.",
+        ).inc(count_tokens(tokens))
+        self._metrics.counter(
+            "daser_cache_matched_tokens_total",
+            "Prompt tokens matched by cache lookup.",
+        ).inc(sum(chunk.token_count for chunk in chunks))
+        if chunks:
+            self._metrics.histogram(
+                "daser_cache_prefix_reuse_tokens",
+                "Tokens reused per cache hit.",
+                buckets=(16, 64, 128, 256, 512, 1024, 2048, 4096),
+            ).observe(sum(chunk.token_count for chunk in chunks))
+        return chunks
+
+    def _lookup_needs_pending_retry(
+        self,
+        tokens: TokenSequence,
+        matches: list[Any],
+        candidate_keys: set[str] | None = None,
+        *,
+        num_computed_tokens: int = 0,
+    ) -> bool:
+        """Return whether an incomplete lookup may be completed by a writer.
+
+        Args:
+            tokens: Prompt token IDs used for the lookup.
+            matches: Retrieval matches returned for the current lookup.
+            candidate_keys: Precomputed candidates for ``tokens``. If omitted,
+                candidates are generated for this check.
+            num_computed_tokens: Tokens the caller already holds locally. A
+                writer of a block inside them cannot add external hits.
+
+        Returns:
+            True when the contiguous matches stop before the block-aligned
+            prompt length and a pending writer holds a key that could extend
+            them past ``num_computed_tokens``.
+        """
+        pending_keys = self._lifecycle.pending_write_keys
+        if not pending_keys:
+            return False
+        if candidate_keys is None:
+            candidate_keys = self._ri.candidate_keys(tokens, "")
+        if not candidate_keys.intersection(pending_keys):
+            return False
+        aligned = (count_tokens(tokens) // self._block_tokens) * self._block_tokens
+        if aligned <= 0:
+            return False
+        covered = 0
+        for match in matches:
+            target_start = int(getattr(match, "target_token_start", 0))
+            token_count = int(getattr(match.meta, "token_count", 0))
+            if target_start > covered:
+                break
+            covered = max(covered, target_start + token_count)
+            if covered >= aligned:
+                return False
+        # A writer of a later block cannot fill a gap left by an evicted one,
+        # and one inside the caller's local prefix adds no external hit.
+        local = (max(0, int(num_computed_tokens)) // self._block_tokens) * (
+            self._block_tokens
+        )
+        blockers = self._ri.continuation_keys(tokens, max(covered, local), "")
+        if blockers is None:
+            blockers = candidate_keys
+        return bool(blockers.intersection(pending_keys))
 
     def _has_store_owner(
         self,
@@ -1520,7 +1769,7 @@ class ServerCore:
             and meta.model_id == model_id
         )
 
-    async def _alloc_or_get_chunk(
+    def _alloc_or_get_chunk(
         self,
         chunk_key: str,
         token_count: int,
@@ -1530,7 +1779,8 @@ class ServerCore:
     ) -> ChunkMeta:
         """Allocate a chunk or reuse a compatible in-flight allocation.
 
-        Evicts least recently used leaves until the slots fit.
+        Allocation takes fresh slot ids only; tier space is reserved when the
+        chunk is stored (``place_store``).
 
         Args:
             chunk_key: cache key for the token sequence.
@@ -1543,9 +1793,8 @@ class ServerCore:
             Existing or newly allocated chunk metadata.
 
         Raises:
-            ValueError: if an existing chunk has incompatible metadata.
-            SlotsExhausted: if no evictable chunk is left and slots still
-                do not fit.
+            ValueError: if an existing chunk has incompatible metadata or the
+                chunk names itself as parent.
         """
         existing = self._cm.store.get(chunk_key)
         if existing is not None:
@@ -1557,28 +1806,20 @@ class ServerCore:
                 raise ValueError(
                     f"chunk_key already exists with incompatible metadata: {chunk_key}"
                 )
-            self._tree.touch([chunk_key])
+            self._tiers.touch([chunk_key])
             return existing
-
+        if parent_key == chunk_key:
+            raise ValueError("a chunk cannot be its own parent")
         pos_offset = self._pe.assign_offset(chunk_key, token_count)
-        while True:
-            try:
-                meta = self._cm.alloc(
-                    chunk_key=chunk_key,
-                    num_slots=num_slots,
-                    token_count=token_count,
-                    model_id=model_id,
-                    pos_offset=pos_offset,
-                    parent_key=parent_key,
-                )
-                break
-            except SlotsExhausted:
-                if not await self._evict_one():
-                    raise
-        if parent_key:
-            self._recharge_path(parent_key)
-        self._tree.add(chunk_key, parent_key)
-        self._record_capacity_metrics()
+        meta = self._cm.alloc(
+            chunk_key=chunk_key,
+            num_slots=num_slots,
+            token_count=token_count,
+            model_id=model_id,
+            pos_offset=pos_offset,
+            parent_key=parent_key,
+        )
+        self._tiers.add_chunk(chunk_key, parent_key)
         return meta
 
     def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:
@@ -1592,7 +1833,6 @@ class ServerCore:
             token_count=meta.token_count,
             pos_offset=pos_offset,
             model_id=meta.model_id,
-            file_offset=meta.start_slot * self._slot_size,
             target_token_start=match.target_token_start,
         )
 
@@ -1608,7 +1848,6 @@ class ServerCore:
             chunk_key=meta.chunk_key,
             start_slot=meta.start_slot,
             num_slots=num_slots,
-            file_offset=meta.start_slot * self._slot_size,
             pos_offset=meta.pos_offset,
             token_count=token_count,
             skipped=skipped,

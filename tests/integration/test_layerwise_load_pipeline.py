@@ -76,9 +76,15 @@ def _kv_cache(geometry: CompressedStoreGeometry) -> torch.Tensor:
 
 
 class _FakeLoadClient:
-    """Async IPC stub that serves leased runs from a device-resident store."""
+    """Async IPC stub that serves leased runs from a device-resident store.
+
+    ``record_offsets`` maps each leased slot id to its record's store offset,
+    as the server maps slot ids to lease-pinned L1 records.
+    """
 
     store: torch.Tensor
+    record_offsets: dict[int, int]
+    record_sizes: dict[int, int]
     pool: FixedCudaStagingPool
     fail_on_call: int = -1
     calls: list[int] = []
@@ -100,14 +106,17 @@ class _FakeLoadClient:
         self,
         buffer_index: int,
         producer_pid: int,
-        file_offsets: Any,
+        start_slots: Any,
+        intra_offsets: Any,
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
+        tp_rank: int = 0,
     ) -> dict[str, Any]:
         """Copy runs into the staging buffer like the server's L1 path."""
         del producer_pid
         assert lease_id == "req"
+        assert tp_rank == 0
         calls = type(self).calls
         calls.append(buffer_index)
         if len(calls) == type(self).fail_on_call:
@@ -115,9 +124,13 @@ class _FakeLoadClient:
         buffer = type(self).pool.buffer(buffer_index)
         store = type(self).store
         total = 0
-        for src, dst, size in zip(file_offsets, target_offsets, nbytes, strict=True):
-            src, dst, size = int(src), int(dst), int(size)
-            assert 0 <= src and src + size <= store.numel()
+        for slot, intra, dst, size in zip(
+            start_slots, intra_offsets, target_offsets, nbytes, strict=True
+        ):
+            slot, intra, dst, size = int(slot), int(intra), int(dst), int(size)
+            # The server rejects a run that leaves its record.
+            assert 0 <= intra and intra + size <= type(self).record_sizes[slot]
+            src = type(self).record_offsets[slot] + intra
             assert 0 <= dst and dst + size <= buffer.numel()
             buffer[dst : dst + size].copy_(store[src : src + size])
             total += size
@@ -174,6 +187,10 @@ def _restore(
 
     pool = FixedCudaStagingPool(torch.device("cuda"), 4 << 20, 2)
     _FakeLoadClient.store = store.cuda()
+    _FakeLoadClient.record_offsets = dict(enumerate(offsets))
+    _FakeLoadClient.record_sizes = {
+        index: len(payload) for index, payload in enumerate(padded)
+    }
     _FakeLoadClient.pool = pool
     _FakeLoadClient.fail_on_call = fail_on_call
     _FakeLoadClient.calls = []
@@ -186,7 +203,6 @@ def _restore(
         kv_caches={"layers": actual},
         layer_names=[f"layer.{index}" for index in range(_LAYERS)],
         local_slot_size=geometry.slot_size,
-        rank_stride_bytes=geometry.slot_size,
         tp_rank=0,
         staging_pool=pool,
         load_key_scale=1.0,
@@ -207,12 +223,11 @@ def _restore(
         start_slot=0,
         num_slots=3,
         block_ids=blocks,
-        file_offset=offsets[0],
         token_count=3 * geometry.block_tokens,
         lease_id="req",
         compressed_slots=[
-            CompressedLoadSlot(index, "compressed", offset, len(payload))
-            for index, (offset, payload) in enumerate(zip(offsets, padded, strict=True))
+            CompressedLoadSlot(index, "compressed", len(payload))
+            for index, payload in enumerate(padded)
         ],
     )
     pipeline.start_layerwise({"req": spec})
@@ -294,7 +309,7 @@ def test_raw_layerwise_restore_matches_slot_copy(
     raw = torch.randint(
         0, 256, (3 * geometry.slot_size,), dtype=torch.uint8, generator=generator
     )
-    # Two raw chunks; the second starts at its own file offset.
+    # Two raw chunks; the second starts at its own (non-adjacent) offset.
     first_offset = IO_ALIGNMENT
     second_offset = first_offset + 2 * geometry.slot_size + IO_ALIGNMENT
     store = torch.zeros(second_offset + geometry.slot_size, dtype=torch.uint8)
@@ -310,6 +325,12 @@ def test_raw_layerwise_restore_matches_slot_copy(
 
     pool = FixedCudaStagingPool(torch.device("cuda"), 4 << 20, 2)
     _FakeLoadClient.store = store.cuda()
+    _FakeLoadClient.record_offsets = {
+        0: first_offset,
+        1: first_offset + geometry.slot_size,
+        2: second_offset,
+    }
+    _FakeLoadClient.record_sizes = dict.fromkeys(range(3), geometry.slot_size)
     _FakeLoadClient.pool = pool
     _FakeLoadClient.fail_on_call = -1
     _FakeLoadClient.calls = []
@@ -322,7 +343,6 @@ def test_raw_layerwise_restore_matches_slot_copy(
         kv_caches={CROSS_LAYER_KV_CACHE_KEY: actual},
         layer_names=[f"layer.{index}" for index in range(_LAYERS)],
         local_slot_size=geometry.slot_size,
-        rank_stride_bytes=geometry.slot_size,
         tp_rank=0,
         staging_pool=pool,
         load_key_scale=1.0,
@@ -339,7 +359,6 @@ def test_raw_layerwise_restore_matches_slot_copy(
             start_slot=0,
             num_slots=2,
             block_ids=blocks[:2],
-            file_offset=first_offset,
             token_count=2 * geometry.block_tokens,
             lease_id="req",
         ),
@@ -348,7 +367,6 @@ def test_raw_layerwise_restore_matches_slot_copy(
             start_slot=2,
             num_slots=1,
             block_ids=blocks[2:],
-            file_offset=second_offset,
             token_count=geometry.block_tokens,
             lease_id="req",
         ),

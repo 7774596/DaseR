@@ -13,19 +13,19 @@
 | worker memory module | vLLM worker | 负责 load/store 独立 fixed pool、indexed lease，以及约 6 GiB combined budget 的单点推导 |
 | staging tensor module | vLLM worker | 负责 slot-major KV copy、CUDA producer synchronization 和 RoPE restore，不拥有 request/IPC 状态 |
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup`、`alloc_chunk` |
-| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunks` |
+| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`transfer_load_runs` 和 staging 注册 |
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |
-| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；当前主路径，编排 L1 pinned-memory + L2 SSD transfer。组合 `L1Cache` + 可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
-| `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；可选兼容 backend，封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
-| `L1Cache` / `L2IoEngine` | DaseR | `daser/transfer/iouring/l1_cache.py`（range-keyed pinned-host LRU 缓存）/ `l2_engine.py`（io_uring positioned I/O）；编排层组合二者，pinned-predicate 单向解耦 |
-| `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，实现为 `LRUReplacementPolicy`（默认）和 `BIPReplacementPolicy`（`compressed-online` 的 L1） |
+| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；当前主路径，按 server 给定的 L1 arena 偏移和 L2 文件偏移搬运字节。持有 pinned arena、staging pool 和可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
+| `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；可选兼容 backend，封装 kvikio cuFile / compat IO，只实现 L2 子集；backend 在初始化时选定，运行期不可切换 |
+| `L2IoEngine` | DaseR | `daser/transfer/iouring/l2_engine.py`；打开已有 store 文件，io_uring positioned I/O、写门和读条带 |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
 | `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、op→handler dispatch table |
 | `ServerCore` | DaseR | 共享控制面核心；管理 chunk、doc、retrieval、position 状态 |
 | `ChunkLifecycle` | DaseR | `daser/server/chunk_lifecycle.py`；chunk commit/写者归属/淘汰状态 + commit waiter，由 `ServerCore` 持有 |
-| `ChunkManager` | DaseR | `daser/server/chunk_manager.py`；first-fit 空闲区间槽位分配、槽位写保持和 index 持久化 |
-| `EvictionTree` | DaseR | `daser/server/eviction.py`；按前缀链 `parent_key` 的叶子优先 LRU 淘汰顺序，由 `ServerCore` 持有 |
+| `ChunkManager` | DaseR | `daser/server/chunk_manager.py`；单调 slot id 分配、`MetadataStore` / `DocRegistry` 组合和 index 持久化 |
+| `TierIndex` | DaseR | `daser/server/tiers.py`；每个 chunk 的 L1/L2 副本、两层 `TlsfAllocator`、放置、接纳、promotion 记账和每层指标 |
+| `EvictionTree` | DaseR | `daser/server/eviction.py`；按前缀链 `parent_key` 的单一拓扑和每层叶子优先 LRU 候选堆，由 `ServerCore` 持有 |
 | `MetadataStore` | DaseR | `chunk_index` 内存状态 |
 | lossless KV codec | shared production module | `daser/compression/`：slot header/descriptor 格式、静态 codebook 和 CPU reference encode/decode；`daser/ops/` 的 TileLang kernel 在 worker 上做在线 pack 和 fused restore |
 | `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
@@ -45,34 +45,30 @@ KV bytes 的 load/store，而是把请求分发给更窄的组件：slot 分配�
 
 `ChunkManager` 和 `MetadataStore` 刻意保持分离。`MetadataStore` 是纯状态容器，
 保存 `chunk_key -> ChunkMeta` 的 `chunk_index`（含前缀链 `parent_key`），并负责
-其 msgpack 序列化。`ChunkManager` 用按地址排序的空闲区间 first-fit 分配槽位，
-空间不足时抛 `SlotsExhausted`，并负责完整 index save/load（加载时从索引重建
-空闲区间）。它不决定淘汰谁：`ServerCore` 从 `EvictionTree` 取最冷的可淘汰叶子
-删除后重试，见 [槽位分配、叶子优先淘汰与 L1/L2 驻留](tier-residency.md)。
+其 msgpack 序列化。`ChunkManager` 分配单调递增、不复用的 slot id（只是身份，
+不是物理地址），并负责完整 index save/load。物理位置和淘汰由 `TierIndex` 与
+`EvictionTree` 决定：store 放置时每层不足才淘汰该层候选，见
+[独立 L1/L2 分层与叶子优先淘汰](tier-residency.md)。
 
 `DocRegistry` 记录用户文档视角的状态：`doc_id`、title、原始 token 数、
-chunk 列表和每个 chunk 是否仍被 cache 命中。`ChunkManager` 只关心 KV store
-里的 slot 资源；当 chunk 被淘汰时，`ServerCore` 通知 `DocRegistry` 更新文档的
-cached mask。因此一个是文档目录，一个是 KV slot allocator，二者不能合并。
+chunk 列表和每个 chunk 是否仍被 cache 命中。`ChunkManager` 只关心 chunk 身份；
+当 chunk 被淘汰时，`ServerCore` 通知 `DocRegistry` 更新文档的 cached mask。
+因此一个是文档目录，一个是 chunk id allocator，二者不能合并。
 
-iouring transfer 的 L1 状态不进入 `MetadataStore`。L1 是
-`TieredIOUringTransferLayer` 进程内的 pinned-memory 热缓存，按 byte range 维护
-命中表和 LRU `ReplacementPolicy`；它是可丢失的加速层，重启后可以从 L2
-`daser.store` 重新填充。L2 chunk metadata 才需要随 `daser.index` 持久化。
+L1 与 L2 驻留都由 server 的 `TierIndex` 维护：每个 chunk 每层最多一段 extent，
+L1 在 pinned arena 中，L2 在 `daser.store` 中。transfer layer 只按给定偏移搬运
+字节，不保存驻留状态。L1 是可丢失的加速层，重启后为空；raw + L2 的 chunk
+metadata 和 L2 偏移随 `daser.index` 持久化。
 
-`--skip-l2` 下，`TieredIOUringTransferLayer` 复用同样的 logical
-slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rings，也不保存
-或恢复 `daser.index`。因此 lookup 和 store 都只对当前进程内的 L1 bytes 有意义；
-L1 淘汰或进程重启后没有 L2 可恢复。
+`--skip-l2` 下 L2 关闭：不分配 `daser.store`，不创建 io_uring rings，也不保存
+或恢复 `daser.index`。store 必须被 L1 接纳，lookup 只返回 L1 副本仍存在的前缀；
+进程重启后冷启动。
 
-`compressed-online` 下，chunk → 物理 record 只由 `ServerCore` 持有的
-`OnlinePackedLayout` 维护：store 先经它放置 packed record（mode、file offset、
-stored length），写完后 `record_store_ranges` 把对应 placement 标为已写；chunk
-离开 metadata store 时由 `ServerCore` 释放其 placement，再通知 removal listener。
-lookup 仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
-展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入槽位
-allocator，transfer backend 也不依赖 server 实现类型。这些 record 只在内存中，
-因此该模式不保存也不恢复 `daser.index`。
+`compressed-online` 下 record 长度是 codec 的 `stored_length`，`TierIndex` 为
+每个 chunk 记录 record 长度，lookup 回复的 `compressed_slots` 只携带
+`{slot_id, mode, stored_length}`，位置由 server 在 load 时解析。codec metadata
+不进入分配器，transfer backend 也不解析 codec。该模式的索引是易失的，不保存也
+不恢复 `daser.index`。
 
 ---
 
@@ -80,10 +76,11 @@ allocator，transfer backend 也不依赖 server 实现类型。这些 record �
 
 DaseR 在 `--store-dir` 下维护两个文件：
 
-- `daser.store`：固定 slot 大小的 KV 数据文件。
+- `daser.store`：L2 KV 数据文件，NOCOW + fallocate，大小等于 `--l2-size` 按
+  粒度 `G` 向下取整；内部按 TP lane 均分，由 `TlsfAllocator` 分配 chunk extent。
 - `daser.index`：msgpack metadata 快照，关机保存、启动恢复。
 
-`compressed-online` 下压缩 data 仍位于 `daser.store` 的 raw envelope 内，但
+`compressed-online` 下压缩 record 按 `stored_length` 紧密放在 chunk extent 内，
 `daser.index` 是易失的：启动时删除旧文件并冷启动，关停时不写入。
 
 当 `--skip-l2` 启用时，这两个文件都不会由当前运行创建或更新；`--store-dir`
@@ -92,13 +89,14 @@ DaseR 在 `--store-dir` 下维护两个文件：
 ```mermaid
 block-beta
     columns 7
-    s0["s0\nchunk A"]:2
-    s2["s2\nfree"]:1
-    s3["s3\nchunk B"]:2
-    s5["s5\nchunk C"]:2
+    a["chunk A\nextent"]:2
+    f0["free"]:1
+    b["chunk B\nextent"]:3
+    c["chunk C"]:1
 ```
 
-每个 slot 保存一个 vLLM KV block 的所有层：
+每个 chunk extent 内 record 在 4 KiB 偏移上首尾相接，extent 起点和长度按 `G`
+对齐。raw record 是一个 slot，保存一个 vLLM KV block 的所有层：
 
 ```mermaid
 block-beta
@@ -127,11 +125,11 @@ slot size 从模型 `config.json` 推导：
 slot_size = num_kv_heads * head_dim * 2 * num_layers * block_tokens * dtype_bytes
 ```
 
-文件偏移：
+偏移由 server 解析（connector 不计算）：
 
 ```text
-slot_offset(slot_i) = slot_i * slot_size
-layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
+record_offset(chunk, i) = rank * lane_bytes + copy.offset + sum(record_sizes[:i])
+layer_offset(raw record, layer_idx) = record_offset + layer_idx * layer_size
 ```
 
 压缩 slot envelope 的逻辑结构为：
@@ -139,8 +137,7 @@ layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
 ```text
 4 KiB-aligned slot header + per-layer K/V plane descriptors
 low-byte streams + packed high-byte symbols + escape-prefix tables + escapes
-4 KiB padding
-unused raw-envelope tail (never read)
+4 KiB padding (stored_length ends here)
 ```
 
 每个 BF16 scalar 的 low byte 原样保存。high byte 使用该 layer/K/V 的 15-entry
@@ -149,8 +146,9 @@ generic static codebook（可由离线 model-bound calibration artifact 显式�
 escape bytes。generic codebook 是启动期默认常量；离线 calibration artifact
 必须绑定模型身份和 plane-major 几何，单次请求不自适应更新。
 
-每个 chunk 占一段连续 slot（`ChunkMeta.start_slot`、`num_slots`）；未被占用的
-slot 由 `ChunkManager` 的空闲区间表示，不单独持久化。
+每个 chunk 有一段连续 slot id（`ChunkMeta.start_slot`、`num_slots`），id 单调
+递增、不复用，只表示身份。每层空闲空间由该层 `TlsfAllocator` 表示，L2 分配器在
+加载时由持久化的 chunk L2 偏移重建。
 
 ---
 
@@ -198,47 +196,41 @@ position 组件。`ServerCore` 只依赖 ABC。
 ### TransferLayer
 
 ```python
+@dataclass(frozen=True)
+class Move:
+    buffer_offset: int     # staging buffer side
+    nbytes: int
+    l1_offset: int | None  # absolute pinned-arena offset
+    l2_offset: int | None  # absolute file offset
+
 class TransferLayer(ABC):
-    coalesce_store_spans: bool = False        # backend opts into span coalescing
-
-    @property
-    def stats(self) -> TransferStats: ...      # tiering counters (zeroed by default)
-    @property
-    def l1_bytes_used(self) -> int: ...         # resident L1 bytes (0 by default)
-
-    async def load_bytes(self, dst, file_offset, nbytes) -> int: ...      # abstract
-    async def store_bytes(self, src, file_offset, nbytes) -> int: ...     # abstract
-    async def load_bytes_grouped(self, dst, spans) -> int: ...   # default: loop
-    async def store_bytes_grouped(self, src, spans) -> int: ...  # default: loop
-    async def drain(self) -> None: ...          # default no-op; override for write-back
-    def close(self) -> None: ...                # abstract
+    async def store(self, buffer, moves) -> StoreHandle: ...   # D2H to L1 (or staging), then L2 write
+    async def load(self, buffer, moves, source) -> None: ...   # source: "l1" | "l2"; l2 may also fill l1_offset
+    async def promote(self, moves) -> None: ...                # L2 -> L1, no GPU
+    async def load_runs(self, buffer, l1_offsets, targets, lengths) -> None: ...
+    async def drain(self) -> None: ...
+    async def close(self) -> None: ...
+    stats, debug_state
 ```
 
-可选能力（`coalesce_store_spans`、`stats`、`l1_bytes_used`、`drain`、grouped
-方法）都在 ABC 上声明并带默认实现，`IPCServer` 直接按接口调用，不做 `getattr`
-探测，也不读后端私有属性。
+`StoreHandle.staged` 在源字节被消费（L1 副本有效）时完成，`persisted` 在 L2 写
+完成时完成。transfer layer 只接受 server 给出的位置，只保留瞬态状态（在途 IO、
+staging buffer、promotion 读），不维护驻留、替换或 lease 状态。
 
 实现：
 
-- `TieredIOUringTransferLayer`：当前主路径的编排层，组合两个内聚组件——
-  `L1Cache`（`l1_cache.py`，range-keyed pinned-host LRU 缓存）和可选的
-  `L2IoEngine`（`l2_engine.py`，io_uring positioned I/O）；纯拷贝/marshalling
-  逻辑在 `copy_ops.py`。store 把 bytes 放入 L1 pool 立即对 load 可见，再异步
-  写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
-  `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
-  pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
-  写回调度胶水留在编排层。每个常驻 range 在 `L1Cache` 里只有一条记录（slice、
-  容量 charge、是否被读过、是否 held），range/slice/allocation 索引都指向这条记录；
-  独占分层的 held range 也由 `L1Cache` 记账，离开 L1 时经 `on_held_release`
-  回调交给编排层写 L2。编排层只保留按 IO 组织的状态：每个 range 最新的 L2 写、
-  按 slice 身份登记的在途写 buffer、每个在途 promotion 一条记录、请求 lease 与
-  readahead。`--skip-l2` 即「不构造 `L2IoEngine`」
-  （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
-  适用于需要 L2 文件的可选 backend。
+- `TieredIOUringTransferLayer`：当前主路径。持有一块 pinned arena（L1 偏移索引
+  其中）、一个小 staging pool（未接纳 L1 的 store 和未 promote 的读）和可选的
+  `L2IoEngine`（`l2_engine.py`，io_uring positioned I/O、写门、读条带）；纯拷贝
+  逻辑在 `copy_ops.py`。L2 文件用 `O_DIRECT` 打开，offset/byte count 要求
+  4096-byte 对齐。server 保证 extent 在 `io_pins > 0` 时不复用、load 只读已有效的
+  extent，因此这里不需要写后写排序或 promotion 过期检测。`--skip-l2` 即不构造
+  `L2IoEngine`，不打开 SSD 文件。
 
 - `GDSTransferLayer`：可选兼容 backend，server 通过 CUDA IPC 打开 worker staging
-  buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输；当前环境不可用，
-  不作为默认流程或优化目标。
+  buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。只实现 L2
+  子集：`store`（`staged == persisted`）、`load(source="l2")`、`drain`、`close`；
+  `promote` / `load_runs` 报错。当前环境不可用，不作为默认流程或优化目标。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。
@@ -253,41 +245,60 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 | op | 调用方 | 请求字段 | 响应字段 |
 |----|--------|----------|----------|
 | `get_runtime_config` | scheduler / worker init | - | `runtime_config` |
-| `lookup` | scheduler | `tokens`, `model_id` | `chunks: list[dict]` |
+| `lookup` | scheduler | `tokens`（或 `token_bytes`）, `model_id`；可选 `external_prefix_queries`, `num_computed_tokens`, `defer_pending` | `chunks: list[dict]`, `index_epoch`（`defer_pending` 遇到在途写者时为 `pending: true`） |
+| `index_epoch` | scheduler | - | `index_epoch`（每次移除 chunk 前进） |
+| `lookup_prefetch` | scheduler | 同 `lookup` + `lease_id` | `chunks`, `spans`, `tier` |
+| `transfer_prefetch` | scheduler | `lease_id` | `ok`, `requested_bytes`, `l1_bytes`, `l2_bytes`；失败为 `error` |
+| `release_transfer_lease` | scheduler | `lease_id` | `ok` |
 | `match_and_alloc` | scheduler | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
-| `alloc_chunk` | scheduler | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
-| `transfer_store` | worker | `payload`, `spans` | `ok: true`, `bytes` |
-| `transfer_load` | worker | `payload`, `spans` | `ok: true`, `bytes` |
-| `commit_chunk` | worker | `chunk_key` | `ok: true` |
-| `evict_chunk` | scheduler | `chunk_key` | `ok: true` |
+| `alloc_chunk` / `alloc_chunks` | scheduler | `chunk_key`, `token_count`, `model_id`, `parent_key` | `start_slot`, `num_slots`, `pos_offset`, `skipped` |
+| `release_chunk_writer` | scheduler | `chunk_key`, `start_slot`, `num_slots` | `released` |
+| `transfer_store` | worker | `payload`, `spans`, `tp_rank`, `tp_size` | `ok`, `bytes`, `chunk_keys` |
+| `transfer_load` | worker | `payload`, `spans`, `tp_rank` | `ok`, `bytes`, `l1_segments`, `l2_segments` |
+| `transfer_load_runs` | worker | `payload`, `lease_id`, `tp_rank`, `runs` | `ok`, `bytes`, `transfer_ms` |
+| `register_load_staging` / `register_store_staging` | worker init | `payload`（CUDA IPC handle、`buffer_index`、`producer_pid`） | `ok` |
+| `transfer_drain` / `init_transfer` | worker / bench | - | `ok` |
+| `evict_chunk` | scheduler | `chunk_key` | `ok` |
+
+span、run 表和 `compressed_slots` 的字段见
+[tier-residency.md](tier-residency.md) 的 IPC 线格式；所有 L1/L2 偏移由 server
+解析，请求里没有文件偏移。
 
 `runtime_config` 包含：
 
 ```json
 {
-  "socket_path": "/tmp/daser.sock",
+  "socket_path": "/path/to/daser.sock",
   "store_path": "/path/to/daser-state/daser.store",
   "slot_size": 2359296,
+  "local_slot_size": 2359296,
+  "tensor_parallel_size": 1,
   "block_tokens": 16,
   "model_id": "/path/to/model-or-served-id",
+  "cache_reuse_mode": "prefix",
   "transfer_mode": "iouring",
   "l1_size_bytes": 1073741824,
-  "l2_size_bytes": 10000000000,
+  "l2_size_bytes": 9999941632,
+  "l1_enabled": true,
+  "l2_enabled": true,
+  "tier_grain": 65536,
+  "l1_lane_bytes": 939524096,
+  "l2_lane_bytes": 9999941632,
+  "staging_bytes": 134217728,
   "skip_l2": false,
   "storage_format": "raw",
-  "bip_enabled": true
+  "l1_accounting": "stored",
+  "prefetch_lease_budget_bytes": 0,
+  "l2_read_stripe_bytes": 0
 }
 ```
 
-`skip_l2=true` 时，`store_path` 为空字符串，`l2_size_bytes` 仍表示控制面
-可分配的逻辑 slot 容量。
+`l2_size_bytes` 是实际文件大小（按 `tier_grain` 与 TP lane 向下取整）。
+`skip_l2=true` 时，`store_path` 为空字符串，不存在 L2。runtime config 不携带
+文件偏移相关的几何（rank stride、槽位总数），connector 也不计算位置。
 
 vLLM 的 `kv_connector_extra_config` 可以携带同名 `storage_format` hint。server
 的 `runtime_config.storage_format` 是权威值；声明了 hint 时，scheduler 和 worker
 都校验它与权威值相同，不一致则显式失败。
-
-`bip_enabled` 是 server 启动时确定的 transfer 开关，connector 从 runtime config
-读取实际生效值。它默认开启，与 storage format 无关；显式 server 参数可以关闭。
-
 IPC 错误以 `{"error": "..."}` 返回，connector client 会转换为
 `RuntimeError`。

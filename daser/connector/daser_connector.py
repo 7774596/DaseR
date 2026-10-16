@@ -144,7 +144,6 @@ class DaserConnector(
                 server_tp_size=1,
                 slot_size=0,
                 store_path="",
-                rank_stride_bytes=0,
                 rope_base=rope_base,
                 rope_rotary_dim=rope_rotary_dim,
                 rope_is_neox_style=rope_is_neox_style,

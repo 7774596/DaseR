@@ -20,10 +20,13 @@ import time
 
 import numpy as np
 
+from daser.transfer import Move
 from daser.transfer.iouring.layer import TieredIOUringTransferLayer
 
 _PAGE = 4096
 _WRITE_CHUNK = 64 << 20
+# Promotions read into the arena; the layer still needs a staging pool.
+_STAGING_BYTES = 64 << 20
 
 
 def _phase_bounds(record: int, phases: int) -> list[tuple[int, int]]:
@@ -55,11 +58,11 @@ async def _fill(args: argparse.Namespace, store: str, phases: int) -> str:
     """Promote every record into a fresh L1 in ``phases`` phases."""
     record = args.record_bytes
     total = args.records * record
-    l2_bytes = (total + (1 << 30)) // _PAGE * _PAGE
     layer = TieredIOUringTransferLayer(
-        path=store,
-        l1_bytes=total + (1 << 30),
-        l2_bytes=l2_bytes,
+        store,
+        l1_bytes=total,
+        staging_bytes=_STAGING_BYTES,
+        l2_bytes=total,
         io_workers=args.io_workers,
         l2_read_stripe_bytes=args.l2_read_stripe,
     )
@@ -67,15 +70,21 @@ async def _fill(args: argparse.Namespace, store: str, phases: int) -> str:
         marks: list[float] = []
         start = time.perf_counter()
         for lo, hi in _phase_bounds(record, phases):
-            await layer.prefetch_bytes_grouped(
+            # L1 mirrors the L2 layout, so a record's phase lands in place.
+            await layer.promote(
                 [
-                    {"file_offset": i * record + lo, "nbytes": hi - lo}
+                    Move(
+                        buffer_offset=0,
+                        nbytes=hi - lo,
+                        l1_offset=i * record + lo,
+                        l2_offset=i * record + lo,
+                    )
                     for i in range(args.records)
                 ]
             )
             marks.append((time.perf_counter() - start) * 1e3)
     finally:
-        layer.close()
+        await layer.close()
     wall = marks[-1]
     return (
         f"K={phases:2d} piece={record // phases / 1e6:6.2f} MB "

@@ -89,7 +89,6 @@ def _validate_tp_layout(
     tp_size: int,
     server_tp_size: int,
     tp_rank: int,
-    rank_stride_bytes: int = 0,
     num_layers: int = 0,
 ) -> None:
     """Validate worker KV geometry against the server-owned TP layout.
@@ -100,7 +99,6 @@ def _validate_tp_layout(
         tp_size: vLLM worker tensor-parallel size.
         server_tp_size: Tensor-parallel size reported by the server.
         tp_rank: Current vLLM tensor-parallel rank.
-        rank_stride_bytes: Byte distance between server-owned rank lanes.
         num_layers: KV layers the worker registered (0 = unknown); used to
             name the layer counts when slot sizes differ by whole layers.
 
@@ -135,8 +133,6 @@ def _validate_tp_layout(
             "worker KV slot geometry does not match DaseR storage layout: "
             f"local={local_slot_size} tp={tp_size} storage={storage_slot_size}" + detail
         )
-    if tp_size > 1 and rank_stride_bytes <= 0:
-        raise ValueError("DaseR runtime config is missing TP rank stride")
 
 
 def _warm_cross_layer_restore_backends(
@@ -242,7 +238,6 @@ class WorkerRuntime:
         server_tp_size: int,
         slot_size: int,
         store_path: str,
-        rank_stride_bytes: int,
         rope_base: float,
         rope_rotary_dim: int,
         rope_is_neox_style: bool,
@@ -261,7 +256,6 @@ class WorkerRuntime:
         self._slot_size = slot_size
         self._local_slot_size = 0
         self._store_path = store_path
-        self._rank_stride_bytes = rank_stride_bytes
         self._rope_base = rope_base
         self._rope_rotary_dim = rope_rotary_dim
         self._rope_is_neox_style = rope_is_neox_style
@@ -314,7 +308,6 @@ class WorkerRuntime:
             self._tp_size,
             self._server_tp_size,
             self._tp_rank,
-            self._rank_stride_bytes,
         )
         self._local_slot_size = local_slot_size
         if self._slot_size == 0:
@@ -545,15 +538,10 @@ class WorkerRuntime:
                     self._tp_size,
                     self._server_tp_size,
                     self._tp_rank,
-                    self._rank_stride_bytes,
                     len(getattr(self, "_layer_names", ())),
                 )
-                self._load_pipeline.configure_rank_geometry(
-                    self._rank_stride_bytes,
-                    self._tp_rank,
-                )
+                self._load_pipeline.configure_rank_geometry(self._tp_rank)
                 self._store_pipeline.configure_rank_geometry(
-                    self._rank_stride_bytes,
                     self._tp_rank,
                     self._tp_size,
                 )
@@ -581,9 +569,6 @@ class WorkerRuntime:
         self._slot_size = int(config.get("slot_size", self._slot_size))
         self._server_tp_size = int(
             config.get("tensor_parallel_size", self._server_tp_size)
-        )
-        self._rank_stride_bytes = int(
-            config.get("rank_stride_bytes", self._rank_stride_bytes)
         )
         self._skip_l2 = bool(config.get("skip_l2", self._skip_l2))
         self._transfer_mode = str(config.get("transfer_mode", self._transfer_mode))
@@ -788,7 +773,6 @@ class WorkerRuntime:
             kv_caches=self._kv_caches,
             layer_names=self._layer_names,
             local_slot_size=self._local_slot_size,
-            rank_stride_bytes=self._rank_stride_bytes,
             tp_rank=self._tp_rank,
             tp_size=self._tp_size,
             staging_bytes=staging_bytes,
@@ -798,7 +782,6 @@ class WorkerRuntime:
             kv_caches=self._kv_caches,
             layer_names=self._layer_names,
             local_slot_size=self._local_slot_size,
-            rank_stride_bytes=self._rank_stride_bytes,
             tp_rank=self._tp_rank,
             staging_pool=load_pool,
             load_key_scale=self._load_key_scale,

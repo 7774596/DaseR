@@ -1,42 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Chunk ids, chunk metadata ownership and index persistence."""
 
 # Standard
+from dataclasses import asdict, dataclass
 import os
-from typing import TYPE_CHECKING
+from typing import Any
 
 # Third Party
 import msgpack
 
 # First Party
 from daser.logging import init_logger
-from daser.server.extents import FreeExtents
+from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import ChunkMeta, MetadataStore
-
-if TYPE_CHECKING:
-    from daser.server.doc_registry import DocRegistry
+from daser.server.tiers import L2Placement
 
 logger = init_logger(__name__)
 
+#: Persisted index layout; files of another version require a cold start.
+_INDEX_FORMAT = 2
 
-class SlotsExhausted(MemoryError):
-    """Raised when no free slot range is long enough for an allocation."""
+
+@dataclass(frozen=True)
+class IndexSnapshot:
+    """Persisted server index (raw chunks with an L2 copy only).
+
+    Attributes:
+        cache_reuse_mode: Cache reuse mode that produced the chunks.
+        next_slot: Next unassigned slot id.
+        tier_grain: Tier allocation grain in bytes.
+        l2_lane_bytes: Bytes of each TP rank's L2 lane.
+        tensor_parallel_size: Number of L2 lanes.
+        metas: Chunk metadata of the persisted chunks.
+        l2: L2 placement of every persisted chunk.
+        docs: Serialized document registry (``DocRegistry.to_dict``).
+    """
+
+    cache_reuse_mode: str | None
+    next_slot: int
+    tier_grain: int
+    l2_lane_bytes: int
+    tensor_parallel_size: int
+    metas: list[ChunkMeta]
+    l2: list[L2Placement]
+    docs: dict[str, dict[str, Any]]
 
 
 class ChunkManager:
-    """Slot allocator and chunk index owner for DaseR's KV store.
+    """Chunk id allocator and owner of chunk and document metadata.
 
-    Slots are handed out first-fit from address-ordered free ranges. The
-    manager never chooses what to evict: ``alloc`` raises ``SlotsExhausted``
-    and the caller removes chunks (see ``docs/design/tier-residency.md``).
-    A removed chunk's slots are reusable at once, unless a write hold still
-    covers it.
+    Slot ids are identities, not addresses: each allocation takes the next
+    ``num_slots`` ids and ids are never reused, so a delayed write or load
+    naming a removed allocation can never alias a later one. Byte capacity
+    lives in ``daser.server.tiers``.
 
     Args:
-        total_slots: number of logical slots.
         metadata_store: MetadataStore instance this manager operates on.
         doc_registry: optional DocRegistry persisted with the index.
-        physical_slots: raw-envelope slots the on-disk L2 file represents;
-            defaults to ``total_slots``.
 
     Async/thread-safety:
         Not thread-safe; owned by the server event loop.
@@ -44,38 +64,20 @@ class ChunkManager:
 
     def __init__(
         self,
-        total_slots: int,
         metadata_store: MetadataStore,
-        doc_registry: "DocRegistry | None" = None,
-        physical_slots: int | None = None,
+        doc_registry: DocRegistry | None = None,
     ) -> None:
-        self._total_slots = total_slots
-        self._physical_slots = physical_slots or total_slots
-        if self._physical_slots <= 0 or self._physical_slots > total_slots:
-            raise ValueError("physical_slots must be within logical slot capacity")
         self._store = metadata_store
         self._doc_registry = doc_registry
-        self._free = FreeExtents(0, total_slots)
-        # Write holds: token -> chunk metas, and per-meta hold counts. A
-        # removed meta with holds keeps its slots until the count drops to 0.
-        self._holds: dict[int, list[ChunkMeta]] = {}
-        self._hold_counts: dict[int, int] = {}
-        self._retired: dict[int, ChunkMeta] = {}
-        self._next_hold = 0
-        self._rebuild_free()
+        self._next_slot = 0
+        # slot id -> (chunk key, slot index inside the chunk), every live slot.
+        self._slots: dict[int, tuple[str, int]] = {}
+        for meta in metadata_store.iter_chunks():
+            self._next_slot = max(self._next_slot, meta.start_slot + meta.num_slots)
+            self._map_slots(meta)
 
     @property
-    def total_slots(self) -> int:
-        """Return logical slot capacity."""
-        return self._total_slots
-
-    @property
-    def physical_slots(self) -> int:
-        """Return raw-envelope slots represented by the physical L2 lane."""
-        return self._physical_slots
-
-    @property
-    def doc_registry(self) -> "DocRegistry | None":
+    def doc_registry(self) -> DocRegistry | None:
         """Return the attached DocRegistry if any."""
         return self._doc_registry
 
@@ -85,14 +87,9 @@ class ChunkManager:
         return self._store
 
     @property
-    def free_slots(self) -> int:
-        """Return slots not owned by a chunk or a pending write hold."""
-        return self._free.free
-
-    @property
-    def free_holes(self) -> int:
-        """Return the number of disjoint free slot ranges (fragmentation)."""
-        return self._free.holes
+    def next_slot(self) -> int:
+        """Return the id the next allocation starts at."""
+        return self._next_slot
 
     def alloc(
         self,
@@ -103,11 +100,11 @@ class ChunkManager:
         pos_offset: int,
         parent_key: str = "",
     ) -> ChunkMeta:
-        """Allocate contiguous slots for a new chunk.
+        """Assign fresh slot ids to a new chunk and index its metadata.
 
         Args:
             chunk_key: unique identifier for the chunk.
-            num_slots: number of contiguous slots required.
+            num_slots: number of slot ids (KV blocks) the chunk covers.
             token_count: number of tokens in this chunk.
             model_id: model identifier for cache invalidation.
             pos_offset: position encoding offset for this chunk.
@@ -117,22 +114,13 @@ class ChunkManager:
             The inserted chunk metadata.
 
         Raises:
-            ValueError: if num_slots is not in ``[1, total_slots]``.
-            SlotsExhausted: if no free range is long enough; nothing changed.
+            ValueError: if ``num_slots < 1`` or the key is already indexed.
         """
-        if not 0 < num_slots <= self._total_slots:
-            raise ValueError(
-                f"num_slots={num_slots} must be within total_slots={self._total_slots}"
-            )
-        start_slot = self._free.reserve(num_slots)
-        if start_slot is None:
-            raise SlotsExhausted(
-                f"no {num_slots} contiguous free slots "
-                f"(free={self._free.free} holes={self._free.holes})"
-            )
+        if num_slots < 1:
+            raise ValueError(f"num_slots must be positive, got {num_slots}")
         meta = ChunkMeta(
             chunk_key=chunk_key,
-            start_slot=start_slot,
+            start_slot=self._next_slot,
             num_slots=num_slots,
             token_count=token_count,
             pos_offset=pos_offset,
@@ -140,100 +128,76 @@ class ChunkManager:
             parent_key=parent_key,
         )
         self._store.insert(meta)
+        self._next_slot += num_slots
+        self._map_slots(meta)
         logger.debug(
-            "[CHUNK] alloc chunk_key=%s start=%d num=%d free=%d",
+            "[CHUNK] alloc chunk_key=%s start=%d num=%d",
             chunk_key,
-            start_slot,
+            meta.start_slot,
             num_slots,
-            self._free.free,
         )
         return meta
 
     def remove(self, chunk_key: str) -> ChunkMeta:
-        """Remove a chunk from the index and free its slots.
-
-        Slots of a chunk under a write hold are freed when the hold ends.
+        """Remove a chunk from the index; its slot ids are never reused.
 
         Args:
-            chunk_key: key of a stored chunk.
+            chunk_key: key of an indexed chunk.
 
         Returns:
             The removed metadata.
 
         Raises:
-            KeyError: if the chunk is not stored.
+            KeyError: if the chunk is not indexed.
         """
         meta = self._store.remove(chunk_key)
-        if self._hold_counts.get(id(meta)):
-            self._retired[id(meta)] = meta
-        else:
-            self._free.release(meta.start_slot, meta.num_slots)
+        for slot in range(meta.start_slot, meta.start_slot + meta.num_slots):
+            del self._slots[slot]
         return meta
 
-    def hold_writes(self, chunk_keys: list[str]) -> int:
-        """Keep the slots of stored chunks reserved until a write ends.
+    def resolve_slot(self, slot_id: int) -> tuple[ChunkMeta, int] | None:
+        """Return the live chunk owning a slot id.
 
         Args:
-            chunk_keys: Keys a transfer is about to write; unknown keys are
-                ignored.
+            slot_id: Slot id from an allocation or lookup result.
 
         Returns:
-            Token to pass to ``end_writes`` exactly once.
-
-        Async/thread-safety:
-            Call on the server event loop before yielding to the transfer.
+            ``(meta, slot_index)`` with ``slot_index`` relative to
+            ``meta.start_slot``, or None when no indexed chunk owns the id.
         """
-        metas = []
-        for key in dict.fromkeys(chunk_keys):
-            meta = self._store.get(key)
-            if meta is not None:
-                metas.append(meta)
-                self._hold_counts[id(meta)] = self._hold_counts.get(id(meta), 0) + 1
-        token = self._next_hold
-        self._next_hold += 1
-        self._holds[token] = metas
-        return token
-
-    def end_writes(self, token: int) -> None:
-        """End a write hold and free slots whose chunk left meanwhile.
-
-        Args:
-            token: Value returned by ``hold_writes``.
-
-        Raises:
-            KeyError: If the token is unknown or already ended.
-        """
-        for meta in self._holds.pop(token):
-            count = self._hold_counts[id(meta)] - 1
-            if count:
-                self._hold_counts[id(meta)] = count
-                continue
-            del self._hold_counts[id(meta)]
-            retired = self._retired.pop(id(meta), None)
-            if retired is not None:
-                self._free.release(retired.start_slot, retired.num_slots)
+        owner = self._slots.get(slot_id)
+        if owner is None:
+            return None
+        meta = self._store.get(owner[0])
+        assert meta is not None
+        return meta, owner[1]
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, path: str, cache_reuse_mode: str | None = None) -> None:
-        """Persist the chunk index and document registry to path.
+    def save(self, path: str, snapshot: IndexSnapshot) -> None:
+        """Atomically write an index snapshot to ``path``.
 
         Args:
             path: absolute file path to write.
-            cache_reuse_mode: optional cache reuse mode that created the
-                persisted metadata.
+            snapshot: State to persist (built by ``ServerCore.save_index``).
+
+        Async/thread-safety:
+            Blocking file IO with fsync; call at shutdown only.
         """
-        tmp_path = path + ".tmp"
         payload = {
-            "total_slots": self._total_slots,
-            "index": self._store.to_bytes(),
-            "cache_reuse_mode": cache_reuse_mode,
-            "doc_registry": (
-                self._doc_registry.to_dict() if self._doc_registry is not None else {}
-            ),
+            "format": _INDEX_FORMAT,
+            "cache_reuse_mode": snapshot.cache_reuse_mode,
+            "next_slot": snapshot.next_slot,
+            "tier_grain": snapshot.tier_grain,
+            "l2_lane_bytes": snapshot.l2_lane_bytes,
+            "tensor_parallel_size": snapshot.tensor_parallel_size,
+            "metas": [asdict(meta) for meta in snapshot.metas],
+            "l2": [[p.chunk_key, p.offset, list(p.record_sizes)] for p in snapshot.l2],
+            "docs": snapshot.docs,
         }
+        tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "wb") as f:
                 f.write(msgpack.packb(payload, use_bin_type=True))
@@ -246,29 +210,34 @@ class ChunkManager:
         logger.info(
             "[CHUNK] state saved to %s (chunks=%d docs=%d)",
             path,
-            len(self._store),
-            len(self._doc_registry) if self._doc_registry is not None else 0,
+            len(snapshot.metas),
+            len(snapshot.docs),
         )
 
-    def load(
-        self,
-        path: str,
-        expected_cache_reuse_mode: str | None = None,
-    ) -> None:
-        """Restore the chunk index from path and rebuild slot occupancy.
+    @staticmethod
+    def read_snapshot(
+        path: str, expected_cache_reuse_mode: str | None = None
+    ) -> IndexSnapshot:
+        """Read an index snapshot written by ``save``.
 
         Args:
             path: absolute file path to read.
-            expected_cache_reuse_mode: optional startup cache reuse mode. When
-                set, persisted metadata from a different mode is rejected.
+            expected_cache_reuse_mode: When set, a snapshot saved by another
+                (or an unknown) cache reuse mode is rejected.
+
+        Returns:
+            The decoded snapshot.
 
         Raises:
-            ValueError: on a reuse-mode or slot-capacity mismatch, or when
-                persisted chunks overlap.
+            ValueError: on an unknown format or a reuse-mode mismatch.
+
+        Async/thread-safety:
+            Blocking file IO; call at startup only.
         """
         with open(path, "rb") as f:
             payload = msgpack.unpackb(f.read(), raw=False)
-
+        if not isinstance(payload, dict) or payload.get("format") != _INDEX_FORMAT:
+            raise ValueError("unsupported index format; cold start is required")
         saved_mode = payload.get("cache_reuse_mode")
         if expected_cache_reuse_mode is not None and saved_mode is None:
             raise ValueError(
@@ -283,29 +252,85 @@ class ChunkManager:
                 f"index was saved with {saved_mode!r}, "
                 f"server started with {expected_cache_reuse_mode!r}"
             )
-        if payload.get("total_slots") != self._total_slots:
-            raise ValueError(
-                f"slot capacity mismatch: index has {payload.get('total_slots')}, "
-                f"server has {self._total_slots}"
-            )
-        self._store.load_bytes(payload["index"])
-        self._rebuild_free()
-        if self._doc_registry is not None:
-            self._doc_registry.load_dict(payload.get("doc_registry", {}) or {})
+        return IndexSnapshot(
+            cache_reuse_mode=saved_mode,
+            next_slot=int(payload["next_slot"]),
+            tier_grain=int(payload["tier_grain"]),
+            l2_lane_bytes=int(payload["l2_lane_bytes"]),
+            tensor_parallel_size=int(payload["tensor_parallel_size"]),
+            metas=[ChunkMeta(**fields) for fields in payload["metas"]],
+            l2=[
+                L2Placement(
+                    chunk_key=str(key),
+                    offset=int(offset),
+                    record_sizes=tuple(int(size) for size in sizes),
+                )
+                for key, offset, sizes in payload["l2"]
+            ],
+            docs=dict(payload.get("docs") or {}),
+        )
 
+    def validate_snapshot(self, snapshot: IndexSnapshot) -> None:
+        """Check that ``restore`` would accept a snapshot.
+
+        Args:
+            snapshot: Snapshot to check.
+
+        Raises:
+            ValueError: if this manager already indexes chunks, keys repeat,
+                or slot ranges are invalid, overlap, or reach ``next_slot``.
+        """
+        if len(self._store) or self._next_slot:
+            raise ValueError("index restore requires an empty chunk manager")
+        ranges = []
+        keys = set()
+        for meta in snapshot.metas:
+            if meta.chunk_key in keys:
+                raise ValueError(f"duplicate restored chunk: {meta.chunk_key}")
+            keys.add(meta.chunk_key)
+            end = meta.start_slot + meta.num_slots
+            if meta.start_slot < 0 or meta.num_slots < 1 or end > snapshot.next_slot:
+                raise ValueError(f"invalid slot range for chunk: {meta.chunk_key}")
+            ranges.append((meta.start_slot, end))
+        ranges.sort()
+        for (_start, end), (next_start, _end) in zip(ranges, ranges[1:], strict=False):
+            if end > next_start:
+                raise ValueError("restored slot ranges overlap")
+
+    def restore(self, snapshot: IndexSnapshot) -> None:
+        """Index the chunks and documents of a snapshot.
+
+        Documents referencing chunks the snapshot does not contain are marked
+        evicted for those chunks.
+
+        Args:
+            snapshot: Snapshot accepted by ``validate_snapshot``.
+
+        Raises:
+            ValueError: if ``validate_snapshot`` rejects it (nothing changes).
+        """
+        self.validate_snapshot(snapshot)
+        for meta in snapshot.metas:
+            self._store.insert(meta)
+            self._map_slots(meta)
+        self._next_slot = snapshot.next_slot
+        if self._doc_registry is not None:
+            self._doc_registry.load_dict(snapshot.docs)
+            for entry in self._doc_registry.all_entries():
+                for key in entry.chunk_keys:
+                    if self._store.get(key) is None:
+                        self._doc_registry.mark_chunk_evicted(entry.doc_id, key)
         logger.info(
-            "[CHUNK] state loaded from %s (chunks=%d docs=%d)",
-            path,
-            len(self._store),
-            len(self._doc_registry) if self._doc_registry is not None else 0,
+            "[CHUNK] state restored (chunks=%d next_slot=%d)",
+            len(snapshot.metas),
+            snapshot.next_slot,
         )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _rebuild_free(self) -> None:
-        """Recompute free slot ranges from the chunk index."""
-        self._free = FreeExtents(0, self._total_slots)
-        for meta in sorted(self._store.iter_chunks(), key=lambda m: m.start_slot):
-            self._free.take(meta.start_slot, meta.num_slots)
+    def _map_slots(self, meta: ChunkMeta) -> None:
+        """Record ``meta`` as the owner of its slot ids."""
+        for index in range(meta.num_slots):
+            self._slots[meta.start_slot + index] = (meta.chunk_key, index)

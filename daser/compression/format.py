@@ -156,7 +156,6 @@ class CompressedStoreGeometry:
     """Immutable geometry shared by a compressed store and its model.
 
     Attributes:
-        num_slots: Number of fixed envelopes in the data file.
         slot_size: Raw bytes reserved for each logical slot.
         block_tokens: Tokens represented by one slot.
         num_layers: Number of model KV layers.
@@ -164,9 +163,11 @@ class CompressedStoreGeometry:
         head_dim: Scalars in each KV head.
         dtype_bytes: Bytes per scalar; version one requires BF16 (two bytes).
         tile_scalars: Independently decodable scalar count used by the kernel.
+        num_slots: Number of slot envelopes a fixed-size buffer holds, or
+            None when the geometry describes records of an unbounded store
+            (the server tier store has no slot count).
     """
 
-    num_slots: int
     slot_size: int
     block_tokens: int
     num_layers: int
@@ -174,6 +175,7 @@ class CompressedStoreGeometry:
     head_dim: int
     dtype_bytes: int = 2
     tile_scalars: int = ONLINE_TILE_SCALARS
+    num_slots: int | None = None
 
     def __post_init__(self) -> None:
         expected = (
@@ -185,7 +187,6 @@ class CompressedStoreGeometry:
             * self.dtype_bytes
         )
         values = (
-            self.num_slots,
             self.slot_size,
             self.block_tokens,
             self.num_layers,
@@ -193,7 +194,9 @@ class CompressedStoreGeometry:
             self.head_dim,
             self.tile_scalars,
         )
-        if any(value <= 0 for value in values):
+        if any(value <= 0 for value in values) or (
+            self.num_slots is not None and self.num_slots <= 0
+        ):
             raise ValueError("compressed store geometry values must be positive")
         if self.dtype_bytes != 2:
             raise ValueError("compressed format version 1 supports BF16 only")
@@ -249,27 +252,6 @@ class CompressedStoreGeometry:
         if envelope is None:
             raise ValueError("compressed-online geometry has no fixed envelope")
         return envelope[2]
-
-    @property
-    def online_min_stored_length(self) -> int:
-        """Return the aligned lower bound for one online packed record.
-
-        Returns:
-            The smallest byte range that the online format can describe for
-            this geometry. The value is used only to size
-            logical metadata; physical admission still uses each record's
-            actual length.
-
-        Async/thread-safety:
-            Pure arithmetic with no I/O or shared state.
-        """
-        max_tiles = (self.plane_scalars + self.tile_scalars - 1) // self.tile_scalars
-        payload_base = (
-            self.plane_scalars
-            + (self.plane_scalars * 3 + 7) // 8
-            + prefix_table_bytes(max_tiles)
-        )
-        return align_up(self.header_bytes + self.plane_count * payload_base)
 
 
 @dataclass(frozen=True)

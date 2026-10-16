@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import os
 import threading
 import time
@@ -123,7 +123,6 @@ class StorePipeline:
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._local_slot_size = 0
-        self._rank_stride_bytes = 0
         self._tp_rank = 0
         self._tp_size = 1
         self._cuda_stream: torch.cuda.Stream | None = None
@@ -156,7 +155,6 @@ class StorePipeline:
         kv_caches: dict[str, torch.Tensor],
         layer_names: list[str],
         local_slot_size: int,
-        rank_stride_bytes: int,
         tp_rank: int,
         tp_size: int,
         staging_bytes: int,
@@ -168,7 +166,6 @@ class StorePipeline:
             kv_caches: Registered vLLM KV tensors.
             layer_names: Stable storage layer order.
             local_slot_size: Bytes stored per slot by this TP rank.
-            rank_stride_bytes: Byte distance between rank lanes.
             tp_rank: Current tensor-parallel rank.
             tp_size: Tensor-parallel world size.
             staging_bytes: Maximum bytes per store batch.
@@ -180,7 +177,6 @@ class StorePipeline:
         self._kv_caches = kv_caches
         self._layer_names = list(layer_names)
         self._local_slot_size = local_slot_size
-        self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
         self._tp_size = tp_size
         self._staging_bytes = staging_bytes
@@ -254,16 +250,10 @@ class StorePipeline:
         self._submit(self._client.init_transfer()).result(timeout=120.0)
         self._register_staging_buffers()
 
-    def configure_rank_geometry(
-        self,
-        rank_stride_bytes: int,
-        tp_rank: int,
-        tp_size: int,
-    ) -> None:
-        """Apply server-finalized tensor-parallel lane geometry.
+    def configure_rank_geometry(self, tp_rank: int, tp_size: int) -> None:
+        """Apply the server-finalized tensor-parallel rank.
 
         Args:
-            rank_stride_bytes: Byte distance between server-owned rank lanes.
             tp_rank: Current tensor-parallel rank.
             tp_size: Tensor-parallel world size used for commit coordination.
 
@@ -271,7 +261,6 @@ class StorePipeline:
             Called on the worker thread after runtime-config refresh and before
             any store is submitted.
         """
-        self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
@@ -636,16 +625,6 @@ class StorePipeline:
     ) -> list[tuple[list[int], list[StoreWriteSpan]]]:
         if not self._kv_caches or self._staging_pool is None:
             return []
-        reqs_to_store = {
-            req_id: replace(
-                spec,
-                file_offset=(
-                    self._tp_rank * self._rank_stride_bytes
-                    + spec.start_slot * self._local_slot_size
-                ),
-            )
-            for req_id, spec in save.reqs_to_store.items()
-        }
         max_batch_bytes = self._staging_bytes
         if getattr(self, "_online_packer", None) is not None:
             # A large first-turn prefix can contain 16+ blocks. Compressing
@@ -658,7 +637,7 @@ class StorePipeline:
                 self._online_pack_batch_slots * self._local_slot_size,
             )
         return build_staging_store_batches(
-            reqs_to_store,
+            save.reqs_to_store,
             self._local_slot_size,
             max_batch_bytes=max_batch_bytes,
         )
@@ -986,15 +965,10 @@ class StorePipeline:
             {
                 "source_offset": span.source_offset,
                 "nbytes": span.nbytes,
-                "file_offset": span.file_offset,
-                "accounted_nbytes": (
-                    self._local_slot_size if span.packed else span.nbytes
-                ),
                 "chunk_key": span.chunk_key,
                 "start_slot": span.start_slot,
                 "num_slots": span.num_slots,
-                "logical_slot_start": span.logical_slot_start,
-                "logical_slot_count": span.logical_slot_count,
+                "slot_index": span.slot_index,
                 "packed": span.packed,
                 "mode": span.packed_mode or "raw",
             }
@@ -1138,7 +1112,9 @@ def build_staging_store_batches(
         max_batch_bytes: Maximum GPU staging bytes in one batch.
 
     Returns:
-        Ordered block ID and server write-span batches.
+        Ordered block ID and server write-span batches. A chunk larger than
+        one batch is split across batches; its spans name the first slot
+        they carry with ``slot_index``.
 
     Async/thread-safety:
         Pure CPU planning; safe to call from worker or store-loop threads.
@@ -1149,7 +1125,7 @@ def build_staging_store_batches(
     batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
     batch_blocks: list[int] = []
     batch_spans: list[StoreWriteSpan] = []
-    written_specs: set[tuple[str, int, int, int, int]] = set()
+    written_specs: set[tuple[str, int, int, int]] = set()
 
     def flush_batch() -> None:
         nonlocal batch_blocks, batch_spans
@@ -1163,7 +1139,6 @@ def build_staging_store_batches(
             spec.chunk_key,
             spec.start_slot,
             spec.num_slots,
-            spec.file_offset,
             len(spec.block_ids),
         )
         if source_key in written_specs:
@@ -1185,7 +1160,7 @@ def build_staging_store_batches(
                 StoreWriteSpan(
                     source_offset=source_slot * slot_size,
                     nbytes=take * slot_size,
-                    file_offset=spec.file_offset + cursor * slot_size,
+                    slot_index=cursor,
                     chunk_key=spec.chunk_key,
                     start_slot=spec.start_slot,
                     num_slots=spec.num_slots,
@@ -1219,13 +1194,10 @@ def _packed_store_spans(
     packed: list[OnlinePackedSlot],
     slot_size: int,
 ) -> list[StoreWriteSpan]:
-    """Build transfer spans for online records, compacting each allocation.
+    """Build one transfer span per online packed record.
 
-    Packed records are emitted back-to-back inside the raw allocation that
-    owns them.  This makes the source and file ranges coalesce into one DMA
-    span when a batch covers adjacent logical slots, while preserving the
-    original raw-stride layout for malformed metadata or records that exceed
-    their reserved capacity.
+    The server places every record of a chunk back to back inside the
+    chunk's tier extents; each span names its record by ``slot_index``.
 
     Args:
         spans: Original raw-stride spans grouped by allocation and batch.
@@ -1254,30 +1226,16 @@ def _packed_store_spans(
         source_records = packed[packed_cursor : packed_cursor + count]
         if len(source_records) != count:
             raise ValueError("packed slot count does not match store spans")
-
-        # Each packed record is aligned and must fit the raw slot envelope.  A
-        # malformed record falls back to the old slot-stride file offset so it
-        # cannot write into a neighbouring allocation.
-        compact_bytes = sum(record.stored_length for record in source_records)
-        compact_file_layout = (
-            source.file_offset >= 0
-            and compact_bytes <= count * slot_size
-            and all(0 < record.stored_length <= slot_size for record in source_records)
-        )
-        file_cursor = source.file_offset
         for relative, record in enumerate(source_records):
             if record.logical_slot != source.logical_slot_start + relative:
                 raise ValueError("packed slots are not ordered within store span")
-            file_offset = (
-                file_cursor
-                if compact_file_layout
-                else source.file_offset + relative * slot_size
-            )
+            if record.stored_length <= 0:
+                raise ValueError("packed record must not be empty")
             result.append(
                 StoreWriteSpan(
                     source_offset=record.source_offset,
                     nbytes=record.stored_length,
-                    file_offset=file_offset,
+                    slot_index=source.slot_index + relative,
                     chunk_key=source.chunk_key,
                     start_slot=source.start_slot,
                     num_slots=source.num_slots,
@@ -1287,8 +1245,6 @@ def _packed_store_spans(
                     packed_mode=record.mode.name.lower(),
                 )
             )
-            if compact_file_layout:
-                file_cursor += record.stored_length
         packed_cursor += count
 
     if packed_cursor != len(packed):

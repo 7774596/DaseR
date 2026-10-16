@@ -26,6 +26,8 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    DEFAULT_L2_BYTES,
+    DEFAULT_TIER_GRAIN,
     L1_ACCOUNTING_MODES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
@@ -46,6 +48,7 @@ from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 from daser.server.store_file import ensure_store_file
+from daser.server.tiers import TierLayout
 
 logger = init_logger(__name__)
 
@@ -57,8 +60,6 @@ class VLLMStartupError(RuntimeError):
         Exception type only; safe to raise from sync or async startup paths.
     """
 
-
-_DEFAULT_L2_SIZE = 10 * 1024 * 1024 * 1024
 
 DASER_ASCII_BANNER = r"""
 
@@ -131,14 +132,14 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
         cfg: resolved DaseR server config.
 
     Raises:
-        ValueError: if an existing store file is smaller than the aligned
-            store size.
+        ValueError: if an existing store file is smaller than one L2 lane per
+            TP rank.
     """
     os.makedirs(cfg.store_dir, exist_ok=True)
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
         return
-    ensure_store_file(cfg.store_path, cfg.aligned_store_bytes)
+    ensure_store_file(cfg.store_path, cfg.store_file_bytes)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -176,8 +177,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--l2-size",
         type=_parse_size_bytes,
-        default=_DEFAULT_L2_SIZE,
-        help="L2 SSD-tier capacity, e.g. 10gb, 10gib, 512mb, or bytes",
+        default=DEFAULT_L2_BYTES,
+        help="L2 SSD-tier capacity across all TP ranks, e.g. 10gb, 10gib, "
+        "512mb, or bytes; each rank gets a grain-aligned lane of 1/TP.",
     )
     parser.add_argument(
         "--socket-path",
@@ -203,8 +205,16 @@ def _parse_args() -> argparse.Namespace:
         "--l1-size",
         type=_parse_size_bytes,
         default=None,
-        help="L1 memory-tier capacity for --transfer-mode=iouring. Defaults "
-        "to min(1GiB, --l2-size).",
+        help="Pinned-memory budget for --transfer-mode=iouring: the L1 lanes "
+        "plus a staging pool of min(256MiB, 1/8) when L2 is enabled. Defaults "
+        "to 1GiB; ignored by --transfer-mode=gds.",
+    )
+    parser.add_argument(
+        "--tier-grain",
+        type=_parse_size_bytes,
+        default=DEFAULT_TIER_GRAIN,
+        help="Allocation unit of the L1 and L2 tiers; a power of two multiple "
+        "of 4KiB (default 64KiB).",
     )
     parser.add_argument(
         "--skip-l2",
@@ -227,17 +237,11 @@ def _parse_args() -> argparse.Namespace:
         "for --storage-format=compressed-online (default: generic palette).",
     )
     parser.add_argument(
-        "--bip-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable BIP replacement for the iouring L1 cache (default: on).",
-    )
-    parser.add_argument(
         "--prefetch-lease-budget",
         type=_parse_size_bytes,
         default=0,
-        help="Cap on L1 bytes retained by in-flight scheduler prefetch leases "
-        "for --transfer-mode=iouring, charged in --l1-accounting units; a "
+        help="Cap on L1 bytes pinned by in-flight scheduler prefetch leases "
+        "for --transfer-mode=iouring, counted in --l1-accounting units; a "
         "prefetch over the cap waits for earlier leases (default 0: no cap).",
     )
     parser.add_argument(
@@ -345,7 +349,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         Fully populated DaseR config.
 
     Raises:
-        ValueError: if L2 size is not a positive slot multiple.
+        ValueError: if the tier sizes cannot hold one record or the selected
+            options conflict.
     """
     vllm_model_id = getattr(args, "vllm_model_id", None) or args.model_path
     if vllm_model_id is None:
@@ -360,26 +365,19 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
             "--skip-l2 is incompatible with --transfer-mode=gds because "
             "GDS requires an L2 store file"
         )
-    l1_size = (
-        min(DEFAULT_IOURING_L1_BYTES, int(args.l2_size))
-        if args.l1_size is None and (transfer_mode == "iouring" or skip_l2)
-        else int(args.l1_size or 0)
-    )
-    total_store_bytes = l1_size if skip_l2 else int(args.l2_size)
-    storage_format = str(getattr(args, "storage_format", STORAGE_FORMAT_RAW))
-    l2_budget = 0
-    if storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE and not skip_l2:
-        # Records kept by L1 alone hold arena addresses but no SSD budget, so
-        # the packed arena addresses L1 + L2 while live SSD bytes stay within
-        # --l2-size (docs/design/tier-residency.md).
-        l2_budget = total_store_bytes
-        total_store_bytes += l1_size
+    if transfer_mode == "gds":
+        if args.l1_size:
+            logger.warning("[SERVER] --transfer-mode=gds has no L1; ignoring --l1-size")
+        l1_size = 0
+    elif args.l1_size is None:
+        l1_size = DEFAULT_IOURING_L1_BYTES
+    else:
+        l1_size = int(args.l1_size)
     cfg = DaserConfig(
         model_path=model_path,
         vllm_model_id=model_id,
         store_dir=args.store_dir,
-        total_store_bytes=total_store_bytes,
-        l2_budget_bytes=l2_budget,
+        l2_size_bytes=0 if skip_l2 else int(args.l2_size),
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         block_tokens=int(args.block_tokens),
@@ -387,31 +385,31 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         transfer_mode=transfer_mode,
         l1_size_bytes=l1_size,
         skip_l2=skip_l2,
+        tier_grain=int(getattr(args, "tier_grain", DEFAULT_TIER_GRAIN)),
         tensor_parallel_size=int(args.tensor_parallel_size),
-        storage_format=storage_format,
-        bip_enabled=bool(args.bip_enabled),
+        storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
         prefetch_lease_budget_bytes=int(getattr(args, "prefetch_lease_budget", 0)),
         l2_read_stripe_bytes=int(getattr(args, "l2_read_stripe", 0)),
         extra_kv_layers=int(getattr(args, "extra_kv_layers", 0)),
     )
-    slot_size = cfg.resolved_slot_size()
-    if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
-        size_arg = "--l1-size" if skip_l2 else "--l2-size"
-        raise ValueError(
-            f"{size_arg} ({cfg.total_store_bytes}) must be at least one "
-            f"slot ({slot_size} bytes)"
-        )
-    if skip_l2 and cfg.l1_size_bytes != cfg.l2_size_bytes:
-        cfg.l1_size_bytes = cfg.l2_size_bytes
     if cfg.transfer_mode == "iouring" and cfg.l1_size_bytes <= 0:
         raise ValueError("--l1-size must be positive for iouring transfer")
-    if (
-        not skip_l2
-        and cfg.l1_size_bytes
-        and cfg.l1_size_bytes > (cfg.l2_budget_bytes or cfg.l2_size_bytes)
-    ):
-        raise ValueError("--l1-size must not exceed --l2-size")
+    # A raw record is the largest record a chunk can store, so each enabled
+    # tier lane must hold at least one.
+    raw_record = cfg.resolved_local_slot_size()
+    min_lane = -(-raw_record // cfg.tier_grain) * cfg.tier_grain
+    if cfg.l1_enabled and cfg.l1_lane_bytes < min_lane:
+        raise ValueError(
+            f"--l1-size ({cfg.l1_size_bytes}) leaves {cfg.l1_lane_bytes} bytes "
+            f"per TP rank after {cfg.staging_bytes} staging bytes; one record "
+            f"needs {min_lane}"
+        )
+    if cfg.l2_enabled and cfg.l2_lane_bytes < min_lane:
+        raise ValueError(
+            f"--l2-size ({cfg.l2_size_bytes}) leaves {cfg.l2_lane_bytes} bytes "
+            f"per TP rank; one record needs {min_lane}"
+        )
     if cfg.prefetch_lease_budget_bytes > cfg.l1_size_bytes:
         raise ValueError("--prefetch-lease-budget must not exceed --l1-size")
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
@@ -430,6 +428,24 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         if violations:
             raise ValueError(f"{cfg.storage_format} requires " + ", ".join(violations))
     return cfg
+
+
+def _tier_layout(cfg: DaserConfig) -> TierLayout:
+    """Return the tier geometry of a finalized server config.
+
+    Args:
+        cfg: Config accepted by ``_build_daser_config``.
+
+    Returns:
+        TierLayout with the config's grain, lanes and L1 record charge.
+    """
+    return TierLayout(
+        grain=cfg.tier_grain,
+        l1_lane_bytes=cfg.l1_lane_bytes,
+        l2_lane_bytes=cfg.l2_lane_bytes,
+        tensor_parallel_size=cfg.tensor_parallel_size,
+        l1_record_bytes=cfg.l1_record_bytes,
+    )
 
 
 def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
@@ -479,29 +495,45 @@ def _build_index_components(
     raise ValueError(f"unknown cache reuse mode: {cache_reuse_mode}")
 
 
-async def _build_core(cfg: DaserConfig) -> ServerCore:
-    """Construct and restore the shared server core.
+def _new_core(cfg: DaserConfig) -> ServerCore:
+    """Construct an empty server core for a config.
 
     Args:
         cfg: DaseR runtime config.
 
     Returns:
-        Restored ServerCore.
+        ServerCore with no chunks.
     """
-    store = MetadataStore()
-    doc_registry = DocRegistry()
-    cm = ChunkManager(
-        total_slots=cfg.total_slots,
-        metadata_store=store,
-        doc_registry=doc_registry,
-        physical_slots=cfg.physical_total_slots,
+    retrieval_index, position_encoder = _build_index_components(
+        cfg.cache_reuse_mode, cfg.block_tokens
+    )
+    return ServerCore(
+        chunk_manager=ChunkManager(MetadataStore(), DocRegistry()),
+        retrieval_index=retrieval_index,
+        position_encoder=position_encoder,
+        tier_layout=_tier_layout(cfg),
+        block_tokens=cfg.block_tokens,
     )
 
+
+async def _build_core(cfg: DaserConfig) -> ServerCore:
+    """Construct the shared server core and restore a persisted index.
+
+    Args:
+        cfg: DaseR runtime config.
+
+    Returns:
+        ServerCore holding the restored chunks, or empty on a cold start.
+
+    Async/thread-safety:
+        Startup only; the index read blocks the event loop briefly.
+    """
+    core = _new_core(cfg)
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; cold-starting volatile index")
     elif not cfg.persists_index:
-        # Packed writes overwrite raw envelopes, so a prior snapshot must not
-        # survive for a later raw restart to trust.
+        # Compressed records overwrite L2 extents, so a prior snapshot must
+        # not survive for a later raw restart to trust.
         if os.path.exists(cfg.index_path):
             os.remove(cfg.index_path)
         logger.info(
@@ -509,26 +541,14 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         )
     elif os.path.exists(cfg.index_path):
         try:
-            cm.load(
+            await core.load_index(
                 cfg.index_path,
                 expected_cache_reuse_mode=cfg.cache_reuse_mode,
             )
             logger.info("[SERVER] restored index from %s", cfg.index_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
-
-    retrieval_index, position_encoder = _build_index_components(
-        cfg.cache_reuse_mode, cfg.block_tokens
-    )
-
-    core = ServerCore(
-        chunk_manager=cm,
-        retrieval_index=retrieval_index,
-        position_encoder=position_encoder,
-        slot_size=cfg.resolved_slot_size(),
-        block_tokens=cfg.block_tokens,
-    )
-    await core.rebuild_retrieval_index()
+            core = _new_core(cfg)
     return core
 
 
@@ -548,7 +568,7 @@ async def _shutdown_server(
         http_server: running uvicorn server instance.
         http_task: task executing ``http_server.serve``.
         ipc_server: DaseR IPC server.
-        core: shared server core whose chunk manager owns persistence.
+        core: shared server core whose index is persisted.
         index_path: destination path for the saved control-plane snapshot.
         cache_reuse_mode: cache reuse mode to record in the snapshot.
         persist_index: when False, do not save metadata because the store
@@ -570,6 +590,11 @@ async def _shutdown_server(
             pass
 
     await ipc_server.stop_accepting()
+    # Finish in-flight L2 writes so their chunks are saved with full copies.
+    try:
+        await ipc_server.drain_transfer()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[SERVER] transfer drain before save failed: %s", exc)
 
     if not persist_index:
         logger.info("[SERVER] not saving volatile index")
@@ -579,10 +604,7 @@ async def _shutdown_server(
         if parent:
             os.makedirs(parent, exist_ok=True)
         try:
-            if cache_reuse_mode is None:
-                core.chunk_manager.save(index_path)
-            else:
-                core.chunk_manager.save(index_path, cache_reuse_mode=cache_reuse_mode)
+            core.save_index(index_path, cache_reuse_mode=cache_reuse_mode)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[SERVER] failed to save index: %s", exc)
     await ipc_server.close()
@@ -613,7 +635,6 @@ def _compression_runtime_config(
         return {}
     model = cfg.model_geometry()
     geometry = CompressedStoreGeometry(
-        num_slots=cfg.physical_total_slots,
         slot_size=cfg.resolved_local_slot_size(),
         block_tokens=cfg.block_tokens,
         num_layers=model.num_layers,
@@ -710,11 +731,18 @@ async def run_server(args: argparse.Namespace) -> None:
         cfg.ipc_socket_path,
     )
     logger.info(
-        "[SERVER] model_id=%s model_path=%s store=%s slots=%d",
+        "[SERVER] model_id=%s model_path=%s store=%s",
         cfg.model_id,
         cfg.model_path,
         "L1-only" if cfg.skip_l2 else cfg.store_path,
-        cfg.total_slots,
+    )
+    logger.info(
+        "[SERVER] tiers grain=%d tp=%d l1_lane=%d l2_lane=%d staging=%d",
+        cfg.tier_grain,
+        cfg.tensor_parallel_size,
+        cfg.l1_lane_bytes,
+        cfg.l2_lane_bytes,
+        cfg.staging_bytes,
     )
     if cfg.skip_l2:
         logger.info(

@@ -34,7 +34,6 @@ class _PrefixIPC:
                 "chunk_key": "doc",
                 "start_slot": 0,
                 "num_slots": 2,
-                "file_offset": 0,
                 "token_count": 8,
                 "target_token_start": 0,
                 "pos_offset": 0,

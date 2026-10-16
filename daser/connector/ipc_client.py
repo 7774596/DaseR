@@ -256,21 +256,24 @@ class IPCClientSync(_IPCClientBase):
         external_prefix_queries: int,
         num_computed_tokens: int = 0,
     ) -> PrefetchLookupResult:
-        """Look up chunks and atomically classify their exact transfer spans.
+        """Look up chunks and lease the L1 copies of their external window.
 
         Args:
-            lease_id: Base vLLM request ID used to retain an all-L1 result.
+            lease_id: Base vLLM request ID naming the server lease.
             tokens: Prompt token IDs sent to the retrieval index.
             model_id: Model identifier.
             external_prefix_queries: vLLM external-prefix query token count.
             num_computed_tokens: Tokens already resident in vLLM's local cache.
 
         Returns:
-            Validated chunks, physical transfer spans, and tier classification.
+            Validated chunks, the window's ``{start_slot, num_slots, nbytes}``
+            spans (``nbytes`` per rank), and the tier classification:
+            ``l1`` when every leased chunk already has an L1 copy, else
+            ``mixed`` or ``l2`` (``transfer_prefetch`` promotes the rest).
 
         Thread-safety:
             Uses the lock-protected scheduler IPC connection. The server makes
-            all-L1 classification and lease acquisition atomic.
+            classification and lease acquisition atomic.
         """
         response = self.call(
             {
@@ -290,7 +293,10 @@ class IPCClientSync(_IPCClientBase):
         ):
             raise RuntimeError("[IPC] invalid lookup_prefetch chunks response")
         if not isinstance(spans, list) or not all(
-            isinstance(span, dict) and "file_offset" in span and "nbytes" in span
+            isinstance(span, dict)
+            and "start_slot" in span
+            and "num_slots" in span
+            and "nbytes" in span
             for span in spans
         ):
             raise RuntimeError("[IPC] invalid lookup_prefetch spans response")
@@ -306,13 +312,9 @@ class IPCClientSync(_IPCClientBase):
             chunks=[dict(chunk) for chunk in chunks],
             spans=[
                 {
-                    "file_offset": int(span["file_offset"]),
+                    "start_slot": int(span["start_slot"]),
+                    "num_slots": int(span["num_slots"]),
                     "nbytes": int(span["nbytes"]),
-                    **(
-                        {"accounted_nbytes": int(span["accounted_nbytes"])}
-                        if "accounted_nbytes" in span
-                        else {}
-                    ),
                 }
                 for span in spans
             ],
@@ -354,7 +356,7 @@ class IPCClientSync(_IPCClientBase):
             parent_key: previous chunk of the prefix chain, or empty.
 
         Returns:
-            Dict with start_slot, file_offset, pos_offset.
+            Dict with start_slot, num_slots, pos_offset and skipped.
         """
         return self.call(
             {
@@ -378,8 +380,8 @@ class IPCClientSync(_IPCClientBase):
             model_id: model identifier.
 
         Returns:
-            List of allocation dicts with chunk_key, start_slot, file_offset,
-            and pos_offset.
+            List of allocation dicts with chunk_key, start_slot, num_slots,
+            token_count, pos_offset and skipped.
         """
         resp = self.call(
             {
@@ -393,23 +395,6 @@ class IPCClientSync(_IPCClientBase):
             raise RuntimeError("[IPC] invalid alloc_chunks response")
         return [dict(alloc) for alloc in allocations]
 
-    def commit_chunk(self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1) -> None:
-        """Mark a chunk as committed (GDS write complete).
-
-        Args:
-            chunk_key: xxh3_128 hex of the chunk's token IDs.
-            tp_rank: tensor-parallel rank whose shard was stored.
-            tp_size: total tensor-parallel ranks required for publication.
-        """
-        self.call(
-            {
-                "op": "commit_chunk",
-                "chunk_key": chunk_key,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
-        )
-
     def transfer_drain(self) -> None:
         """Wait for server-owned transfer-layer background work.
 
@@ -419,35 +404,31 @@ class IPCClientSync(_IPCClientBase):
         """
         self.call({"op": "transfer_drain"})
 
-    def transfer_prefetch(
-        self,
-        spans: list[dict[str, int]],
-        lease_id: str | None = None,
-    ) -> dict[str, int]:
-        """Synchronously promote storage spans into the host-memory tier.
+    def transfer_prefetch(self, lease_id: str) -> dict[str, int]:
+        """Synchronously bring a lease's chunks into the host-memory tier.
 
         Args:
-            spans: Storage spans containing ``file_offset`` and ``nbytes``.
-            lease_id: Optional admitted request ID that retains promoted bytes.
+            lease_id: Request lease from ``lookup_with_prefetch``.
 
         Returns:
-            Requested, L1-resident, and L2-read byte counts.
+            Requested, already-L1 and promoted (L2-read) byte counts.
+
+        Raises:
+            RuntimeError: If the lease is gone or a chunk could not be brought
+                into L1; the caller releases the lease and loads without it.
 
         Thread-safety:
             Intended for a dedicated scheduler prefetch thread because the RPC
-            waits for all required L2 reads.
+            waits for the lease budget and every promotion read.
         """
-        payload: dict[str, Any] = {"op": "transfer_prefetch", "spans": spans}
-        if lease_id is not None:
-            payload["lease_id"] = lease_id
-        response = self.call(payload)
+        response = self.call({"op": "transfer_prefetch", "lease_id": lease_id})
         fields = ("requested_bytes", "l1_bytes", "l2_bytes")
         if any(field not in response for field in fields):
             raise RuntimeError("[IPC] invalid transfer_prefetch response")
         return {field: int(response[field]) for field in fields}
 
     def release_transfer_lease(self, lease_id: str) -> None:
-        """Idempotently release server transfer bytes retained for a request.
+        """Idempotently release the L1 pins of one request lease.
 
         Args:
             lease_id: Base vLLM request ID to clean up.
@@ -588,44 +569,6 @@ class IPCClientAsync(_IPCClientBase):
         async with self._lock:
             await self._reset()
 
-    async def commit_chunk(
-        self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1
-    ) -> None:
-        """Async: mark a chunk as committed.
-
-        Args:
-            chunk_key: xxh3_128 hex of the token IDs.
-            tp_rank: tensor-parallel rank whose shard was stored.
-            tp_size: total tensor-parallel ranks required for publication.
-        """
-        await self.call(
-            {
-                "op": "commit_chunk",
-                "chunk_key": chunk_key,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
-        )
-
-    async def commit_chunks(
-        self, chunk_keys: list[str], tp_rank: int = 0, tp_size: int = 1
-    ) -> None:
-        """Async: mark multiple chunks as committed in one RPC.
-
-        Args:
-            chunk_keys: xxh3_128 hex chunk keys.
-            tp_rank: tensor-parallel rank whose shards were stored.
-            tp_size: total tensor-parallel ranks required for publication.
-        """
-        await self.call(
-            {
-                "op": "commit_chunks",
-                "chunk_keys": chunk_keys,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
-        )
-
     async def transfer_drain(self) -> None:
         """Async: wait for server-owned transfer-layer background work.
 
@@ -676,7 +619,8 @@ class IPCClientAsync(_IPCClientBase):
 
         Args:
             data: source bytes.
-            spans: byte spans containing source_offset, nbytes, and file_offset.
+            spans: store spans ``{source_offset, nbytes, chunk_key,
+                start_slot, num_slots, slot_index, packed, mode}``.
             tp_rank: tensor-parallel rank that owns the stored shard.
             tp_size: total tensor-parallel ranks required before publication.
 
@@ -700,25 +644,26 @@ class IPCClientAsync(_IPCClientBase):
     async def transfer_load_bytes(
         self,
         spans: list[dict[str, int]],
-        lease_id: str | None = None,
+        tp_rank: int = 0,
     ) -> bytes:
         """Load bytes through the server-owned transfer layer.
 
         Args:
-            spans: byte spans containing target_offset, nbytes, and file_offset.
-            lease_id: Optional base request ID retaining host-tier bytes.
+            spans: load spans ``{target_offset, start_slot, num_slots,
+                nbytes}``.
+            tp_rank: tensor-parallel rank whose lane is read.
 
         Returns:
             Loaded bytes in target-offset order.
         """
-        request: dict[str, Any] = {
-            "op": "transfer_load",
-            "payload": {"return_data": True},
-            "spans": spans,
-        }
-        if lease_id is not None:
-            request["lease_id"] = lease_id
-        resp = await self.call(request)
+        resp = await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": spans,
+                "tp_rank": tp_rank,
+            }
+        )
         data = resp.get("data", b"")
         if not isinstance(data, bytes):
             raise RuntimeError("[IPC] invalid transfer_load data response")
@@ -750,7 +695,8 @@ class IPCClientAsync(_IPCClientBase):
             allocation_offset: byte offset of ``device_ptr`` from
                 ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
-            spans: byte spans containing source_offset, nbytes, and file_offset.
+            spans: store spans ``{source_offset, nbytes, chunk_key,
+                start_slot, num_slots, slot_index, packed, mode}``.
             tp_rank: tensor-parallel rank that owns the stored shard.
             tp_size: total tensor-parallel ranks required before publication.
         """
@@ -786,7 +732,7 @@ class IPCClientAsync(_IPCClientBase):
         allocation_offset: int,
         producer_pid: int,
         spans: list[dict[str, int]],
-        lease_id: str | None = None,
+        tp_rank: int = 0,
     ) -> dict[str, Any]:
         """Load into a CUDA IPC buffer through the server transfer layer.
 
@@ -801,12 +747,13 @@ class IPCClientAsync(_IPCClientBase):
             allocation_offset: byte offset of ``device_ptr`` from
                 ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
-            spans: byte spans containing target_offset, nbytes, and file_offset.
-            lease_id: Optional base request ID retaining host-tier bytes.
+            spans: load spans ``{target_offset, start_slot, num_slots,
+                nbytes}``.
+            tp_rank: tensor-parallel rank whose lane is read.
 
         Returns:
-            Server response including transferred bytes and optional timing
-            counters.
+            Server response including transferred bytes, ``l1_segments`` /
+            ``l2_segments`` and timing counters.
         """
         request: dict[str, Any] = {
             "op": "transfer_load",
@@ -820,30 +767,33 @@ class IPCClientAsync(_IPCClientBase):
                 "producer_pid": producer_pid,
             },
             "spans": spans,
+            "tp_rank": tp_rank,
         }
-        if lease_id is not None:
-            request["lease_id"] = lease_id
         return await self.call(request)
 
     async def transfer_load_runs(
         self,
         buffer_index: int,
         producer_pid: int,
-        file_offsets: Any,
+        start_slots: Any,
+        intra_offsets: Any,
         target_offsets: Any,
         nbytes: Any,
         lease_id: str,
+        tp_rank: int = 0,
     ) -> dict[str, Any]:
-        """Copy leased runs into a registered fixed CUDA staging buffer.
+        """Copy runs of leased L1 records into a registered CUDA staging buffer.
 
         Args:
             buffer_index: Worker-local registered load staging buffer index.
             producer_pid: Process ID that registered the staging buffer.
-            file_offsets: Physical run starts (int64-convertible sequence).
+            start_slots: Slot id of each run's record (int64-convertible).
+            intra_offsets: Byte offset of each run inside its record.
             target_offsets: Destination offsets inside the staging buffer.
             nbytes: Run lengths.
-            lease_id: Request lease from ``lookup_prefetch`` retaining every
-                run in L1.
+            lease_id: Request lease from ``lookup_prefetch`` pinning every
+                named slot in L1.
+            tp_rank: tensor-parallel rank whose lane is read.
 
         Returns:
             Server response with ``bytes`` and ``transfer_ms`` after the
@@ -857,7 +807,8 @@ class IPCClientAsync(_IPCClientBase):
 
         runs = numpy.stack(
             [
-                numpy.asarray(file_offsets, dtype=numpy.int64),
+                numpy.asarray(start_slots, dtype=numpy.int64),
+                numpy.asarray(intra_offsets, dtype=numpy.int64),
                 numpy.asarray(target_offsets, dtype=numpy.int64),
                 numpy.asarray(nbytes, dtype=numpy.int64),
             ]
@@ -870,12 +821,13 @@ class IPCClientAsync(_IPCClientBase):
                     "producer_pid": int(producer_pid),
                 },
                 "lease_id": lease_id,
+                "tp_rank": int(tp_rank),
                 "runs": runs.tobytes(),
             }
         )
 
     async def release_transfer_lease(self, lease_id: str) -> dict[str, Any]:
-        """Release host-tier bytes retained for one request.
+        """Release the L1 pins of one request lease.
 
         Args:
             lease_id: Request lease from ``lookup_prefetch``.
@@ -987,7 +939,7 @@ class IPCClientAsync(_IPCClientBase):
         producer_pid: int,
         nbytes: int,
         spans: list[dict[str, int]],
-        lease_id: str | None = None,
+        tp_rank: int = 0,
     ) -> dict[str, Any]:
         """Load into a previously registered fixed CUDA staging buffer.
 
@@ -996,11 +948,13 @@ class IPCClientAsync(_IPCClientBase):
                 through ``register_staging_cuda(direction="load")``.
             producer_pid: Process ID that registered the staging buffer.
             nbytes: logical bytes to write for this transfer.
-            spans: byte spans containing target_offset, nbytes, and file_offset.
-            lease_id: Optional base request ID retaining host-tier bytes.
+            spans: load spans ``{target_offset, start_slot, num_slots,
+                nbytes}``.
+            tp_rank: tensor-parallel rank whose lane is read.
 
         Returns:
-            Server response including transferred bytes and timing counters.
+            Server response including transferred bytes, ``l1_segments`` /
+            ``l2_segments`` and timing counters.
 
         Async/thread-safety:
             Runs on the worker load event loop and avoids per-load CUDA IPC
@@ -1014,7 +968,6 @@ class IPCClientAsync(_IPCClientBase):
                 "nbytes": int(nbytes),
             },
             "spans": spans,
+            "tp_rank": tp_rank,
         }
-        if lease_id is not None:
-            request["lease_id"] = lease_id
         return await self.call(request)

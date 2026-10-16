@@ -1,119 +1,102 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Exact-size CUDA pinned host buffers and a first-fit staging sub-allocator."""
+
 # Standard
 from collections.abc import Callable
 
 
-class _SliceLeaseState:
-    """Reference-counted ownership for one physical pool allocation."""
-
-    def __init__(
-        self,
-        release: Callable[[int, int], None],
-        offset: int,
-        size: int,
-    ) -> None:
-        self.refs = 1
-        self.release = release
-        self.offset = offset
-        self.size = size
-
-
 def _align_up(value: int, alignment: int) -> int:
     """Round a byte count up to an alignment boundary."""
-    if alignment <= 0:
-        raise ValueError("alignment must be positive")
-    return ((value + alignment - 1) // alignment) * alignment
+    return -(-value // alignment) * alignment
 
 
 class PinnedMemoryBuffer:
-    """CUDA page-locked host byte buffer used by the transfer L1 tier.
+    """One dedicated CUDA page-locked host allocation of exactly ``size`` bytes.
+
+    The bytes come from ``cupy.cuda.PinnedMemory`` (``cudaHostAlloc``), not
+    CuPy's caching pinned pool, which rounds requests up to powers of two and
+    keeps freed blocks; the physical backing therefore equals the configured
+    capacity. The pages are portable across CUDA contexts.
 
     Args:
-        size: Number of bytes to allocate and lock.
+        size: Positive number of bytes to allocate and lock.
 
     Async/thread-safety:
-        The buffer is synchronous and not internally synchronized. Callers must
-        serialize concurrent mutation.
+        Not internally synchronized; callers serialize mutation of the bytes.
+        ``close`` drops this owner's reference, which frees the pages
+        synchronously once no memoryview from ``view`` remains alive.
     """
 
     def __init__(self, size: int) -> None:
-        if size < 0:
-            raise ValueError("size must be non-negative")
-        self._size = size
+        if size <= 0:
+            raise ValueError("pinned buffer size must be positive")
         import cupy
 
-        self._memory = cupy.cuda.alloc_pinned_memory(size if size > 0 else 1)
-        self._closed = False
+        self._size = size
+        memory = cupy.cuda.PinnedMemory(size, cupy.cuda.runtime.hostAllocPortable)
+        self._pointer: cupy.cuda.PinnedMemoryPointer | None = (
+            cupy.cuda.PinnedMemoryPointer(memory, 0)
+        )
 
     def view(self) -> memoryview:
-        """Return a byte-addressable memoryview for the pinned buffer.
+        """Return a writable byte memoryview over the whole allocation.
 
         Returns:
-            Writable byte memoryview over the live pinned allocation.
+            Memoryview of ``len(self)`` bytes; it keeps the pages alive until
+            released.
 
-        Thread-safety:
-            The returned view is not synchronized; callers must serialize
-            concurrent mutation.
+        Raises:
+            RuntimeError: If the buffer is closed.
         """
-        return memoryview(self._memory).cast("B")[: self._size]
+        if self._pointer is None:
+            raise RuntimeError("pinned buffer is closed")
+        return memoryview(self._pointer).cast("B")[: self._size]
 
     def ptr_at(self, offset: int = 0) -> int:
-        """Return the host pointer for a byte offset into the pinned buffer.
+        """Return the host pointer of a byte offset inside the allocation.
 
         Args:
-            offset: Byte offset inside the allocation.
+            offset: Byte offset in ``[0, len(self)]``.
 
         Returns:
-            Integer host pointer suitable for CUDA runtime copy APIs.
+            Integer host pointer usable by CUDA runtime copy APIs.
 
-        Thread-safety:
-            Safe to call concurrently while the buffer is open. The returned
-            pointer must not be used after ``close()``.
+        Raises:
+            ValueError: If ``offset`` is outside the buffer.
+            RuntimeError: If the buffer is closed.
         """
-        if offset < 0 or offset > self._size:
+        if self._pointer is None:
+            raise RuntimeError("pinned buffer is closed")
+        if not 0 <= offset <= self._size:
             raise ValueError("offset is outside pinned buffer")
-        return int(self._memory.ptr) + offset
+        return int(self._pointer.ptr) + offset
 
     def close(self) -> None:
-        """Release the CUDA pinned pages.
-
-        Returns:
-            None.
+        """Drop the allocation; idempotent.
 
         Thread-safety:
-            Call when no other thread is reading or writing the buffer.
+            Call after every IO and DMA using the pages has completed.
         """
-        if self._closed:
-            return
-        self._memory = None
-        self._closed = True
+        self._pointer = None
 
     def __len__(self) -> int:
-        """Return the pinned buffer size in bytes.
-
-        Returns:
-            Allocated logical size in bytes.
-
-        Thread-safety:
-            Safe to call concurrently because the size is immutable.
-        """
+        """Return the allocation size in bytes."""
         return self._size
 
 
 class PinnedMemorySlice:
-    """Logical byte slice leased from a pinned memory pool.
+    """Byte range of a ``PinnedMemoryPool`` backing, returned on ``close``.
 
     Args:
-        owner: Backing pinned allocation.
+        owner: Backing pinned buffer.
         offset: Byte offset inside ``owner``.
-        size: Logical slice size in bytes.
-        release: Callback invoked once when ``close`` releases the lease.
+        size: Slice size in bytes.
+        release: Called once with ``(offset, size)`` when the slice closes.
 
     Async/thread-safety:
-        The slice is not internally synchronized. Pool metadata mutation is
-        protected by the owning pool; callers must still serialize concurrent
-        reads and writes to the returned memoryview.
+        Not internally synchronized; the owning pool's caller serializes
+        allocation and release.
     """
 
     def __init__(
@@ -122,128 +105,68 @@ class PinnedMemorySlice:
         offset: int,
         size: int,
         release: Callable[[int, int], None],
-        *,
-        _lease: _SliceLeaseState | None = None,
     ) -> None:
-        if offset < 0 or size < 0 or offset + size > len(owner):
+        if offset < 0 or size <= 0 or offset + size > len(owner):
             raise ValueError("slice is outside pinned buffer")
         self._owner = owner
         self._offset = offset
         self._size = size
-        self._release = release
-        self._lease = _lease or _SliceLeaseState(release, offset, size)
-        self._closed = False
-
-    @property
-    def allocation_id(self) -> int:
-        """Return the identity of this slice's physical pool allocation.
-
-        Returns:
-            Stable identity shared by all children until their final close.
-            It identifies ownership, not a file offset or a CUDA pointer.
-
-        Thread-safety:
-            Immutable while the slice exists; callers must keep a live slice
-            while using the identity to track resident allocation ownership.
-        """
-        return id(self._lease)
-
-    def subslice(self, offset: int, size: int) -> "PinnedMemorySlice":
-        """Return a child view that shares this slice's pool ownership.
-
-        Args:
-            offset: Byte offset relative to this slice.
-            size: Logical child size in bytes.
-
-        Returns:
-            A separately addressable slice whose close is reference-counted
-            against the original pool allocation.
-
-        Raises:
-            ValueError: If the child range is outside this slice.
-
-        Thread-safety:
-            The lease counter is intended for transfer-layer metadata
-            ownership under its asyncio lock; callers must not concurrently
-            close the same child from multiple threads.
-        """
-        if self._closed:
-            raise RuntimeError("cannot create a subslice from a closed slice")
-        if offset < 0 or size < 0 or offset + size > self._size:
-            raise ValueError("subslice is outside pinned slice")
-        self._lease.refs += 1
-        return PinnedMemorySlice(
-            self._owner,
-            self._offset + offset,
-            size,
-            self._release,
-            _lease=self._lease,
-        )
+        self._release: Callable[[int, int], None] | None = release
 
     def view(self) -> memoryview:
-        """Return a byte-addressable memoryview for the leased slice.
+        """Return a writable byte memoryview over the slice.
 
-        Returns:
-            Writable byte memoryview over the live pinned slice.
-
-        Thread-safety:
-            The returned view is not synchronized. It must not be used after
-            ``close`` returns.
+        Raises:
+            RuntimeError: If the slice is closed.
         """
-        if self._closed:
+        if self._release is None:
             raise RuntimeError("pinned slice is closed")
         return self._owner.view()[self._offset : self._offset + self._size]
 
     def ptr_at(self, offset: int = 0) -> int:
-        """Return the host pointer for a byte offset into the slice.
+        """Return the host pointer of a byte offset inside the slice.
 
         Args:
-            offset: Byte offset inside this slice.
+            offset: Byte offset in ``[0, len(self)]``.
 
         Returns:
-            Integer host pointer suitable for CUDA runtime copy APIs.
+            Integer host pointer usable by CUDA runtime copy APIs.
 
-        Thread-safety:
-            Safe while the slice remains open. The returned pointer must not be
-            used after ``close``.
+        Raises:
+            ValueError: If ``offset`` is outside the slice.
+            RuntimeError: If the slice is closed.
         """
-        if offset < 0 or offset > self._size:
-            raise ValueError("offset is outside pinned slice")
-        if self._closed:
+        if self._release is None:
             raise RuntimeError("pinned slice is closed")
+        if not 0 <= offset <= self._size:
+            raise ValueError("offset is outside pinned slice")
         return self._owner.ptr_at(self._offset + offset)
 
     def close(self) -> None:
-        """Release the slice back to the owning pool.
-
-        Returns:
-            None.
+        """Return the slice to its pool; idempotent.
 
         Thread-safety:
-            Call only after no thread or CUDA operation is using the slice.
+            Call only after no thread or CUDA operation uses the slice.
         """
-        if self._closed:
-            return
-        self._closed = True
-        self._lease.refs -= 1
-        if self._lease.refs == 0:
-            self._lease.release(self._lease.offset, self._lease.size)
+        release, self._release = self._release, None
+        if release is not None:
+            release(self._offset, self._size)
 
     def __len__(self) -> int:
-        """Return the logical slice size in bytes."""
+        """Return the slice size in bytes."""
         return self._size
 
 
 class PinnedMemoryPool:
-    """Fixed-capacity page-locked memory pool for transfer L1 entries.
+    """Fixed-capacity first-fit sub-allocator over one pinned buffer.
 
     Args:
-        capacity: Total logical bytes available for leases.
-        alignment: Byte alignment used for each lease.
+        capacity: Bytes to allocate, rounded up to ``alignment``.
+        alignment: Alignment of every slice offset and reserved length.
 
     Async/thread-safety:
-        Pool metadata mutation is synchronous. Callers should invoke
-        ``allocate`` and ``close`` from the transfer layer's metadata lock.
+        Synchronous and unlocked: call ``allocate`` and close slices from one
+        thread (the transfer event loop).
     """
 
     def __init__(self, capacity: int, alignment: int = 4096) -> None:
@@ -255,52 +178,53 @@ class PinnedMemoryPool:
         self._capacity = _align_up(capacity, alignment)
         self._memory = PinnedMemoryBuffer(self._capacity)
         self._free: list[tuple[int, int]] = [(0, self._capacity)]
+        self._used = 0
         self._closed = False
 
+    @property
+    def capacity(self) -> int:
+        """Return the pool size in bytes."""
+        return self._capacity
+
+    @property
+    def used_bytes(self) -> int:
+        """Return the bytes held by open slices, alignment included."""
+        return self._used
+
     def allocate(self, size: int) -> PinnedMemorySlice | None:
-        """Lease a pinned slice from the pool.
+        """Reserve a slice of ``size`` bytes.
 
         Args:
-            size: Logical byte count requested.
+            size: Positive byte count.
 
         Returns:
-            A pinned slice, or ``None`` when no contiguous free range can hold
-            the aligned request.
+            The slice, or None when no free range holds the aligned request.
 
-        Thread-safety:
-            Mutates pool free-list metadata and should be serialized by the
-            caller.
+        Raises:
+            ValueError: If ``size`` is not positive.
+            RuntimeError: If the pool is closed.
         """
         if self._closed:
             raise RuntimeError("pinned pool is closed")
-        if size < 0:
-            raise ValueError("size must be non-negative")
-        aligned = _align_up(size if size > 0 else 1, self._alignment)
-        for idx, (offset, free_size) in enumerate(self._free):
+        if size <= 0:
+            raise ValueError("size must be positive")
+        aligned = _align_up(size, self._alignment)
+        for index, (offset, free_size) in enumerate(self._free):
             if free_size < aligned:
                 continue
-            remaining = free_size - aligned
-            if remaining:
-                self._free[idx] = (offset + aligned, remaining)
+            if free_size > aligned:
+                self._free[index] = (offset + aligned, free_size - aligned)
             else:
-                self._free.pop(idx)
-            return PinnedMemorySlice(
-                owner=self._memory,
-                offset=offset,
-                size=size,
-                release=self._release,
-            )
+                self._free.pop(index)
+            self._used += aligned
+            return PinnedMemorySlice(self._memory, offset, size, self._release)
         return None
 
     def close(self) -> None:
-        """Release the backing pinned allocation.
-
-        Returns:
-            None.
+        """Release the backing allocation; idempotent.
 
         Thread-safety:
-            Call after all leases have been returned and no transfer is using
-            the pool.
+            Call after every slice is closed and no IO uses the pool.
         """
         if self._closed:
             return
@@ -309,22 +233,15 @@ class PinnedMemoryPool:
         self._memory.close()
 
     def _release(self, offset: int, size: int) -> None:
-        """Return an aligned slice to the free list."""
-        aligned = _align_up(size if size > 0 else 1, self._alignment)
-        self._free.append((offset, aligned))
-        self._free.sort()
+        """Return an aligned range to the free list, merging neighbours."""
+        aligned = _align_up(size, self._alignment)
+        self._used -= aligned
+        if self._closed:
+            return
         merged: list[tuple[int, int]] = []
-        for free_offset, free_size in self._free:
-            if not merged:
-                merged.append((free_offset, free_size))
-                continue
-            prev_offset, prev_size = merged[-1]
-            prev_end = prev_offset + prev_size
-            if free_offset <= prev_end:
-                merged[-1] = (
-                    prev_offset,
-                    max(prev_end, free_offset + free_size) - prev_offset,
-                )
+        for start, length in sorted([*self._free, (offset, aligned)]):
+            if merged and start == merged[-1][0] + merged[-1][1]:
+                merged[-1] = (merged[-1][0], merged[-1][1] + length)
             else:
-                merged.append((free_offset, free_size))
+                merged.append((start, length))
         self._free = merged
