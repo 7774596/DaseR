@@ -9,8 +9,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import heapq
 
-# Priority of a chunk no lookup can reach (an ancestor left the index).
-_ORPHAN = -1
+# Subtracted from an orphan's tick so every orphan sorts before every
+# reachable node while orphans keep their recency order.
+_ORPHAN_BASE = 1 << 62
+# Heap entries allowed beyond two per node before stale ones are dropped.
+_COMPACT_SLACK = 16
 
 
 @dataclass
@@ -33,12 +36,21 @@ class EvictionTree:
     uncommitted ones.
 
     One recency tick is shared by all tiers. Each tier has its own lazy
-    min-heap of ``(priority, seq, key)``; the caller-supplied
-    ``is_candidate(tier, key)`` predicate decides membership. Entries are
-    validated when popped, so updates only push: call ``refresh`` after any
-    event that can make a chunk a candidate. Removing a node re-queues its
-    parent, which may have become a leaf. Per-pop cost is amortised
-    O(log n).
+    min-heap of ``(priority, seq, key)``, priority being ``(orphan first,
+    tick)``; the caller-supplied ``is_candidate(tier, key)`` predicate decides
+    membership. A tier queues at most one live entry per node (the one whose
+    ``seq`` it records); others are superseded and dropped when popped.
+    Candidacy is checked when an entry is queued and again when it is popped,
+    so call ``refresh`` after any event that can make a chunk a candidate.
+    Removing a node re-queues its parent, which may have become a leaf.
+
+    Recency refreshes (``touch``) only raise priorities, so they leave a
+    queued entry in place: it surfaces early and ``pop_victim`` re-queues it
+    at the node's current priority. The victim is still the candidate with
+    the lowest current priority, while a hit on a queued node costs O(1)
+    instead of a predicate call and a heap push. Priority decreases (orphan
+    marking) re-queue at once. Superseded entries are compacted away, so a
+    tier holds at most about two entries per node.
 
     Args:
         tiers: Names of the tiers that get a candidate heap.
@@ -58,6 +70,8 @@ class EvictionTree:
         self._nodes: dict[str, _Node] = {}
         self._children: dict[str, set[str]] = {}
         self._heaps: dict[str, list[tuple[int, int, str]]] = {t: [] for t in tiers}
+        # Per tier: key -> seq of its live heap entry.
+        self._queued: dict[str, dict[str, int]] = {t: {} for t in tiers}
         self._seq = 0
         self._tick = 0
 
@@ -105,6 +119,8 @@ class EvictionTree:
         node = self._nodes.pop(key, None)
         if node is None:
             return
+        for queued in self._queued.values():
+            queued.pop(key, None)
         parent = node.parent_key
         if parent:
             siblings = self._children.get(parent)
@@ -120,16 +136,22 @@ class EvictionTree:
     def touch(self, keys: list[str]) -> None:
         """Mark nodes as just used.
 
+        A node already queued in a tier keeps its entry there (corrected when
+        popped); a node not queued in a tier is queued if it is a candidate,
+        so a touch also acts as ``refresh`` (commit relies on this once a
+        pending writer is gone).
+
         Args:
             keys: Chunk keys; unknown keys are ignored. Within one call, later
                 keys count as more recent.
+
+        Async/thread-safety:
+            O(1) per key when the key is queued in every tier.
         """
-        for key in keys:
-            node = self._nodes.get(key)
-            if node is None:
-                continue
-            node.tick = self._next_tick()
-            self._requeue(key)
+        nodes = self._nodes
+        self._touch_nodes(
+            [(key, node) for key in keys if (node := nodes.get(key)) is not None]
+        )
 
     def touch_path(self, key: str) -> None:
         """Mark a node and all its present ancestors as just used.
@@ -143,13 +165,15 @@ class EvictionTree:
         Async/thread-safety:
             O(depth of ``key``), on the server event loop.
         """
-        path = []
-        seen = set()
-        while key and key not in seen and key in self._nodes:
-            seen.add(key)
-            path.append(key)
-            key = self._nodes[key].parent_key
-        self.touch(path[::-1])
+        nodes = self._nodes
+        # Insertion-ordered; also stops at a parent-link cycle.
+        path: dict[str, _Node] = {}
+        node = nodes.get(key)
+        while node is not None and key not in path:
+            path[key] = node
+            key = node.parent_key
+            node = nodes.get(key) if key else None
+        self._touch_nodes(list(reversed(path.items())))
 
     def refresh(self, key: str) -> None:
         """Re-queue a node after an event that may make it a candidate.
@@ -173,7 +197,8 @@ class EvictionTree:
 
         Orphans come first, then the least recently used candidate. The entry
         is consumed; the caller evicts the chunk's copy in ``tier`` (and
-        ``refresh``-es it if it keeps the node).
+        ``refresh``-es it if it keeps the node). A popped non-candidate is
+        consumed too and returns only after ``refresh``.
 
         Args:
             tier: Tier name given at construction.
@@ -182,40 +207,77 @@ class EvictionTree:
             The victim key, or None when no candidate is left.
         """
         heap = self._heaps[tier]
+        queued = self._queued[tier]
         while heap:
-            priority, _seq, key = heapq.heappop(heap)
-            if key not in self._nodes or self._priority(key) != priority:
-                # Removed, or a newer entry with the current priority exists.
+            priority, seq, key = heapq.heappop(heap)
+            if queued.get(key) != seq:
+                # Removed, consumed, or superseded by a newer entry.
                 continue
+            current = self._priority(key)
+            if priority != current:
+                # Touched since queued: move the entry to its true place.
+                self._seq += 1
+                queued[key] = self._seq
+                heapq.heappush(heap, (current, self._seq, key))
+                continue
+            del queued[key]
             if self._is_candidate(tier, key):
                 return key
         return None
 
+    def _touch_nodes(self, path: list[tuple[str, _Node]]) -> None:
+        """Give each node a fresh tick in order; queue new candidates only."""
+        queues = self._queued.items()
+        is_candidate = self._is_candidate
+        tick = self._tick
+        for key, node in path:
+            tick += 1
+            node.tick = tick
+            for tier, queued in queues:
+                if key not in queued and is_candidate(tier, key):
+                    self._push(tier, key)
+        self._tick = tick
+
     def _priority(self, key: str) -> int:
         """Return the eviction priority of a node (lower goes first)."""
         node = self._nodes[key]
-        return _ORPHAN if node.orphan else node.tick
+        return node.tick - _ORPHAN_BASE if node.orphan else node.tick
 
     def _requeue(self, key: str) -> None:
-        """Queue a present node in every tier it is a candidate of."""
-        if sum(map(len, self._heaps.values())) > 4 * len(self._nodes) + 2048:
-            self._rebuild_heaps()
-        self._seq += 1
-        entry = (self._priority(key), self._seq, key)
-        for tier, heap in self._heaps.items():
-            if self._is_candidate(tier, key):
-                heapq.heappush(heap, entry)
+        """Queue a present node in every tier it is a new candidate of.
 
-    def _rebuild_heaps(self) -> None:
-        """Replace every heap with one entry per current candidate."""
-        for tier in self._heaps:
-            entries = []
-            for key in self._nodes:
-                if self._is_candidate(tier, key):
-                    self._seq += 1
-                    entries.append((self._priority(key), self._seq, key))
-            heapq.heapify(entries)
-            self._heaps[tier] = entries
+        A tier that already queues the node keeps its entry: that entry's
+        priority is at most the current one and candidacy is rechecked when
+        it is popped.
+        """
+        for tier, queued in self._queued.items():
+            if key not in queued and self._is_candidate(tier, key):
+                self._push(tier, key)
+
+    def _lower(self, key: str) -> None:
+        """Re-queue a node whose priority just decreased, in every tier.
+
+        A queued entry would surface too late, so it is superseded at once.
+        """
+        for tier, queued in self._queued.items():
+            if key in queued or self._is_candidate(tier, key):
+                self._push(tier, key)
+
+    def _push(self, tier: str, key: str) -> None:
+        """Push ``key``'s current priority as its live entry in ``tier``.
+
+        Superseded entries stay in the heap until popped; once they exceed
+        one per node the heap is compacted, so a tier holds at most about
+        one live and one stale entry per node.
+        """
+        heap = self._heaps[tier]
+        queued = self._queued[tier]
+        if len(heap) > 2 * len(self._nodes) + _COMPACT_SLACK:
+            heap[:] = [entry for entry in heap if queued.get(entry[2]) == entry[1]]
+            heapq.heapify(heap)
+        self._seq += 1
+        queued[key] = self._seq
+        heapq.heappush(heap, (self._priority(key), self._seq, key))
 
     def _mark_subtree(self, key: str, orphan: bool) -> None:
         """Set reachability below ``key`` and re-queue its nodes.
@@ -231,8 +293,12 @@ class EvictionTree:
             if node is None or child in seen:
                 continue
             seen.add(child)
+            lowered = orphan and not node.orphan
             node.orphan = orphan
-            self._requeue(child)
+            if lowered:
+                self._lower(child)
+            else:
+                self._requeue(child)
             stack.extend(self._children.get(child, ()))
 
     def _next_tick(self) -> int:
