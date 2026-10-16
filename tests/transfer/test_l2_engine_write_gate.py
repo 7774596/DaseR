@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 import mmap
 from pathlib import Path
 import threading
@@ -80,6 +81,43 @@ def test_ungated_write_ignores_reads_and_shares_executor(tmp_path: Path) -> None
     assert engine.timing_us["write_gate"] == 0
     assert engine.write_executor is engine.executor
     engine.close()
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_write_batch_persists_every_extent(tmp_path: Path, gated: bool) -> None:
+    """``write_batch`` writes extents beyond one ring's capacity, gated or not."""
+    count = 70
+    engine = L2IoEngine(
+        create_store_file(str(tmp_path / "l2"), 2 * count * PAGE),
+        2 * count * PAGE,
+        2,
+        write_gate=gated,
+    )
+    writes = [(2 * i * PAGE, _page(i % 251)) for i in range(count)]
+    try:
+        assert asyncio.run(engine.write_batch(writes)) == count * PAGE
+        assert asyncio.run(engine.write_batch([])) == 0
+        for i in (0, 63, 64, count - 1):
+            dst = memoryview(mmap.mmap(-1, PAGE))
+            assert engine.read_into(2 * i * PAGE, dst, engine.next_uring()) == PAGE
+            assert bytes(dst) == bytes([i % 251]) * PAGE
+        assert engine.timing_us["write_io"] > 0
+    finally:
+        engine.close()
+
+
+def test_write_batch_raises_after_all_jobs_end(tmp_path: Path) -> None:
+    """An out-of-range extent fails the batch; the engine stays usable."""
+    engine = L2IoEngine(create_store_file(str(tmp_path / "l2"), 2 * PAGE), 2 * PAGE, 1)
+    try:
+        with pytest.raises(ValueError):
+            asyncio.run(engine.write_batch([(0, _page(1)), (-PAGE, _page(2))]))
+        assert asyncio.run(engine.write_batch([(PAGE, _page(5))])) == PAGE
+        dst = memoryview(mmap.mmap(-1, PAGE))
+        assert engine.read_into(PAGE, dst, engine.next_uring()) == PAGE
+        assert bytes(dst) == bytes([5]) * PAGE
+    finally:
+        engine.close()
 
 
 def test_engine_opens_existing_file_without_creating_or_resizing(

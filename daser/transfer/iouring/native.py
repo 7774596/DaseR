@@ -179,6 +179,11 @@ class NativeIOUring:
             offset=_IORING_OFF_SQES,
         )
 
+    @property
+    def batch_capacity(self) -> int:
+        """Return the most IOs one ``read_batch_into``/``write_batch_from`` takes."""
+        return int(self._params.sq_entries)
+
     def read_into(self, fd: int, file_offset: int, dst: memoryview) -> int:
         """Read bytes at a file offset into a writable buffer.
 
@@ -275,12 +280,63 @@ class NativeIOUring:
             buffers until return, including on errors; destinations must not
             overlap. O_DIRECT alignment remains the caller's responsibility.
         """
-        if len(reads) > self._params.sq_entries:
-            raise ValueError("read batch exceeds io_uring submission capacity")
+        return self._run_batch(_IORING_OP_READ, fd, reads, on_complete)
+
+    def write_batch_from(
+        self, fd: int, writes: Sequence[tuple[int, memoryview]]
+    ) -> int:
+        """Write independent extents with one bounded submission batch.
+
+        Args:
+            fd: Open file descriptor, optionally using O_DIRECT.
+            writes: Sequence of (byte offset, contiguous source). Each source
+                must be nonempty, no larger than the kernel IO limit, and
+                exportable as a writable buffer (pinned or mmap memory; the
+                kernel only reads it). The batch must fit the ring submission
+                capacity.
+
+        Returns:
+            Total bytes written. Short IO and submission errors are raised
+            only after all submitted operations have been drained.
+
+        Async/thread-safety:
+            Blocking; offload to an executor. The ring lock covers the entire
+            batch. Callers retain all buffers unchanged until return,
+            including on errors. O_DIRECT alignment remains the caller's
+            responsibility.
+        """
+        return self._run_batch(_IORING_OP_WRITE, fd, writes, None)
+
+    def close(self) -> None:
+        """Close the io_uring file descriptor and ring mappings.
+
+        Returns:
+            None.
+
+        Thread-safety:
+            Call after all read/write calls have returned. The method does not
+            coordinate with in-flight operations.
+        """
+        self._sqes.close()
+        if self._cq_ring_owned:
+            self._cq_ring.close()
+        self._sq_ring.close()
+        os.close(self._ring_fd)
+
+    def _run_batch(
+        self,
+        opcode: int,
+        fd: int,
+        extents: Sequence[tuple[int, memoryview]],
+        on_complete: Callable[[int, int], None] | None,
+    ) -> int:
+        """Submit one bounded batch of reads or writes and drain it."""
+        if len(extents) > self._params.sq_entries:
+            raise ValueError("batch exceeds io_uring submission capacity")
         # Validate every buffer before publishing any SQE. Holding these views
         # also prevents caller-owned backing storage from being resized while
-        # the kernel still has its address, including when a later read fails.
-        views = [(offset, memoryview(dst).cast("B")) for offset, dst in reads]
+        # the kernel still has its address, including when a later IO fails.
+        views = [(offset, memoryview(buf).cast("B")) for offset, buf in extents]
         for offset, view in views:
             if offset < 0 or view.readonly or not 0 < len(view) <= _MAX_RW_COUNT:
                 raise ValueError(
@@ -298,7 +354,7 @@ class NativeIOUring:
             try:
                 for index, (offset, view) in enumerate(views):
                     self._submit(
-                        _IORING_OP_READ,
+                        opcode,
                         fd,
                         offset,
                         view,
@@ -309,7 +365,7 @@ class NativeIOUring:
                 while submitted < len(views):
                     accepted = self._enter(len(views) - submitted, 0)
                     if accepted == 0:
-                        raise RuntimeError("io_uring accepted no queued reads")
+                        raise RuntimeError("io_uring accepted no queued IO")
                     submitted += accepted
             except BaseException as exc:
                 first_error = exc
@@ -350,22 +406,6 @@ class NativeIOUring:
         if first_error is not None:
             raise first_error
         return total
-
-    def close(self) -> None:
-        """Close the io_uring file descriptor and ring mappings.
-
-        Returns:
-            None.
-
-        Thread-safety:
-            Call after all read/write calls have returned. The method does not
-            coordinate with in-flight operations.
-        """
-        self._sqes.close()
-        if self._cq_ring_owned:
-            self._cq_ring.close()
-        self._sq_ring.close()
-        os.close(self._ring_fd)
 
     def _submit_and_wait(
         self,

@@ -133,3 +133,73 @@ def test_error_releases_internal_buffer_exports(tmp_path: Path) -> None:
         view.release()
         buf.close()
         os.close(fd)
+
+
+def test_sparse_write_batch_persists_extents_across_ring_reuse(
+    tmp_path: Path,
+) -> None:
+    """Each source lands at its own offset; the ring is reusable after."""
+    path = tmp_path / "write.store"
+    path.write_bytes(bytes(8192))
+    fd = os.open(path, os.O_RDWR)
+    ring = NativeIOUring(entries=8)
+    offsets = [4001, 19, 987, 43, 7000, 0, 2048, 300]
+    try:
+        for round_index in range(20):
+            sources = [bytearray([round_index + i]) * 13 for i in range(8)]
+            assert (
+                ring.write_batch_from(
+                    fd, list(zip(offsets, map(memoryview, sources), strict=True))
+                )
+                == 8 * 13
+            )
+            for offset, source in zip(offsets, sources, strict=True):
+                assert os.pread(fd, 13, offset) == source
+        assert ring.write_batch_from(fd, []) == 0
+    finally:
+        ring.close()
+        os.close(fd)
+
+
+def test_write_batch_drains_before_error_and_can_be_reused(tmp_path: Path) -> None:
+    """A failed write batch leaves no CQEs for the next caller."""
+    path = tmp_path / "write_error.store"
+    path.write_bytes(b"a" * 4096)
+    read_only = os.open(path, os.O_RDONLY)
+    ring = NativeIOUring(entries=8)
+    sources = [bytearray(b"b" * 512) for _ in range(8)]
+    try:
+        with pytest.raises(OSError):
+            ring.write_batch_from(
+                read_only,
+                [(i * 512, memoryview(src)) for i, src in enumerate(sources)],
+            )
+        assert path.read_bytes() == b"a" * 4096
+        dst = bytearray(4096)
+        assert ring.read_into(read_only, 0, memoryview(dst)) == 4096
+        assert dst == b"a" * 4096
+    finally:
+        ring.close()
+        os.close(read_only)
+
+
+def test_write_batch_validation_precedes_any_io(tmp_path: Path) -> None:
+    """Reject invalid sources and oversized batches before writing anything."""
+    path = tmp_path / "write_validate.store"
+    path.write_bytes(b"x" * 128)
+    fd = os.open(path, os.O_RDWR)
+    ring = NativeIOUring(entries=2)
+    src = bytearray(b"y" * 16)
+    try:
+        for writes in (
+            [(0, memoryview(src)), (16, memoryview(b"readonly"))],
+            [(0, memoryview(src))] * 3,
+            [(0, memoryview(src)), (-1, memoryview(src))],
+            [(0, memoryview(src)), (16, memoryview(bytearray()))],
+        ):
+            with pytest.raises(ValueError):
+                ring.write_batch_from(fd, writes)
+            assert path.read_bytes() == b"x" * 128
+    finally:
+        ring.close()
+        os.close(fd)

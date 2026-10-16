@@ -179,18 +179,18 @@ def test_staged_resolves_before_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str
 ) -> None:
     """``staged`` resolves after the snapshot, ``persisted`` after the write."""
-    original = NativeIOUring.write
+    original = NativeIOUring.write_batch_from
     started = threading.Event()
     release = threading.Event()
 
     def held_write(
-        self: NativeIOUring, fd: int, file_offset: int, data: bytes | memoryview
+        self: NativeIOUring, fd: int, writes: Sequence[tuple[int, memoryview]]
     ) -> int:
         started.set()
         assert release.wait(10)
-        return original(self, fd, file_offset, data)
+        return original(self, fd, writes)
 
-    monkeypatch.setattr(NativeIOUring, "write", held_write)
+    monkeypatch.setattr(NativeIOUring, "write_batch_from", held_write)
 
     async def scenario() -> None:
         layer = _layer(tmp_path, l1=4 * PAGE)
@@ -224,7 +224,7 @@ def test_large_arena_store_writes_while_later_groups_snapshot(
 ) -> None:
     """Arena snapshots run in 128 MiB groups; L2 writes start group by group."""
     original_copy = copy_ops.copy_src_to_pinned
-    original_write = NativeIOUring.write
+    original_write = NativeIOUring.write_batch_from
     copies: list[int] = []
     first_written = threading.Event()
 
@@ -238,14 +238,14 @@ def test_large_arena_store_writes_while_later_groups_snapshot(
         original_copy(src, pinned, target_offset, nbytes)
 
     def write(
-        self: NativeIOUring, fd: int, file_offset: int, data: bytes | memoryview
+        self: NativeIOUring, fd: int, writes: Sequence[tuple[int, memoryview]]
     ) -> int:
-        written = original_write(self, fd, file_offset, data)
+        written = original_write(self, fd, writes)
         first_written.set()
         return written
 
     monkeypatch.setattr(copy_ops, "copy_src_to_pinned", copy)
-    monkeypatch.setattr(NativeIOUring, "write", write)
+    monkeypatch.setattr(NativeIOUring, "write_batch_from", write)
     nbytes = 128 * MIB + 2 * PAGE
 
     async def scenario() -> None:
@@ -272,11 +272,11 @@ def test_persist_error_surfaces_on_handle_and_drain(
     """A failed L2 write fails ``persisted`` only and is raised once by drain."""
 
     def failing_write(
-        self: NativeIOUring, fd: int, file_offset: int, data: bytes | memoryview
+        self: NativeIOUring, fd: int, writes: Sequence[tuple[int, memoryview]]
     ) -> int:
         raise OSError(errno.EIO, "injected write failure")
 
-    monkeypatch.setattr(NativeIOUring, "write", failing_write)
+    monkeypatch.setattr(NativeIOUring, "write_batch_from", failing_write)
 
     async def scenario() -> None:
         layer = _layer(tmp_path)
@@ -578,6 +578,44 @@ def test_many_small_reads_split_into_ring_sized_batches(
     assert max(batches) <= 64
 
 
+def test_scattered_arena_store_writes_in_ring_sized_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group's scattered L2 runs share native write batches of at most 64."""
+    original = NativeIOUring.write_batch_from
+    batches: list[int] = []
+
+    def counting(
+        self: NativeIOUring, fd: int, writes: Sequence[tuple[int, memoryview]]
+    ) -> int:
+        batches.append(len(writes))
+        return original(self, fd, writes)
+
+    monkeypatch.setattr(NativeIOUring, "write_batch_from", counting)
+    count = 100
+
+    async def scenario() -> None:
+        layer = _layer(tmp_path, l1=count * PAGE, l2=2 * count * PAGE, io_workers=2)
+        payload = _pattern(count * PAGE, 13)
+        moves = [
+            Move(i * PAGE, PAGE, l1_offset=i * PAGE, l2_offset=2 * i * PAGE)
+            for i in range(count)
+        ]
+        try:
+            await (await layer.store(payload, moves)).persisted
+            assert layer.stats.l2_writes == count
+            assert layer.stats.l2_write_bytes == count * PAGE
+        finally:
+            await layer.close()
+        store = tmp_path / "l2.store"
+        for i in (0, 63, 64, count - 1):
+            expected = payload[i * PAGE : (i + 1) * PAGE]
+            assert _read_file(store, 2 * i * PAGE, PAGE) == expected
+
+    asyncio.run(scenario())
+    assert sorted(batches) == [36, 64]
+
+
 @pytest.mark.parametrize("stripe", [0, 16 * MIB])
 def test_large_arena_read_striped_or_serial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stripe: int
@@ -661,16 +699,16 @@ def test_close_drains_then_rejects_new_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``close`` waits for in-flight stores, is idempotent and final."""
-    original = NativeIOUring.write
+    original = NativeIOUring.write_batch_from
     release = threading.Event()
 
     def held_write(
-        self: NativeIOUring, fd: int, file_offset: int, data: bytes | memoryview
+        self: NativeIOUring, fd: int, writes: Sequence[tuple[int, memoryview]]
     ) -> int:
         assert release.wait(10)
-        return original(self, fd, file_offset, data)
+        return original(self, fd, writes)
 
-    monkeypatch.setattr(NativeIOUring, "write", held_write)
+    monkeypatch.setattr(NativeIOUring, "write_batch_from", held_write)
 
     async def scenario() -> None:
         layer = _layer(tmp_path)

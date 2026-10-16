@@ -19,6 +19,7 @@ from typing import Any
 
 # First Party
 from daser.transfer.iouring.native import NativeIOUring
+from daser.transfer.tasks import settle
 
 #: Write-gate granularity: a gated write is issued in pieces of this size and
 #: re-checks for in-flight reads between pieces.
@@ -262,6 +263,59 @@ class L2IoEngine:
             written += uring.write(self._fd, file_offset + written, piece)
         return written
 
+    async def write_batch(self, writes: list[tuple[int, memoryview]]) -> int:
+        """Persist many extents with as few executor jobs as possible.
+
+        Ungated, the writes are submitted in native batches of up to one
+        ring's capacity, one executor job per batch, so they do not queue
+        ahead of reads one job per extent. With ``write_gate`` it issues
+        each extent as its own job through ``write`` (gated pieces).
+
+        Args:
+            writes: Aligned (file offset, source) pairs; sources follow the
+                ``NativeIOUring.write_batch_from`` buffer contract.
+
+        Returns:
+            Bytes written.
+
+        Raises:
+            IOError: On a short write (raised after every job ended).
+            OSError: On a failed write.
+
+        Async/thread-safety:
+            Call on the owning event loop. The caller must keep every source
+            unchanged until this returns, also on errors and cancellation.
+        """
+        if not writes:
+            return 0
+        loop = asyncio.get_running_loop()
+        if self._write_gate:
+            jobs = [
+                loop.run_in_executor(
+                    self._write_executor,
+                    self.timed("write", self._write_exact),
+                    file_offset,
+                    data,
+                    self.next_uring(),
+                )
+                for file_offset, data in writes
+            ]
+        else:
+            jobs = []
+            for start in range(0, len(writes), self._urings[0].batch_capacity):
+                uring = self.next_uring()
+                batch = writes[start : start + uring.batch_capacity]
+                jobs.append(
+                    loop.run_in_executor(
+                        self._write_executor,
+                        self.timed("write", uring.write_batch_from),
+                        self._fd,
+                        batch,
+                    )
+                )
+        await settle(jobs)
+        return sum(job.result() for job in jobs)
+
     def submit_read_batch(
         self, reads: list[tuple[int, memoryview]]
     ) -> tuple[asyncio.Future[int], list[asyncio.Future[int]]]:
@@ -318,6 +372,15 @@ class L2IoEngine:
         for uring in self._urings:
             uring.close()
         os.close(self._fd)
+
+    def _write_exact(
+        self, file_offset: int, data: memoryview, uring: NativeIOUring
+    ) -> int:
+        """Blocking (gated) write of one extent that fails on a short write."""
+        written = self.write(file_offset, data, uring)
+        if written != len(data):
+            raise IOError(f"short io_uring write: {written} != {len(data)}")
+        return written
 
     def _wait_reads_drained(self) -> int:
         """Block until no read job is in native IO, bounded by the gate cap.

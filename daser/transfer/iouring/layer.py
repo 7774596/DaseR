@@ -112,20 +112,6 @@ def _snapshot_runs(
         copy_ops.copy_src_to_pinned(source, host, host_offset, nbytes)
 
 
-def _write_exact(
-    l2: L2IoEngine, file_offset: int, data: memoryview, uring: NativeIOUring
-) -> int:
-    """Blocking L2 write that fails on a short write.
-
-    Returns:
-        Bytes written.
-    """
-    written = l2.write(file_offset, data, uring)
-    if written != len(data):
-        raise IOError(f"short io_uring write: {written} != {len(data)}")
-    return written
-
-
 def _read_exact(
     l2: L2IoEngine, file_offset: int, data: memoryview, uring: NativeIOUring
 ) -> int:
@@ -458,15 +444,14 @@ class TieredIOUringTransferLayer(TransferLayer):
             staged_moves = [move for move in moves if move.l1_offset is None]
             for group in _snapshot_groups(arena_moves):
                 await self._snapshot_arena(buffer, group)
-                for run in coalesce_moves(
+                runs = coalesce_moves(
                     [move for move in group if move.l2_offset is not None],
                     ("l2", "l1"),
-                ):
-                    assert self._arena is not None and run.l1_offset is not None
-                    view = self._arena.view()[
-                        run.l1_offset : run.l1_offset + run.nbytes
-                    ]
-                    writes.append(self._spawn("l2_write", self._write(run, view)))
+                )
+                if runs:
+                    # One write job set per group: per-run jobs would queue
+                    # ahead of reads on the shared executor.
+                    writes.append(self._spawn("l2_write", self._write(runs)))
             if staged_moves:
                 await self._store_staged(buffer, staged_moves, writes)
         except BaseException as exc:
@@ -539,9 +524,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             [(piece.buffer_offset, data, 0, piece.nbytes) for piece, data in group],
         )
         for piece, data in group:
-            writes.append(
-                self._spawn("l2_write", self._write(piece, data.view(), data))
-            )
+            writes.append(self._spawn("l2_write", self._write([piece], data)))
         group.clear()
 
     async def _snapshot(
@@ -556,28 +539,28 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     async def _write(
         self,
-        move: Move,
-        view: memoryview,
+        runs: list[Move],
         owned: pinned_pool.PinnedMemorySlice | None = None,
     ) -> None:
-        """Persist ``view`` at ``move.l2_offset``; release ``owned`` after."""
-        assert self._l2 is not None and move.l2_offset is not None
-        l2 = self._l2
+        """Persist ``runs`` at their ``l2_offset``; release ``owned`` after.
+
+        Sources are the runs' arena extents, or the single run's ``owned``
+        staging slice.
+        """
+        assert self._l2 is not None
+        writes = []
+        for run in runs:
+            assert run.l2_offset is not None
+            if owned is not None:
+                view = owned.view()
+            else:
+                assert self._arena is not None and run.l1_offset is not None
+                view = self._arena.view()[run.l1_offset : run.l1_offset + run.nbytes]
+            writes.append((run.l2_offset, view))
         try:
-            await settle(
-                [
-                    asyncio.get_running_loop().run_in_executor(
-                        l2.write_executor,
-                        l2.timed("write", _write_exact),
-                        l2,
-                        move.l2_offset,
-                        view,
-                        l2.next_uring(),
-                    )
-                ]
-            )
-            self._stats.l2_writes += 1
-            self._stats.l2_write_bytes += move.nbytes
+            await self._l2.write_batch(writes)
+            self._stats.l2_writes += len(runs)
+            self._stats.l2_write_bytes += sum(run.nbytes for run in runs)
         finally:
             if owned is not None and self._staging is not None:
                 self._staging.release(owned)
