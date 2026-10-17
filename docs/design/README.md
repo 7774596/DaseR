@@ -14,3 +14,4 @@ IO，在 DaseR server 进程内维护 HTTP server、IPC server 和控制面状�
 | [可观测性指标优化](metrics-optimization.md) | Prometheus 指标精简、L1/vLLM 集成、Dashboard 重设计 |
 | [在途 load 合并](inflight-load-coalescing.md) | 同前缀在途外部 load 时后到请求等待并复用本地前缀命中（`coalesce_loads`，默认关） |
 | [独立 L1/L2 分层与叶子优先淘汰](tier-residency.md) | server 索引的逐层 chunk 副本、TLSF 分配器、每层叶子优先 LRU 与对称候选规则、write-through 与 L1 接纳、promotion/readahead、prefetch lease、NOCOW store 文件 |
+| [L2 设备感知的链分散放置](l2-device-spread.md) | 无特权探测 store 文件区间到物理盘的映射（FIEMAP + `/sys/block` 计数），分区 TLSF，新 chunk 避开父 chunk 所在盘，使前缀读并行多盘（`--l2-device-zones`） |

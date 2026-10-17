@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
-from daser.server.allocator import TlsfAllocator
+from daser.server.allocator import TlsfAllocator, ZonedAllocator
 from daser.server.eviction import EvictionTree
 
 logger = init_logger(__name__)
@@ -26,6 +26,11 @@ L2 = "l2"
 TIERS = (L1, L2)
 #: Alignment of every record inside a copy (O_DIRECT / GDS).
 RECORD_ALIGNMENT = 4096
+#: Victims a spread L2 placement may evict per device zone before it gives
+#: up avoiding its parent's zone.
+_SPREAD_EVICTIONS_PER_ZONE = 2
+#: Ancestor levels searched for the zone a new L2 extent should avoid.
+_SPREAD_ANCESTORS = 4
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -94,6 +99,10 @@ class TierLayout:
         l1_record_bytes: When positive, every L1 record occupies at least
             this many bytes (raw-equivalent L1 accounting); 0 uses the
             stored size.
+        l2_zones: Device zones of the L2 lane as ``(start, end, zone)``
+            runs tiling ``[0, l2_lane_bytes)`` (see
+            ``daser.server.device_zones``); empty means one device. With
+            several zones a new chunk avoids its parent's zone.
 
     Raises:
         ValueError: if a field is invalid or both tiers are disabled.
@@ -104,6 +113,7 @@ class TierLayout:
     l2_lane_bytes: int
     tensor_parallel_size: int = 1
     l1_record_bytes: int = 0
+    l2_zones: tuple[tuple[int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         grain = self.grain
@@ -124,6 +134,14 @@ class TierLayout:
             raise ValueError("tensor_parallel_size must be positive")
         if self.l1_record_bytes < 0 or self.l1_record_bytes % RECORD_ALIGNMENT:
             raise ValueError("l1_record_bytes must be a non-negative 4 KiB multiple")
+        if self.l2_zones and (
+            not self.l2_lane_bytes
+            or any(start % grain or end % grain for start, end, _z in self.l2_zones)
+        ):
+            raise ValueError("l2_zones need L2 and grain-aligned bounds")
+        if self.l2_zones:
+            # Raises ValueError unless the runs tile the lane with dense ids.
+            ZonedAllocator(self.l2_lane_bytes, grain, self.l2_zones)
 
     def lane_bytes(self, tier: str) -> int:
         """Return the lane size of ``tier`` in bytes (0 when disabled).
@@ -340,7 +358,7 @@ class TierStats:
 class _TierState:
     """Mutable per-tier bookkeeping."""
 
-    allocator: TlsfAllocator
+    allocator: TlsfAllocator | ZonedAllocator
     used: int = 0
     pinned: int = 0
     copies: int = 0
@@ -386,11 +404,17 @@ class TierIndex:
         self._on_lost = on_lost
         self._metrics = metrics_registry or REGISTRY
         self._tp_mask = (1 << layout.tensor_parallel_size) - 1
-        self._tiers = {
-            tier: _TierState(TlsfAllocator(layout.lane_bytes(tier), layout.grain))
-            for tier in TIERS
-            if layout.enabled(tier)
-        }
+        self._tiers: dict[str, _TierState] = {}
+        if layout.enabled(L1):
+            self._tiers[L1] = _TierState(
+                TlsfAllocator(layout.l1_lane_bytes, layout.grain)
+            )
+        self._l2_zones: ZonedAllocator | None = None
+        if layout.enabled(L2):
+            self._l2_zones = ZonedAllocator(
+                layout.l2_lane_bytes, layout.grain, layout.l2_zones
+            )
+            self._tiers[L2] = _TierState(self._l2_zones)
         self._chunks: dict[str, ChunkTiers] = {}
         self._tree = EvictionTree(tuple(self._tiers), self._is_candidate)
 
@@ -1047,7 +1071,11 @@ class TierIndex:
                 self._tiers[tier].copies += delta
 
     def _reserve_l2(self, fresh: list[tuple[str, tuple[int, ...]]]) -> dict[str, int]:
-        """Reserve L2 extents for new chunks, contiguously when possible.
+        """Reserve L2 extents for new chunks.
+
+        On one device zone the batch is reserved contiguously when possible.
+        With several zones each chunk avoids the zone of its nearest ancestor
+        with an L2 extent (see ``docs/design/l2-device-spread.md``).
 
         Returns:
             Lane offset per key.
@@ -1058,10 +1086,14 @@ class TierIndex:
         """
         if not fresh:
             return {}
-        allocator = self._tiers[L2].allocator
+        allocator = self._l2_zones
+        assert allocator is not None
         lengths = [self._layout.extent_length(L2, sizes) for _key, sizes in fresh]
         offsets: dict[str, int] = {}
-        start = allocator.reserve(sum(lengths)) if len(fresh) > 1 else None
+        spread = allocator.zone_count > 1
+        start = (
+            allocator.reserve(sum(lengths)) if len(fresh) > 1 and not spread else None
+        )
         if start is not None:
             for (key, _sizes), length in zip(fresh, lengths, strict=True):
                 offsets[key] = start
@@ -1069,7 +1101,8 @@ class TierIndex:
             return offsets
         try:
             for (key, _sizes), length in zip(fresh, lengths, strict=True):
-                offset = self._reserve(L2, length)
+                avoid = self._parent_zone(key, offsets) if spread else frozenset()
+                offset = self._reserve(L2, length, avoid)
                 if offset is None:
                     raise TierFull(L2, length, io_blocked=False)
                 offsets[key] = offset
@@ -1080,8 +1113,17 @@ class TierIndex:
             raise
         return offsets
 
-    def _reserve(self, tier: str, length: int) -> int | None:
+    def _reserve(
+        self, tier: str, length: int, avoid: frozenset[int] = frozenset()
+    ) -> int | None:
         """Reserve ``length`` bytes in ``tier``, evicting candidates.
+
+        Args:
+            tier: ``L1`` or ``L2``.
+            length: Extent bytes.
+            avoid: L2 zones to keep the extent out of. They are avoided for
+                up to ``_SPREAD_EVICTIONS_PER_ZONE`` evictions per zone, then
+                (or once no candidate is left) any zone is accepted.
 
         Returns:
             Lane offset, or None when no candidate is left.
@@ -1090,8 +1132,17 @@ class TierIndex:
         if length > state.allocator.size:
             return None
         evicted = 0
+        victims = 0
         while True:
-            offset = state.allocator.reserve(length)
+            if avoid:
+                assert self._l2_zones is not None
+                offset = self._l2_zones.reserve(length, avoid)
+                if offset is None and (
+                    victims >= _SPREAD_EVICTIONS_PER_ZONE * self._l2_zones.zone_count
+                ):
+                    offset = self._relax_spread(length)
+            else:
+                offset = state.allocator.reserve(length)
             if offset is not None:
                 if evicted:
                     state.extra_evicted_bytes += max(0, evicted - length)
@@ -1102,8 +1153,46 @@ class TierIndex:
                 return offset
             victim = self._tree.pop_victim(tier)
             if victim is None:
-                return None
+                return self._relax_spread(length) if avoid else None
             evicted += self._evict(tier, victim)
+            victims += 1
+
+    def _relax_spread(self, length: int) -> int | None:
+        """Reserve an L2 extent in any zone, counting the given-up spread."""
+        assert self._l2_zones is not None
+        offset = self._l2_zones.reserve(length)
+        if offset is not None:
+            self._metrics.counter(
+                "daser_tier_l2_spread_relaxed_total",
+                "L2 placements that could not avoid the parent chunk's device.",
+            ).inc()
+        return offset
+
+    def _parent_zone(self, key: str, pending: dict[str, int]) -> frozenset[int]:
+        """Return the L2 zone of ``key``'s nearest ancestor with an extent.
+
+        Args:
+            key: New chunk.
+            pending: Offsets reserved earlier in the same batch.
+
+        Returns:
+            One zone id, or empty when no ancestor within
+            ``_SPREAD_ANCESTORS`` levels has an L2 extent.
+        """
+        assert self._l2_zones is not None
+        parent = self._tree.parent(key)
+        for _level in range(_SPREAD_ANCESTORS):
+            if not parent:
+                break
+            offset = pending.get(parent)
+            if offset is None:
+                chunk = self._chunks.get(parent)
+                if chunk is not None and chunk.l2 is not None:
+                    offset = chunk.l2.offset
+            if offset is not None:
+                return frozenset((self._l2_zones.zone_of(offset),))
+            parent = self._tree.parent(parent)
+        return frozenset()
 
     def _evict(self, tier: str, key: str) -> int:
         """Evict ``key``'s copy in ``tier``; drop the chunk if it was the last.

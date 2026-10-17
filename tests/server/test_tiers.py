@@ -34,6 +34,7 @@ class Harness:
         l2: int = 0,
         tp: int = 1,
         l1_record_bytes: int = 0,
+        zones: tuple[tuple[int, int, int], ...] = (),
     ) -> None:
         self.layout = TierLayout(
             grain=G,
@@ -41,6 +42,7 @@ class Harness:
             l2_lane_bytes=l2 * G,
             tensor_parallel_size=tp,
             l1_record_bytes=l1_record_bytes,
+            l2_zones=tuple((a * G, b * G, z) for a, b, z in zones),
         )
         self.blocked: set[str] = set()
         self.lost: list[str] = []
@@ -82,6 +84,14 @@ class Harness:
         return placement
 
 
+def _zone(h: Harness, offset: int) -> int:
+    """Return the L2 zone of a lane offset (0 without zones)."""
+    for start, end, zone in h.layout.l2_zones:
+        if start <= offset < end:
+            return zone
+    return 0
+
+
 def assert_invariants(h: Harness, quiescent: bool = True) -> None:
     """Check the tier accounting and residency contract of ``h``.
 
@@ -105,6 +115,8 @@ def assert_invariants(h: Harness, quiescent: bool = True) -> None:
             assert copy.offset % G == 0 and copy.length % G == 0
             assert copy.length == h.layout.extent_length(tier, chunk.record_sizes)
             assert copy.offset + copy.length <= h.layout.lane_bytes(tier)
+            if tier == L2:
+                assert _zone(h, copy.offset) == _zone(h, copy.offset + copy.length - 1)
             extents[tier].append((copy.offset, copy.length))
             copies[tier] += 1
             if quiescent:
@@ -187,6 +199,76 @@ def test_batch_of_new_chunks_gets_one_contiguous_l2_extent() -> None:
     for placement in placements:
         h.finish(placement)
     assert_invariants(h)
+
+
+def test_zones_spread_a_chain_off_each_parents_device() -> None:
+    h = Harness(l2=12, zones=((0, 4, 0), (4, 8, 1), (8, 12, 2)))
+    h.add("a")
+    for parent, key in (("a", "b"), ("b", "c"), ("c", "d")):
+        h.add(key, parent)
+    placements = h.tiers.place_store([(key, (G,)) for key in "abcd"])
+    zones = [_zone(h, p.l2.offset) for p in placements]
+    assert all(left != right for left, right in zip(zones, zones[1:], strict=False))
+    for placement in placements:
+        h.finish(placement)
+    # A later chunk avoids its stored parent's zone too.
+    e = h.store("e", parent="d")
+    assert _zone(h, e.l2.offset) != zones[-1]
+    assert_invariants(h)
+
+
+def test_full_zones_evict_lru_until_an_allowed_zone_fits() -> None:
+    h = Harness(l2=4, zones=((0, 2, 0), (2, 4, 1)))
+    root = h.store("r")
+    h.store("x")
+    h.store("y")
+    h.store("z")
+    # L2 is full; "c" must leave the root's zone, so LRU victims are taken
+    # until the other zone has room (the oldest is in the root's zone).
+    c = h.store("c", parent="r")
+    assert _zone(h, c.l2.offset) != _zone(h, root.l2.offset)
+    assert h.tiers.chunk("r") is not None
+    assert_invariants(h)
+
+
+def test_spread_relaxes_when_only_the_parent_zone_has_room() -> None:
+    registry = MetricsRegistry()
+    layout = TierLayout(
+        grain=G,
+        l1_lane_bytes=0,
+        l2_lane_bytes=4 * G,
+        l2_zones=((0, 2 * G, 0), (2 * G, 4 * G, 1)),
+    )
+    tiers = TierIndex(
+        layout,
+        blocked=lambda _k: False,
+        on_lost=lambda _k: None,
+        metrics_registry=registry,
+    )
+    tiers.add_chunk("r")
+    tiers.add_chunk("pin")
+    (root,) = tiers.place_store([("r", (G,))])
+    (pinned,) = tiers.place_store([("pin", (2 * G,))])
+    # "pin" stays io pinned and fills the other zone, so it cannot be evicted.
+    assert root.l2.offset < 2 * G <= pinned.l2.offset
+    tiers.mark_valid(root.l2, 0)
+    tiers.unpin_io(root.l2)
+    tiers.add_chunk("c", "r")
+    (child,) = tiers.place_store([("c", (G,))])
+    assert child.l2.offset < 2 * G
+    assert "daser_tier_l2_spread_relaxed_total 1" in registry.render_prometheus()
+
+
+def test_layout_rejects_bad_l2_zones() -> None:
+    for zones in (
+        ((0, G, 0),),
+        ((0, G, 0), (G, 4 * G, 2)),
+        ((0, 2 * G + 1, 0), (2 * G + 1, 4 * G, 1)),
+    ):
+        with pytest.raises(ValueError):
+            TierLayout(grain=G, l1_lane_bytes=0, l2_lane_bytes=4 * G, l2_zones=zones)
+    with pytest.raises(ValueError):
+        TierLayout(grain=G, l1_lane_bytes=G, l2_lane_bytes=0, l2_zones=((0, G, 0),))
 
 
 def test_batch_falls_back_to_per_chunk_eviction_when_fragmented() -> None:
@@ -587,7 +669,7 @@ def test_l2_restore_rejects_invalid_placements() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("seed", range(12))
 async def test_random_operations_keep_tier_invariants(seed: int) -> None:
     """Random chain stores, failures, loads, promotions and leases.
 
@@ -599,7 +681,13 @@ async def test_random_operations_keep_tier_invariants(seed: int) -> None:
     rng = random.Random(seed)
     tp = rng.choice((1, 2))
     l2 = 0 if seed % 4 == 3 else rng.randint(6, 14)
-    h = Harness(l1=rng.randint(3, 8), l2=l2, tp=tp)
+    # Seeds 8+ split L2 into three interleaved device zones.
+    zones = (
+        tuple((i * l2 // 6, (i + 1) * l2 // 6, i % 3) for i in range(6))
+        if seed >= 8 and l2
+        else ()
+    )
+    h = Harness(l1=rng.randint(3, 8), l2=l2, tp=tp, zones=zones)
     chains: list[str] = []
     leases = []
     serial = 0

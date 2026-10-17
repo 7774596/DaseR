@@ -192,6 +192,15 @@ class EvictionTree:
         """
         return not self._children.get(key)
 
+    def parent(self, key: str) -> str:
+        """Return the parent key of node ``key`` (empty for a root or unknown).
+
+        Args:
+            key: Chunk key.
+        """
+        node = self._nodes.get(key)
+        return node.parent_key if node is not None else ""
+
     def pop_victim(self, tier: str) -> str | None:
         """Return the lowest-priority candidate of ``tier``.
 
