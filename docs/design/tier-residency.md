@@ -141,6 +141,38 @@ T 层副本存在且有效，且 io_pins_T == 0
 - 分配失败且唯一的阻碍是 `io_pins`（时间短）时，调用方等待该层的 `io_released`
   事件后重试；lease 固定和未提交写者不等待。
 
+### 排队提示（queue hint，默认不用）
+
+闭环 max-concurrency 负载下，排队发生在客户端 gateway：P 个会话中 C 个在 vLLM
+里，其余 P − C 个请求在 gateway 的 FIFO 里按顺序等放行。会话轮转时 LRU 正好
+淘汰最快要用的前缀（循环访问），gateway 的队列却已经给出了接下来的访问顺序。
+
+- gateway 在请求入队时 `PUT /queue_hint/{request_id}`（body 为 prompt token
+  的本机字节序 int32，与 IPC 线格式相同），放行给 vLLM 时 `DELETE /queue_hint/{request_id}`。
+  server 用 `RetrievalIndex.chain_keys` 把 token 换成前缀链 key，按到达顺序给每个
+  请求一个递增 `seq`，调用 `EvictionTree.want(request_id, seq, keys)`；释放时
+  `unwant(request_id)`。
+- 提示按 key 记录（key → 想要它的 seq 集合），不要求 key 已存在：提示期间才 commit
+  的 chunk 加入树时直接继承提示。
+- 优先级：孤儿 < 未提示（按 tick）< 被提示。被提示节点的优先级为
+  `_HINT_BASE − min_seq`，`_HINT_BASE` 大于任何 tick，所以被提示的块比任何未提示
+  块晚淘汰；被提示的块之间，`seq` 最大的（离放行最远）先淘汰，即队列视野内的
+  Belady。孤儿不可达，提示也救不了，仍最先淘汰。
+- `want` 只抬高优先级，沿用惰性堆（出堆时纠正）。`unwant` 先按前缀顺序给不再被
+  任何请求提示的 key 一个新 tick（释放即放行，随后的 lookup 会刷新同一条链），
+  再立即重新入堆（优先级降低）。
+- 叶子优先不变：同一请求的链上祖先与后代 seq 相同，候选谓词仍只允许叶子或有另一层
+  副本的节点被淘汰。
+- 开销：每个排队请求 O(prompt 块数) 的 key，入队和放行各一次 O(块数)；不进 vLLM
+  调度路径。HTTP 与 IPC 共用 server 事件循环，hash 一个 100k token 的 prompt 约
+  毫秒级。
+- 指标：`daser_queue_hint_requests`（gauge，排队提示数）、
+  `daser_queue_hint_keys`（gauge，被提示 key 数）、
+  `daser_queue_hint_evicted_copies_total{tier}`（淘汰了仍被提示的副本，说明容量
+  连队列视野都装不下）。
+- 只用于排队在 server 可见的 gateway 前面的部署；不发提示时行为与原 LRU 完全
+  相同。
+
 ## Store 流程
 
 1. scheduler `alloc_chunks` 分配 id、写入 `ChunkMeta`、加入树节点；分配阶段不检查

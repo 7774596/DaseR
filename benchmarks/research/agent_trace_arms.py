@@ -525,6 +525,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Real session token stream passed to the replay (see lm_trace_export).",
     )
     parser.add_argument(
+        "--daser-queue-hint",
+        action="store_true",
+        help="Send client-queue hints to the DaseR server (DaseR arms only).",
+    )
+    parser.add_argument(
         "--daser-prefetch-max-requests",
         type=int,
         default=0,
@@ -866,6 +871,11 @@ async def run_arm(
                     *(
                         ["--session-rate", str(args.session_rate)]
                         if args.session_rate
+                        else []
+                    ),
+                    *(
+                        ["--queue-hint-url", manager.daser_url]
+                        if args.daser_queue_hint and arm.startswith("daser")
                         else []
                     ),
                     "--served-model-name",

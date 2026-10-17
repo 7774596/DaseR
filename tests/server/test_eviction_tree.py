@@ -409,3 +409,96 @@ def test_repeated_touches_and_orphaning_keep_heap_memory_bounded() -> None:
     # Unbounded queueing would add ~100 heap entries (>7 KiB) per cycle.
     assert after - warm < 64 * 1024
     assert drain(tree) == keys[1:] + keys[:1]
+
+
+def test_queue_hint_keeps_hinted_chain_after_unhinted() -> None:
+    """Hinted nodes go after every unhinted one, even more recent ones."""
+    tree, _ = make_tree()
+    chain(tree, ["a0", "a1"])
+    chain(tree, ["b0", "b1"])
+    tree.want("r1", ["a0", "a1"])
+    assert tree.is_wanted("a1") and not tree.is_wanted("b1")
+    assert tree.hinted_requests == 1 and tree.hinted_keys == 2
+    assert drain(tree) == ["b1", "b0", "a1", "a0"]
+
+
+def test_queue_hint_evicts_latest_hint_first() -> None:
+    """Among hinted chains, the one that will be admitted last goes first."""
+    tree, _ = make_tree()
+    chain(tree, ["a0", "a1"])
+    chain(tree, ["b0", "b1"])
+    tree.want("first", ["b0", "b1"])
+    tree.want("second", ["a0", "a1"])
+    assert drain(tree) == ["a1", "a0", "b1", "b0"]
+
+
+def test_queue_hint_shared_prefix_follows_earliest_hint() -> None:
+    """A key hinted by several requests keeps the earliest one's rank."""
+    tree, _ = make_tree()
+    chain(tree, ["p", "a"])
+    tree.add("b", "p")
+    tree.want("first", ["p", "a"])
+    tree.want("second", ["p", "b"])
+    assert drain(tree) == ["b", "a", "p"]
+
+
+def test_queue_hint_orphans_still_go_first() -> None:
+    """A hint cannot rescue an unreachable node."""
+    tree, _ = make_tree()
+    tree.add("x", "gone")
+    chain(tree, ["a0"])
+    tree.want("r", ["x"])
+    assert drain(tree) == ["x", "a0"]
+
+
+def test_queue_release_makes_keys_most_recent_at_once() -> None:
+    """Released keys rank as just used, not by their pre-hint tick."""
+    tree, _ = make_tree()
+    chain(tree, ["a0", "a1"])
+    chain(tree, ["b0", "b1"])
+    tree.want("r", ["a0", "a1"])
+    # Queue the hinted priority, then release: the lower priority must apply
+    # immediately even though entries for the hinted rank are queued.
+    assert tree.pop_victim("l2") == "b1"
+    tree.refresh("b1")
+    tree.unwant("r")
+    assert not tree.is_wanted("a0") and tree.hinted_keys == 0
+    assert drain(tree) == ["b1", "b0", "a1", "a0"]
+    tree.unwant("r")  # unknown ids are ignored
+
+
+def test_queue_release_of_earliest_hint_lowers_shared_key() -> None:
+    """Dropping the earliest of two hints re-ranks a shared key by the later."""
+    tree, _ = make_tree()
+    chain(tree, ["a0"])
+    chain(tree, ["b0"])
+    tree.want("first", ["a0"])
+    tree.want("second", ["b0"])
+    tree.want("third", ["a0"])
+    # Surface both at their hinted rank so the queued entries are current.
+    assert tree.pop_victim("l2") == "b0"
+    tree.refresh("b0")
+    tree.unwant("first")
+    # a0 now ranks by "third" (after "second"), so it goes first.
+    assert drain(tree) == ["a0", "b0"]
+
+
+def test_queue_hint_applies_to_keys_added_later() -> None:
+    """A chunk committed while hinted inherits the hint."""
+    tree, _ = make_tree()
+    tree.want("r", ["a0"])
+    chain(tree, ["b0"])
+    chain(tree, ["a0"])
+    chain(tree, ["c0"])
+    assert drain(tree) == ["b0", "c0", "a0"]
+
+
+def test_queue_hint_replaces_same_id() -> None:
+    """Re-hinting an id drops its old keys."""
+    tree, _ = make_tree()
+    chain(tree, ["a0"])
+    chain(tree, ["b0"])
+    tree.want("r", ["a0"])
+    tree.want("r", ["b0"])
+    assert tree.hinted_requests == 1 and not tree.is_wanted("a0")
+    assert drain(tree) == ["a0", "b0"]

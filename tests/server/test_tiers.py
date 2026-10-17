@@ -355,6 +355,34 @@ def test_eviction_takes_leaf_lru_and_keeps_chain_heads() -> None:
     assert_invariants(h)
 
 
+def test_queue_hint_keeps_queued_chunks_and_counts_hinted_evictions() -> None:
+    registry = MetricsRegistry()
+    h = Harness(l2=2)
+    h.tiers = TierIndex(
+        h.layout,
+        blocked=lambda key: key in h.blocked,
+        on_lost=h.lost.append,
+        metrics_registry=registry,
+    )
+    h.store("a0")
+    h.store("b0")
+    h.tiers.want("r1", ["a0"])
+    h.store("c0")
+    # LRU would take a0; the queued request keeps it.
+    assert h.lost == ["b0"]
+    h.tiers.want("r2", ["c0"])
+    h.store("d0")
+    # Both remaining copies are hinted: the later hint (c0) goes first.
+    assert h.lost == ["b0", "c0"]
+    text = registry.render_prometheus()
+    assert 'daser_queue_hint_evicted_copies_total{tier="l2"} 1' in text
+    assert "daser_queue_hint_requests 2" in text
+    h.tiers.unwant("r1")
+    h.tiers.unwant("r2")
+    assert "daser_queue_hint_requests 0" in registry.render_prometheus()
+    assert_invariants(h)
+
+
 def test_copy_with_a_full_pair_is_evicted_even_inside_a_chain() -> None:
     h = Harness(l1=1, l2=4)
     h.store("a0")

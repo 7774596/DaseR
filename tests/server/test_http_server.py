@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 from typing import Any
 import warnings
@@ -1010,3 +1011,15 @@ def test_chunk_reuse_repeated_separator_keeps_hits_contiguous_before_suffix() ->
     ]
     assert hit_starts == [0, *hit_ends[:-1]]
     assert hit_ends[-1] == len(fake_vllm.completions[0][0]) - len(_chat_suffix())
+
+
+def test_queue_hint_endpoints_hint_prompt_blocks() -> None:
+    """PUT hints every full block of the token body; DELETE drops it."""
+    client, _, _ = _make_client()
+    tokens = list(range(2 * BLOCK_TOKENS + 1))
+    response = client.put("/queue_hint/r1", content=array.array("i", tokens).tobytes())
+    assert response.status_code == 200
+    assert response.json() == {"keys": 2}
+    assert client.put("/queue_hint/r2", content=b"\x00\x01").status_code == 400
+    assert client.delete("/queue_hint/r1").json() == {"ok": True}
+    assert client.delete("/queue_hint/unknown").json() == {"ok": True}

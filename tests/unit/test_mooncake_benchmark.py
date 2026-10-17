@@ -1363,3 +1363,65 @@ def test_chained_replay_splices_the_parent_output_into_the_child(
     assert all("generated_token_ids" not in r for r in results)
     written = (tmp_path / "requests.jsonl").read_text()
     assert "generated_token_ids" not in written
+
+
+def test_queue_hints_cover_the_client_queue_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request is hinted when it starts waiting and released when admitted."""
+    events: list[tuple[str, str]] = []
+
+    class Hints:
+        def __init__(self, base_url: str, timeout_seconds: float) -> None:
+            assert base_url == "http://daser"
+
+        async def hint(self, request_id: str, prompt: list[int]) -> str | None:
+            events.append(("hint", request_id))
+            assert len(prompt) == 512
+            return None
+
+        async def release(self, request_id: str) -> str | None:
+            events.append(("release", request_id))
+            return "HTTPError: down" if request_id == "trace-2" else None
+
+        async def close(self) -> None:
+            events.append(("close", ""))
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        index, prompt = args[2].sample_id, args[3]
+        events.append(("send", f"trace-{index}"))
+        if kwargs.get("on_send"):
+            kwargs["on_send"]()
+        await asyncio.sleep(0.01)
+        return RequestResult(index, "d", "", 1.0, 2.0, len(prompt), 1)
+
+    monkeypatch.setattr(benchmark, "_QueueHints", Hints)
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [TraceRequest(i, 0, 512, 1, (10 * i + 1,)) for i in range(3)]
+    output = tmp_path / "hints.jsonl"
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100_000),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://a",
+            served_model_name="m",
+            output_path=output,
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            queue_hint_url="http://daser",
+        )
+    )
+    # Queued requests stay hinted while the slot is busy and are released
+    # just before their own send.
+    assert events.index(("hint", "trace-2")) < events.index(("release", "trace-1"))
+    for i in range(3):
+        rid = f"trace-{i}"
+        hinted = events.index(("hint", rid))
+        released = events.index(("release", rid))
+        assert hinted < released < events.index(("send", rid))
+    assert events[-1] == ("close", "")
+    records = {r["trace_index"]: r for r in map(json.loads, output.open())}
+    assert records[2]["queue_hint_error"] == "HTTPError: down"
+    assert "queue_hint_error" not in records[0]

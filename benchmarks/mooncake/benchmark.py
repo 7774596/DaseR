@@ -1000,6 +1000,7 @@ async def replay(
     session_population: int = 0,
     session_ramp_s: float = 0.0,
     session_rate: float = 0.0,
+    queue_hint_url: str | None = None,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -1085,6 +1086,10 @@ async def replay(
             their trace timestamps are ignored. Requests inside a session keep
             their prefix dependencies and gaps. Exclusive with
             ``session_population``.
+        queue_hint_url: DaseR HTTP URL to send queue hints to: a request's
+            prompt is hinted when it starts waiting for an in-flight slot and
+            released when admitted. Records carry ``queue_hint_error`` when a
+            hint call failed. ``None`` sends no hints.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -1094,8 +1099,8 @@ async def replay(
 
     Async/thread-safety:
         Uses one asyncio event loop for scheduling and a dedicated writer
-        thread for result IO. Prompt construction is serialized per task after
-        admission and does not run in the writer thread.
+        thread for result IO. Each task builds its prompt when it starts
+        waiting for an in-flight slot, not in the writer thread.
     """
 
     if max_inflight <= 0:
@@ -1163,6 +1168,9 @@ async def replay(
             },
         )
     gates = _session_gates(selection.eligible, bool(session_population or session_rate))
+    hints = (
+        None if queue_hint_url is None else _QueueHints(queue_hint_url, timeout_seconds)
+    )
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -1202,6 +1210,7 @@ async def replay(
                         prewarm_chunk_tokens=prewarm_chunk_tokens,
                         prewarm_max_waiting=prewarm_max_waiting,
                         start_gate=gates.get(request.session_id),
+                        hints=hints,
                     )
                 )
                 for position, request in enumerate(selection.eligible)
@@ -1253,6 +1262,8 @@ async def replay(
                 await asyncio.gather(population, return_exceptions=True)
     finally:
         writer.close()
+        if hints is not None:
+            await hints.close()
     return results, time.perf_counter() - started_at, aborted
 
 
@@ -1352,6 +1363,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Outstanding work (s) at which sticky-saturated drops affinity.",
+    )
+    parser.add_argument(
+        "--queue-hint-url",
+        default=None,
+        help="DaseR HTTP URL to send client-queue hints to (off by default).",
     )
     parser.add_argument("--served-model-name", default="")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -1516,6 +1532,7 @@ async def main_async(args: argparse.Namespace) -> int:
         session_population=args.session_population,
         session_ramp_s=args.session_ramp_s,
         session_rate=args.session_rate,
+        queue_hint_url=args.queue_hint_url,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1695,6 +1712,61 @@ async def _rebind_when_waiting(
             remaining = poll_s
         await asyncio.wait({stream}, timeout=remaining)
     return None
+
+
+class _QueueHints:
+    """Tell a DaseR server which requests wait in the client queue.
+
+    ``hint`` is sent when a request starts waiting for an in-flight slot and
+    ``release`` when it is admitted, so the server can keep queued prefixes
+    resident (see "排队提示" in ``docs/design/tier-residency.md``). Failures
+    are reported, never raised: a lost hint only falls back to plain LRU.
+
+    Args:
+        base_url: DaseR HTTP server base URL.
+        timeout_seconds: Per-call timeout.
+
+    Async/thread-safety:
+        Owns its own client so hint calls never wait for a replay connection
+        slot; use on the replay event loop only.
+    """
+
+    def __init__(self, base_url: str, timeout_seconds: float) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+
+    async def hint(self, request_id: str, prompt: list[int]) -> str | None:
+        """Hint a queued request's prompt; return an error string on failure.
+
+        Args:
+            request_id: Unique replay request id.
+            prompt: Token IDs the request will send.
+        """
+        return await self._call("PUT", request_id, array("i", prompt).tobytes())
+
+    async def release(self, request_id: str) -> str | None:
+        """Drop a request's hint; return an error string on failure.
+
+        Args:
+            request_id: Id given to ``hint``.
+        """
+        return await self._call("DELETE", request_id, None)
+
+    async def close(self) -> None:
+        """Close the hint client."""
+        await self._client.aclose()
+
+    async def _call(
+        self, method: str, request_id: str, body: bytes | None
+    ) -> str | None:
+        try:
+            response = await self._client.request(
+                method, f"{self._base_url}/queue_hint/{request_id}", content=body
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return None
 
 
 @dataclass
@@ -1938,9 +2010,11 @@ async def _run_request(
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
     start_gate: _SessionGate | None = None,
+    hints: _QueueHints | None = None,
 ) -> dict[str, Any]:
     try:
         return await _run_request_after_dependency(
+            hints=hints,
             prewarm=prewarm,
             prewarm_chunk_tokens=prewarm_chunk_tokens,
             prewarm_max_waiting=prewarm_max_waiting,
@@ -1991,6 +2065,7 @@ async def _run_request_after_dependency(
     prewarm_chunk_tokens: int = 0,
     prewarm_max_waiting: int | None = None,
     start_gate: _SessionGate | None = None,
+    hints: _QueueHints | None = None,
 ) -> dict[str, Any]:
     # A dependent request with a recorded gap is paced by its producer's
     # completion, not by its arrival timestamp.
@@ -2045,13 +2120,23 @@ async def _run_request_after_dependency(
     if gap_paced:
         # The request arrives when its gap ends.
         scheduled_offset = queued_at - started_at
-    if admit_after is not None:
-        await admit_after.wait()
-    async with outer_sem:
+    # Built before queueing so a queue hint can name its blocks.
+    prompt = prompt_builder.build(request)
+    hint_id = f"trace-{request.index}"
+    hint_errors: list[str] = []
+    if hints is not None and (error := await hints.hint(hint_id, prompt)):
+        hint_errors.append(error)
+    try:
+        if admit_after is not None:
+            await admit_after.wait()
+        await outer_sem.acquire()
+    finally:
+        if hints is not None and (error := await hints.release(hint_id)):
+            hint_errors.append(error)
+    try:
         admitted_at = time.perf_counter()
         if admitted is not None:
             admitted.set()
-        prompt = prompt_builder.build(request)
         sent_at = admitted_at
         wait_s = router.rebind_wait_s(request)
         instance, work = router.acquire(request)
@@ -2126,6 +2211,8 @@ async def _run_request_after_dependency(
                 ttft_ms=result.ttft_ms + shift_ms,
                 latency_ms=result.latency_ms + shift_ms,
             )
+    finally:
+        outer_sem.release()
     prompt_builder.record(request, prompt, result.generated_token_ids)
     record = _result_record(
         request=request,
@@ -2146,6 +2233,8 @@ async def _run_request_after_dependency(
         record["prewarm_pieces"] = prewarm_pieces
         record["prewarm_yielded"] = prewarm_yielded
     record["rebinds"] = rebinds
+    if hint_errors:
+        record["queue_hint_error"] = "; ".join(hint_errors)
     writer.write(record)
     return record
 

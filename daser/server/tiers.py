@@ -455,6 +455,28 @@ class TierIndex:
         """
         return self._tree.is_leaf(key)
 
+    def want(self, hint_id: str, keys: list[str]) -> None:
+        """Keep a queued request's prefix chunks resident until it is admitted.
+
+        See ``EvictionTree.want``; hinted chunks are evicted after every
+        unhinted one, latest hint first.
+
+        Args:
+            hint_id: Request id.
+            keys: Prefix-chain keys the request will look up.
+        """
+        self._tree.want(hint_id, keys)
+        self._publish_hint_metrics()
+
+    def unwant(self, hint_id: str) -> None:
+        """Drop a queue hint; its chunks become most recently used.
+
+        Args:
+            hint_id: Id given to ``want``; unknown ids are ignored.
+        """
+        self._tree.unwant(hint_id)
+        self._publish_hint_metrics()
+
     def remove(self, key: str) -> None:
         """Drop a chunk's copies and tree node (explicit eviction, deletion).
 
@@ -1126,6 +1148,11 @@ class TierIndex:
         self._metrics.counter(
             "daser_tier_evicted_bytes_total", "Extent bytes evicted per tier."
         ).inc(length, labels=labels)
+        if self._tree.is_wanted(key):
+            self._metrics.counter(
+                "daser_queue_hint_evicted_copies_total",
+                "Evicted copies a queued request still needed.",
+            ).inc(labels=labels)
         survivor = chunk.copy(_other(tier))
         if survivor is not None and not self.is_full(survivor):
             # A partial copy cannot serve reads; the chunk is gone either way.
@@ -1197,3 +1224,12 @@ class TierIndex:
             "daser_tier_l1_admission_skips_total",
             "Chunks L1 could not admit (stored or read through staging).",
         ).inc()
+
+    def _publish_hint_metrics(self) -> None:
+        """Set the queue-hint gauges."""
+        self._metrics.gauge(
+            "daser_queue_hint_requests", "Queued requests with a live hint."
+        ).set(self._tree.hinted_requests)
+        self._metrics.gauge(
+            "daser_queue_hint_keys", "Chunk keys named by a live queue hint."
+        ).set(self._tree.hinted_keys)

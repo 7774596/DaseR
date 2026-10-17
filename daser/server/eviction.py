@@ -12,6 +12,9 @@ import heapq
 # Subtracted from an orphan's tick so every orphan sorts before every
 # reachable node while orphans keep their recency order.
 _ORPHAN_BASE = 1 << 62
+# Added to a queue-hinted node's priority (minus its earliest hint seq) so
+# every hinted node sorts after every unhinted one.
+_HINT_BASE = 1 << 61
 # Heap entries allowed beyond two per node before stale ones are dropped.
 _COMPACT_SLACK = 16
 
@@ -52,6 +55,12 @@ class EvictionTree:
     marking) re-queue at once. Superseded entries are compacted away, so a
     tier holds at most about two entries per node.
 
+    Queue hints (``want``/``unwant``) name keys a queued request will look up
+    once admitted. A hinted reachable node sorts after every unhinted one;
+    among hinted nodes the one whose earliest hint came last goes first, so
+    the tier keeps what the queue needs soonest. Hints are kept per key, so
+    a chunk added while hinted inherits its hint.
+
     Args:
         tiers: Names of the tiers that get a candidate heap.
         is_candidate: Returns whether a present node may be evicted from a
@@ -74,6 +83,10 @@ class EvictionTree:
         self._queued: dict[str, dict[str, int]] = {t: {} for t in tiers}
         self._seq = 0
         self._tick = 0
+        # Queue hints: hint id -> (seq, keys) and key -> seqs hinting it.
+        self._hints: dict[str, tuple[int, list[str]]] = {}
+        self._wanted: dict[str, set[int]] = {}
+        self._hint_seq = 0
 
     def __len__(self) -> int:
         """Return the number of nodes."""
@@ -192,10 +205,85 @@ class EvictionTree:
         """
         return not self._children.get(key)
 
+    @property
+    def hinted_requests(self) -> int:
+        """Return the number of live queue hints."""
+        return len(self._hints)
+
+    @property
+    def hinted_keys(self) -> int:
+        """Return the number of keys named by at least one live hint."""
+        return len(self._wanted)
+
+    def is_wanted(self, key: str) -> bool:
+        """Return whether a live queue hint names ``key``.
+
+        Args:
+            key: Chunk key (need not be a node).
+        """
+        return key in self._wanted
+
+    def want(self, hint_id: str, keys: list[str]) -> None:
+        """Record that a queued request will look up ``keys``.
+
+        Hints are ordered by arrival: a later hint is assumed to be admitted
+        later. A hint with an id already present replaces the old one.
+
+        Args:
+            hint_id: Caller-chosen request id.
+            keys: Prefix-chain keys the request will look up; keys need not
+                be nodes yet.
+
+        Async/thread-safety:
+            O(len(keys)); only raises priorities, so queued entries are
+            corrected lazily by ``pop_victim``.
+        """
+        if hint_id in self._hints:
+            self.unwant(hint_id)
+        self._hint_seq += 1
+        seq = self._hint_seq
+        keys = list(dict.fromkeys(keys))
+        self._hints[hint_id] = (seq, keys)
+        for key in keys:
+            self._wanted.setdefault(key, set()).add(seq)
+
+    def unwant(self, hint_id: str) -> None:
+        """Drop a queue hint once its request is admitted (or abandoned).
+
+        Keys no longer hinted by anyone get fresh ticks in prefix order (the
+        admitted request is about to use them) and are re-queued at their
+        lower priority at once.
+
+        Args:
+            hint_id: Id given to ``want``; unknown ids are ignored.
+
+        Async/thread-safety:
+            O(len(keys)) plus one heap push per lowered node and tier.
+        """
+        hint = self._hints.pop(hint_id, None)
+        if hint is None:
+            return
+        seq, keys = hint
+        for key in keys:
+            seqs = self._wanted.get(key)
+            if seqs is None:
+                continue
+            earliest = min(seqs)
+            seqs.discard(seq)
+            if not seqs:
+                del self._wanted[key]
+                node = self._nodes.get(key)
+                if node is not None:
+                    node.tick = self._next_tick()
+                    self._lower(key)
+            elif earliest == seq and key in self._nodes:
+                self._lower(key)
+
     def pop_victim(self, tier: str) -> str | None:
         """Return the lowest-priority candidate of ``tier``.
 
-        Orphans come first, then the least recently used candidate. The entry
+        Orphans come first, then the least recently used unhinted
+        candidate, then the hinted candidate hinted latest. The entry
         is consumed; the caller evicts the chunk's copy in ``tier`` (and
         ``refresh``-es it if it keeps the node). A popped non-candidate is
         consumed too and returns only after ``refresh``.
@@ -241,7 +329,10 @@ class EvictionTree:
     def _priority(self, key: str) -> int:
         """Return the eviction priority of a node (lower goes first)."""
         node = self._nodes[key]
-        return node.tick - _ORPHAN_BASE if node.orphan else node.tick
+        if node.orphan:
+            return node.tick - _ORPHAN_BASE
+        seqs = self._wanted.get(key)
+        return _HINT_BASE - min(seqs) if seqs else node.tick
 
     def _requeue(self, key: str) -> None:
         """Queue a present node in every tier it is a new candidate of.

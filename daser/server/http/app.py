@@ -9,7 +9,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import uuid
 
 # Third Party
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -636,6 +636,24 @@ def build_http_app(
                 status_code=504,
                 detail="DaseR drain timed out waiting for pending stores",
             ) from exc
+        return {"ok": True}
+
+    @app.put("/queue_hint/{request_id}")
+    async def queue_hint_endpoint(request_id: str, request: Request) -> dict[str, int]:
+        """Hint the prefix of a request waiting in the gateway queue.
+
+        The body is the prompt's token IDs as native int32 bytes (the IPC
+        token wire format). Hints are ordered by arrival.
+        """
+        body = await request.body()
+        if len(body) % 4:
+            raise HTTPException(status_code=400, detail="body is not int32 tokens")
+        return {"keys": core.queue_hint(request_id, body)}
+
+    @app.delete("/queue_hint/{request_id}")
+    async def queue_release_endpoint(request_id: str) -> dict[str, bool]:
+        """Drop a request's queue hint once the gateway admits it."""
+        core.queue_release(request_id)
         return {"ok": True}
 
     @app.post("/documents", status_code=201)

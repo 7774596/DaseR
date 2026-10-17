@@ -500,6 +500,38 @@ class ServerCore:
             "in terms of cached tokens accepted by vLLM.",
         ).inc(hits)
 
+    def queue_hint(self, request_id: str, tokens: TokenSequence) -> int:
+        """Keep a gateway-queued request's prefix resident until it is admitted.
+
+        Hints are ordered by arrival (FIFO admission); see "排队提示" in
+        ``docs/design/tier-residency.md``. Re-hinting an id replaces it.
+
+        Args:
+            request_id: Gateway request id, later passed to ``queue_release``.
+            tokens: Prompt token IDs the request will send.
+
+        Returns:
+            Number of prefix-chain keys hinted (0 when the retrieval index has
+            no fixed match order).
+
+        Async/thread-safety:
+            Pure CPU work on the server event loop: hashes the prompt once.
+        """
+        keys = self._ri.chain_keys(tokens)
+        self._tiers.want(request_id, keys)
+        return len(keys)
+
+    def queue_release(self, request_id: str) -> None:
+        """Drop a queue hint once its request is admitted (or abandoned).
+
+        Args:
+            request_id: Id given to ``queue_hint``; unknown ids are ignored.
+
+        Async/thread-safety:
+            Runs on the server event loop.
+        """
+        self._tiers.unwant(request_id)
+
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str, parent_key: str = ""
     ) -> Allocation:
