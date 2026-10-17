@@ -43,7 +43,6 @@ from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
-from daser.server.device_zones import probe_device_zones
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
 from daser.server.ipc import IPCServer
@@ -141,24 +140,6 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
         logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
         return
     ensure_store_file(cfg.store_path, cfg.store_file_bytes)
-
-
-def _probe_l2_zones(cfg: DaserConfig, mode: str) -> tuple[tuple[int, int, int], ...]:
-    """Map the rank 0 L2 lane of the store file to device zones.
-
-    Args:
-        cfg: resolved DaseR server config; the store file exists.
-        mode: ``--l2-device-zones`` value, ``auto`` or ``off``.
-
-    Returns:
-        Zones for ``TierLayout.l2_zones``; empty for one zone.
-
-    Async/thread-safety:
-        Blocking; startup only, before the transfer layer opens the file.
-    """
-    if mode == "off" or cfg.skip_l2:
-        return ()
-    return probe_device_zones(cfg.store_path, cfg.l2_lane_bytes, cfg.tier_grain)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -270,15 +251,6 @@ def _parse_args() -> argparse.Namespace:
         help="For --transfer-mode=iouring, split each large L2 read into parts "
         "of about this size submitted together, keeping many IOs in flight per "
         "request; must be a multiple of 4 KiB (default 0: one serial read).",
-    )
-    parser.add_argument(
-        "--l2-device-zones",
-        choices=("auto", "off"),
-        default="auto",
-        help="auto: probe which block device holds each range of the L2 store "
-        "file at startup and place a new chunk off its parent chunk's device, "
-        "so one prefix read spans devices; off: treat the file as one device "
-        "(default: auto).",
     )
     parser.add_argument(
         "--extra-kv-layers",
@@ -458,18 +430,14 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     return cfg
 
 
-def _tier_layout(
-    cfg: DaserConfig, l2_zones: tuple[tuple[int, int, int], ...] = ()
-) -> TierLayout:
+def _tier_layout(cfg: DaserConfig) -> TierLayout:
     """Return the tier geometry of a finalized server config.
 
     Args:
         cfg: Config accepted by ``_build_daser_config``.
-        l2_zones: L2 lane device zones from ``_probe_l2_zones``.
 
     Returns:
-        TierLayout with the config's grain, lanes, L1 record charge and L2
-        device zones.
+        TierLayout with the config's grain, lanes and L1 record charge.
     """
     return TierLayout(
         grain=cfg.tier_grain,
@@ -477,7 +445,6 @@ def _tier_layout(
         l2_lane_bytes=cfg.l2_lane_bytes,
         tensor_parallel_size=cfg.tensor_parallel_size,
         l1_record_bytes=cfg.l1_record_bytes,
-        l2_zones=l2_zones,
     )
 
 
@@ -528,14 +495,11 @@ def _build_index_components(
     raise ValueError(f"unknown cache reuse mode: {cache_reuse_mode}")
 
 
-def _new_core(
-    cfg: DaserConfig, l2_zones: tuple[tuple[int, int, int], ...] = ()
-) -> ServerCore:
+def _new_core(cfg: DaserConfig) -> ServerCore:
     """Construct an empty server core for a config.
 
     Args:
         cfg: DaseR runtime config.
-        l2_zones: L2 lane device zones.
 
     Returns:
         ServerCore with no chunks.
@@ -547,19 +511,16 @@ def _new_core(
         chunk_manager=ChunkManager(MetadataStore(), DocRegistry()),
         retrieval_index=retrieval_index,
         position_encoder=position_encoder,
-        tier_layout=_tier_layout(cfg, l2_zones),
+        tier_layout=_tier_layout(cfg),
         block_tokens=cfg.block_tokens,
     )
 
 
-async def _build_core(
-    cfg: DaserConfig, l2_zones: tuple[tuple[int, int, int], ...] = ()
-) -> ServerCore:
+async def _build_core(cfg: DaserConfig) -> ServerCore:
     """Construct the shared server core and restore a persisted index.
 
     Args:
         cfg: DaseR runtime config.
-        l2_zones: L2 lane device zones.
 
     Returns:
         ServerCore holding the restored chunks, or empty on a cold start.
@@ -567,7 +528,7 @@ async def _build_core(
     Async/thread-safety:
         Startup only; the index read blocks the event loop briefly.
     """
-    core = _new_core(cfg, l2_zones)
+    core = _new_core(cfg)
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; cold-starting volatile index")
     elif not cfg.persists_index:
@@ -587,7 +548,7 @@ async def _build_core(
             logger.info("[SERVER] restored index from %s", cfg.index_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
-            core = _new_core(cfg, l2_zones)
+            core = _new_core(cfg)
     return core
 
 
@@ -725,7 +686,7 @@ async def run_server(args: argparse.Namespace) -> None:
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
-    core = await _build_core(cfg, _probe_l2_zones(cfg, args.l2_device_zones))
+    core = await _build_core(cfg)
 
     runtime_config = cfg.runtime_config()
     runtime_config.update(_compression_runtime_config(cfg, args))

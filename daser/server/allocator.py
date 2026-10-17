@@ -18,14 +18,7 @@ A one-byte-per-grain free map (1 MiB per 64 GiB of capacity at the default
 the free block covering a range. Its checks are C-level byte scans bounded
 by the extent (``release``) or the covering free block (``take``), so no
 operation depends on the number of free blocks.
-
-``ZonedAllocator`` keeps one TLSF allocator per zone (a set of ranges with
-one physical placement), so its extents never cross a zone.
 """
-
-# Standard
-import bisect
-from collections.abc import Collection
 
 #: Second-level subdivisions per power-of-two range (log2 = 3).
 _SL_LOG2 = 3
@@ -74,25 +67,16 @@ class TlsfAllocator:
         size: managed capacity in bytes; positive multiple of ``grain``.
         grain: allocation unit in bytes; a power of two and a multiple of
             4096.
-        free_ranges: Initially free ``(offset, length)`` byte ranges, sorted,
-            disjoint, grain-aligned and inside ``[0, size)``; the rest starts
-            reserved and is never handed out unless released. None frees the
-            whole range.
 
     Raises:
-        ValueError: if ``grain``, ``size`` or ``free_ranges`` is invalid.
+        ValueError: if ``grain`` or ``size`` is invalid.
 
     Async/thread-safety:
         Not synchronized. Callers use one allocator from a single thread
         (the server event loop).
     """
 
-    def __init__(
-        self,
-        size: int,
-        grain: int,
-        free_ranges: list[tuple[int, int]] | None = None,
-    ) -> None:
+    def __init__(self, size: int, grain: int) -> None:
         if grain <= 0 or grain & (grain - 1) or grain % _IO_ALIGNMENT:
             raise ValueError(
                 f"grain must be a power of two multiple of {_IO_ALIGNMENT}, got {grain}"
@@ -110,21 +94,10 @@ class TlsfAllocator:
         self._bins: dict[tuple[int, int], dict[int, None]] = {}
         self._length_of: dict[int, int] = {}
         self._start_of_end: dict[int, int] = {}
+        # One byte per grain unit: 1 = free, 0 = reserved.
+        self._free_map = bytearray(b"\x01") * self._units
         self._free_units = 0
-        if free_ranges is None:
-            # One byte per grain unit: 1 = free, 0 = reserved.
-            self._free_map = bytearray(b"\x01") * self._units
-            self._insert_free(0, self._units)
-            return
-        self._free_map = bytearray(self._units)
-        previous_end = 0
-        for offset, length in free_ranges:
-            start, units = self._check_range(offset, length)
-            if start < previous_end:
-                raise ValueError("free_ranges must be sorted and disjoint")
-            previous_end = start + units
-            self._free_map[start:previous_end] = b"\x01" * units
-            self._insert_free(start, units)
+        self._insert_free(0, self._units)
 
     @property
     def size(self) -> int:
@@ -315,183 +288,3 @@ class TlsfAllocator:
                 self._fl_bitmap &= ~(1 << fl)
         self._free_units -= units
         return units
-
-
-class ZonedAllocator:
-    """Grain-aligned extent allocator whose extents never cross a zone.
-
-    A zone is a set of byte ranges with one physical placement (for the L2
-    store file: one device). Each zone has its own ``TlsfAllocator`` over the
-    whole range with only the zone's ranges initially free, so a reservation
-    always lies inside one zone and free blocks of different zones never
-    coalesce. See ``docs/design/l2-device-spread.md``.
-
-    Args:
-        size: managed capacity in bytes; positive multiple of ``grain``.
-        grain: allocation unit in bytes (see ``TlsfAllocator``).
-        zones: ``(start, end, zone)`` runs, sorted and covering
-            ``[0, size)`` without gaps; bounds are grain multiples, zone ids
-            are ``0..n-1``. Empty means a single zone.
-
-    Raises:
-        ValueError: if ``zones`` does not tile ``[0, size)`` or its ids are
-            not dense.
-
-    Async/thread-safety:
-        Not synchronized; owned by the server event loop.
-    """
-
-    def __init__(
-        self, size: int, grain: int, zones: tuple[tuple[int, int, int], ...] = ()
-    ) -> None:
-        runs = list(zones) or [(0, size, 0)]
-        ids = {zone for _start, _end, zone in runs}
-        if ids != set(range(len(ids))):
-            raise ValueError(f"zone ids must be 0..n-1, got {sorted(ids)}")
-        position = 0
-        for start, end, _zone in runs:
-            if start != position or end <= start:
-                raise ValueError(f"zones must tile [0, {size}) in order")
-            position = end
-        if position != size:
-            raise ValueError(f"zones must tile [0, {size}) in order")
-        self._starts = [start for start, _end, _zone in runs]
-        self._runs = runs
-        self._zones = [
-            TlsfAllocator(
-                size,
-                grain,
-                [(start, end - start) for start, end, z in runs if z == zone],
-            )
-            for zone in range(len(ids))
-        ]
-
-    @property
-    def size(self) -> int:
-        """Return the managed capacity in bytes."""
-        return self._zones[0].size
-
-    @property
-    def grain(self) -> int:
-        """Return the allocation unit in bytes."""
-        return self._zones[0].grain
-
-    @property
-    def zone_count(self) -> int:
-        """Return the number of zones."""
-        return len(self._zones)
-
-    @property
-    def free_bytes(self) -> int:
-        """Return the total free bytes over all zones."""
-        return sum(zone.free_bytes for zone in self._zones)
-
-    @property
-    def holes(self) -> int:
-        """Return the number of maximal free extents over all zones."""
-        return sum(zone.holes for zone in self._zones)
-
-    @property
-    def largest_free(self) -> int:
-        """Return the longest free extent in bytes over all zones."""
-        return max(zone.largest_free for zone in self._zones)
-
-    def zone_free_bytes(self, zone: int) -> int:
-        """Return the free bytes of one zone.
-
-        Args:
-            zone: zone id.
-        """
-        return self._zones[zone].free_bytes
-
-    def zone_of(self, offset: int) -> int:
-        """Return the zone holding byte ``offset``.
-
-        Args:
-            offset: byte offset in ``[0, size)``.
-
-        Raises:
-            ValueError: if ``offset`` is out of range.
-        """
-        if not 0 <= offset < self.size:
-            raise ValueError(f"offset {offset} outside [0, {self.size})")
-        return self._runs[bisect.bisect_right(self._starts, offset) - 1][2]
-
-    def reserve(self, length: int, avoid: Collection[int] = ()) -> int | None:
-        """Allocate ``length`` contiguous bytes inside one zone.
-
-        Zones not in ``avoid`` are tried from most to least free bytes.
-
-        Args:
-            length: positive multiple of ``grain``.
-            avoid: zone ids not to use.
-
-        Returns:
-            Byte offset of the extent, or None if no allowed zone has a free
-            extent that long.
-
-        Raises:
-            ValueError: if ``length`` is not a positive multiple of ``grain``.
-        """
-        order = sorted(
-            (zone for zone in range(len(self._zones)) if zone not in avoid),
-            key=lambda zone: -self._zones[zone].free_bytes,
-        )
-        if length <= 0 or length % self.grain:
-            raise ValueError(
-                f"length must be a positive multiple of grain {self.grain}, "
-                f"got {length}"
-            )
-        for zone in order:
-            offset = self._zones[zone].reserve(length)
-            if offset is not None:
-                return offset
-        return None
-
-    def release(self, offset: int, length: int) -> None:
-        """Free ``[offset, offset + length)``, split at zone bounds.
-
-        Args:
-            offset: byte offset; multiple of ``grain``.
-            length: positive multiple of ``grain``.
-
-        Raises:
-            ValueError: if the range is misaligned, out of bounds, or overlaps
-                free space.
-        """
-        for zone, start, part in self._split(offset, length):
-            self._zones[zone].release(start, part)
-
-    def take(self, offset: int, length: int) -> None:
-        """Reserve the exact range ``[offset, offset + length)``.
-
-        A range crossing zone bounds is taken piecewise (persisted placements
-        may predate the current zone map).
-
-        Args:
-            offset: byte offset; multiple of ``grain``.
-            length: positive multiple of ``grain``.
-
-        Raises:
-            ValueError: if the range is misaligned, out of bounds, or not
-                entirely free.
-        """
-        for zone, start, part in self._split(offset, length):
-            self._zones[zone].take(start, part)
-
-    def _split(self, offset: int, length: int) -> list[tuple[int, int, int]]:
-        """Return ``(zone, offset, length)`` pieces of a range, by zone run."""
-        if length <= 0 or offset < 0 or offset + length > self.size:
-            raise ValueError(
-                f"range [{offset}, +{length}) outside allocator size {self.size}"
-            )
-        pieces = []
-        index = bisect.bisect_right(self._starts, offset) - 1
-        end = offset + length
-        while offset < end:
-            _start, run_end, zone = self._runs[index]
-            part_end = min(end, run_end)
-            pieces.append((zone, offset, part_end - offset))
-            offset = part_end
-            index += 1
-        return pieces
