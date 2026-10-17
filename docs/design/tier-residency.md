@@ -176,6 +176,16 @@ T 层副本存在且有效，且 io_pins_T == 0
   已 commit 的 chunk 时抛 `ChunkUnavailable`，不保留任何 pin。
 - L2 读且 L1 可接纳时，同一次读把字节放进新 L1 extent 再 H2D，L1 副本随之有效；
   不可接纳时经 staging pool 读。
+- 流式 load：`transfer_load` 先把 span 拆成逐 chunk 的段，校验字节数并算好
+  buffer offset，此时不 pin。没有在途 promotion 的 chunk
+  （`ServerCore.promotion_pending`）立即 pin，作为第一批发出（各层
+  `transfer.load` 加本批 promote-on-read）。之后每批只等一个仍在 promote 的
+  chunk，并带上届时已就绪的其余 chunk。这样已在 L1 的 chunk 与 readahead 的
+  SSD 读重叠，而不是全部等到最后一个 promotion 完成才开始拷贝。每批的 promote-on-read 在本批读完时就
+  `finish_promotion`，之后等待它们的 load 不必等整个请求结束。请求返回前等
+  所有批次结束，再统一 `release_load`；任一批失败时其余批仍跑完，返回第一个
+  错误。`daser_load_phase_seconds_total{phase="resolve"}` 记阻塞在规划（等
+  promotion）上的时间，`io` 记其余墙钟时间，即未被等待覆盖的拷贝时间。
 - readahead（两层都启用、lookup 带 `external_prefix_queries` 时）：lookup 命中
   后，server 对外部窗口中只有 L2 副本的 chunk 调用 `begin_promotions`，按
   `DASER_LOAD_READAHEAD`（每片字节，默认 1 GiB）切片、最多

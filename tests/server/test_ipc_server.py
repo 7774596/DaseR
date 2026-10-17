@@ -602,6 +602,80 @@ async def test_l2_read_promotes_the_chunk_into_l1(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_load_copies_ready_chunks_while_another_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An L1 chunk is copied before a sibling's in-flight promotion ends."""
+    fake = FakeTransfer()
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    core = make_core(64, 2)
+    server = make_ipc_server(tmp_path, core=core)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        b = await store_raw_chunk(socket_path, "b", pattern(1))
+        await evict_from_l1(socket_path, core, ["b"])
+        a = await store_raw_chunk(socket_path, "a", pattern(2))
+        assert L1 in core.full_tiers("a")
+        (promotion,) = await core.begin_promotions(["b"])
+        assert promotion is not None and core.promotion_pending("b")
+        loading = asyncio.ensure_future(
+            load(
+                socket_path,
+                [
+                    load_span(b["start_slot"]),
+                    load_span(a["start_slot"], target_offset=RECORD),
+                ],
+            )
+        )
+        for _ in range(200):
+            if fake.loads or loading.done():
+                break
+            await asyncio.sleep(0.01)
+        early = list(fake.loads)
+        still_waiting = not loading.done()
+        core.finish_promotion(promotion, True)
+        reply = await asyncio.wait_for(loading, 5)
+    finally:
+        await server.stop()
+    assert still_waiting
+    assert [
+        (source, [m.buffer_offset for m in moves]) for _b, moves, source in early
+    ] == [(L1, [RECORD])]
+    assert (reply["l1_segments"], reply["l2_segments"]) == (2, 0)
+    assert [m.buffer_offset for _b, moves, _s in fake.loads for m in moves] == [
+        RECORD,
+        0,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_span_with_wrong_nbytes_reads_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A span whose nbytes disagrees with its records fails before any IO."""
+    fake = FakeTransfer()
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _self: fake)
+    server = make_ipc_server(tmp_path)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        a = await store_raw_chunk(socket_path, "a", pattern(1))
+        b = await store_raw_chunk(socket_path, "b", pattern(2))
+        reply = await load(
+            socket_path,
+            [
+                load_span(a["start_slot"]),
+                {**load_span(b["start_slot"], target_offset=RECORD), "nbytes": 1},
+            ],
+        )
+    finally:
+        await server.stop()
+    assert "record bytes" in reply["error"]
+    assert fake.loads == []
+
+
+@pytest.mark.asyncio
 async def test_packed_store_publishes_record_modes(tmp_path: Path) -> None:
     """A packed chunk carries per-slot modes and stored lengths in lookups."""
     registry = MetricsRegistry()

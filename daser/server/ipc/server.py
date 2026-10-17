@@ -10,8 +10,9 @@ absolute ``Move`` offsets:
   ``store_staged`` / ``store_persisted`` (or ``store_failed``). The reply is
   sent once the worker buffer was consumed; a chunk without an L1 copy is
   replied after its L2 write, so the chunk is published by then.
-- ``transfer_load``: ``plan_load`` per span -> one ``TransferLayer.load`` per
-  source tier; whole L2-only chunks are promoted into L1 on the same read.
+- ``transfer_load``: ``plan_load`` per chunk -> one ``TransferLayer.load`` per
+  source tier and ready batch (a batch is cut before a chunk whose promotion
+  is in flight); whole L2-only chunks are promoted into L1 on the same read.
 - Lookup readahead promotes the external window's L2-only chunks in the
   background (bounded in flight).
 - Prefetch leases pin the L1 copies of a request's window; layer-wise runs
@@ -211,6 +212,25 @@ async def _outcome(futures: Sequence[asyncio.Future[Any]]) -> BaseException | No
     if cancelled is not None:
         raise cancelled
     return _first_error(futures)
+
+
+@dataclass(frozen=True)
+class _LoadPart:
+    """The slots one load span reads from one chunk.
+
+    Attributes:
+        chunk_key: Chunk read.
+        start_slot: First slot id read.
+        num_slots: Slots read.
+        target_offset: Destination buffer offset of the first record.
+        nbytes: Record bytes read on one rank.
+    """
+
+    chunk_key: str
+    start_slot: int
+    num_slots: int
+    target_offset: int
+    nbytes: int
 
 
 @dataclass(eq=False)
@@ -1038,7 +1058,9 @@ class IPCServer:
 
         Async/thread-safety:
             Runs on the IPC event loop. Whole L2-only chunks read here are
-            promoted into L1 by the same read (all ranks' lanes).
+            promoted into L1 by the same read (all ranks' lanes). Segments
+            are copied in batches, so ready chunks are not held back by a
+            later chunk's in-flight promotion.
         """
         started = time.perf_counter()
         payload = msg.get("payload", {})
@@ -1060,19 +1082,11 @@ class IPCServer:
                 "load_staging_buffer_index" not in payload
             )
         segments: list[LoadSegment] = []
-        promotions: list[Promotion] = []
-        ok = False
+        before = asdict(transfer.stats)
+        planning_started = time.perf_counter()
         try:
-            planned = await self._plan_spans(spans)
-            resolved = time.perf_counter()
-            segments = [segment for _target, segment in planned]
-            promotions = await self._promote_on_read(segments)
-            before = asdict(transfer.stats)
-            await self._run_load(transfer, buffer, planned, promotions, tp_rank)
-            ok = True
+            wait_s = await self._stream_load(transfer, buffer, spans, tp_rank, segments)
         finally:
-            for promotion in promotions:
-                self._core.finish_promotion(promotion, ok)
             self._core.release_load(segments)
             if one_shot:
                 buffer.close()
@@ -1080,11 +1094,12 @@ class IPCServer:
         after = asdict(transfer.stats)
         total = sum(segment.nbytes for segment in segments)
         l1_segments = sum(segment.tier == L1 for segment in segments)
+        io_s = finished - planning_started - wait_s
         self._record_load_metrics(
             l1_segments,
             len(segments) - l1_segments,
-            resolve_s=resolved - started,
-            io_s=finished - resolved,
+            resolve_s=planning_started - started + wait_s,
+            io_s=io_s,
         )
         self._record_transfer_metrics("load", total, finished - started)
         response: dict[str, Any] = {
@@ -1098,7 +1113,7 @@ class IPCServer:
             return response
         response["transfer_ms"] = (finished - started) * 1000
         response["transfer_open_ms"] = open_ms
-        response["transfer_load_ms"] = (finished - resolved) * 1000
+        response["transfer_load_ms"] = io_s * 1000
         response["transfer_stats_delta"] = {
             key: int(after[key]) - int(before[key]) for key in after
         }
@@ -1530,44 +1545,129 @@ class IPCServer:
     # Load helpers
     # ------------------------------------------------------------------
 
-    async def _plan_spans(
-        self, spans: list[dict[str, Any]]
-    ) -> list[tuple[int, LoadSegment]]:
-        """Resolve load spans to pinned segments with their buffer offsets.
+    async def _stream_load(
+        self,
+        transfer: TransferLayer,
+        buffer: Any,
+        spans: list[dict[str, Any]],
+        tp_rank: int,
+        segments: list[LoadSegment],
+    ) -> float:
+        """Plan load spans chunk by chunk and copy them in ready batches.
+
+        Every chunk without an in-flight promotion is pinned and copied in a
+        first batch; each later batch waits for one promoting chunk and takes
+        every deferred chunk ready by then, so copies overlap the waits.
+
+        Args:
+            transfer: Transfer layer.
+            buffer: Destination buffer.
+            spans: ``{target_offset, start_slot, num_slots, nbytes}`` spans.
+            tp_rank: Loading rank.
+            segments: Filled with every pinned segment, also on failure; the
+                caller releases them with ``ServerCore.release_load`` once
+                this returns.
+
+        Returns:
+            Seconds blocked planning (waiting for promotions).
+
+        Raises:
+            ValueError: If a span's ``nbytes`` differs from its records.
+            ChunkUnavailable: If a slot has no committed chunk.
+            BaseException: The first failure, after every batch ended.
+
+        Async/thread-safety:
+            Runs on the IPC event loop; batches run as tasks that never
+            outlive this call.
+        """
+        parts = self._load_parts(spans)
+        batches: list[asyncio.Future[None]] = []
+        wait_s = 0.0
+
+        async def plan(part: _LoadPart) -> tuple[int, LoadSegment]:
+            planned = await self._core.plan_load(part.start_slot, part.num_slots)
+            segments.extend(planned)
+            if len(planned) != 1 or planned[0].nbytes != part.nbytes:
+                raise ChunkUnavailable(f"chunk {part.chunk_key} changed meanwhile")
+            return part.target_offset, planned[0]
+
+        def flush(batch: list[tuple[int, LoadSegment]]) -> None:
+            if batch:
+                batches.append(
+                    asyncio.ensure_future(
+                        self._load_batch(transfer, buffer, batch, tp_rank)
+                    )
+                )
+
+        try:
+            deferred = [p for p in parts if self._core.promotion_pending(p.chunk_key)]
+            # No await between the checks and these pins (plan_load waits
+            # only on promotions), so the first batch never blocks.
+            flush(
+                [
+                    await plan(part)
+                    for part in parts
+                    if not self._core.promotion_pending(part.chunk_key)
+                ]
+            )
+            while deferred:
+                waited = time.perf_counter()
+                batch = [await plan(deferred.pop(0))]
+                wait_s += time.perf_counter() - waited
+                waiting = []
+                for part in deferred:
+                    if self._core.promotion_pending(part.chunk_key):
+                        waiting.append(part)
+                    else:
+                        batch.append(await plan(part))
+                deferred = waiting
+                flush(batch)
+        finally:
+            error = await _outcome(batches)
+        if error is not None:
+            raise error
+        return wait_s
+
+    def _load_parts(self, spans: list[dict[str, Any]]) -> list[_LoadPart]:
+        """Split load spans into per-chunk parts with their buffer offsets.
 
         Args:
             spans: ``{target_offset, start_slot, num_slots, nbytes}`` spans.
 
         Returns:
-            ``(buffer offset, segment)`` pairs in span order; release the
-            segments with ``ServerCore.release_load``.
+            Parts in span order; nothing is pinned.
 
         Raises:
-            ValueError: If a span's ``nbytes`` differs from its records.
+            ValueError: If a span is malformed or its ``nbytes`` differs from
+                its records.
             ChunkUnavailable: If a slot has no committed chunk.
         """
-        planned: list[tuple[int, LoadSegment]] = []
-        try:
-            for span in spans:
-                target = int(span["target_offset"])
-                segments = await self._core.plan_load(
-                    int(span["start_slot"]), int(span["num_slots"])
+        parts: list[_LoadPart] = []
+        for span in spans:
+            target = int(span["target_offset"])
+            start_slot = int(span["start_slot"])
+            num_slots = int(span["num_slots"])
+            if target < 0 or num_slots < 1:
+                raise ValueError(f"invalid load span at slot {start_slot}")
+            resolved = self._core.resolve_slots(start_slot, num_slots)
+            if resolved is None:
+                raise ChunkUnavailable(f"slot {start_slot} has no committed chunk")
+            slot = start_slot
+            nbytes = 0
+            for key, index, count in resolved:
+                records = self._core.chunk_records(key)
+                if records is None:
+                    raise ChunkUnavailable(f"chunk {key} has no tier copy")
+                size = sum(records.record_sizes[index : index + count])
+                parts.append(_LoadPart(key, slot, count, target + nbytes, size))
+                nbytes += size
+                slot += count
+            if nbytes != int(span["nbytes"]):
+                raise ValueError(
+                    f"load span at slot {start_slot} has {nbytes} "
+                    f"record bytes, not {span['nbytes']}"
                 )
-                planned.extend((target, segment) for segment in segments)
-                nbytes = 0
-                for index in range(len(planned) - len(segments), len(planned)):
-                    segment = planned[index][1]
-                    planned[index] = (target + nbytes, segment)
-                    nbytes += segment.nbytes
-                if nbytes != int(span["nbytes"]) or target < 0:
-                    raise ValueError(
-                        f"load span at slot {span['start_slot']} has {nbytes} "
-                        f"record bytes, not {span['nbytes']}"
-                    )
-        except BaseException:
-            self._core.release_load([segment for _target, segment in planned])
-            raise
-        return planned
+        return parts
 
     async def _promote_on_read(self, segments: list[LoadSegment]) -> list[Promotion]:
         """Admit the whole L2-only chunks of a load into L1.
@@ -1593,6 +1693,36 @@ class IPCServer:
             return []
         promotions = await self._core.begin_promotions(list(dict.fromkeys(keys)))
         return [promotion for promotion in promotions if promotion is not None]
+
+    async def _load_batch(
+        self,
+        transfer: TransferLayer,
+        buffer: Any,
+        planned: list[tuple[int, LoadSegment]],
+        tp_rank: int,
+    ) -> None:
+        """Copy one batch of pinned segments, promoting its whole L2 chunks.
+
+        Args:
+            transfer: Transfer layer.
+            buffer: Destination buffer.
+            planned: ``(buffer offset, segment)`` pairs.
+            tp_rank: Loading rank.
+
+        Raises:
+            BaseException: The first transfer failure, after every call
+                ended; the batch's promotions are finished either way.
+        """
+        promotions = await self._promote_on_read(
+            [segment for _target, segment in planned]
+        )
+        ok = False
+        try:
+            await self._run_load(transfer, buffer, planned, promotions, tp_rank)
+            ok = True
+        finally:
+            for promotion in promotions:
+                self._core.finish_promotion(promotion, ok)
 
     async def _run_load(
         self,

@@ -967,6 +967,26 @@ class ServerCore:
             record_modes=self._record_modes.get(chunk_key, ()),
         )
 
+    def promotion_pending(self, chunk_key: str) -> bool:
+        """Return whether a load of the chunk would wait for a promotion.
+
+        Args:
+            chunk_key: Chunk key.
+
+        Returns:
+            True while an L2 -> L1 read of the chunk is in flight.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop; takes no pin, so
+            the answer is a hint that may change at the next await.
+        """
+        chunk = self._tiers.chunk(chunk_key)
+        return (
+            chunk is not None
+            and chunk.l1 is not None
+            and (chunk.l1.promotion is not None)
+        )
+
     def full_tiers(self, chunk_key: str) -> tuple[str, ...]:
         """Return the tiers holding a copy of the chunk valid on every rank.
 
