@@ -1153,7 +1153,7 @@ async def test_load_runs_maps_slots_to_leased_l1_offsets(
             {
                 "op": "transfer_load_runs",
                 "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
-                "lease_id": "req",
+                "lease_ids": ["req"],
                 "tp_rank": 0,
                 "runs": runs_bytes(
                     [starts[1], starts[0]], [64, 0], [0, 512], [256, 512]
@@ -1175,13 +1175,58 @@ async def test_load_runs_maps_slots_to_leased_l1_offsets(
 
 
 @pytest.mark.asyncio
+async def test_load_runs_reads_records_of_several_leases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One run table may name slots of every lease of the step."""
+    server, core, fake, starts, _opened = await leased_chain_server(
+        tmp_path, monkeypatch
+    )
+    tokens = [50, 51, 52, 53]
+    other = (await alloc_and_store(core, first_rolling_key(tokens))).start_slot
+    try:
+        leased = await _send_recv(
+            sock(tmp_path),
+            {
+                "op": "lookup_prefetch",
+                "lease_id": "req-2",
+                "tokens": tokens + [99],
+                "model_id": "m",
+                "external_prefix_queries": 5,
+                "num_computed_tokens": 0,
+            },
+        )
+        assert leased["tier"] == "l1"
+        planned = await core.plan_load(other, 1)
+        lane = planned[0].lane_offset
+        core.release_load(planned)
+        reply = await _send_recv(
+            sock(tmp_path),
+            {
+                "op": "transfer_load_runs",
+                "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
+                "lease_ids": ["req", "req-2"],
+                "tp_rank": 0,
+                "runs": runs_bytes([starts[0], other], [0, 0], [0, 512], [512, 512]),
+            },
+        )
+    finally:
+        await server.stop()
+    assert reply["ok"] is True and reply["bytes"] == 1024
+    ((_buffer, offsets, _targets, _lengths),) = fake.runs
+    assert offsets[1] == core.tier_layout.absolute_offset(L1, 0, lane)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "bad",
     [
         {"payload": {}},
         {"runs": b""},
         {"runs": b"\0" * 24},
-        {"lease_id": "other"},
+        {"lease_ids": ["other"]},
+        {"lease_ids": []},
+        {"lease_ids": ["req", "other"]},
         {"slots": [999]},
         {"intra": [RECORD - 8]},
         {"intra": [-8]},
@@ -1199,7 +1244,7 @@ async def test_load_runs_rejects_malformed_requests(
     msg = {
         "op": "transfer_load_runs",
         "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
-        "lease_id": "req",
+        "lease_ids": ["req"],
         "tp_rank": 0,
         "runs": runs_bytes(slots, intra, [0], [16]),
         **bad,

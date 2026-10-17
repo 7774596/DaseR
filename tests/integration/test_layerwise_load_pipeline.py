@@ -89,6 +89,7 @@ class _FakeLoadClient:
     fail_on_call: int = -1
     calls: list[int] = []
     released: list[str] = []
+    leases: tuple[str, ...] = ("req",)
 
     def __init__(self, socket_path: str) -> None:
         del socket_path
@@ -110,12 +111,12 @@ class _FakeLoadClient:
         intra_offsets: Any,
         target_offsets: Any,
         nbytes: Any,
-        lease_id: str,
+        lease_ids: Any,
         tp_rank: int = 0,
     ) -> dict[str, Any]:
         """Copy runs into the staging buffer like the server's L1 path."""
         del producer_pid
-        assert lease_id == "req"
+        assert tuple(lease_ids) == type(self).leases
         assert tp_rank == 0
         calls = type(self).calls
         calls.append(buffer_index)
@@ -195,6 +196,7 @@ def _restore(
     _FakeLoadClient.fail_on_call = fail_on_call
     _FakeLoadClient.calls = []
     _FakeLoadClient.released = []
+    _FakeLoadClient.leases = ("req",)
     monkeypatch.setattr(load_module, "IPCClientAsync", _FakeLoadClient)
 
     actual = _kv_cache(geometry)
@@ -335,6 +337,8 @@ def test_raw_layerwise_restore_matches_slot_copy(
     _FakeLoadClient.fail_on_call = -1
     _FakeLoadClient.calls = []
     _FakeLoadClient.released = []
+    # Two requests scheduled in one step, each with its own lease.
+    _FakeLoadClient.leases = ("req-a", "req-b")
     monkeypatch.setattr(load_module, "IPCClientAsync", _FakeLoadClient)
 
     actual = _kv_cache(geometry)
@@ -354,21 +358,21 @@ def test_raw_layerwise_restore_matches_slot_copy(
     )
     pipeline.initialize_transfer()
     specs = {
-        "req:load:0": ReqLoadSpec(
+        "req-a:load:0": ReqLoadSpec(
             chunk_key="a",
             start_slot=0,
             num_slots=2,
             block_ids=blocks[:2],
             token_count=2 * geometry.block_tokens,
-            lease_id="req",
+            lease_id="req-a",
         ),
-        "req:load:1": ReqLoadSpec(
+        "req-b:load:0": ReqLoadSpec(
             chunk_key="b",
             start_slot=2,
             num_slots=1,
             block_ids=blocks[2:],
             token_count=geometry.block_tokens,
-            lease_id="req",
+            lease_id="req-b",
         ),
     }
     bits = actual.view(torch.int16)
@@ -386,6 +390,6 @@ def test_raw_layerwise_restore_matches_slot_copy(
         # No header read: one transfer per layer on alternating lanes.
         lanes = [layer % 2 for layer in range(_LAYERS)]
         assert _FakeLoadClient.calls == lanes
-        assert _FakeLoadClient.released == ["req"]
+        assert _FakeLoadClient.released == ["req-a", "req-b"]
     finally:
         pipeline.shutdown()

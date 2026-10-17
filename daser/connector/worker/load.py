@@ -192,21 +192,21 @@ def _load_source_descriptor(
 
 def _layerwise_records(
     specs: dict[str, ReqLoadSpec],
-) -> tuple[np.ndarray, list[int], str, bool]:
+) -> tuple[np.ndarray, list[int], tuple[str, ...], bool]:
     """Flatten one step's layer-wise loads into packed or raw records.
 
     Args:
         specs: Synchronously scheduled load specs of this step.
 
     Returns:
-        Record slot ids, matching destination blocks, the single request
-        lease that pins every record in L1, and whether the records are
-        packed (otherwise every record is a raw slot-major slot).
+        Record slot ids, matching destination blocks, the sorted request
+        leases that together pin every record in L1, and whether the records
+        are packed (otherwise every record is a raw slot-major slot).
 
     Raises:
         ValueError: If a spec mixes packed and raw records, carries a raw
             fallback slot, a position offset, or no lease, the step mixes
-            leases or formats, or two records target one block.
+            formats, or two records target one block.
 
     Async/thread-safety:
         Pure planning on the load thread.
@@ -215,8 +215,8 @@ def _layerwise_records(
     block_ids: list[int] = []
     formats: set[bool] = set()
     leases = {spec.lease_id for spec in specs.values()}
-    if len(leases) != 1 or "" in leases:
-        raise ValueError(f"layer-wise load needs one request lease, got {leases}")
+    if not leases or "" in leases:
+        raise ValueError("layer-wise load needs a lease for every request")
     for spec in specs.values():
         packed = bool(spec.compressed_slots)
         formats.add(packed)
@@ -240,7 +240,7 @@ def _layerwise_records(
     return (
         np.asarray(slots, dtype=np.int64),
         block_ids,
-        leases.pop(),
+        tuple(sorted(leases)),
         formats.pop(),
     )
 
@@ -1459,7 +1459,7 @@ class LoadPipeline:
         tasks: list[asyncio.Task[dict[str, Any]]] = []
         stream: torch.cuda.Stream | None = None
         try:
-            slots, block_ids, lease_id, packed = _layerwise_records(specs)
+            slots, block_ids, lease_ids, packed = _layerwise_records(specs)
             self._ensure_cuda_streams()
             pool = self._staging_pool
             if pool is None:
@@ -1479,7 +1479,7 @@ class LoadPipeline:
 
             if packed:
                 stream, plan_group, restore_group = await self._packed_layer_groups(
-                    state, slots, block_ids, lease_id, buffers, carve
+                    state, slots, block_ids, lease_ids, buffers, carve
                 )
             else:
                 stream, plan_group, restore_group = self._raw_layer_groups(
@@ -1502,7 +1502,7 @@ class LoadPipeline:
                         intra,
                         targets,
                         sizes,
-                        lease_id,
+                        lease_ids,
                         tp_rank=self._tp_rank,
                     )
                 finally:
@@ -1570,7 +1570,7 @@ class LoadPipeline:
         state: _LayerwiseLoad,
         slots: np.ndarray,
         block_ids: list[int],
-        lease_id: str,
+        lease_ids: tuple[str, ...],
         buffers: list[torch.Tensor],
         carve: Callable[[int], list[torch.Tensor]],
     ) -> tuple[
@@ -1587,7 +1587,7 @@ class LoadPipeline:
             state: Shared step state.
             slots: Slot id of every record.
             block_ids: Destination block of every record.
-            lease_id: Request lease pinning the records in L1.
+            lease_ids: Request leases pinning the records in L1.
             buffers: The two staging lanes.
             carve: Returns a view of the given bytes at the head of each
                 staging buffer (one lane each).
@@ -1621,7 +1621,7 @@ class LoadPipeline:
             np.zeros(records, dtype=np.int64),
             tail + np.arange(records, dtype=np.int64) * record_header,
             np.full(records, record_header, dtype=np.int64),
-            lease_id,
+            lease_ids,
             tp_rank=self._tp_rank,
         )
         host = self._header_host

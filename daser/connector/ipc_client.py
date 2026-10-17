@@ -3,6 +3,7 @@
 # Standard
 import array
 import asyncio
+from collections.abc import Sequence
 import contextlib
 from dataclasses import dataclass
 import socket
@@ -779,7 +780,7 @@ class IPCClientAsync(_IPCClientBase):
         intra_offsets: Any,
         target_offsets: Any,
         nbytes: Any,
-        lease_id: str,
+        lease_ids: Sequence[str],
         tp_rank: int = 0,
     ) -> dict[str, Any]:
         """Copy runs of leased L1 records into a registered CUDA staging buffer.
@@ -791,8 +792,8 @@ class IPCClientAsync(_IPCClientBase):
             intra_offsets: Byte offset of each run inside its record.
             target_offsets: Destination offsets inside the staging buffer.
             nbytes: Run lengths.
-            lease_id: Request lease from ``lookup_prefetch`` pinning every
-                named slot in L1.
+            lease_ids: Request leases from ``lookup_prefetch``; together
+                they pin every named slot in L1.
             tp_rank: tensor-parallel rank whose lane is read.
 
         Returns:
@@ -820,7 +821,7 @@ class IPCClientAsync(_IPCClientBase):
                     "load_staging_buffer_index": int(buffer_index),
                     "producer_pid": int(producer_pid),
                 },
-                "lease_id": lease_id,
+                "lease_ids": [str(lease_id) for lease_id in lease_ids],
                 "tp_rank": int(tp_rank),
                 "runs": runs.tobytes(),
             }

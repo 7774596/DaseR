@@ -255,7 +255,7 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 | `release_chunk_writer` | scheduler | `chunk_key`, `start_slot`, `num_slots` | `released` |
 | `transfer_store` | worker | `payload`, `spans`, `tp_rank`, `tp_size` | `ok`, `bytes`, `chunk_keys` |
 | `transfer_load` | worker | `payload`, `spans`, `tp_rank` | `ok`, `bytes`, `l1_segments`, `l2_segments` |
-| `transfer_load_runs` | worker | `payload`, `lease_id`, `tp_rank`, `runs` | `ok`, `bytes`, `transfer_ms` |
+| `transfer_load_runs` | worker | `payload`, `lease_ids`, `tp_rank`, `runs` | `ok`, `bytes`, `transfer_ms` |
 | `register_load_staging` / `register_store_staging` | worker init | `payload`（CUDA IPC handle、`buffer_index`、`producer_pid`） | `ok` |
 | `transfer_drain` / `init_transfer` | worker / bench | - | `ok` |
 | `evict_chunk` | scheduler | `chunk_key` | `ok` |

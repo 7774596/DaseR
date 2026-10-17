@@ -229,7 +229,7 @@ T 层副本存在且有效，且 io_pins_T == 0
 | load 请求 | `payload`、`spans`、`tp_rank` |
 | load span | `{target_offset, start_slot, num_slots, nbytes}`；server 校验 `nbytes` 等于所覆盖 record 之和 |
 | load 回复 | `{ok, bytes, l1_segments, l2_segments}`，外加 `data`（`return_data`）或耗时与 `transfer_stats_delta` |
-| `transfer_load_runs` | `payload`（已注册 load staging）、`lease_id`、`tp_rank`、`runs`：`(4, n)` int64 表 `(start_slots, intra_offsets, targets, lengths)` 的字节；`intra_offsets` 相对所指 slot 起点，run 不能越出该 record，slot 必须在 lease 内；回复 `{ok, bytes, transfer_ms}` |
+| `transfer_load_runs` | `payload`（已注册 load staging）、`lease_ids`（本 step 每个请求一个）、`tp_rank`、`runs`：`(4, n)` int64 表 `(start_slots, intra_offsets, targets, lengths)` 的字节；`intra_offsets` 相对所指 slot 起点，run 不能越出该 record，slot 必须在某个 lease 内；回复 `{ok, bytes, transfer_ms}` |
 | runtime config | 删除 `rank_stride_bytes`、`total_slots`、`l2_budget_bytes`、`total_store_bytes`、`bip_enabled`；新增 `tier_grain`、`l1_enabled`、`l2_enabled`、`l1_lane_bytes`、`l2_lane_bytes`、`staging_bytes` |
 
 store 回复时机：本请求所有 chunk 都有 L1 extent 时在 staging 完成后回复，L2

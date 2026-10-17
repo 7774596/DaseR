@@ -492,7 +492,7 @@ async def test_async_client_packs_leased_runs_as_one_table(
         intra_offsets=[0, 64],
         target_offsets=[0, 32],
         nbytes=[16, 32],
-        lease_id="request-runs",
+        lease_ids=["request-runs"],
         tp_rank=1,
     )
 
@@ -501,7 +501,7 @@ async def test_async_client_packs_leased_runs_as_one_table(
         {
             "op": "transfer_load_runs",
             "payload": {"load_staging_buffer_index": 1, "producer_pid": 43},
-            "lease_id": "request-runs",
+            "lease_ids": ["request-runs"],
             "tp_rank": 1,
             "runs": array.array("q", [3, 7, 0, 64, 0, 32, 16, 32]).tobytes(),
         }

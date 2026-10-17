@@ -214,6 +214,33 @@ async def _outcome(futures: Sequence[asyncio.Future[Any]]) -> BaseException | No
     return _first_error(futures)
 
 
+def _lease_tables(
+    states: Sequence["_LeaseState"],
+) -> tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+    """Merge ready leases' slot tables into one sorted lookup table.
+
+    Args:
+        states: Leases whose ``_lease_ready`` task completed.
+
+    Returns:
+        ``(slot ids, L1 lane offsets, record sizes)`` sorted by slot id. A
+        slot pinned by several leases (a shared prefix chunk) maps to the
+        same L1 record, so the first entry is kept.
+    """
+    tables = []
+    for state in states:
+        assert state.slot_ids is not None and state.lane_offsets is not None
+        assert state.record_sizes is not None
+        tables.append((state.slot_ids, state.lane_offsets, state.record_sizes))
+    if len(tables) == 1:
+        return tables[0]
+    slots, lanes, sizes = (
+        numpy.concatenate(column) for column in zip(*tables, strict=True)
+    )
+    slot_ids, first = numpy.unique(slots, return_index=True)
+    return slot_ids, lanes[first], sizes[first]
+
+
 @dataclass(frozen=True)
 class _LoadPart:
     """The slots one load span reads from one chunk.
@@ -1123,21 +1150,23 @@ class IPCServer:
         """Copy byte runs of a lease's L1 records into a registered buffer.
 
         Layer-wise delivery copies one plane group of every record of a
-        request per call. ``runs`` packs ``(start_slots, intra_offsets,
+        step's requests per call. ``runs`` packs ``(start_slots, intra_offsets,
         targets, lengths)`` as one ``(4, n)`` int64 array: each run reads
         ``lengths[i]`` bytes at ``intra_offsets[i]`` inside the record of slot
         ``start_slots[i]``.
 
         Args:
             msg: IPC request with ``payload`` (registered staging buffer),
-                ``lease_id``, ``tp_rank`` and ``runs`` bytes.
+                ``lease_ids`` (one per request of the step), ``tp_rank`` and
+                ``runs`` bytes.
 
         Returns:
             ``{"ok", "bytes", "transfer_ms"}`` once the copies completed on
             the device.
 
         Raises:
-            ValueError: If the run table is malformed, a slot is not leased
+            ValueError: If the run table is malformed, a lease is not active,
+                a slot is in none of the leases
                 or a run leaves its record.
             ChunkUnavailable: If the lease could not bring a chunk into L1.
 
@@ -1147,7 +1176,7 @@ class IPCServer:
             until ``release_transfer_lease``.
         """
         started = time.perf_counter()
-        lease_id = str(msg.get("lease_id", ""))
+        lease_ids = [str(lease_id) for lease_id in msg.get("lease_ids", [])]
         packed = msg.get("runs")
         payload = msg.get("payload", {})
         tp_rank = int(msg.get("tp_rank", 0))
@@ -1155,28 +1184,32 @@ class IPCServer:
             raise ValueError("transfer_load_runs requires a registered buffer")
         if not isinstance(packed, bytes) or not packed or len(packed) % 32:
             raise ValueError("transfer_load_runs runs must be (4, n) int64 bytes")
-        state = self._leases.get(lease_id)
-        if state is None:
-            raise ValueError(f"transfer lease {lease_id!r} is not active")
-        await asyncio.shield(self._lease_ready(state))
+        if not lease_ids:
+            raise ValueError("transfer_load_runs requires lease_ids")
+        states = []
+        for lease_id in lease_ids:
+            state = self._leases.get(lease_id)
+            if state is None:
+                raise ValueError(f"transfer lease {lease_id!r} is not active")
+            states.append(state)
+        await asyncio.shield(
+            asyncio.gather(*(self._lease_ready(state) for state in states))
+        )
+        slot_ids, lane_offsets, record_sizes = _lease_tables(states)
         slots, intra, targets, lengths = numpy.frombuffer(
             packed, dtype=numpy.int64
         ).reshape(4, -1)
-        assert state.slot_ids is not None and state.lane_offsets is not None
-        assert state.record_sizes is not None
-        index = numpy.searchsorted(state.slot_ids, slots)
-        if int(index.max()) >= len(state.slot_ids) or not numpy.array_equal(
-            state.slot_ids[index], slots
+        index = numpy.searchsorted(slot_ids, slots)
+        if int(index.max()) >= len(slot_ids) or not numpy.array_equal(
+            slot_ids[index], slots
         ):
-            raise ValueError("transfer_load_runs names a slot outside its lease")
+            raise ValueError("transfer_load_runs names a slot outside its leases")
         if int(intra.min()) < 0 or bool(
-            numpy.any(intra + lengths > state.record_sizes[index])
+            numpy.any(intra + lengths > record_sizes[index])
         ):
             raise ValueError("transfer_load_runs run leaves its record")
         offsets = (
-            self._layout.absolute_offset(L1, tp_rank, 0)
-            + state.lane_offsets[index]
-            + intra
+            self._layout.absolute_offset(L1, tp_rank, 0) + lane_offsets[index] + intra
         )
         await self._ensure_transfer().load_runs(
             self._payload_buffer(payload), offsets, targets, lengths

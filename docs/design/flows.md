@@ -248,7 +248,9 @@ chunk 选层；整 chunk 的 L2 读在 L1 可接纳时同一次读 promote 进 L
 load 结束后由 `release_transfer_lease` 释放。prefix lookup 返回的 run 可能合并
 多个相邻 chunk，server 按 chunk（`resolve_slots`）取 lease 和 promote。
 `layerwise_load`（默认关）只作用于 L1 副本已被 prefetch lease 固定的命中：`start_load_kv` 启动按层
-恢复，`wait_for_layer_load(layer_name)` 让该层 attention 只等自己那一层。vLLM 只在
+恢复，`wait_for_layer_load(layer_name)` 让该层 attention 只等自己那一层。一个 step
+里可能有多个 layerwise 请求，每个请求各带自己的 lease。每层只发一次
+`transfer_load_runs`，带上这些请求的全部 `lease_ids`。vLLM 只在
 uniform decode batch 上 replay FULL CUDA graph（会跳过逐层 hook），所以 forward
 context 为 FULL 或没有 attention metadata 时，`start_load_kv` 在返回前等完全部层。
 

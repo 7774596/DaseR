@@ -210,7 +210,7 @@ IPC server 面向 vLLM `DaserConnector`：
 | `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `pos_offset` |
 | `transfer_store` | `payload`, `spans`, `tp_rank`, `tp_size` | `ok`, `bytes`, `chunk_keys` |
 | `transfer_load` | `payload`, `spans`, `tp_rank` | `ok`, `bytes`, `l1_segments`, `l2_segments` |
-| `transfer_load_runs` | `payload`, `lease_id`, `tp_rank`, `runs` | `ok`, `bytes` |
+| `transfer_load_runs` | `payload`, `lease_ids`, `tp_rank`, `runs` | `ok`, `bytes` |
 | `evict_chunk` | `chunk_key` | `ok` |
 
 完整 op 列表见 [components.md](components.md)，span 与 run 字段见
