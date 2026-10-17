@@ -1368,7 +1368,7 @@ def test_chained_replay_splices_the_parent_output_into_the_child(
 def test_queue_hints_cover_the_client_queue_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A request is hinted when it starts waiting and released when admitted."""
+    """A request is hinted when it starts waiting and released when it ends."""
     events: list[tuple[str, str]] = []
 
     class Hints:
@@ -1413,14 +1413,13 @@ def test_queue_hints_cover_the_client_queue_wait(
             queue_hint_url="http://daser",
         )
     )
-    # Queued requests stay hinted while the slot is busy and are released
-    # just before their own send.
-    assert events.index(("hint", "trace-2")) < events.index(("release", "trace-1"))
+    # Queued requests are hinted while the slot is busy; each stays hinted
+    # through its own run.
+    assert events.index(("hint", "trace-2")) < events.index(("release", "trace-0"))
     for i in range(3):
         rid = f"trace-{i}"
-        hinted = events.index(("hint", rid))
-        released = events.index(("release", rid))
-        assert hinted < released < events.index(("send", rid))
+        sent = events.index(("send", rid))
+        assert events.index(("hint", rid)) < sent < events.index(("release", rid))
     assert events[-1] == ("close", "")
     records = {r["trace_index"]: r for r in map(json.loads, output.open())}
     assert records[2]["queue_hint_error"] == "HTTPError: down"

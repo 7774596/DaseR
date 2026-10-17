@@ -501,7 +501,7 @@ class ServerCore:
         ).inc(hits)
 
     def queue_hint(self, request_id: str, tokens: TokenSequence) -> int:
-        """Keep a gateway-queued request's prefix resident until it is admitted.
+        """Keep a gateway-queued request's prefix resident until it finishes.
 
         Hints are ordered by arrival (FIFO admission); see "排队提示" in
         ``docs/design/tier-residency.md``. Re-hinting an id replaces it.
@@ -522,7 +522,7 @@ class ServerCore:
         return len(keys)
 
     def queue_release(self, request_id: str) -> None:
-        """Drop a queue hint once its request is admitted (or abandoned).
+        """Drop a queue hint once its request finishes (or is abandoned).
 
         Args:
             request_id: Id given to ``queue_hint``; unknown ids are ignored.

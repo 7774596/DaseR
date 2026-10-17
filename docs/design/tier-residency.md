@@ -148,7 +148,10 @@ T 层副本存在且有效，且 io_pins_T == 0
 淘汰最快要用的前缀（循环访问），gateway 的队列却已经给出了接下来的访问顺序。
 
 - gateway 在请求入队时 `PUT /queue_hint/{request_id}`（body 为 prompt token
-  的本机字节序 int32，与 IPC 线格式相同），放行给 vLLM 时 `DELETE /queue_hint/{request_id}`。
+  的本机字节序 int32，与 IPC 线格式相同），请求结束时 `DELETE /queue_hint/{request_id}`。
+  提示必须保留到请求结束：放行即释放时，在跑请求的 chunk 变成未提示的 MRU，排在所有
+  排队提示之下，lookup 与 load 之间被淘汰，load 失败（R227 实测 `slot has no
+  committed chunk`）。在跑请求最早到达，seq 最小，因此最晚淘汰。
   server 用 `RetrievalIndex.chain_keys` 把 token 换成前缀链 key，调用
   `EvictionTree.want(request_id, keys)`，树按到达顺序给每个提示一个递增 `seq`；
   释放时 `unwant(request_id)`。
@@ -159,11 +162,10 @@ T 层副本存在且有效，且 io_pins_T == 0
   块晚淘汰；被提示的块之间，`seq` 最大的（离放行最远）先淘汰，即队列视野内的
   Belady。孤儿不可达，提示也救不了，仍最先淘汰。
 - `want` 只抬高优先级，沿用惰性堆（出堆时纠正）。`unwant` 先按前缀顺序给不再被
-  任何请求提示的 key 一个新 tick（释放即放行，随后的 lookup 会刷新同一条链），
-  再立即重新入堆（优先级降低）。
+  任何请求提示的 key 一个新 tick（请求刚用过），再立即重新入堆（优先级降低）。
 - 叶子优先不变：同一请求的链上祖先与后代 seq 相同，候选谓词仍只允许叶子或有另一层
   副本的节点被淘汰。
-- 开销：每个排队请求 O(prompt 块数) 的 key，入队和放行各一次 O(块数)；不进 vLLM
+- 开销：每个排队或在跑请求 O(prompt 块数) 的 key，入队和结束各一次 O(块数)；不进 vLLM
   调度路径。HTTP 与 IPC 共用 server 事件循环，hash 一个 100k token 的 prompt 约
   毫秒级。
 - 指标：`daser_queue_hints_total` / `daser_queue_hint_keys_total`（收到的提示数与

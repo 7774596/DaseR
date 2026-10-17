@@ -456,7 +456,7 @@ class TierIndex:
         return self._tree.is_leaf(key)
 
     def want(self, hint_id: str, keys: list[str]) -> None:
-        """Keep a queued request's prefix chunks resident until it is admitted.
+        """Keep a queued request's prefix chunks resident until it finishes.
 
         See ``EvictionTree.want``; hinted chunks are evicted after every
         unhinted one, latest hint first.

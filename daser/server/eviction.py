@@ -55,10 +55,11 @@ class EvictionTree:
     marking) re-queue at once. Superseded entries are compacted away, so a
     tier holds at most about two entries per node.
 
-    Queue hints (``want``/``unwant``) name keys a queued request will look up
-    once admitted. A hinted reachable node sorts after every unhinted one;
-    among hinted nodes the one whose earliest hint came last goes first, so
-    the tier keeps what the queue needs soonest. Hints are kept per key, so
+    Queue hints (``want``/``unwant``) name keys a queued or running request
+    looks up, from the time it is queued until it finishes. A hinted
+    reachable node sorts after every unhinted one; among hinted nodes the one
+    whose earliest hint came last goes first, so the tier keeps what the
+    queue needs soonest. Hints are kept per key, so
     a chunk added while hinted inherits its hint.
 
     Args:
@@ -248,11 +249,11 @@ class EvictionTree:
             self._wanted.setdefault(key, set()).add(seq)
 
     def unwant(self, hint_id: str) -> None:
-        """Drop a queue hint once its request is admitted (or abandoned).
+        """Drop a queue hint once its request finishes (or is abandoned).
 
         Keys no longer hinted by anyone get fresh ticks in prefix order (the
-        admitted request is about to use them) and are re-queued at their
-        lower priority at once.
+        request just used them) and are re-queued at their lower priority at
+        once.
 
         Args:
             hint_id: Id given to ``want``; unknown ids are ignored.

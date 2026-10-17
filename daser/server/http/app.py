@@ -652,7 +652,7 @@ def build_http_app(
 
     @app.delete("/queue_hint/{request_id}")
     async def queue_release_endpoint(request_id: str) -> dict[str, bool]:
-        """Drop a request's queue hint once the gateway admits it."""
+        """Drop a request's queue hint once it finishes."""
         core.queue_release(request_id)
         return {"ok": True}
 

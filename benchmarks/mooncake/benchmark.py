@@ -1088,7 +1088,7 @@ async def replay(
             ``session_population``.
         queue_hint_url: DaseR HTTP URL to send queue hints to: a request's
             prompt is hinted when it starts waiting for an in-flight slot and
-            released when admitted. Records carry ``queue_hint_error`` when a
+            released when it finishes. Records carry ``queue_hint_error`` when a
             hint call failed. ``None`` sends no hints.
 
     Returns:
@@ -1718,7 +1718,8 @@ class _QueueHints:
     """Tell a DaseR server which requests wait in the client queue.
 
     ``hint`` is sent when a request starts waiting for an in-flight slot and
-    ``release`` when it is admitted, so the server can keep queued prefixes
+    ``release`` when it finishes, so the server can keep queued and running
+    prefixes
     resident (see "排队提示" in ``docs/design/tier-residency.md``). Failures
     are reported, never raised: a lost hint only falls back to plain LRU.
 
@@ -2130,9 +2131,10 @@ async def _run_request_after_dependency(
         if admit_after is not None:
             await admit_after.wait()
         await outer_sem.acquire()
-    finally:
-        if hints is not None and (error := await hints.release(hint_id)):
-            hint_errors.append(error)
+    except BaseException:
+        if hints is not None:
+            await hints.release(hint_id)
+        raise
     try:
         admitted_at = time.perf_counter()
         if admitted is not None:
@@ -2213,6 +2215,10 @@ async def _run_request_after_dependency(
             )
     finally:
         outer_sem.release()
+        # Held until the request ends: its chunks must outrank queued ones
+        # between the scheduler's lookup and the load.
+        if hints is not None and (error := await hints.release(hint_id)):
+            hint_errors.append(error)
     prompt_builder.record(request, prompt, result.generated_token_ids)
     record = _result_record(
         request=request,
