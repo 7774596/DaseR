@@ -449,6 +449,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prewarm-max-waiting", type=int, default=None)
     parser.add_argument("--session-population", type=int, default=0)
     parser.add_argument("--session-ramp-s", type=float, default=0.0)
+    parser.add_argument("--session-rate", type=float, default=0.0)
     parser.add_argument("--gpu-kv-size", type=parse_size_bytes, default="24gib")
     parser.add_argument(
         "--gpu-util",
@@ -860,6 +861,11 @@ async def run_arm(
                     *(
                         ["--session-ramp-s", str(args.session_ramp_s)]
                         if args.session_ramp_s
+                        else []
+                    ),
+                    *(
+                        ["--session-rate", str(args.session_rate)]
+                        if args.session_rate
                         else []
                     ),
                     "--served-model-name",

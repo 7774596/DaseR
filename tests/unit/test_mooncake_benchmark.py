@@ -730,6 +730,7 @@ def _population_replay(
     monkeypatch: pytest.MonkeyPatch,
     population: int,
     ramp_s: float = 0.0,
+    rate: float = 0.0,
 ) -> list[tuple[int, str, float]]:
     """Replay three two-turn sessions that all start at t=0; log send/finish."""
     events: list[tuple[int, str, float]] = []
@@ -767,6 +768,7 @@ def _population_replay(
             prefix_dependencies=True,
             session_population=population,
             session_ramp_s=ramp_s,
+            session_rate=rate,
         )
     )
     return events
@@ -1246,6 +1248,46 @@ def test_session_ramp_staggers_the_first_population_starts(
     # instead of all landing within the 10 ms the unramped replay allows.
     assert starts[2] - starts[0] > 0.05
     assert starts[2] - starts[0] < 3.0
+
+
+def test_session_rate_starts_sessions_at_poisson_arrivals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Open arrivals space session starts by exponential gaps, not by slots.
+
+    All three sessions share timestamp 0; with rate 10/s the starts spread
+    by seeded gaps of mean 0.1 s, a session may start while others are still
+    running, and turns inside a session keep their dependency.
+    """
+    events = _population_replay(tmp_path, monkeypatch, population=0, rate=10.0)
+    at = {(i, kind): t for i, kind, t in events}
+
+    starts = [at[(2 * sid, "send")] for sid in range(3)]
+    assert starts == sorted(starts)
+    assert starts[2] - starts[0] > 0.02
+    assert starts[2] - starts[0] < 3.0
+    for sid in range(3):
+        assert at[(2 * sid + 1, "send")] >= at[(2 * sid, "done")]
+
+
+def test_session_rate_and_population_are_exclusive(tmp_path: Path) -> None:
+    """A run is either a closed population or an open arrival process."""
+    with pytest.raises(ValueError, match="exclusive"):
+        asyncio.run(
+            replay(
+                selection=select_requests([], max_model_len=100_000),
+                prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+                server_url="http://a",
+                served_model_name="m",
+                output_path=tmp_path / "x.jsonl",
+                max_inflight=1,
+                timeout_seconds=1.0,
+                time_scale=1.0,
+                seed=0,
+                session_population=2,
+                session_rate=1.0,
+            )
+        )
 
 
 def test_chain_parent_is_the_latest_turn_the_request_extends() -> None:

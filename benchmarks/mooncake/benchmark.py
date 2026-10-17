@@ -999,6 +999,7 @@ async def replay(
     prewarm_max_waiting: int | None = None,
     session_population: int = 0,
     session_ramp_s: float = 0.0,
+    session_rate: float = 0.0,
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -1078,6 +1079,12 @@ async def replay(
             together, so the population reaches steady state without a
             synchronized cold-start burst. Later sessions still start when a
             slot frees.
+        session_rate: When positive, run an open session arrival process:
+            sessions start in trace order at seeded Poisson arrivals of this
+            many sessions per second, regardless of how many are active, and
+            their trace timestamps are ignored. Requests inside a session keep
+            their prefix dependencies and gaps. Exclusive with
+            ``session_population``.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -1103,6 +1110,10 @@ async def replay(
         raise ValueError("session_population must be non-negative")
     if session_ramp_s < 0:
         raise ValueError("session_ramp_s must be non-negative")
+    if not math.isfinite(session_rate) or session_rate < 0:
+        raise ValueError("session_rate must be finite and non-negative")
+    if session_rate and session_population:
+        raise ValueError("session_rate and session_population are exclusive")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
     if chain_outputs and strict_order:
@@ -1151,7 +1162,7 @@ async def replay(
                 for request, parent in zip(selection.eligible, chain, strict=True)
             },
         )
-    gates = _session_gates(selection.eligible, session_population)
+    gates = _session_gates(selection.eligible, bool(session_population or session_rate))
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds)
     limits = httpx.Limits(
@@ -1197,7 +1208,9 @@ async def replay(
             ]
             population = (
                 asyncio.create_task(
-                    _admit_sessions(
+                    _arrive_sessions(list(gates.values()), session_rate)
+                    if session_rate
+                    else _admit_sessions(
                         list(gates.values()), session_population, session_ramp_s
                     )
                 )
@@ -1318,6 +1331,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Spread the first --session-population session starts as a "
         "Poisson process over about this many seconds (0 starts them together).",
+    )
+    parser.add_argument(
+        "--session-rate",
+        type=float,
+        default=0.0,
+        help="Open loop: start sessions in trace order as a Poisson process of "
+        "this many sessions per second, ignoring trace timestamps (exclusive "
+        "with --session-population; 0 disables).",
     )
     parser.add_argument(
         "--prewarm-max-waiting",
@@ -1494,6 +1515,7 @@ async def main_async(args: argparse.Namespace) -> int:
         prewarm_max_waiting=args.prewarm_max_waiting,
         session_population=args.session_population,
         session_ramp_s=args.session_ramp_s,
+        session_rate=args.session_rate,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1700,20 +1722,21 @@ class _SessionGate:
 
 
 def _session_gates(
-    requests: Sequence[TraceRequest], population: int
+    requests: Sequence[TraceRequest], enabled: bool
 ) -> dict[int | None, _SessionGate]:
-    """Build per-session gates in first-request order for a closed population.
+    """Build per-session gates in first-request order.
 
     Args:
         requests: Eligible requests in replay order.
-        population: Maximum concurrently active sessions; zero disables.
+        enabled: Whether session starts are gated (closed population or
+            open session arrivals).
 
     Returns:
         A gate per session keyed by ``session_id`` in the order sessions first
-        appear, each counting the session's requests; empty when
-        ``population`` is zero.
+        appear, each counting the session's requests; empty when not
+        ``enabled``.
     """
-    if not population:
+    if not enabled:
         return {}
     gates: dict[int | None, _SessionGate] = {}
     for request in requests:
@@ -1751,6 +1774,19 @@ async def _admit_sessions(
     finally:
         for holder in holders:
             holder.cancel()
+
+
+async def _arrive_sessions(gates: list[_SessionGate], rate: float) -> None:
+    """Open session gates in order at seeded Poisson arrivals.
+
+    The first gate opens at once; each later one after an exponential gap of
+    mean ``1 / rate`` seconds, independent of how many sessions are active.
+    """
+    rng = random.Random(0)
+    for index, gate in enumerate(gates):
+        if index:
+            await asyncio.sleep(rng.expovariate(rate))
+        gate.opened.set()
 
 
 async def _prewarm_prefix(
