@@ -149,9 +149,9 @@ T 层副本存在且有效，且 io_pins_T == 0
 
 - gateway 在请求入队时 `PUT /queue_hint/{request_id}`（body 为 prompt token
   的本机字节序 int32，与 IPC 线格式相同），放行给 vLLM 时 `DELETE /queue_hint/{request_id}`。
-  server 用 `RetrievalIndex.chain_keys` 把 token 换成前缀链 key，按到达顺序给每个
-  请求一个递增 `seq`，调用 `EvictionTree.want(request_id, seq, keys)`；释放时
-  `unwant(request_id)`。
+  server 用 `RetrievalIndex.chain_keys` 把 token 换成前缀链 key，调用
+  `EvictionTree.want(request_id, keys)`，树按到达顺序给每个提示一个递增 `seq`；
+  释放时 `unwant(request_id)`。
 - 提示按 key 记录（key → 想要它的 seq 集合），不要求 key 已存在：提示期间才 commit
   的 chunk 加入树时直接继承提示。
 - 优先级：孤儿 < 未提示（按 tick）< 被提示。被提示节点的优先级为
