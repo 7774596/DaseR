@@ -466,6 +466,10 @@ class TierIndex:
             keys: Prefix-chain keys the request will look up.
         """
         self._tree.want(hint_id, keys)
+        self._metrics.counter("daser_queue_hints_total", "Queue hints received.").inc()
+        self._metrics.counter(
+            "daser_queue_hint_keys_total", "Chunk keys named by queue hints."
+        ).inc(len(keys))
         self._publish_hint_metrics()
 
     def unwant(self, hint_id: str) -> None:

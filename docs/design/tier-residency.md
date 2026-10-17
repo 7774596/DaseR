@@ -166,7 +166,8 @@ T 层副本存在且有效，且 io_pins_T == 0
 - 开销：每个排队请求 O(prompt 块数) 的 key，入队和放行各一次 O(块数)；不进 vLLM
   调度路径。HTTP 与 IPC 共用 server 事件循环，hash 一个 100k token 的 prompt 约
   毫秒级。
-- 指标：`daser_queue_hint_requests`（gauge，排队提示数）、
+- 指标：`daser_queue_hints_total` / `daser_queue_hint_keys_total`（收到的提示数与
+  key 数）、`daser_queue_hint_requests`（gauge，排队提示数）、
   `daser_queue_hint_keys`（gauge，被提示 key 数）、
   `daser_queue_hint_evicted_copies_total{tier}`（淘汰了仍被提示的副本，说明容量
   连队列视野都装不下）。

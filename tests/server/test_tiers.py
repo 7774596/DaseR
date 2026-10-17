@@ -377,6 +377,7 @@ def test_queue_hint_keeps_queued_chunks_and_counts_hinted_evictions() -> None:
     text = registry.render_prometheus()
     assert 'daser_queue_hint_evicted_copies_total{tier="l2"} 1' in text
     assert "daser_queue_hint_requests 2" in text
+    assert "daser_queue_hints_total 2" in text
     h.tiers.unwant("r1")
     h.tiers.unwant("r2")
     assert "daser_queue_hint_requests 0" in registry.render_prometheus()
