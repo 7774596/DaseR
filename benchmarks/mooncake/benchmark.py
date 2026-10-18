@@ -1760,13 +1760,20 @@ class _QueueHints:
     async def _call(
         self, method: str, request_id: str, body: bytes | None
     ) -> str | None:
-        try:
-            response = await self._client.request(
-                method, f"{self._base_url}/queue_hint/{request_id}", content=body
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            return f"{type(exc).__name__}: {exc}"
+        # PUT/DELETE are idempotent; retry once when a stale keep-alive
+        # connection drops, otherwise a lost release pins the hint forever.
+        url = f"{self._base_url}/queue_hint/{request_id}"
+        for attempt in range(2):
+            try:
+                response = await self._client.request(method, url, content=body)
+                response.raise_for_status()
+            except httpx.TransportError as exc:
+                if attempt == 0:
+                    continue
+                return f"{type(exc).__name__}: {exc}"
+            except httpx.HTTPError as exc:
+                return f"{type(exc).__name__}: {exc}"
+            return None
         return None
 
 

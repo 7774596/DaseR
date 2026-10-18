@@ -11,6 +11,7 @@ import signal
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 from benchmarks.mooncake import benchmark
@@ -1424,3 +1425,54 @@ def test_queue_hints_cover_the_client_queue_wait(
     records = {r["trace_index"]: r for r in map(json.loads, output.open())}
     assert records[2]["queue_hint_error"] == "HTTPError: down"
     assert "queue_hint_error" not in records[0]
+
+
+def test_queue_hints_retry_once_on_dropped_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dropped keep-alive connection is retried; a second drop is reported."""
+    calls: list[str] = []
+    drops = {"DELETE trace-0": 1, "DELETE trace-1": 2}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call = f"{request.method} {request.url.path.rsplit('/', 1)[-1]}"
+        if request.url.host == "daser":
+            calls.append(call)
+        if drops.get(call, 0) > 0:
+            drops[call] -= 1
+            raise httpx.RemoteProtocolError("Server disconnected", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        if kwargs.get("on_send"):
+            kwargs["on_send"]()
+        return RequestResult(args[2].sample_id, "d", "", 1.0, 2.0, len(args[3]), 1)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        benchmark.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [TraceRequest(i, 0, 512, 1, (10 * i + 1,)) for i in range(2)]
+    output = tmp_path / "hints.jsonl"
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100_000),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://a",
+            served_model_name="m",
+            output_path=output,
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1.0,
+            seed=0,
+            queue_hint_url="http://daser",
+        )
+    )
+    assert calls.count("DELETE trace-0") == 2
+    assert calls.count("DELETE trace-1") == 2
+    records = {r["trace_index"]: r for r in map(json.loads, output.open())}
+    assert "queue_hint_error" not in records[0]
+    assert records[1]["queue_hint_error"].startswith("RemoteProtocolError")
