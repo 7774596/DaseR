@@ -27,6 +27,10 @@ TIERS = (L1, L2)
 #: Eviction-tree heap of L1-only chunks waiting to be written to L2
 #: (exclusive tiers).
 _DEMOTE = "demote"
+#: Demotion candidates a batch skips (subtree pinned) before it ends.
+_STALL_SKIP_LIMIT = 32
+#: Nodes a subtree walk for a droppable leaf visits at most.
+_SUBTREE_SCAN_LIMIT = 4096
 #: Alignment of every record inside a copy (O_DIRECT / GDS).
 RECORD_ALIGNMENT = 4096
 
@@ -1002,10 +1006,12 @@ class TierIndex:
         Chunks leave the demotion heap in eviction order, tail first: a
         chunk is a candidate only once no child chunk is dirty. Each gets an L2
         extent, evicting only L2 candidates of strictly lower priority, so a
-        cold chunk never pushes out a hotter or hinted one. A leaf that does
-        not fit is the coldest chunk of both tiers and is dropped from L1
-        instead (it may be the chunk's last copy); a non-leaf that does not
-        fit ends the batch.
+        cold chunk never pushes out a hotter or hinted one. A chunk that
+        does not fit is the coldest of both tiers: the deepest leaves below
+        it are dropped from both tiers until it fits; a leaf is dropped from
+        L1 instead (it may be the chunk's last copy). A chunk whose subtree
+        has nothing droppable (pinned) is skipped and re-queued; the batch
+        ends after ``_STALL_SKIP_LIMIT`` skips.
 
         Args:
             max_bytes: Stop once the admitted L1 lane bytes reach this.
@@ -1020,6 +1026,7 @@ class TierIndex:
         if not self._exclusive:
             raise RuntimeError("demotion needs exclusive tiers")
         demotions: list[Demotion] = []
+        stalled: list[str] = []
         admitted = 0
         while admitted < max_bytes:
             key = self._tree.pop_victim(_DEMOTE)
@@ -1037,9 +1044,12 @@ class TierIndex:
                     self._evict(L1, key)
                     self._count_demotion("dropped")
                     continue
+                # Pinned below: try the next candidate, re-queue this one.
                 self._count_demotion("stalled")
-                self._tree.refresh(key)
-                break
+                stalled.append(key)
+                if len(stalled) >= _STALL_SKIP_LIMIT:
+                    break
+                continue
             target = self._new_copy(key, L2, offset, chunk.record_sizes)
             chunk.l2 = target
             self._tiers[L2].copies += 1
@@ -1057,6 +1067,8 @@ class TierIndex:
                     target=target,
                 )
             )
+        for key in stalled:
+            self._tree.refresh(key)
         return demotions
 
     def finish_demotion(self, demotion: Demotion, ok: bool) -> None:
@@ -1268,47 +1280,69 @@ class TierIndex:
         return False
 
     def _reserve_over_subtree(self, key: str, length: int) -> int | None:
-        """Reserve an L2 extent for demoting ``key`` by evicting its subtree.
+        """Reserve an L2 extent for demoting ``key`` by dropping its subtree.
 
-        Called when no L2 candidate of lower priority than ``key`` is left. A
-        queue hint names a whole prefix with one seq, so ``key``'s hinted
-        descendants tie with it and the ``below`` floor keeps them; dropping
-        ``key`` instead would orphan them, and leaving it dirty stalls
-        demotion, so L1 stops admitting and promoting. Evicting the deepest
-        L2 candidates below ``key`` first keeps the longest prefix.
+        Called when no L2 candidate of lower priority than ``key`` is left,
+        i.e. ``key`` is the coldest chunk of both tiers. Its descendants are
+        worth no more than it (a lookup reaches them only through it), but
+        ties keep them past the ``below`` floor: one queue hint gives a whole
+        prefix the same seq, and touches give tails newer ticks than heads.
+        Dropping ``key`` would orphan them, and leaving it dirty stalls
+        demotion, so L1 stops admitting and promoting. Dropping the deepest
+        leaves below ``key`` from both tiers first keeps the longest prefix.
 
         Returns:
-            Lane offset, or None when no L2 candidate is left below ``key``.
+            Lane offset, or None when nothing below ``key`` can be dropped.
         """
         allocator = self._tiers[L2].allocator
         if length > allocator.size:
             return None
         while (offset := allocator.reserve(length)) is None:
-            victim = self._deepest_l2_candidate(key)
+            victim = self._deepest_droppable(key)
             if victim is None:
                 return None
-            self._evict(L2, victim)
+            for tier in TIERS:
+                chunk = self._chunks.get(victim)
+                if chunk is not None and chunk.copy(tier) is not None:
+                    self._evict(tier, victim)
             self._metrics.counter(
-                "daser_tier_demotion_subtree_evictions_total",
-                "L2 copies below a demoting chunk evicted to make room for it.",
+                "daser_tier_demotion_subtree_drops_total",
+                "Chunks below a demoting chunk dropped to make room for it.",
             ).inc()
         return offset
 
-    def _deepest_l2_candidate(self, key: str) -> str | None:
-        """Return an L2 candidate below ``key`` with no candidate below it."""
+    def _deepest_droppable(self, key: str) -> str | None:
+        """Return the deepest leaf below ``key`` whose copies may all go.
+
+        A droppable leaf has tier state, no lease, no uncommitted writer,
+        and only full copies without io pins. The walk visits at most
+        ``_SUBTREE_SCAN_LIMIT`` nodes.
+        """
         found: str | None = None
-        stack = [(child, 1) for child in self._tree.children(key)]
         depth = 0
+        stack = [(child, 1) for child in self._tree.children(key)]
         seen = {key}
-        while stack:
+        while stack and len(seen) <= _SUBTREE_SCAN_LIMIT:
             node, level = stack.pop()
             if node in seen:
                 continue
             seen.add(node)
-            if level > depth and self._is_candidate(L2, node):
+            children = self._tree.children(node)
+            if children:
+                stack.extend((child, level + 1) for child in children)
+            elif level > depth and self._is_droppable(node):
                 found, depth = node, level
-            stack.extend((child, level + 1) for child in self._tree.children(node))
         return found
+
+    def _is_droppable(self, key: str) -> bool:
+        """Return whether every copy of ``key`` may be evicted now."""
+        chunk = self._chunks.get(key)
+        if chunk is None or chunk.lease_pins or self._blocked(key):
+            return False
+        copies = [copy for copy in (chunk.l1, chunk.l2) if copy is not None]
+        return bool(copies) and all(
+            not copy.io_pins and self.is_full(copy) for copy in copies
+        )
 
     def _refresh_parent(self, key: str) -> None:
         """Re-queue ``key``'s parent: it may have lost its last dirty child."""

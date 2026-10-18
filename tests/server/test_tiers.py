@@ -725,7 +725,7 @@ def test_hinted_demotion_evicts_its_own_subtree_instead_of_stalling() -> None:
     assert demotion.chunk_key == "a" and h.lost == ["b"]
     h.tiers.finish_demotion(demotion, ok=True)
     text = h.registry.render_prometheus()
-    assert "daser_tier_demotion_subtree_evictions_total 1" in text
+    assert "daser_tier_demotion_subtree_drops_total 1" in text
     assert_invariants(h)
 
     stuck = Harness(l1=1, l2=1, exclusive=True)
@@ -738,6 +738,25 @@ def test_hinted_demotion_evicts_its_own_subtree_instead_of_stalling() -> None:
     assert 'outcome="stalled"} 1' in stuck.registry.render_prometheus()
     stuck.blocked.discard("b")
     assert_invariants(stuck)
+
+
+def test_demotion_drops_dirty_tails_below_the_coldest_chunk() -> None:
+    h = Harness(l1=3, l2=1, exclusive=True, clean_bytes=2 * G)
+    h.store("a")  # L1
+    h.store("c", parent="a")  # L1
+    (first,) = h.tiers.begin_demotions(G)
+    assert first.chunk_key == "c"
+    h.tiers.finish_demotion(first, ok=True)
+    h.store("x")  # takes c's clean L1 extent; c is L2 only
+    h.store("g", parent="c")  # L1, dirty tail below the L2 middle
+    # a is the coldest; its L2 child c is not dirty, but the only way to
+    # make room in L2 runs through g, which is in L1 alone.
+    demotions = h.tiers.begin_demotions(G)
+    assert [d.chunk_key for d in demotions] == ["a"]
+    assert sorted(h.lost) == ["c", "g"]
+    for demotion in demotions:
+        h.tiers.finish_demotion(demotion, ok=True)
+    assert_invariants(h)
 
 
 def test_exclusive_store_drops_a_dirty_leaf_when_l2_is_stuck() -> None:
