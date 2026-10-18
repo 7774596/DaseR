@@ -714,6 +714,32 @@ def test_demotion_runs_chains_tail_first() -> None:
     assert_invariants(one)
 
 
+def test_hinted_demotion_evicts_its_own_subtree_instead_of_stalling() -> None:
+    h = Harness(l1=1, l2=1, exclusive=True)
+    h.store("a")  # L1, dirty
+    h.store("b", parent="a")  # L1 full of a dirty copy: L2 only
+    # One hint names the whole prefix, so b ties with a and the floor keeps
+    # it; a non-leaf a would stall demotion and freeze L1.
+    h.tiers.want("r", ["a", "b"])
+    (demotion,) = h.tiers.begin_demotions(G)
+    assert demotion.chunk_key == "a" and h.lost == ["b"]
+    h.tiers.finish_demotion(demotion, ok=True)
+    text = h.registry.render_prometheus()
+    assert "daser_tier_demotion_subtree_evictions_total 1" in text
+    assert_invariants(h)
+
+    stuck = Harness(l1=1, l2=1, exclusive=True)
+    stuck.store("a")
+    stuck.store("b", parent="a")
+    stuck.tiers.want("r", ["a", "b"])
+    stuck.blocked.add("b")  # nothing below a may leave L2
+    assert stuck.tiers.begin_demotions(G) == []
+    assert stuck.lost == []
+    assert 'outcome="stalled"} 1' in stuck.registry.render_prometheus()
+    stuck.blocked.discard("b")
+    assert_invariants(stuck)
+
+
 def test_exclusive_store_drops_a_dirty_leaf_when_l2_is_stuck() -> None:
     h = Harness(l1=1, l2=1, exclusive=True)
     h.store("a")  # L1, dirty

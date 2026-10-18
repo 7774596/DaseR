@@ -1031,10 +1031,13 @@ class TierIndex:
             length = self._layout.extent_length(L2, chunk.record_sizes)
             offset = self._reserve(L2, length, below=key)
             if offset is None:
+                offset = self._reserve_over_subtree(key, length)
+            if offset is None:
                 if self._tree.is_leaf(key) and not chunk.lease_pins:
                     self._evict(L1, key)
                     self._count_demotion("dropped")
                     continue
+                self._count_demotion("stalled")
                 self._tree.refresh(key)
                 break
             target = self._new_copy(key, L2, offset, chunk.record_sizes)
@@ -1263,6 +1266,49 @@ class TierIndex:
             if state is not None and state.l1 is not None and state.l2 is None:
                 return True
         return False
+
+    def _reserve_over_subtree(self, key: str, length: int) -> int | None:
+        """Reserve an L2 extent for demoting ``key`` by evicting its subtree.
+
+        Called when no L2 candidate of lower priority than ``key`` is left. A
+        queue hint names a whole prefix with one seq, so ``key``'s hinted
+        descendants tie with it and the ``below`` floor keeps them; dropping
+        ``key`` instead would orphan them, and leaving it dirty stalls
+        demotion, so L1 stops admitting and promoting. Evicting the deepest
+        L2 candidates below ``key`` first keeps the longest prefix.
+
+        Returns:
+            Lane offset, or None when no L2 candidate is left below ``key``.
+        """
+        allocator = self._tiers[L2].allocator
+        if length > allocator.size:
+            return None
+        while (offset := allocator.reserve(length)) is None:
+            victim = self._deepest_l2_candidate(key)
+            if victim is None:
+                return None
+            self._evict(L2, victim)
+            self._metrics.counter(
+                "daser_tier_demotion_subtree_evictions_total",
+                "L2 copies below a demoting chunk evicted to make room for it.",
+            ).inc()
+        return offset
+
+    def _deepest_l2_candidate(self, key: str) -> str | None:
+        """Return an L2 candidate below ``key`` with no candidate below it."""
+        found: str | None = None
+        stack = [(child, 1) for child in self._tree.children(key)]
+        depth = 0
+        seen = {key}
+        while stack:
+            node, level = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if level > depth and self._is_candidate(L2, node):
+                found, depth = node, level
+            stack.extend((child, level + 1) for child in self._tree.children(node))
+        return found
 
     def _refresh_parent(self, key: str) -> None:
         """Re-queue ``key``'s parent: it may have lost its last dirty child."""
@@ -1510,7 +1556,7 @@ class TierIndex:
         ).inc()
 
     def _count_demotion(self, outcome: str) -> None:
-        """Count one demotion by outcome (ok, failed, dropped)."""
+        """Count one demotion by outcome (ok, failed, dropped, stalled)."""
         self._metrics.counter(
             "daser_tier_demotions_total",
             "Exclusive-tier L1 -> L2 demotions by outcome.",

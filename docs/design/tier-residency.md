@@ -254,8 +254,12 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   不被 L1 接纳的 store 报 `TierFull`、请求失败。子节点得到 L2 副本或失去 L1 副本时
   刷新父节点。
   `begin_demotions(max_bytes)` 为出堆的 chunk 预留 L2 extent，只允许淘汰优先级严格
-  低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。挤不下时：叶子
-  是两层里最冷的块，直接从 L1 丢弃（可能是最后一份，计 `dropped`）；非叶子结束本批。
+  低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。挤不下时，先淘汰
+  它子树里最深的 L2 候选（计 `daser_tier_demotion_subtree_evictions_total`）：一条
+  queue hint 用同一个 seq 提示整条前缀，子孙与它优先级相等，下限挡住它们；R228 实测
+  frawxq / cmpxq P20 因此降级停摆（L1 干净字节 0、L1 不再接纳），丢弃祖先又会让子孙
+  成为孤儿，淘汰最深的子孙保住最长前缀。仍挤不下：叶子是两层里最冷的块，直接从 L1
+  丢弃（可能是最后一份，计 `dropped`）；非叶子结束本批（计 `stalled`）。
   两份副本 io pin，IPC server 调 `transfer.demote`（L1 extent 写到 L2 extent，经 L2 写门），
   `finish_demotion(ok)` 成功时 L2 副本对所有 rank 有效，L1 副本变为干净、可同步淘汰；
   失败时丢弃 L2 副本。
