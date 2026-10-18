@@ -1001,6 +1001,7 @@ async def replay(
     session_ramp_s: float = 0.0,
     session_rate: float = 0.0,
     queue_hint_url: str | None = None,
+    admission: str = "fifo",
 ) -> tuple[list[dict[str, Any]], float, bool]:
     """Replay eligible requests and incrementally write completion records.
 
@@ -1090,6 +1091,10 @@ async def replay(
             prompt is hinted when it starts waiting for an in-flight slot and
             released when it finishes. Records carry ``queue_hint_error`` when a
             hint call failed. ``None`` sends no hints.
+        admission: Which waiting request gets a freed in-flight slot:
+            ``fifo`` (arrival order) or ``random`` (seeded draw among the
+            waiters, so a closed population does not run in a fixed
+            rotation). Exclusive with ``ordered_admission``.
 
     Returns:
         Completion-order result dictionaries of finished requests, measured
@@ -1121,6 +1126,10 @@ async def replay(
         raise ValueError("session_rate and session_population are exclusive")
     if strict_order and ordered_admission:
         raise ValueError("strict_order and ordered_admission are exclusive")
+    if admission not in ("fifo", "random"):
+        raise ValueError(f"unknown admission: {admission}")
+    if admission == "random" and ordered_admission:
+        raise ValueError("random admission and ordered_admission are exclusive")
     if chain_outputs and strict_order:
         raise ValueError("chain_outputs and strict_order are exclusive")
     scheduled_offset_seconds(0, time_scale)
@@ -1137,7 +1146,11 @@ async def replay(
     for request in selection.skipped:
         writer.write(_skipped_record(request))
 
-    outer_sem = asyncio.Semaphore(max_inflight)
+    outer_sem: asyncio.Semaphore | _RandomAdmission = (
+        _RandomAdmission(max_inflight, seed)
+        if admission == "random"
+        else asyncio.Semaphore(max_inflight)
+    )
     done_events = [asyncio.Event() for _ in selection.eligible]
     admitted_events = [asyncio.Event() for _ in selection.eligible]
     predecessors: list[int | None] = (
@@ -1438,6 +1451,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--admission",
+        choices=("fifo", "random"),
+        default="fifo",
+        help=(
+            "Which waiting request gets a freed --max-inflight slot: arrival "
+            "order, or a seeded random waiter (no fixed session rotation)."
+        ),
+    )
+    parser.add_argument(
         "--dependency-gap-s",
         type=float,
         default=0.0,
@@ -1533,6 +1555,7 @@ async def main_async(args: argparse.Namespace) -> int:
         session_ramp_s=args.session_ramp_s,
         session_rate=args.session_rate,
         queue_hint_url=args.queue_hint_url,
+        admission=args.admission,
     )
     after_metrics = await _metrics_snapshot(server_urls)
     summary = summarise(
@@ -1777,6 +1800,55 @@ class _QueueHints:
         return None
 
 
+class _RandomAdmission:
+    """In-flight limit that admits a seeded random waiter when a slot frees.
+
+    Replaces the FIFO ``asyncio.Semaphore``: with zero think time a FIFO
+    client queue serves a closed population in a fixed rotation (the LRU
+    worst case); random admission makes the order between sessions random
+    while each session keeps its turn order.
+
+    Async/thread-safety:
+        Single event loop only.
+    """
+
+    def __init__(self, limit: int, seed: int) -> None:
+        """Create the limiter.
+
+        Args:
+            limit: Slots (maximum in-flight requests).
+            seed: Seed of the admission draw.
+        """
+        self._free = limit
+        self._rng = random.Random(seed)
+        self._waiters: list[asyncio.Future[None]] = []
+
+    async def acquire(self) -> None:
+        """Wait for a slot; among waiters the next one admitted is random."""
+        if self._free > 0 and not self._waiters:
+            self._free -= 1
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                # Granted a slot as the cancel landed: pass it on.
+                self.release()
+            else:
+                self._waiters.remove(waiter)
+            raise
+
+    def release(self) -> None:
+        """Free a slot and admit one random waiter, if any."""
+        if self._waiters:
+            waiter = self._waiters.pop(self._rng.randrange(len(self._waiters)))
+            waiter.set_result(None)
+        else:
+            self._free += 1
+
+
 @dataclass
 class _SessionGate:
     """Start and end signals of one session in a closed population.
@@ -2003,7 +2075,7 @@ async def _run_request(
     client: httpx.AsyncClient,
     router: InstanceRouter,
     served_model_name: str,
-    outer_sem: asyncio.Semaphore,
+    outer_sem: asyncio.Semaphore | _RandomAdmission,
     started_at: float,
     timeout_seconds: float,
     time_scale: float,
@@ -2059,7 +2131,7 @@ async def _run_request_after_dependency(
     client: httpx.AsyncClient,
     router: InstanceRouter,
     served_model_name: str,
-    outer_sem: asyncio.Semaphore,
+    outer_sem: asyncio.Semaphore | _RandomAdmission,
     started_at: float,
     timeout_seconds: float,
     time_scale: float,

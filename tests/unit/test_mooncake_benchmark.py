@@ -1476,3 +1476,118 @@ def test_queue_hints_retry_once_on_dropped_connection(
     records = {r["trace_index"]: r for r in map(json.loads, output.open())}
     assert "queue_hint_error" not in records[0]
     assert records[1]["queue_hint_error"].startswith("RemoteProtocolError")
+
+
+def _admission_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, admission: str, seed: int
+) -> tuple[list[int], int]:
+    """Replay six independent requests through one slot; return send order."""
+    sent: list[int] = []
+    inflight = 0
+    peak = 0
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        nonlocal inflight, peak
+        sample = args[2]
+        kwargs["on_send"]()
+        sent.append(sample.sample_id)
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.005)
+        inflight -= 1
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [TraceRequest(i, 0, 10, 1, (100 + i,)) for i in range(6)]
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / f"{admission}-{seed}.jsonl",
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=seed,
+            admission=admission,
+        )
+    )
+    return sent, peak
+
+
+def test_random_admission_draws_a_seeded_waiter_per_freed_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Random admission keeps the limit, admits everyone, and is seeded."""
+    fifo, fifo_peak = _admission_order(tmp_path, monkeypatch, "fifo", 0)
+    drawn, peak = _admission_order(tmp_path, monkeypatch, "random", 0)
+    again, _ = _admission_order(tmp_path, monkeypatch, "random", 0)
+
+    assert fifo == [0, 1, 2, 3, 4, 5]
+    assert fifo_peak == peak == 1
+    assert sorted(drawn) == fifo
+    assert drawn != fifo
+    assert again == drawn
+
+
+def test_random_admission_keeps_session_turn_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session's next turn still waits for its prefix producer."""
+    sent: list[int] = []
+
+    async def stream(*args: Any, **kwargs: Any) -> RequestResult:
+        sample = args[2]
+        kwargs["on_send"]()
+        sent.append(sample.sample_id)
+        await asyncio.sleep(0.005)
+        return RequestResult(sample.sample_id, "d", "", 1.0, 1.0, 1, 1, None)
+
+    monkeypatch.setattr(benchmark, "vllm_completion_stream", stream)
+    requests = [
+        TraceRequest(0, 0, 10, 1, (1,)),
+        TraceRequest(1, 0, 10, 1, (5,)),
+        TraceRequest(2, 0, 10, 1, (1, 2)),
+        TraceRequest(3, 0, 10, 1, (5, 6)),
+        TraceRequest(4, 0, 10, 1, (1, 2, 3)),
+    ]
+    asyncio.run(
+        replay(
+            selection=select_requests(requests, max_model_len=100),
+            prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+            server_url="http://unused",
+            served_model_name="m",
+            output_path=tmp_path / "requests.jsonl",
+            max_inflight=1,
+            timeout_seconds=1.0,
+            time_scale=1e6,
+            seed=3,
+            prefix_dependencies=True,
+            admission="random",
+        )
+    )
+
+    assert sorted(sent) == [0, 1, 2, 3, 4]
+    assert sent.index(0) < sent.index(2) < sent.index(4)
+    assert sent.index(1) < sent.index(3)
+
+
+def test_random_admission_excludes_ordered_admission(tmp_path: Path) -> None:
+    """Random and trace-ordered admission cannot be combined."""
+    with pytest.raises(ValueError, match="exclusive"):
+        asyncio.run(
+            replay(
+                selection=select_requests([], max_model_len=100),
+                prompt_builder=PromptBuilder(vocab_size=1000, special_token_ids=[]),
+                server_url="http://unused",
+                served_model_name="m",
+                output_path=tmp_path / "requests.jsonl",
+                max_inflight=2,
+                timeout_seconds=1.0,
+                time_scale=1e6,
+                seed=0,
+                ordered_admission=True,
+                admission="random",
+            )
+        )

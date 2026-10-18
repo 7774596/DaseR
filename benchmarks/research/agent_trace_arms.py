@@ -507,6 +507,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Admit requests in trace order while up to --max-inflight overlap.",
     )
     parser.add_argument(
+        "--admission",
+        choices=("fifo", "random"),
+        default="fifo",
+        help="Freed --max-inflight slot goes to the oldest or a random waiter.",
+    )
+    parser.add_argument(
         "--dependency-gap-s",
         type=float,
         default=0.0,
@@ -900,6 +906,8 @@ async def run_arm(
                     *(["--strict-order"] if args.strict_order else []),
                     *(["--chain-outputs"] if args.chain_outputs else []),
                     *(["--ordered-admission"] if args.ordered_admission else []),
+                    "--admission",
+                    args.admission,
                     "--dependency-gap-s",
                     str(args.dependency_gap_s),
                     *(
