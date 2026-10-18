@@ -665,7 +665,9 @@ class TierIndex:
         candidates) and an L1 extent when L1 can admit it after evicting L1
         candidates; otherwise its store skips L1. Without L2 an L1 shortage
         fails the batch. With exclusive tiers a new chunk gets the L1 extent
-        alone when L1 admits it, else the L2 extent alone.
+        alone when L1 admits it, else the L2 extent alone; when L2 cannot
+        place it either, the coldest dirty L1 leaf without a lease is dropped
+        (its only copy) and L1 is tried again.
 
         Args:
             chunks: ``(chunk_key, record_sizes)`` per chunk; every key must be
@@ -710,10 +712,20 @@ class TierIndex:
             for key, sizes in fresh:
                 created[key] = ChunkTiers(record_sizes=sizes)
             if self._exclusive:
-                # L1 first; only the chunks L1 does not admit go to L2.
-                self._place_l1(fresh, created, pinned)
-                fresh = [(k, s) for k, s in fresh if created[k].l1 is None]
-            l2_offsets = self._reserve_l2(fresh) if L2 in self._tiers else {}
+                # L1 first; only the chunks L1 does not admit go to L2. When
+                # L2 has no room either, dirty L1 leaves are dropped to make
+                # L1 room before the store fails.
+                while True:
+                    self._place_l1(fresh, created, pinned)
+                    fresh = [(k, s) for k, s in fresh if created[k].l1 is None]
+                    try:
+                        l2_offsets = self._reserve_l2(fresh)
+                        break
+                    except TierFull:
+                        if not self._drop_dirty_leaf():
+                            raise
+            else:
+                l2_offsets = self._reserve_l2(fresh) if L2 in self._tiers else {}
             for key, sizes in fresh:
                 chunk = created[key]
                 if key in l2_offsets:
@@ -987,7 +999,8 @@ class TierIndex:
     def begin_demotions(self, max_bytes: int) -> list[Demotion]:
         """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.
 
-        Chunks leave the demotion heap in eviction order. Each gets an L2
+        Chunks leave the demotion heap in eviction order, tail first: a
+        chunk is a candidate only once no child chunk is dirty. Each gets an L2
         extent, evicting only L2 candidates of strictly lower priority, so a
         cold chunk never pushes out a hotter or hinted one. A leaf that does
         not fit is the coldest chunk of both tiers and is dropped from L1
@@ -1029,6 +1042,8 @@ class TierIndex:
             self._tiers[L2].copies += 1
             self._pin(source)
             self._pin(target)
+            # No longer dirty: its parent may now demote (tail first).
+            self._refresh_parent(key)
             self._demoting_bytes += source.length
             admitted += source.length
             demotions.append(
@@ -1219,6 +1234,7 @@ class TierIndex:
                 and self.is_full(source)
                 and not self._tree.is_orphan(key)
                 and not self._blocked(key)
+                and not self._has_dirty_child(key)
             )
         copy = chunk.copy(tier)
         if copy is None or copy.io_pins or not self.is_full(copy):
@@ -1233,6 +1249,49 @@ class TierIndex:
             # A dirty copy leaves L1 through a demotion; orphans are dropped.
             return self._tree.is_orphan(key)
         return self._tree.is_leaf(key)
+
+    def _has_dirty_child(self, key: str) -> bool:
+        """Return whether a child chunk of ``key`` is in L1 with no L2 copy.
+
+        Demotion runs tail first: a parent demoted before its dirty children
+        would sit in L2 as a non-leaf, which is no L2 candidate until those
+        children leave, so L2 could fill with chunks it cannot evict.
+        """
+        chunks = self._chunks
+        for child in self._tree.children(key):
+            state = chunks.get(child)
+            if state is not None and state.l1 is not None and state.l2 is None:
+                return True
+        return False
+
+    def _refresh_parent(self, key: str) -> None:
+        """Re-queue ``key``'s parent: it may have lost its last dirty child."""
+        if self._exclusive:
+            parent = self._tree.parent(key)
+            if parent:
+                self._tree.refresh(parent)
+
+    def _drop_dirty_leaf(self) -> bool:
+        """Drop the coldest dirty L1 leaf without a lease (exclusive tiers).
+
+        Last resort of a store L2 cannot place: the dropped chunk loses its
+        only copy, which beats failing the request.
+
+        Returns:
+            Whether a chunk was dropped.
+        """
+        skipped: list[str] = []
+        dropped = False
+        while (key := self._tree.pop_victim(_DEMOTE)) is not None:
+            if self._tree.is_leaf(key) and not self._chunks[key].lease_pins:
+                self._evict(L1, key)
+                self._count_demotion("dropped")
+                dropped = True
+                break
+            skipped.append(key)
+        for key in skipped:
+            self._tree.refresh(key)
+        return dropped
 
     def _validate_sizes(self, sizes: tuple[int, ...]) -> None:
         """Reject an empty or misaligned record size list."""
@@ -1391,6 +1450,7 @@ class TierIndex:
             self._clean_bytes -= chunk.l1.length
         if copy.tier == L1:
             chunk.l1 = None
+            self._refresh_parent(copy.chunk_key)
         else:
             chunk.l2 = None
         if copy.attached:

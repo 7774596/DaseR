@@ -206,6 +206,23 @@ class EvictionTree:
         """
         return not self._children.get(key)
 
+    def children(self, key: str) -> tuple[str, ...]:
+        """Return the child nodes of ``key``.
+
+        Args:
+            key: Chunk key.
+        """
+        return tuple(self._children.get(key, ()))
+
+    def parent(self, key: str) -> str:
+        """Return the parent key of node ``key`` (empty for a chain head).
+
+        Args:
+            key: Chunk key; unknown keys return an empty string.
+        """
+        node = self._nodes.get(key)
+        return node.parent_key if node is not None else ""
+
     @property
     def hinted_requests(self) -> int:
         """Return the number of live queue hints."""

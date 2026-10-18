@@ -688,6 +688,56 @@ async def test_exclusive_promotion_moves_the_chunk_to_l1() -> None:
     assert_invariants(failed)
 
 
+def test_demotion_runs_chains_tail_first() -> None:
+    h = Harness(l1=3, l2=8, exclusive=True, clean_bytes=3 * G)
+    h.store("a")
+    h.store("b", parent="a")
+    h.store("c", parent="b")
+    # a is the coldest, but a parent waits until its dirty children have L2
+    # copies: otherwise it would sit in L2 as a non-leaf L2 cannot evict.
+    demotions = h.tiers.begin_demotions(3 * G)
+    assert [d.chunk_key for d in demotions] == ["c", "b", "a"]
+    for demotion in demotions:
+        h.tiers.finish_demotion(demotion, ok=True)
+    assert_invariants(h)
+
+    one = Harness(l1=2, l2=8, exclusive=True, clean_bytes=2 * G)
+    one.store("a")
+    one.store("b", parent="a")
+    (demotion,) = one.tiers.begin_demotions(G)
+    assert demotion.chunk_key == "b"
+    # A failed child demotion leaves it dirty, so the parent waits again.
+    one.tiers.finish_demotion(demotion, ok=False)
+    (retry,) = one.tiers.begin_demotions(G)
+    assert retry.chunk_key == "b"
+    one.tiers.finish_demotion(retry, ok=True)
+    assert_invariants(one)
+
+
+def test_exclusive_store_drops_a_dirty_leaf_when_l2_is_stuck() -> None:
+    h = Harness(l1=1, l2=1, exclusive=True)
+    h.store("a")  # L1, dirty
+    h.store("b")  # L2 only
+    h.blocked.add("b")  # no L2 candidate left
+    placement = h.store("c")
+    assert placement.l1 is not None and placement.l2 is None
+    assert h.lost == ["a"]
+    assert 'outcome="dropped"} 1' in h.registry.render_prometheus()
+    assert_invariants(h)
+
+    leased = Harness(l1=1, l2=1, exclusive=True)
+    leased.store("a")
+    leased.store("b")
+    leased.blocked.add("b")
+    lease = leased.tiers.pin_lease("a")
+    assert lease is not None
+    with pytest.raises(TierFull):
+        leased.store("c")
+    assert leased.lost == [] and leased.tiers.is_present("a")
+    leased.tiers.unpin_lease(lease)
+    assert_invariants(leased)
+
+
 def test_begin_demotions_needs_exclusive_tiers() -> None:
     with pytest.raises(RuntimeError):
         Harness(l1=2, l2=2).tiers.begin_demotions(G)
