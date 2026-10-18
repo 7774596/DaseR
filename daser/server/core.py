@@ -2,12 +2,14 @@
 
 # Standard
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 import os
 from typing import Any, Optional
 
 # First Party
+from daser.config import EXCLUSIVE_CLEAN_ENV, EXCLUSIVE_TIERS_ENV
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
 from daser.logging import init_logger
@@ -22,6 +24,7 @@ from daser.server.tiers import (
     L2,
     TIERS,
     ChunkUnavailable,
+    Demotion,
     Lease,
     Promotion,
     StorePlacement,
@@ -349,12 +352,17 @@ class ServerCore:
         self._lost: list[str] = []
         # Codec modes of packed chunks with tier state (raw chunks have none).
         self._record_modes: dict[str, tuple[str, ...]] = {}
+        clean = os.environ.get(EXCLUSIVE_CLEAN_ENV)
         self._tiers = TierIndex(
             tier_layout,
             blocked=self._has_pending_writer,
             on_lost=self._on_lost,
             metrics_registry=self._metrics,
+            exclusive=os.environ.get(EXCLUSIVE_TIERS_ENV) == "1",
+            clean_bytes=int(clean) if clean else None,
         )
+        # Called after a tier change leaves a demotion deficit (exclusive).
+        self._demotion_listener: Callable[[], None] | None = None
         self._tiers.publish_metrics()
 
     @property
@@ -727,6 +735,7 @@ class ServerCore:
         for copy in (placement.l1, placement.l2):
             if copy is not None:
                 self._tiers.unpin_io(copy)
+        self._notify_demotions()
 
     async def store_staged(
         self, placement: StorePlacement, tp_rank: int, tp_size: int
@@ -756,6 +765,7 @@ class ServerCore:
         if placement.l2 is None:
             self._tiers.unpin_io(placement.l1)
             await self._finish_rank(placement.chunk_key, valid, tp_rank, tp_size)
+            self._notify_demotions()
         elif valid:
             await self._maybe_publish(placement.chunk_key, tp_rank, tp_size)
 
@@ -790,6 +800,7 @@ class ServerCore:
         if l1 is not None:
             self._tiers.unpin_io(l1)
         await self._finish_rank(placement.chunk_key, valid, tp_rank, tp_size)
+        self._notify_demotions()
 
     async def store_failed(
         self, placement: StorePlacement, tp_rank: int, tp_size: int
@@ -922,6 +933,7 @@ class ServerCore:
         """
         for segment in segments:
             self._tiers.unpin_io(segment.copy)
+        self._notify_demotions()
 
     def finish_promotion(self, promotion: Promotion, ok: bool) -> None:
         """Complete a promotion started by ``begin_promotions``.
@@ -931,6 +943,55 @@ class ServerCore:
             ok: Whether the L2 -> L1 read succeeded on every rank.
         """
         self._tiers.finish_promotion(promotion, ok)
+        self._tiers.publish_metrics()
+        self._notify_demotions()
+
+    @property
+    def exclusive_tiers(self) -> bool:
+        """Return whether L1 and L2 hold disjoint chunks."""
+        return self._tiers.exclusive
+
+    def set_demotion_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register the callback run when a tier change leaves a deficit.
+
+        With exclusive tiers the IPC server (which owns the transfer layer)
+        starts demotions from it; see ``demotion_deficit``.
+
+        Args:
+            listener: Synchronous callback, or None to clear it.
+        """
+        self._demotion_listener = listener
+
+    def demotion_deficit(self) -> int:
+        """Return the L1 lane bytes to demote (see ``TierIndex``)."""
+        return self._tiers.demotion_deficit()
+
+    async def begin_demotions(self, max_bytes: int) -> list[Demotion]:
+        """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.
+
+        Args:
+            max_bytes: L1 lane bytes to admit at most (one more chunk may
+                cross it).
+
+        Returns:
+            Demotions; both copies are io pinned until ``finish_demotion``.
+
+        Async/thread-safety:
+            Runs on the server event loop; flushes chunks lost to evictions.
+        """
+        demotions = self._tiers.begin_demotions(max_bytes)
+        await self._flush_lost()
+        self._tiers.publish_metrics()
+        return demotions
+
+    def finish_demotion(self, demotion: Demotion, ok: bool) -> None:
+        """Complete a demotion started by ``begin_demotions``.
+
+        Args:
+            demotion: The demotion.
+            ok: Whether the L1 -> L2 write succeeded on every rank.
+        """
+        self._tiers.finish_demotion(demotion, ok)
         self._tiers.publish_metrics()
 
     def pin_lease(self, chunk_key: str) -> Lease | None:
@@ -951,6 +1012,7 @@ class ServerCore:
             lease: The lease; releasing one of a removed chunk is a no-op.
         """
         self._tiers.unpin_lease(lease)
+        self._notify_demotions()
 
     async def begin_promotions(self, chunk_keys: list[str]) -> list[Promotion | None]:
         """Admit committed L2-only chunks into L1 for L2 -> L1 reads.
@@ -1569,6 +1631,16 @@ class ServerCore:
         """Finish an operation that may have evicted tier copies."""
         await self._flush_lost()
         self._tiers.publish_metrics()
+        self._notify_demotions()
+
+    def _notify_demotions(self) -> None:
+        """Run the demotion listener while L1 lacks free or clean bytes.
+
+        Called after tier changes and whenever io pins or leases drop, since
+        a dirty L1 copy becomes demotable only once unpinned.
+        """
+        if self._demotion_listener is not None and self._tiers.demotion_deficit():
+            self._demotion_listener()
 
     def _count_eviction(self, reason: str) -> None:
         """Count one chunk that left the index."""

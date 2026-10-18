@@ -280,7 +280,16 @@ class EvictionTree:
             elif earliest == seq and key in self._nodes:
                 self._lower(key)
 
-    def pop_victim(self, tier: str) -> str | None:
+    def is_orphan(self, key: str) -> bool:
+        """Return whether ``key`` is a node below an absent ancestor.
+
+        Args:
+            key: Chunk key; unknown keys are not orphans.
+        """
+        node = self._nodes.get(key)
+        return node is not None and node.orphan
+
+    def pop_victim(self, tier: str, below: str | None = None) -> str | None:
         """Return the lowest-priority candidate of ``tier``.
 
         Orphans come first, then the least recently used unhinted
@@ -291,14 +300,24 @@ class EvictionTree:
 
         Args:
             tier: Tier name given at construction.
+            below: When set, a node; only a candidate whose priority is
+                strictly lower than this node's is returned, and the lowest
+                entry stays queued otherwise.
 
         Returns:
-            The victim key, or None when no candidate is left.
+            The victim key, or None when no candidate is left (below the
+            floor).
         """
         heap = self._heaps[tier]
         queued = self._queued[tier]
+        floor = self._priority(below) if below is not None else None
         while heap:
-            priority, seq, key = heapq.heappop(heap)
+            priority, seq, key = heap[0]
+            if floor is not None and priority >= floor and queued.get(key) == seq:
+                # Priorities only rise while queued, so nothing is below.
+                if priority == self._priority(key):
+                    return None
+            heapq.heappop(heap)
             if queued.get(key) != seq:
                 # Removed, consumed, or superseded by a newer entry.
                 continue

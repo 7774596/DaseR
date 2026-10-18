@@ -502,3 +502,32 @@ def test_queue_hint_replaces_same_id() -> None:
     tree.want("r", ["b0"])
     assert tree.hinted_requests == 1 and not tree.is_wanted("a0")
     assert drain(tree) == ["a0", "b0"]
+
+
+def test_pop_victim_below_returns_only_strictly_colder_nodes() -> None:
+    tree, _ = make_tree()
+    for key in ("a", "b", "c"):
+        tree.add(key)
+    assert tree.pop_victim("l2", below="a") is None
+    # The coldest entry stays queued when nothing is below the floor.
+    assert tree.pop_victim("l2", below="b") == "a"
+    tree.remove("a")
+    tree.touch(["b"])
+    # b's stale entry is requeued on the way; c is now colder than b.
+    assert tree.pop_victim("l2", below="b") == "c"
+    tree.want("r1", ["b"])
+    tree.add("d")
+    # Hinted b ranks above unhinted d.
+    assert tree.pop_victim("l2", below="b") == "d"
+    assert tree.pop_victim("l2", below="b") is None
+    assert drain(tree) == ["b"]
+
+
+def test_is_orphan_tracks_absent_ancestors() -> None:
+    tree, _ = make_tree()
+    chain(tree, ["a0", "a1"])
+    assert not tree.is_orphan("a1") and not tree.is_orphan("missing")
+    tree.remove("a0")
+    assert tree.is_orphan("a1")
+    tree.add("a0")
+    assert not tree.is_orphan("a1")

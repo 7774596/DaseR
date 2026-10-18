@@ -220,6 +220,21 @@ class TransferLayer(ABC):
         """
         raise NotImplementedError("transfer backend has no L1 arena to promote into")
 
+    async def demote(self, moves: Sequence[Move]) -> None:
+        """Write L1 arena extents to L2 ranges without touching a GPU.
+
+        Args:
+            moves: Ranges with both ``l1_offset`` (source) and ``l2_offset``.
+
+        Raises:
+            NotImplementedError: If the backend has no L1 arena.
+
+        Async/thread-safety:
+            Returns after every write ended; cancellation is deferred until
+            the submitted writes stopped using the extents.
+        """
+        raise NotImplementedError("transfer backend has no L1 arena to demote from")
+
     async def load_runs(
         self,
         buffer: Any,

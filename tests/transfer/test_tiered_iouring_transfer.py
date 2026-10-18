@@ -330,6 +330,38 @@ def test_promote_then_load_from_arena(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_demote_writes_arena_extents_to_l2(tmp_path: Path) -> None:
+    """``demote`` persists arena extents that an L2 load then returns."""
+
+    async def scenario() -> None:
+        layer = _layer(tmp_path, l1=4 * PAGE)
+        payload = _pattern(2 * PAGE, 8)
+        try:
+            handle = await layer.store(
+                payload,
+                [Move(0, PAGE, l1_offset=PAGE), Move(PAGE, PAGE, l1_offset=2 * PAGE)],
+            )
+            await handle.persisted
+            assert layer.stats.l2_writes == 0
+            await layer.demote(
+                [
+                    Move(0, PAGE, l1_offset=PAGE, l2_offset=4 * PAGE),
+                    Move(0, PAGE, l1_offset=2 * PAGE, l2_offset=5 * PAGE),
+                ]
+            )
+            # Adjacent in both tiers: one coalesced write.
+            assert layer.stats.l2_writes == 1
+            assert layer.stats.l2_write_bytes == 2 * PAGE
+            assert layer.stats.d2h_copies == 1
+            assert _read_file(tmp_path / "l2.store", 4 * PAGE, 2 * PAGE) == payload
+            with pytest.raises(ValueError, match="l1_offset"):
+                await layer.demote([Move(0, PAGE, l2_offset=0)])
+        finally:
+            await layer.close()
+
+    asyncio.run(scenario())
+
+
 def test_l2_load_with_arena_fill(tmp_path: Path) -> None:
     """An L2 load with ``l1_offset`` also fills that arena extent."""
 

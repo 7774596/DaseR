@@ -34,6 +34,8 @@ class Harness:
         l2: int = 0,
         tp: int = 1,
         l1_record_bytes: int = 0,
+        exclusive: bool = False,
+        clean_bytes: int | None = None,
     ) -> None:
         self.layout = TierLayout(
             grain=G,
@@ -45,11 +47,15 @@ class Harness:
         self.blocked: set[str] = set()
         self.lost: list[str] = []
         self.parents: dict[str, str] = {}
+        self.registry = MetricsRegistry()
+        self.clean_target = l1 * G // 8 if clean_bytes is None else clean_bytes
         self.tiers = TierIndex(
             self.layout,
             blocked=lambda key: key in self.blocked,
             on_lost=self.lost.append,
-            metrics_registry=MetricsRegistry(),
+            metrics_registry=self.registry,
+            exclusive=exclusive,
+            clean_bytes=clean_bytes,
         )
 
     def add(self, key: str, parent: str = "") -> None:
@@ -92,6 +98,7 @@ def assert_invariants(h: Harness, quiescent: bool = True) -> None:
     tiers = h.tiers
     extents: dict[str, list[tuple[int, int]]] = {tier: [] for tier in TIERS}
     copies = {tier: 0 for tier in TIERS}
+    clean = 0
     for key in h.parents:
         chunk = tiers.chunk(key)
         if chunk is None:
@@ -109,6 +116,8 @@ def assert_invariants(h: Harness, quiescent: bool = True) -> None:
             copies[tier] += 1
             if quiescent:
                 assert copy.io_pins == 0
+        if tiers.is_full(chunk.l1) and tiers.is_full(chunk.l2):
+            clean += chunk.l1.length
         if quiescent:
             # No partial survivor: every chunk with tier state is present.
             assert tiers.is_present(key), key
@@ -131,6 +140,9 @@ def assert_invariants(h: Harness, quiescent: bool = True) -> None:
             assert start + length <= nxt
         if quiescent:
             assert stats.used == sum(length for _start, length in spans)
+    if quiescent and tiers.exclusive:
+        free = tiers.stats(L1).free
+        assert tiers.demotion_deficit() == max(0, h.clean_target - free - clean)
 
 
 # ----------------------------------------------------------------------
@@ -563,6 +575,125 @@ def test_begin_promotion_needs_an_l2_only_full_chunk() -> None:
 
 
 # ----------------------------------------------------------------------
+# Exclusive tiers
+# ----------------------------------------------------------------------
+
+
+def test_exclusive_tiers_need_both_tiers() -> None:
+    with pytest.raises(ValueError):
+        Harness(l1=4, exclusive=True)
+    with pytest.raises(ValueError):
+        Harness(l2=4, exclusive=True)
+    assert Harness(l1=4, l2=4).tiers.demotion_deficit() == 0
+
+
+def test_exclusive_store_goes_to_one_tier_and_dirty_l1_stays() -> None:
+    h = Harness(l1=2, l2=4, exclusive=True, clean_bytes=G)
+    first = h.store("a")
+    assert first.l1 is not None and first.l2 is None
+    assert h.tiers.demotion_deficit() == 0  # one grain still free
+    h.store("b")
+    # L1 is full of dirty copies: neither is evicted, so c goes to L2 only.
+    assert h.tiers.demotion_deficit() == G
+    third = h.store("c")
+    assert third.l1 is None and third.l2 is not None
+    assert h.lost == [] and h.tiers.stats(L1).admission_skips == 1
+    assert_invariants(h)
+
+
+def test_demotion_writes_the_coldest_dirty_copy_and_makes_it_clean() -> None:
+    h = Harness(l1=2, l2=4, exclusive=True, clean_bytes=G)
+    h.store("a")
+    h.store("b")
+    (demotion,) = h.tiers.begin_demotions(G)
+    assert demotion.chunk_key == "a" and demotion.source.tier == L1
+    assert demotion.target.tier == L2 and demotion.target.io_pins == 1
+    # The in-flight demotion covers the deficit; a is not demoted twice.
+    assert h.tiers.demotion_deficit() == 0
+    (second,) = h.tiers.begin_demotions(G)
+    assert second.chunk_key == "b"
+    assert_invariants(h, quiescent=False)
+    h.tiers.finish_demotion(second, ok=False)
+    h.tiers.finish_demotion(demotion, ok=True)
+    a = h.tiers.chunk("a")
+    assert a is not None and h.tiers.is_full(a.l1) and h.tiers.is_full(a.l2)
+    assert h.tiers.demotion_deficit() == 0
+    assert_invariants(h)
+    # The clean L1 copy is evicted for the next store; a stays in L2.
+    placement = h.store("c")
+    assert placement.l1 is not None and placement.l2 is None
+    a = h.tiers.chunk("a")
+    assert a is not None and a.l1 is None and h.tiers.is_full(a.l2)
+    text = h.registry.render_prometheus()
+    assert 'daser_tier_demotions_total{outcome="ok"} 1' in text
+    assert f"daser_tier_demoted_bytes_total {G}" in text
+    assert_invariants(h)
+
+
+def test_failed_demotion_drops_the_l2_copy() -> None:
+    h = Harness(l1=1, l2=4, exclusive=True)
+    h.store("a")
+    (demotion,) = h.tiers.begin_demotions(G)
+    h.tiers.finish_demotion(demotion, ok=False)
+    a = h.tiers.chunk("a")
+    assert a is not None and a.l2 is None and h.tiers.is_full(a.l1)
+    assert h.tiers.stats(L2).used == 0
+    assert 'outcome="failed"} 1' in h.registry.render_prometheus()
+    assert_invariants(h)
+
+
+def test_demotion_evicts_only_colder_l2_copies() -> None:
+    h = Harness(l1=1, l2=1, exclusive=True)
+    h.store("a")  # L1
+    h.store("b")  # L2: hotter than a
+    # a is the coldest chunk of both tiers and cannot displace b: dropped.
+    assert h.tiers.begin_demotions(G) == []
+    assert h.lost == ["a"] and h.tiers.is_present("b")
+    assert 'outcome="dropped"} 1' in h.registry.render_prometheus()
+    assert_invariants(h)
+
+    hot = Harness(l1=1, l2=1, exclusive=True)
+    hot.store("a")
+    hot.store("b")
+    hot.tiers.touch(["a"])
+    (demotion,) = hot.tiers.begin_demotions(G)
+    assert demotion.chunk_key == "a" and hot.lost == ["b"]
+    hot.tiers.finish_demotion(demotion, ok=True)
+    assert_invariants(hot)
+
+
+@pytest.mark.asyncio
+async def test_exclusive_promotion_moves_the_chunk_to_l1() -> None:
+    h = Harness(l1=1, l2=4, exclusive=True)
+    h.store("a")
+    h.store("b")  # L2 only
+    h.tiers.remove("a")
+    promotion = h.tiers.begin_promotion("b")
+    assert promotion is not None
+    h.tiers.finish_promotion(promotion, ok=True)
+    b = h.tiers.chunk("b")
+    assert b is not None and b.l2 is None and h.tiers.is_full(b.l1)
+    assert h.tiers.stats(L2).used == 0
+    assert_invariants(h)
+
+    failed = Harness(l1=1, l2=4, exclusive=True)
+    failed.store("a")
+    failed.store("b")
+    failed.tiers.remove("a")
+    promotion = failed.tiers.begin_promotion("b")
+    assert promotion is not None
+    failed.tiers.finish_promotion(promotion, ok=False)
+    b = failed.tiers.chunk("b")
+    assert b is not None and b.l1 is None and failed.tiers.is_full(b.l2)
+    assert_invariants(failed)
+
+
+def test_begin_demotions_needs_exclusive_tiers() -> None:
+    with pytest.raises(RuntimeError):
+        Harness(l1=2, l2=2).tiers.begin_demotions(G)
+
+
+# ----------------------------------------------------------------------
 # Persistence
 # ----------------------------------------------------------------------
 
@@ -616,9 +747,11 @@ def test_l2_restore_rejects_invalid_placements() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("seed", range(12))
 async def test_random_operations_keep_tier_invariants(seed: int) -> None:
-    """Random chain stores, failures, loads, promotions and leases.
+    """Random chain stores, failures, loads, promotions, demotions and leases.
+
+    Seeds 8 and up run exclusive tiers.
 
     After every step: every chunk with tier state is present (a copy valid
     on every rank), capacity eviction never strands a child without its
@@ -627,8 +760,16 @@ async def test_random_operations_keep_tier_invariants(seed: int) -> None:
     """
     rng = random.Random(seed)
     tp = rng.choice((1, 2))
-    l2 = 0 if seed % 4 == 3 else rng.randint(6, 14)
-    h = Harness(l1=rng.randint(3, 8), l2=l2, tp=tp)
+    exclusive = seed >= 8
+    l2 = 0 if seed % 4 == 3 and not exclusive else rng.randint(6, 14)
+    l1 = rng.randint(3, 8)
+    h = Harness(
+        l1=l1,
+        l2=l2,
+        tp=tp,
+        exclusive=exclusive,
+        clean_bytes=G * rng.randint(1, l1) if exclusive else None,
+    )
     chains: list[str] = []
     leases = []
     serial = 0
@@ -682,6 +823,11 @@ async def test_random_operations_keep_tier_invariants(seed: int) -> None:
                 if promotion is not None:
                     assert_invariants(h, quiescent=False)
                     h.tiers.finish_promotion(promotion, ok=rng.random() < 0.8)
+        elif op < 0.85 and exclusive:
+            demotions = h.tiers.begin_demotions(G * rng.randint(1, 3))
+            assert_invariants(h, quiescent=False)
+            for demotion in demotions:
+                h.tiers.finish_demotion(demotion, ok=rng.random() < 0.8)
         elif op < 0.9:
             live = [key for key in h.parents if h.tiers.chunk(key) is not None]
             if live and len(leases) < 2:

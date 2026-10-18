@@ -244,6 +244,7 @@ async def test_lookup_waits_only_for_online_packed_store(
     class LookupCore:
         tier_layout = make_layout(l2_records=4)
         index_epoch = 0
+        exclusive_tiers = False
 
         def __init__(self) -> None:
             self.waits: list[bool] = []
@@ -915,6 +916,43 @@ async def store_chain(socket_path: str, tokens: list[int]) -> list[dict[str, Any
         )
         parent = key
     return allocations
+
+
+@pytest.mark.asyncio
+async def test_exclusive_tiers_demote_cold_l1_chunks_to_l2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full L1 demotes its coldest chunk; its bytes then load from L2."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", str(RECORD))
+    registry = MetricsRegistry()
+    core = make_core(64, 2, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=2, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    await server.start()
+    try:
+        a = await store_raw_chunk(socket_path, "a", pattern(1))
+        assert core.full_tiers("a") == (L1,)
+        await store_raw_chunk(socket_path, "b", pattern(2))
+        # L1 is full of dirty copies: the coldest one was written to L2.
+        assert core.full_tiers("a") == (L1, L2)
+        assert core.full_tiers("b") == (L1,)
+        await store_raw_chunk(socket_path, "c", pattern(3))
+        tiers = {key: core.full_tiers(key) for key in ("a", "b", "c")}
+        reply = await load(socket_path, [load_span(a["start_slot"])])
+        await drain(socket_path)
+        loaded = {key: core.full_tiers(key) for key in ("a", "b", "c")}
+    finally:
+        await server.stop()
+    # c took a's clean L1 extent; b was demoted next.
+    assert tiers == {"a": (L2,), "b": (L1, L2), "c": (L1,)}
+    assert (reply["l1_segments"], reply["l2_segments"]) == (0, 1)
+    assert reply["data"] == pattern(1)
+    # The read moved a back into L1 (dropping its L2 copy) over b's clean
+    # copy, which left L1 dirty again: c was demoted.
+    assert loaded == {"a": (L1,), "b": (L2,), "c": (L1, L2)}
+    rendered = registry.render_prometheus()
+    assert 'daser_tier_demotions_total{outcome="ok"} 3.0' in rendered
 
 
 @pytest.mark.asyncio

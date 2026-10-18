@@ -317,6 +317,29 @@ class TieredIOUringTransferLayer(TransferLayer):
         if moves:
             await settle([self._spawn("load", self._read_l2(None, list(moves)))])
 
+    async def demote(self, moves: Sequence[Move]) -> None:
+        """Write arena extents to their L2 ranges.
+
+        Args:
+            moves: Ranges with ``l1_offset`` (source) and ``l2_offset``.
+
+        Raises:
+            NotImplementedError: If the layer has no arena or no L2.
+            ValueError: For an invalid move; nothing is submitted.
+            IOError: On a failed or short write.
+
+        Async/thread-safety:
+            Runs on the L2 write executor (and its write gate); cancellation
+            is deferred until the submitted writes ended.
+        """
+        self._check_open()
+        if self._arena is None or self._l2 is None:
+            raise NotImplementedError("demotion needs both an L1 arena and L2")
+        self._validate(moves, "promote", None)
+        runs = coalesce_moves(list(moves), ("l2", "l1"))
+        if runs:
+            await settle([self._spawn("l2_write", self._write(runs))])
+
     async def load_runs(
         self,
         buffer: Any,

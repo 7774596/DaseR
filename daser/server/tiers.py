@@ -24,6 +24,9 @@ logger = init_logger(__name__)
 L1 = "l1"
 L2 = "l2"
 TIERS = (L1, L2)
+#: Eviction-tree heap of L1-only chunks waiting to be written to L2
+#: (exclusive tiers).
+_DEMOTE = "demote"
 #: Alignment of every record inside a copy (O_DIRECT / GDS).
 RECORD_ALIGNMENT = 4096
 
@@ -278,6 +281,26 @@ class Promotion:
 
 
 @dataclass(frozen=True)
+class Demotion:
+    """An admitted L1 -> L2 write; returned by ``TierIndex.begin_demotions``.
+
+    Exclusive tiers only. Both copies carry one io pin until
+    ``TierIndex.finish_demotion``.
+
+    Attributes:
+        chunk_key: Demoted chunk.
+        record_sizes: Per-slot record sizes in bytes.
+        source: Valid L1 copy to write from.
+        target: New L2 copy to fill.
+    """
+
+    chunk_key: str
+    record_sizes: tuple[int, ...]
+    source: TierCopy
+    target: TierCopy
+
+
+@dataclass(frozen=True)
 class Lease:
     """A request lease keeping one chunk's L1 copy from eviction.
 
@@ -361,6 +384,13 @@ class TierIndex:
     either the other tier holds a valid copy or the chunk is a leaf. Evicting
     a chunk's last copy removes it from the index and calls ``on_lost``.
 
+    With ``exclusive`` the tiers hold different chunks (see "独占分层" in
+    the design doc): a store goes to L1 only when L1 admits it, else to L2
+    only; a promotion drops its L2 source; an L1-only (dirty) copy is a
+    candidate only when the chunk is an orphan, and leaves L1 through a
+    demotion (``begin_demotions`` / ``finish_demotion``) that writes it to
+    L2 first.
+
     Args:
         layout: Tier geometry.
         blocked: Returns True for a chunk that must keep its copies (pending
@@ -368,6 +398,12 @@ class TierIndex:
         on_lost: Called synchronously with the key of a chunk whose last
             copy was evicted, after its tier state and tree node are gone.
         metrics_registry: Registry for tier counters and gauges.
+        exclusive: Keep L1 and L2 disjoint; needs both tiers.
+        clean_bytes: Exclusive only: L1 lane bytes to keep free or clean
+            (``demotion_deficit``); None means an eighth of the L1 lane.
+
+    Raises:
+        ValueError: if ``exclusive`` is set without both tiers.
 
     Async/thread-safety:
         Owned by the server event loop. Every method is synchronous except
@@ -380,7 +416,11 @@ class TierIndex:
         blocked: Callable[[str], bool],
         on_lost: Callable[[str], None],
         metrics_registry: MetricsRegistry | None = None,
+        exclusive: bool = False,
+        clean_bytes: int | None = None,
     ) -> None:
+        if exclusive and not (layout.enabled(L1) and layout.enabled(L2)):
+            raise ValueError("exclusive tiers need both L1 and L2")
         self._layout = layout
         self._blocked = blocked
         self._on_lost = on_lost
@@ -392,7 +432,16 @@ class TierIndex:
             if layout.enabled(tier)
         }
         self._chunks: dict[str, ChunkTiers] = {}
-        self._tree = EvictionTree(tuple(self._tiers), self._is_candidate)
+        self._exclusive = exclusive
+        self._clean_target = (
+            layout.l1_lane_bytes // 8 if clean_bytes is None else clean_bytes
+        )
+        # Exclusive: L1 lane bytes of chunks full in both tiers, and of
+        # chunks being demoted.
+        self._clean_bytes = 0
+        self._demoting_bytes = 0
+        heaps = tuple(self._tiers) + ((_DEMOTE,) if exclusive else ())
+        self._tree = EvictionTree(heaps, self._is_candidate)
 
     @property
     def layout(self) -> TierLayout:
@@ -590,6 +639,15 @@ class TierIndex:
             self._metrics.gauge(
                 "daser_tier_free_holes", "Disjoint free extents per tier lane."
             ).set(state.allocator.holes, labels=labels)
+        if self._exclusive:
+            self._metrics.gauge(
+                "daser_tier_l1_clean_bytes",
+                "Exclusive tiers: L1 bytes of chunks also full in L2.",
+            ).set(self._clean_bytes * tp)
+            self._metrics.gauge(
+                "daser_tier_demoting_bytes",
+                "Exclusive tiers: L1 bytes being written to L2.",
+            ).set(self._demoting_bytes * tp)
 
     # ------------------------------------------------------------------
     # Stores
@@ -606,7 +664,8 @@ class TierIndex:
         all new chunks of the batch if possible, else per chunk, evicting L2
         candidates) and an L1 extent when L1 can admit it after evicting L1
         candidates; otherwise its store skips L1. Without L2 an L1 shortage
-        fails the batch.
+        fails the batch. With exclusive tiers a new chunk gets the L1 extent
+        alone when L1 admits it, else the L2 extent alone.
 
         Args:
             chunks: ``(chunk_key, record_sizes)`` per chunk; every key must be
@@ -648,27 +707,21 @@ class TierIndex:
                     if copy is not None:
                         self._pin(copy)
                         pinned.append(copy)
+            for key, sizes in fresh:
+                created[key] = ChunkTiers(record_sizes=sizes)
+            if self._exclusive:
+                # L1 first; only the chunks L1 does not admit go to L2.
+                self._place_l1(fresh, created, pinned)
+                fresh = [(k, s) for k, s in fresh if created[k].l1 is None]
             l2_offsets = self._reserve_l2(fresh) if L2 in self._tiers else {}
             for key, sizes in fresh:
-                chunk = ChunkTiers(record_sizes=sizes)
-                created[key] = chunk
+                chunk = created[key]
                 if key in l2_offsets:
                     chunk.l2 = self._new_copy(key, L2, l2_offsets[key], sizes)
                     self._pin(chunk.l2)
                     pinned.append(chunk.l2)
-            for key, sizes in fresh:
-                chunk = created[key]
-                length = self._layout.extent_length(L1, sizes)
-                offset = self._reserve(L1, length) if L1 in self._tiers else None
-                if offset is None:
-                    if L2 not in self._tiers:
-                        raise TierFull(L1, length, self._io_blocked(L1, length))
-                    if L1 in self._tiers:
-                        self._count_admission_skip()
-                    continue
-                chunk.l1 = self._new_copy(key, L1, offset, sizes)
-                self._pin(chunk.l1)
-                pinned.append(chunk.l1)
+            if not self._exclusive:
+                self._place_l1(fresh, created, pinned)
         except TierFull as exc:
             # Created copies are detached, so the unpin releases their extents.
             for copy in reversed(pinned):
@@ -896,6 +949,10 @@ class TierIndex:
         chunk = self._chunks.get(promotion.chunk_key)
         if target.attached and chunk is not None:
             if ok:
+                if self._exclusive and chunk.l2 is promotion.source:
+                    # Exclusive: the chunk moves to L1; in-flight reads keep
+                    # the source extent until their pins drop.
+                    self._detach(chunk, promotion.source)
                 target.valid_ranks = self._tp_mask
             else:
                 self._detach(chunk, target)
@@ -904,6 +961,114 @@ class TierIndex:
         if future is not None and not future.done():
             future.set_result(ok and target.attached)
         self._tree.refresh(promotion.chunk_key)
+
+    # ------------------------------------------------------------------
+    # Demotion (exclusive tiers)
+    # ------------------------------------------------------------------
+
+    @property
+    def exclusive(self) -> bool:
+        """Return whether L1 and L2 hold disjoint chunks."""
+        return self._exclusive
+
+    def demotion_deficit(self) -> int:
+        """Return the L1 lane bytes to demote to restore the clean target.
+
+        Returns:
+            ``max(0, target - (free + clean + demoting))`` in lane bytes; 0
+            without exclusive tiers.
+        """
+        if not self._exclusive:
+            return 0
+        free = self._tiers[L1].allocator.free_bytes
+        covered = free + self._clean_bytes + self._demoting_bytes
+        return max(0, self._clean_target - covered)
+
+    def begin_demotions(self, max_bytes: int) -> list[Demotion]:
+        """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.
+
+        Chunks leave the demotion heap in eviction order. Each gets an L2
+        extent, evicting only L2 candidates of strictly lower priority, so a
+        cold chunk never pushes out a hotter or hinted one. A leaf that does
+        not fit is the coldest chunk of both tiers and is dropped from L1
+        instead (it may be the chunk's last copy); a non-leaf that does not
+        fit ends the batch.
+
+        Args:
+            max_bytes: Stop once the admitted L1 lane bytes reach this.
+
+        Returns:
+            Admitted demotions; both copies of each carry one io pin until
+            ``finish_demotion``.
+
+        Raises:
+            RuntimeError: without exclusive tiers.
+        """
+        if not self._exclusive:
+            raise RuntimeError("demotion needs exclusive tiers")
+        demotions: list[Demotion] = []
+        admitted = 0
+        while admitted < max_bytes:
+            key = self._tree.pop_victim(_DEMOTE)
+            if key is None:
+                break
+            chunk = self._chunks[key]
+            source = chunk.l1
+            assert source is not None
+            length = self._layout.extent_length(L2, chunk.record_sizes)
+            offset = self._reserve(L2, length, below=key)
+            if offset is None:
+                if self._tree.is_leaf(key) and not chunk.lease_pins:
+                    self._evict(L1, key)
+                    self._count_demotion("dropped")
+                    continue
+                self._tree.refresh(key)
+                break
+            target = self._new_copy(key, L2, offset, chunk.record_sizes)
+            chunk.l2 = target
+            self._tiers[L2].copies += 1
+            self._pin(source)
+            self._pin(target)
+            self._demoting_bytes += source.length
+            admitted += source.length
+            demotions.append(
+                Demotion(
+                    chunk_key=key,
+                    record_sizes=chunk.record_sizes,
+                    source=source,
+                    target=target,
+                )
+            )
+        return demotions
+
+    def finish_demotion(self, demotion: Demotion, ok: bool) -> None:
+        """Complete a demotion: validate or drop the L2 copy, unpin both.
+
+        On success the L1 copy is clean and may be evicted at once.
+
+        Args:
+            demotion: Value from ``begin_demotions``.
+            ok: Whether the L1 -> L2 write succeeded on every rank.
+        """
+        source, target = demotion.source, demotion.target
+        self._demoting_bytes -= source.length
+        chunk = self._chunks.get(demotion.chunk_key)
+        if target.attached and chunk is not None:
+            if ok:
+                target.valid_ranks = self._tp_mask
+                if self._is_clean(chunk):
+                    self._clean_bytes += source.length
+                nbytes = target.length * self._layout.tensor_parallel_size
+                self._metrics.counter(
+                    "daser_tier_demoted_bytes_total",
+                    "L1 bytes written to L2 by demotions (all rank lanes).",
+                ).inc(nbytes)
+            else:
+                self._detach(chunk, target)
+        self._count_demotion("ok" if ok else "failed")
+        self._unpin(target)
+        self._unpin(source)
+        self._tree.refresh(demotion.chunk_key)
 
     # ------------------------------------------------------------------
     # Leases
@@ -1038,10 +1203,23 @@ class TierIndex:
     # ------------------------------------------------------------------
 
     def _is_candidate(self, tier: str, key: str) -> bool:
-        """Return whether ``key``'s copy in ``tier`` may be evicted now."""
+        """Return whether ``key``'s copy in ``tier`` may be evicted now.
+
+        For the ``_DEMOTE`` heap: whether its L1 copy may be demoted now.
+        """
         chunk = self._chunks.get(key)
         if chunk is None:
             return False
+        if tier == _DEMOTE:
+            source = chunk.l1
+            return (
+                chunk.l2 is None
+                and source is not None
+                and not source.io_pins
+                and self.is_full(source)
+                and not self._tree.is_orphan(key)
+                and not self._blocked(key)
+            )
         copy = chunk.copy(tier)
         if copy is None or copy.io_pins or not self.is_full(copy):
             return False
@@ -1049,7 +1227,12 @@ class TierIndex:
             return False
         if self._blocked(key):
             return False
-        return self.is_full(chunk.copy(_other(tier))) or self._tree.is_leaf(key)
+        if self.is_full(chunk.copy(_other(tier))):
+            return True
+        if self._exclusive and tier == L1:
+            # A dirty copy leaves L1 through a demotion; orphans are dropped.
+            return self._tree.is_orphan(key)
+        return self._tree.is_leaf(key)
 
     def _validate_sizes(self, sizes: tuple[int, ...]) -> None:
         """Reject an empty or misaligned record size list."""
@@ -1071,6 +1254,31 @@ class TierIndex:
         for tier in TIERS:
             if chunk.copy(tier) is not None:
                 self._tiers[tier].copies += delta
+
+    def _place_l1(
+        self,
+        fresh: list[tuple[str, tuple[int, ...]]],
+        created: dict[str, ChunkTiers],
+        pinned: list[TierCopy],
+    ) -> None:
+        """Give each new chunk an L1 copy when L1 admits it.
+
+        Raises:
+            TierFull: if L1 cannot admit a chunk and L2 is disabled.
+        """
+        for key, sizes in fresh:
+            length = self._layout.extent_length(L1, sizes)
+            offset = self._reserve(L1, length) if L1 in self._tiers else None
+            if offset is None:
+                if L2 not in self._tiers:
+                    raise TierFull(L1, length, self._io_blocked(L1, length))
+                if L1 in self._tiers:
+                    self._count_admission_skip()
+                continue
+            chunk = created[key]
+            chunk.l1 = self._new_copy(key, L1, offset, sizes)
+            self._pin(chunk.l1)
+            pinned.append(chunk.l1)
 
     def _reserve_l2(self, fresh: list[tuple[str, tuple[int, ...]]]) -> dict[str, int]:
         """Reserve L2 extents for new chunks, contiguously when possible.
@@ -1106,8 +1314,13 @@ class TierIndex:
             raise
         return offsets
 
-    def _reserve(self, tier: str, length: int) -> int | None:
+    def _reserve(self, tier: str, length: int, below: str | None = None) -> int | None:
         """Reserve ``length`` bytes in ``tier``, evicting candidates.
+
+        Args:
+            tier: Tier to reserve in.
+            length: Extent bytes.
+            below: Evict only candidates of lower priority than this node.
 
         Returns:
             Lane offset, or None when no candidate is left.
@@ -1126,7 +1339,7 @@ class TierIndex:
                         "Evicted bytes beyond the deficit that triggered them.",
                     ).inc(max(0, evicted - length), labels={"tier": tier})
                 return offset
-            victim = self._tree.pop_victim(tier)
+            victim = self._tree.pop_victim(tier, below=below)
             if victim is None:
                 return None
             evicted += self._evict(tier, victim)
@@ -1173,6 +1386,9 @@ class TierIndex:
 
     def _detach(self, chunk: ChunkTiers, copy: TierCopy) -> None:
         """Take ``copy`` off its chunk; free the extent unless io pinned."""
+        if self._exclusive and self._is_clean(chunk):
+            assert chunk.l1 is not None
+            self._clean_bytes -= chunk.l1.length
         if copy.tier == L1:
             chunk.l1 = None
         else:
@@ -1187,6 +1403,10 @@ class TierIndex:
                 future.set_result(False)
         if copy.io_pins == 0:
             self._release(copy)
+
+    def _is_clean(self, chunk: ChunkTiers) -> bool:
+        """Return whether both of a chunk's copies are full."""
+        return self.is_full(chunk.l1) and self.is_full(chunk.l2)
 
     def _release(self, copy: TierCopy) -> None:
         """Return a detached, unpinned copy's extent to its allocator."""
@@ -1228,6 +1448,13 @@ class TierIndex:
             "daser_tier_l1_admission_skips_total",
             "Chunks L1 could not admit (stored or read through staging).",
         ).inc()
+
+    def _count_demotion(self, outcome: str) -> None:
+        """Count one demotion by outcome (ok, failed, dropped)."""
+        self._metrics.counter(
+            "daser_tier_demotions_total",
+            "Exclusive-tier L1 -> L2 demotions by outcome.",
+        ).inc(labels={"outcome": outcome})
 
     def _publish_hint_metrics(self) -> None:
         """Set the queue-hint gauges."""

@@ -51,6 +51,7 @@ from daser.server.tiers import (
     L1,
     L2,
     ChunkUnavailable,
+    Demotion,
     Lease,
     Promotion,
     StorePlacement,
@@ -399,6 +400,16 @@ class IPCServer:
             os.environ.get(LOAD_READAHEAD_WINDOW_ENV) or 4
         )
         self._readahead_inflight = 0
+        # Exclusive tiers: demotion batches of about one readahead piece (all
+        # rank lanes), at most four in flight.
+        self._demote_piece = (
+            self._readahead_piece or DEFAULT_LOAD_READAHEAD_BYTES
+        ) // self._layout.tensor_parallel_size
+        self._demote_budget = 4 * self._demote_piece
+        self._demote_inflight = 0
+        self._demote_scheduled = False
+        if core.exclusive_tiers:
+            core.set_demotion_listener(self._kick_demotions)
         self._lease_budget = int(
             self._runtime_config.get("prefetch_lease_budget_bytes", 0)
         )
@@ -464,6 +475,7 @@ class IPCServer:
                 "leases": len(self._leases),
                 "lease_waiters": len(self._lease_waiters),
                 "readahead_inflight": self._readahead_inflight,
+                "demote_inflight": self._demote_inflight,
             },
         )
         self._server = await asyncio.start_unix_server(
@@ -1927,6 +1939,78 @@ class IPCServer:
                 "daser_readahead_bytes_total",
                 "Lookup readahead bytes by outcome.",
             ).inc(nbytes, labels={"outcome": "read" if ok else "dropped"})
+
+    # ------------------------------------------------------------------
+    # Demotion helpers (exclusive tiers)
+    # ------------------------------------------------------------------
+
+    def _kick_demotions(self) -> None:
+        """Start demotions when L1 lacks free or clean bytes.
+
+        Registered as the core's demotion listener; also re-run when a
+        demotion batch ends. At most one filler task runs at a time.
+        """
+        if (
+            self._demote_scheduled
+            or self._transfer is None
+            or self._demote_inflight >= self._demote_budget
+            or not self._core.demotion_deficit()
+        ):
+            return
+        self._demote_scheduled = True
+        self._spawn(self._fill_demotions())
+
+    async def _fill_demotions(self) -> None:
+        """Admit demotion batches until the deficit or the window is covered."""
+        try:
+            while (
+                self._demote_inflight < self._demote_budget
+                and self._core.demotion_deficit()
+            ):
+                demotions = await self._core.begin_demotions(self._demote_piece)
+                if not demotions:
+                    break
+                lane_bytes = sum(d.source.length for d in demotions)
+                self._demote_inflight += lane_bytes
+                self._spawn(self._run_demotions(demotions, lane_bytes))
+        finally:
+            self._demote_scheduled = False
+
+    async def _run_demotions(self, demotions: list[Demotion], lane_bytes: int) -> None:
+        """Write one demotion batch to L2 and finish its demotions.
+
+        Args:
+            demotions: Admitted demotions.
+            lane_bytes: Their L1 lane bytes.
+        """
+        ok = False
+        try:
+            moves = [m for d in demotions for m in self._demotion_moves(d)]
+            await self._ensure_transfer().demote(moves)
+            ok = True
+        finally:
+            for demotion in demotions:
+                self._core.finish_demotion(demotion, ok)
+            self._demote_inflight -= lane_bytes
+            self._kick_demotions()
+
+    def _demotion_moves(self, demotion: Demotion) -> list[Move]:
+        """Return the L1 -> L2 moves of a demotion on every rank lane.
+
+        Args:
+            demotion: Admitted demotion.
+        """
+        nbytes = sum(demotion.record_sizes)
+        layout = self._layout
+        return [
+            Move(
+                buffer_offset=0,
+                nbytes=nbytes,
+                l1_offset=layout.absolute_offset(L1, rank, demotion.source.offset),
+                l2_offset=layout.absolute_offset(L2, rank, demotion.target.offset),
+            )
+            for rank in range(layout.tensor_parallel_size)
+        ]
 
     # ------------------------------------------------------------------
     # Lease helpers

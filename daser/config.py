@@ -46,6 +46,11 @@ LAYERWISE_GPU_STALL_ENV = "DASER_LAYERWISE_GPU_STALL"
 #: L2 writes run on their own executor in 16 MiB pieces that pause (bounded)
 #: while any L2 read is in native IO (default on; ``0`` disables).
 L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
+#: Research switch: ``1`` keeps L1 and L2 disjoint (store to one tier, demote
+#: L1 victims to L2); needs both tiers. ``DASER_EXCLUSIVE_CLEAN`` sets the L1
+#: lane bytes kept free or clean (default an eighth of the L1 lane).
+EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
+EXCLUSIVE_CLEAN_ENV = "DASER_EXCLUSIVE_CLEAN"
 
 
 @dataclass(frozen=True)

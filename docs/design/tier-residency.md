@@ -17,7 +17,8 @@ compressed-online 共用同一套放置和淘汰路径。所有放置、淘汰�
    有效副本，或它是 chunk 树的叶子。
 4. 淘汰 chunk 的最后一个副本即把它移出索引；只淘汰一个副本时仅释放该 extent。
 5. store 对 L2 write-through；L1 能接纳时把 D2H snapshot 留作 L1 副本。L2 命中
-   按同一接纳规则 promote 进 L1。
+   按同一接纳规则 promote 进 L1。研究开关 `DASER_EXCLUSIVE_TIERS=1` 改为两层独占
+   （见「独占分层」）。
 
 驻留按 chunk 粒度：一层要么持有 chunk 的全部 record，要么一个都没有。每层副本
 因此是一段连续 extent，不存在部分 record 状态，候选规则是逐 chunk 的谓词。
@@ -233,6 +234,42 @@ T 层副本存在且有效，且 io_pins_T == 0
   `ServerCore.resolve_slots(start_slot, num_slots)` 把 run 拆回各 chunk，不能把
   run 当作单个 chunk。
 
+## 独占分层（`DASER_EXCLUSIVE_TIERS=1`，默认关）
+
+默认的 write-through 下每个 chunk 都在 L2，两层又共用同一份 recency，所以 L1 近似是
+L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测外部命中与 64 GiB
+包含式模拟一致；同一访问序列下 96 GiB 并集的模拟命中高得多。独占模式让 L1 与 L2
+存不同的 chunk（DEMOTE / ULC 式的降级写回），压缩与 queue hint 都在这份更大的容量上
+起作用。两层都启用时才可开启，否则启动报错。
+
+- store：新 chunk 先尝试 L1；L1 接纳的只放 L1（不写 L2，`store_staged` 即结束该
+  rank 的 store），不接纳的只放 L2（同默认路径）。
+- promotion 成功后摘除 L2 源副本（在途读仍 io pin 着它，读完才释放 extent）。
+- 只在 L1 的 chunk 称为**脏**。L1 候选谓词改为「L2 副本完整，或 chunk 是孤儿」：脏的
+  非孤儿副本不能同步淘汰，必须先降级；孤儿不可达，直接丢弃。L2 候选谓词不变。
+- 降级（demotion）：树多一个 `demote` 堆，候选为 L1 完整、无 io pin、无 L2 副本、
+  非孤儿、无未提交写者的 chunk，按同一优先级出堆（未提示的 LRU 先、提示过的最后）。
+  `begin_demotions(max_bytes)` 为出堆的 chunk 预留 L2 extent，只允许淘汰优先级严格
+  低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。挤不下时：叶子
+  是两层里最冷的块，直接从 L1 丢弃（可能是最后一份，计 `dropped`）；非叶子结束本批。
+  两份副本 io pin，IPC server 调 `transfer.demote`（L1 extent 写到 L2 extent，经 L2 写门），
+  `finish_demotion(ok)` 成功时 L2 副本对所有 rank 有效，L1 副本变为干净、可同步淘汰；
+  失败时丢弃 L2 副本。
+- 干净余量：TierIndex 记 L1 干净字节（两层都完整的 chunk 的 L1 extent）与在途降级
+  字节，`demotion_deficit = max(0, 目标 − (L1 空闲 + 干净 + 在途))`。目标默认 L1 lane
+  的 1/8，可用 `DASER_EXCLUSIVE_CLEAN`（字节）调整。每次 tier 变化、store 发布、load /
+  lease / promotion 放下 pin 后，core 若有缺口就回调 IPC server（脏副本要等 io pin 放下
+  且写者提交后才可降级）；server 按 readahead 分片大小（默认 1 GiB，所有 rank 合计）
+  成批发起降级，最多 4 片在途，一批结束再检查一次。余量
+  不够时 store 跳过 L1 直接写 L2、promotion 被跳过（照常从 L2 经 staging 读），不会
+  阻塞。
+- 写入量：每个 chunk 的字节在离开 L1 时写一次 L2（被 promote 过的 chunk 再离开时
+  再写一次），不再在 store 时无条件写 L2。
+- 持久化：只有 L2 副本进 `daser.index`，独占模式下脏 chunk 在重启后丢失（compressed-online
+  本就易失）。
+- 指标：`daser_tier_demotions_total{outcome}`、`daser_tier_demoted_bytes_total`、
+  gauge `daser_tier_l1_clean_bytes`、`daser_tier_demoting_bytes`。
+
 ## Prefetch lease（`--daser-prefetch-max-requests`，默认 0）
 
 - `lookup_prefetch`（必须带 `lease_id`，同 id 的旧 lease 先释放）对外部窗口的
@@ -309,7 +346,7 @@ class Move:
 
 `store`（返回 `StoreHandle`，`staged` 在源字节被消费、L1 副本有效时完成，
 `persisted` 在 L2 写完时完成）、`load(buffer, moves, source)`、`promote(moves)`、
-`load_runs`、`drain`、`close`。iouring 持有一块 pinned arena（L1 偏移索引其中）和
+`demote(moves)`（arena extent 写到 L2，独占分层用）、`load_runs`、`drain`、`close`。iouring 持有一块 pinned arena（L1 偏移索引其中）和
 一个小的 staging pool；staging 的等待只依赖在途 IO，不会死锁。extent 在
 `io_pins > 0` 时不会被复用，load 不会读到尚未有效的 extent，因此 transfer 层不
 需要写后写排序、promotion 过期检测或按地址的 lease。GDS 只实现 L2 子集：
@@ -338,6 +375,8 @@ extent，全部通过才修改状态；用 `take` 重建 L2 分配器，L1 为�
 - readahead 的字节在被读之前不固定，store 压力大时可能被淘汰，代价是一次 L2 读。
 - 驻留按 chunk 粒度：只读 chunk 一部分的 L2 load 不 promote 该 chunk。
 - 每个 chunk 因粒度取整浪费不到 `G`。
+- 独占分层下，后代仍在 L1 的 L2-only 非叶子不是 L2 候选；这样的块占住 L2 时降级
+  可能失败，本批停止，之后的 store 跳过 L1 直接写 L2，直到 L2 有可淘汰的块。
 - TP ranks 并发 load 同一 L2-only chunk 时，若某 rank 规划时在等另一个 chunk 的
   promotion，期间另一 rank 已 promote 该 chunk（含全部 lane），前者的
   `begin_promotions` 返回 None，仍从 L2 读自己的 lane：多一次 L2 读，数据正确
