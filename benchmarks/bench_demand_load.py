@@ -79,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--io-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--bip-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use BIP replacement (off preserves the original benchmark default)",
+    )
     parser.add_argument("--l1-bytes", type=parse_size, default=None)
     parser.add_argument("--max-device-bytes", type=parse_size, default=2 << 30)
     parser.add_argument(
@@ -374,7 +380,7 @@ async def run_wave(
         l1_bytes=l1_bytes,
         l2_bytes=int(payload.nbytes),
         io_workers=args.io_workers,
-        bip_enabled=False,
+        bip_enabled=args.bip_enabled,
     )
     destinations: list[CudaDestination] = []
     tasks: list[asyncio.Task[float]] = []
