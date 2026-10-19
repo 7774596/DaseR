@@ -9,7 +9,11 @@ import os
 from typing import Any, Optional
 
 # First Party
-from daser.config import EXCLUSIVE_CLEAN_ENV, EXCLUSIVE_TIERS_ENV
+from daser.config import (
+    EXCLUSIVE_CLEAN_ENV,
+    EXCLUSIVE_KEEP_PROMOTED_ENV,
+    EXCLUSIVE_TIERS_ENV,
+)
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
 from daser.logging import init_logger
@@ -360,6 +364,7 @@ class ServerCore:
             metrics_registry=self._metrics,
             exclusive=os.environ.get(EXCLUSIVE_TIERS_ENV) == "1",
             clean_bytes=int(clean) if clean else None,
+            keep_promoted=os.environ.get(EXCLUSIVE_KEEP_PROMOTED_ENV) == "1",
         )
         # Called after a tier change leaves a demotion deficit (exclusive).
         self._demotion_listener: Callable[[], None] | None = None

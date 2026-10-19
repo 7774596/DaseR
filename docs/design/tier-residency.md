@@ -245,6 +245,11 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
 - store：新 chunk 先尝试 L1；L1 接纳的只放 L1（不写 L2，`store_staged` 即结束该
   rank 的 store），不接纳的只放 L2（同默认路径）。
 - promotion 成功后摘除 L2 源副本（在途读仍 io pin 着它，读完才释放 extent）。
+  研究开关 `DASER_EXCLUSIVE_KEEP_PROMOTED=1` 改为保留源副本：promote 进来的 chunk
+  是干净的，离开 L1 时直接丢 L1 副本，不再降级写回。readahead 把外部窗口提进 L1
+  后紧接着就被 load 走，摘源会让每次 readahead 换来一次 L2 读 + 一次降级写
+  （R233：关 readahead 后 L2 写 −11%，ΣTTFT 1.04×）；保留源只多占 L2 容量，
+  由 L2 照常淘汰（淘汰 L2 副本后 chunk 回到脏）。
 - 只在 L1 的 chunk 称为**脏**。L1 候选谓词改为「L2 副本完整，或 chunk 是孤儿」：脏的
   非孤儿副本不能同步淘汰，必须先降级；孤儿不可达，直接丢弃。L2 候选谓词不变。
 - 降级（demotion）：树多一个 `demote` 堆，候选为 L1 完整、无 io pin、无 L2 副本、

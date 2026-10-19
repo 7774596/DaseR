@@ -49,8 +49,11 @@ L2_WRITE_GATE_ENV = "DASER_L2_WRITE_GATE"
 #: Research switch: ``1`` keeps L1 and L2 disjoint (store to one tier, demote
 #: L1 victims to L2); needs both tiers. ``DASER_EXCLUSIVE_CLEAN`` sets the L1
 #: lane bytes kept free or clean (default an eighth of the L1 lane).
+#: ``DASER_EXCLUSIVE_KEEP_PROMOTED=1`` keeps a promotion's L2 source, so the
+#: promoted chunk is clean (droppable from L1 without a demotion write).
 EXCLUSIVE_TIERS_ENV = "DASER_EXCLUSIVE_TIERS"
 EXCLUSIVE_CLEAN_ENV = "DASER_EXCLUSIVE_CLEAN"
+EXCLUSIVE_KEEP_PROMOTED_ENV = "DASER_EXCLUSIVE_KEEP_PROMOTED"
 
 
 @dataclass(frozen=True)

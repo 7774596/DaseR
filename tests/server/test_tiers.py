@@ -36,6 +36,7 @@ class Harness:
         l1_record_bytes: int = 0,
         exclusive: bool = False,
         clean_bytes: int | None = None,
+        keep_promoted: bool = False,
     ) -> None:
         self.layout = TierLayout(
             grain=G,
@@ -56,6 +57,7 @@ class Harness:
             metrics_registry=self.registry,
             exclusive=exclusive,
             clean_bytes=clean_bytes,
+            keep_promoted=keep_promoted,
         )
 
     def add(self, key: str, parent: str = "") -> None:
@@ -785,6 +787,28 @@ def test_demotion_drops_dirty_tails_below_the_coldest_chunk() -> None:
     assert sorted(h.lost) == ["c", "g"]
     for demotion in demotions:
         h.tiers.finish_demotion(demotion, ok=True)
+    assert_invariants(h)
+
+
+@pytest.mark.asyncio
+async def test_exclusive_keep_promoted_leaves_a_clean_droppable_l1_copy() -> None:
+    h = Harness(l1=1, l2=4, exclusive=True, clean_bytes=G, keep_promoted=True)
+    h.store("a")
+    h.store("b")  # L2 only
+    h.tiers.remove("a")
+    promotion = h.tiers.begin_promotion("b")
+    assert promotion is not None
+    h.tiers.finish_promotion(promotion, ok=True)
+    b = h.tiers.chunk("b")
+    assert b is not None and h.tiers.is_full(b.l1) and h.tiers.is_full(b.l2)
+    # Clean: L1 needs no demotion, and the next store drops b's L1 copy.
+    assert h.tiers.l1_room() == G and h.tiers.demotion_deficit() == 0
+    assert_invariants(h)
+    placement = h.store("c")
+    assert placement.l1 is not None and placement.l2 is None
+    b = h.tiers.chunk("b")
+    assert b is not None and b.l1 is None and h.tiers.is_full(b.l2)
+    assert h.lost == []
     assert_invariants(h)
 
 

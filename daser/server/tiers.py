@@ -390,8 +390,9 @@ class TierIndex:
 
     With ``exclusive`` the tiers hold different chunks (see "独占分层" in
     the design doc): a store goes to L1 only when L1 admits it, else to L2
-    only; a promotion drops its L2 source; an L1-only (dirty) copy is a
-    candidate only when the chunk is an orphan, and leaves L1 through a
+    only; a promotion drops its L2 source (unless ``keep_promoted``); an
+    L1-only (dirty) copy is a candidate only when the chunk is an orphan,
+    and leaves L1 through a
     demotion (``begin_demotions`` / ``finish_demotion``) that writes it to
     L2 first.
 
@@ -405,6 +406,8 @@ class TierIndex:
         exclusive: Keep L1 and L2 disjoint; needs both tiers.
         clean_bytes: Exclusive only: L1 lane bytes to keep free or clean
             (``demotion_deficit``); None means an eighth of the L1 lane.
+        keep_promoted: Exclusive only: a promotion keeps its L2 source, so
+            the promoted chunk is clean and leaves L1 without a demotion.
 
     Raises:
         ValueError: if ``exclusive`` is set without both tiers.
@@ -422,6 +425,7 @@ class TierIndex:
         metrics_registry: MetricsRegistry | None = None,
         exclusive: bool = False,
         clean_bytes: int | None = None,
+        keep_promoted: bool = False,
     ) -> None:
         if exclusive and not (layout.enabled(L1) and layout.enabled(L2)):
             raise ValueError("exclusive tiers need both L1 and L2")
@@ -437,6 +441,7 @@ class TierIndex:
         }
         self._chunks: dict[str, ChunkTiers] = {}
         self._exclusive = exclusive
+        self._keep_promoted = keep_promoted
         self._clean_target = (
             layout.l1_lane_bytes // 8 if clean_bytes is None else clean_bytes
         )
@@ -967,11 +972,15 @@ class TierIndex:
         chunk = self._chunks.get(promotion.chunk_key)
         if target.attached and chunk is not None:
             if ok:
-                if self._exclusive and chunk.l2 is promotion.source:
+                kept = chunk.l2 is promotion.source
+                if self._exclusive and kept and not self._keep_promoted:
                     # Exclusive: the chunk moves to L1; in-flight reads keep
                     # the source extent until their pins drop.
                     self._detach(chunk, promotion.source)
+                    kept = False
                 target.valid_ranks = self._tp_mask
+                if self._exclusive and kept and self._is_clean(chunk):
+                    self._clean_bytes += target.length
             else:
                 self._detach(chunk, target)
         self._unpin(target)
