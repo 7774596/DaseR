@@ -1295,7 +1295,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         error: BaseException | None = None
         while True:
             async with self._lock:
-                pending = list(self._pending_l2.values()) + list(self._pending_h2d)
+                copies = list(self._pending_h2d)
+                pending = list(self._pending_l2.values()) + copies
+                # A completed copy has released its DMA owners, but its done
+                # callback may still be queued behind this drain. Reap that
+                # registration now: the all-done wait fast path does not yield
+                # and would otherwise starve the callback. Keep the task in
+                # this round's snapshot so its failure is still observed.
+                self._pending_h2d.difference_update(
+                    copy for copy in copies if copy.done()
+                )
                 if not pending:
                     # A failed write may already have left the registry while
                     # unrelated native IO still owned pinned memory. Report it

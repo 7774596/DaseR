@@ -2,7 +2,10 @@
 """Hold unleased source pages until delayed destination copies complete."""
 
 import asyncio
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -179,6 +182,124 @@ def test_failed_copy_drains_slow_sibling_before_load_returns(
                 completion.complete()
             await asyncio.gather(loading, return_exceptions=True)
             await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["success", "submit_error", "error_with_pending"])
+def test_drain_observes_completed_copy_before_done_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    outcome: str,
+) -> None:
+    """Drain must observe completed copies without starving their queued callbacks.
+
+    Args:
+        tmp_path (Path): Parent-owned scratch, including child pytest artifacts.
+        monkeypatch (pytest.MonkeyPatch): Public copy-operation test doubles.
+        request (pytest.FixtureRequest): Exact test case to run in the child.
+        outcome (str): Successful, failed, or failed-plus-pending copy scenario.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        One event loop runs in the child. A subprocess watchdog bounds a busy
+        loop that would also prevent asyncio.wait_for from firing. Only public
+        transfer APIs and CPU buffers are used; skip_l2 creates no SSD store.
+    """
+    child_key = "DASER_DRAIN_CALLBACK_TEST_CHILD"
+    if os.environ.get(child_key) != request.node.nodeid:
+        env = dict(os.environ)
+        env[child_key] = request.node.nodeid
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        # The parent owns this directory even if a stuck child must be killed
+        # before pytest can run its own session cleanup.
+        env["DASER_TEST_SCRATCH_ROOT"] = str(tmp_path / "child-scratch")
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", request.node.nodeid],
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
+    fast = DeferredDestination()
+    slow = DeferredDestination() if outcome == "error_with_pending" else None
+
+    def event(dst: Any, chunks: list[copy_ops.CopyChunk]) -> DeferredDestination:
+        assert isinstance(dst, DeferredDestination)
+        return dst
+
+    def enqueue(dst: DeferredDestination, chunks: list[copy_ops.CopyChunk]) -> None:
+        dst.chunks.extend(chunks)
+        if dst is fast and outcome != "success":
+            raise RuntimeError("completed copy submission failed")
+
+    def record(dst: DeferredDestination, completion: DeferredDestination) -> None:
+        assert dst is completion
+        if dst is fast:
+            dst.complete()
+        dst.submitted.set()
+
+    monkeypatch.setattr(copy_ops, "destination_copy_event", event)
+    monkeypatch.setattr(copy_ops, "copy_grouped_to_dst", enqueue)
+    monkeypatch.setattr(copy_ops, "record_destination_copy_event", record)
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "unused.store"),
+            l1_bytes=4096,
+            l2_bytes=0,
+            skip_l2=True,
+        )
+        tasks: list[asyncio.Task[int]] = []
+        try:
+            await layer.store_bytes(b"a" * 4096, 0, 4096)
+            for dst in [fast, *([slow] if slow is not None else [])]:
+                tasks.append(
+                    asyncio.create_task(
+                        layer.load_bytes_grouped(
+                            dst,
+                            [{"file_offset": 0, "target_offset": 0, "nbytes": 4096}],
+                        )
+                    )
+                )
+            # First turn submits copies; the second lets the already-complete
+            # fast copy finish. This task resumes before its queued done
+            # callbacks, exactly when public drain can see a completed owner.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert fast.submitted.is_set()
+            if slow is not None:
+                assert slow.submitted.is_set() and not slow.done
+                asyncio.get_running_loop().call_later(0.01, slow.complete)
+            if outcome == "success":
+                await layer.drain()
+            else:
+                with pytest.raises(RuntimeError, match="completed copy submission"):
+                    await layer.drain()
+            if slow is not None:
+                assert slow.done and slow.data == b"a" * 4096
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if outcome == "success":
+                assert results == [4096]
+            else:
+                assert isinstance(results[0], RuntimeError)
+                if slow is not None:
+                    assert results[1] == 4096
+            assert fast.data == b"a" * 4096
+            await layer.drain()
+        finally:
+            if slow is not None:
+                slow.complete()
+            await asyncio.gather(*tasks, return_exceptions=True)
             layer.close()
 
     asyncio.run(scenario())
