@@ -630,6 +630,35 @@ def test_demotion_writes_the_coldest_dirty_copy_and_makes_it_clean() -> None:
     assert_invariants(h)
 
 
+def test_l1_demand_demotes_until_the_room_is_clean() -> None:
+    h = Harness(l1=3, l2=8, exclusive=True, clean_bytes=G)
+    for key in "abc":
+        h.store(key)
+    assert h.tiers.l1_room() == 0
+    assert h.tiers.demotion_deficit() == G
+    # A promotion waiting for two grains raises the target by two.
+    h.tiers.add_l1_demand(2 * G)
+    assert h.tiers.demotion_deficit() == 3 * G
+    demotions = h.tiers.begin_demotions(2 * G)
+    assert [d.chunk_key for d in demotions] == ["a", "b"]
+    for demotion in demotions:
+        h.tiers.finish_demotion(demotion, ok=True)
+    assert h.tiers.l1_room() == 2 * G
+    assert h.tiers.demotion_deficit() == G
+    h.tiers.add_l1_demand(-2 * G)
+    assert h.tiers.demotion_deficit() == 0
+    with pytest.raises(AssertionError):
+        h.tiers.add_l1_demand(-G)
+
+
+def test_l1_room_counts_only_free_bytes_without_exclusive_tiers() -> None:
+    h = Harness(l1=2, l2=4)
+    h.store("a")
+    assert h.tiers.l1_room() == G
+    h.store("b")
+    assert h.tiers.l1_room() == 0
+
+
 def test_failed_demotion_drops_the_l2_copy() -> None:
     h = Harness(l1=1, l2=4, exclusive=True)
     h.store("a")

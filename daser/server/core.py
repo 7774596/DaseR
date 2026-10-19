@@ -966,6 +966,24 @@ class ServerCore:
         """Return the L1 lane bytes to demote (see ``TierIndex``)."""
         return self._tiers.demotion_deficit()
 
+    def l1_room(self) -> int:
+        """Return the L1 lane bytes a promotion can take without a demotion.
+
+        See ``TierIndex.l1_room``; an upper bound with exclusive tiers.
+        """
+        return self._tiers.l1_room()
+
+    def add_l1_demand(self, lane_bytes: int) -> None:
+        """Raise (negative: lower) the L1 room demotions must keep.
+
+        Raising it starts demotions through the demotion listener.
+
+        Args:
+            lane_bytes: L1 lane bytes to add (see ``TierIndex.add_l1_demand``).
+        """
+        self._tiers.add_l1_demand(lane_bytes)
+        self._notify_demotions()
+
     async def begin_demotions(self, max_bytes: int) -> list[Demotion]:
         """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.
 

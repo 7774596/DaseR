@@ -1059,6 +1059,60 @@ async def test_prefetch_lease_promotes_and_pins_its_window(
 
 
 @pytest.mark.asyncio
+async def test_exclusive_prefetch_demotes_dirty_l1_chunks_to_make_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An L1 full of dirty chunks is demoted so a lease can promote."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", "0")
+    registry = MetricsRegistry()
+    core = make_core(64, 2, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=2, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await server.start()
+    try:
+        for index, key in enumerate(("p", "q")):
+            await store_raw_chunk(socket_path, key, pattern(40 + index))
+        # L1 holds two dirty chunks and keeps no clean room: the chain is
+        # stored to L2 only.
+        allocations = await store_chain(socket_path, tokens)
+        before = [core.full_tiers(key) for key in (*keys, "p", "q")]
+        leased = await _send_recv(
+            socket_path,
+            {
+                "op": "lookup_prefetch",
+                "lease_id": "req",
+                "tokens": tokens + [99],
+                "model_id": "m",
+                "external_prefix_queries": 9,
+                "num_computed_tokens": 0,
+            },
+        )
+        prefetch = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
+        )
+        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
+        await _send_recv(
+            socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
+        )
+        after = [core.full_tiers(key) for key in (*keys, "p", "q")]
+    finally:
+        await server.stop()
+    assert before == [(L2,), (L2,), (L1,), (L1,)]
+    assert leased["tier"] == "l2"
+    assert prefetch["ok"] is True and prefetch["l2_bytes"] == 2 * RECORD
+    assert (loaded["l1_segments"], loaded["data"]) == (2, pattern(1) + pattern(2))
+    # p and q were demoted, then their clean L1 copies made room.
+    assert after == [(L1,), (L1,), (L2,), (L2,)]
+    assert core.demotion_deficit() == 0
+    rendered = registry.render_prometheus()
+    assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
+    assert "daser_prefetch_room_timeouts_total" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_prefetch_lease_waits_for_the_lease_budget(tmp_path: Path) -> None:
     """A lease that does not fit the budget waits for an earlier release."""
     core = make_core(64, 1)
