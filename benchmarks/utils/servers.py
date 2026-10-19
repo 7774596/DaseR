@@ -839,7 +839,10 @@ class ServerManager:
 
         Returns:
             JSON-serialisable vLLM connector configuration, including the
-            effective prefetch state used by the scheduler role.
+            effective prefetch state used by the scheduler role. Lookups do
+            not pin chunks, so a hit can be evicted before its load runs;
+            ``kv_load_failure_policy`` makes vLLM recompute those blocks
+            instead of failing the request.
 
         Thread-safety:
             Pure calculation over immutable service configuration.
@@ -861,6 +864,7 @@ class ServerManager:
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",
             "kv_role": "kv_both",
+            "kv_load_failure_policy": "recompute",
             "kv_connector_extra_config": extra_config,
         }
 

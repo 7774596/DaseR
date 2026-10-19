@@ -139,8 +139,11 @@ socket path：
 vllm serve /path/to/model \
     --port 8001 \
     --no-enable-prefix-caching \
-    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
+    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
 ```
+
+lookup 命中不 pin chunk，load 前 chunk 可能被逐出；`kv_load_failure_policy`
+设为 `recompute` 时 vLLM 重算这些块，默认 `fail` 会让请求失败。
 
 再启动 DaseR：
 

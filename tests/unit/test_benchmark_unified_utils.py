@@ -2118,6 +2118,7 @@ def test_daser_prefetch_resolution_and_manifest_payload() -> None:
 
     assert manifest.prefetch_enabled is True
     assert manifest.prefetch_max_requests == 2
+    assert payload["kv_load_failure_policy"] == "recompute"
     assert payload["kv_connector_extra_config"] == {
         "socket_path": "/data/zwt/daser_test/bench/daser.sock",
         "cache_reuse_mode": "chunk",

@@ -29,8 +29,12 @@ connector identity and the IPC socket path:
 vllm serve /path/to/model \
     --port 8001 \
     --no-enable-prefix-caching \
-    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
+    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
 ```
+
+A lookup hit is not pinned, so a chunk can be evicted before its load runs.
+`kv_load_failure_policy` `recompute` makes vLLM recompute those blocks; the
+default `fail` aborts the request.
 
 Then start DaseR:
 
