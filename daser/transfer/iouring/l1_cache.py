@@ -22,6 +22,11 @@ from daser.replacement import LRUReplacementPolicy, ReplacementPolicy
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
 
+def _unpinned_after_close(key: tuple[int, int], data: PinnedMemorySlice) -> bool:
+    """A closed cache no longer borrows its owner's pinning callback."""
+    return False
+
+
 @dataclass(frozen=True)
 class L1RangeHit:
     """One L1-backed subrange inside a requested load span."""
@@ -108,8 +113,21 @@ class L1Cache:
         return self._slice_ids.copy()
 
     def close(self) -> None:
-        """Release the pinned pool backing this cache."""
+        """Release the pinned pool and stop retaining the callback owner.
+
+        Args:
+            None.
+        Returns:
+            None.
+        Async/thread-safety:
+            Shutdown only; all external IO/DMA owners must have finished.
+            Calls after the first close are harmless.
+        """
         self._pool.close()
+        # A bound predicate otherwise forms owner -> cache -> owner, retaining
+        # the closed transfer's metadata until cyclic GC. End that ownership
+        # explicitly at shutdown; active-cache eviction semantics are unchanged.
+        self._is_pinned = _unpinned_after_close
 
     def find(
         self, file_offset: int

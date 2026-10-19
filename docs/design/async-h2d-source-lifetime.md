@@ -64,3 +64,9 @@ holes; the fixed pinned pool still charges the entire original allocation
 until its final child or external owner closes. Replacement continues to evict
 whole allocations, so a small surviving fragment can temporarily reduce
 effective capacity but cannot permit premature reuse of an in-flight buffer.
+
+After all IO/DMA owners finish, closing L1 releases its backing pool and drops
+its injected pinning predicate. A bound predicate would otherwise retain the
+closed transfer through an owner/cache reference cycle until cyclic GC. Ending
+that callback ownership at close releases metadata promptly without changing
+active-cache eviction or adding work to the read/write hot path.

@@ -3,6 +3,7 @@
 """Public L1 ownership behavior across shared slices and eviction."""
 
 import ctypes
+import weakref
 
 import pytest
 
@@ -11,6 +12,7 @@ pytest.importorskip("cupy")
 from daser.replacement import LRUReplacementPolicy, ReplacementPolicy
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.iouring.l1_cache import L1Cache
+from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 
 
 def test_resident_identity_tracks_children_and_capacity_eviction() -> None:
@@ -248,4 +250,33 @@ def test_fragment_eviction_cannot_reuse_detached_writer_allocation() -> None:
         reused.close()
     finally:
         original.close()
+        cache.close()
+
+
+def test_close_releases_injected_callback_owner() -> None:
+    """A retained closed cache must not keep its former orchestrator alive.
+
+    Args:
+        None.
+    Returns:
+        None; a weak reference verifies callback ownership ends at close.
+    Async/thread-safety:
+        Synchronous shutdown with no outstanding buffers or native operations.
+        No explicit cyclic collection is needed to release the callback owner.
+    """
+
+    class Owner:
+        def pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
+            """Return False for the idle owner's slices; no shared-state writes."""
+            return False
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    cache = L1Cache(4096, 4096, owner.pinned)
+    del owner
+    try:
+        assert reference() is not None
+        cache.close()
+        assert reference() is None
+    finally:
         cache.close()
