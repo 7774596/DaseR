@@ -24,12 +24,32 @@ order. Worker staging, decode and vLLM completion contracts are unchanged.
 Validation covers delayed DMA with L1 replacement, overlapping stores, L2
 promotion, cancellation and byte-exact restoration on a real CUDA device.
 
-Packed stores have the inverse ownership boundary: an executor thread copies
-the worker's source into a reserved pinned destination. Cancelling the asyncio
+Raw and packed stores have the inverse ownership boundary: an executor thread
+copies the worker's source into a reserved pinned destination. Cancelling the asyncio
 await cannot stop that thread. The store therefore shields and drains the copy
 task before propagating cancellation or freeing either buffer, including when
 the caller cancels repeatedly. Failed snapshots release their reservation and
 wake pool waiters before returning, so unrelated stores can reuse the pages.
+Both paths use one snapshot helper and the same cancellation-safe future drain;
+raw grouped stores retain their per-span snapshots and packed stores retain
+bounded contiguous-source snapshots.
+
+Every asynchronous L2 write uses one task for predecessor ordering, native IO,
+completion accounting and final ownership release. Waiting for predecessors
+cannot cancel their writes. The native executor future is drained before the
+write task releases its slice, even when its waiter is cancelled repeatedly.
+The range-key registry records the newest write for ordering, while the existing
+slice-identity registry retains each older writer's independent buffer. There
+is no additional slice retain, copy or pool allocation.
+
+A store still returns after its snapshot is accepted into L1 and persistence
+is scheduled. If cancellation arrives after publication, cleanup only releases
+unowned slices: L1, request leases and L2 writers can independently retain the
+published children, including children immediately evicted by BIP/accounting.
+Transfer drain finishes all current writes and destination copies before
+reporting an asynchronous write error. The synchronous close fallback keeps
+all writer buffers until the executor has joined; normal callers should drain
+before closing.
 
 Overwriting part of a resident range preserves the untouched fragments as
 reference-counted child slices of its existing allocation. The children are

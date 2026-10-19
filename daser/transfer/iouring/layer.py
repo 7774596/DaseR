@@ -80,6 +80,15 @@ async def _drain_transfer_futures(futures: Sequence[asyncio.Future[Any]]) -> Non
         raise cancellation
 
 
+def _observe_l2_write_completion(task: asyncio.Task[None]) -> None:
+    """Retrieve background errors already published through the L2 error queue."""
+    # Completed tasks leave the range registry before drain can observe them.
+    # Consuming their exception prevents an unhandled-task warning; awaiting a
+    # predecessor still raises the same exception and drain reports the queue.
+    if not task.cancelled():
+        task.exception()
+
+
 @dataclass
 class _Promotion:
     """One reserved L2 read shared by overlapping load and prefetch callers.
@@ -701,6 +710,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Returns:
             Number of bytes stored.
+
+        Async/thread-safety:
+            In tiered mode the source remains immutable until the D2H snapshot
+            finishes, including during cancellation. Success accepts the bytes
+            into L1 and schedules SSD persistence; await drain for completion.
         """
         self._check_range(file_offset, nbytes)
         accounting = (
@@ -748,9 +762,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             # The source snapshot is immutable while this copy runs. Offload
             # the potentially millisecond-scale CUDA-to-host transfer so the
             # server event loop can continue servicing lookup/load IPC.
-            await asyncio.to_thread(self._copy_src_to_pinned, src, data, nbytes)
+            await self._snapshot_src_to_pinned(src, data, nbytes)
         except BaseException:
-            data.close()
+            async with self._lock:
+                self._close_unowned_slice_locked(data)
             raise
         try:
             while True:
@@ -776,9 +791,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             return nbytes
         except BaseException:
             async with self._lock:
-                if not self._l1.contains_slice(data):
-                    data.close()
-                    self._l1.notify_pool_waiters()
+                # Publication can evict this slice while its SSD write still
+                # owns it. Cancellation of the store is not write completion.
+                self._close_unowned_slice_locked(data)
             raise
 
     async def store_bytes_grouped(
@@ -989,13 +1004,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
             # Keep blocking CUDA-to-host staging out of the asyncio event loop;
             # L1 metadata publication remains serialized below this await.
-            snapshot = asyncio.create_task(
-                asyncio.to_thread(self._copy_src_to_pinned, source, data, total)
-            )
-            # Cancelling an executor await does not stop its CUDA memcpy.
-            # Keep both the exported source and pinned destination alive until
-            # the real copy ends, including repeated cancellation requests.
-            await _drain_transfer_futures([snapshot])
+            await self._snapshot_src_to_pinned(source, data, total)
         except BaseException:
             # Release the reservation before logging so a diagnostic failure
             # cannot strand stores waiting for these pinned pages.
@@ -1053,16 +1062,22 @@ class TieredIOUringTransferLayer(TransferLayer):
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
                     data.close()
-                    # Ensure every scheduled write has entered the executor
-                    # before callers can close the layer synchronously.
-                    await asyncio.sleep(0)
-                    return total
+            if not waiters:
+                # Yield outside the metadata lock so independent writes enter
+                # the executor before callers can close synchronously. Writes
+                # with predecessors retain their existing ordering barrier.
+                await asyncio.sleep(0)
+                return total
             data.close()
             await self._wait_lease_waiters(waiters)
         except BaseException:
-            data.close()
-            for _key, child in children:
-                child.close()
+            async with self._lock:
+                data.close()
+                for _key, child in children:
+                    # A partially published group can already have independent
+                    # L2 owners, including children evicted during publication.
+                    self._close_unowned_slice_locked(child)
+                self._l1.notify_pool_waiters()
             raise
         return await self._store_packed_source_group(src, spans)
 
@@ -1277,13 +1292,23 @@ class TieredIOUringTransferLayer(TransferLayer):
             Must be called from the owning asyncio event loop before shutdown
             when durable L2 contents are required.
         """
+        error: BaseException | None = None
         while True:
             async with self._lock:
                 pending = list(self._pending_l2.values()) + list(self._pending_h2d)
-                self._raise_l2_error_locked()
-            if not pending:
-                return
-            await _drain_transfer_futures(pending)
+                if not pending:
+                    # A failed write may already have left the registry while
+                    # unrelated native IO still owned pinned memory. Report it
+                    # only after every current owner has finished.
+                    self._raise_l2_error_locked()
+                    if error is not None:
+                        raise error
+                    return
+            try:
+                await _drain_transfer_futures(pending)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
 
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
@@ -1444,34 +1469,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Schedule one L2 write and start independent IO immediately."""
         if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
-        if previous:
-            return asyncio.create_task(
-                self._write_l2_async(key, file_offset, data, previous)
-            )
-
-        loop = asyncio.get_event_loop()
-        future = asyncio.create_task(self._run_l2_write(loop, file_offset, data))
-        return asyncio.create_task(self._track_l2_write(key, data, future))
-
-    async def _track_l2_write(
-        self,
-        key: tuple[int, int],
-        data: PinnedMemorySlice,
-        future: asyncio.Future[None],
-    ) -> None:
-        """Publish completion for an already-submitted L2 write."""
-        current = asyncio.current_task()
-        try:
-            await future
-            async with self._lock:
-                self._stats.l2_writes += 1
-        except BaseException as exc:
-            async with self._lock:
-                self._l2_errors.append(exc)
-            raise
-        finally:
-            async with self._lock:
-                self._finish_l2_write_locked(key, data, current)
+        task = asyncio.create_task(
+            self._write_l2_async(key, file_offset, data, previous)
+        )
+        task.add_done_callback(_observe_l2_write_completion)
+        return task
 
     async def _write_l2_async(
         self,
@@ -1484,7 +1486,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         current = asyncio.current_task()
         try:
             if previous:
-                await asyncio.gather(*previous)
+                # A later write may be cancelled during shutdown. Its ordering
+                # dependency must neither cancel an earlier writer nor release
+                # that writer's bytes while the executor still uses them.
+                await _drain_transfer_futures(previous)
             loop = asyncio.get_event_loop()
             if self._l2 is None:
                 raise RuntimeError("L2 writes are disabled when skip_l2 is true")
@@ -1529,13 +1534,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
-        await loop.run_in_executor(
+        future = loop.run_in_executor(
             self._l2.executor,
             self._write_l2,
             file_offset,
             data,
             self._next_uring(),
         )
+        # The asyncio task can be cancelled without stopping the native write.
+        # Its pinned source remains owned until the executor actually returns.
+        await _drain_transfer_futures([future])
 
     def _raise_l2_error_locked(self) -> None:
         """Raise and clear the first asynchronous L2 write failure."""
@@ -2065,6 +2073,24 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _slice_src(self, src: Any, offset: int, nbytes: int) -> Any:
         """Return a readable source slice."""
         return copy_ops.slice_src(src, offset, nbytes)
+
+    async def _snapshot_src_to_pinned(
+        self,
+        src: Any,
+        data: PinnedMemorySlice,
+        nbytes: int,
+    ) -> None:
+        """Finish one raw or packed D2H snapshot before releasing its owners.
+
+        The caller owns the reserved destination and source until this method
+        exits. Executor cancellation cannot stop CUDA DMA, so repeated caller
+        cancellation is deferred until the actual snapshot finishes. Callers
+        publish the reservation only on success and release it on failure.
+        """
+        snapshot = asyncio.create_task(
+            asyncio.to_thread(self._copy_src_to_pinned, src, data, nbytes)
+        )
+        await _drain_transfer_futures([snapshot])
 
     def _copy_src_to_pinned(
         self,
