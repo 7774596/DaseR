@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 from collections.abc import Iterable, Sequence
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,23 @@ async def _drain_transfer_futures(futures: Sequence[asyncio.Future[Any]]) -> Non
     # Keep every owner alive until it really completes, including when another
     # future fails or the caller is cancelled repeatedly during cleanup.
     cancellation: asyncio.CancelledError | None = None
+    if len(futures) == 1:
+        # Snapshot copies and native writes normally have one owner. Gathering
+        # that one future adds a callback and an event-loop turn before its
+        # shield can wake the caller. Shield the actual completion instead;
+        # repeated cancellation still cannot release its DMA/IO buffers early.
+        future = futures[0]
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        result = future.result()
+        if isinstance(result, BaseException):
+            raise result
+        if cancellation is not None:
+            raise cancellation
+        return
     if all(future.done() for future in futures):
         # Single-read rounds already observed their executor completion. Avoid
         # another event-loop turn, but retrieve every result before raising so
@@ -2096,8 +2114,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         cancellation is deferred until the actual snapshot finishes. Callers
         publish the reservation only on success and release it on failure.
         """
-        snapshot = asyncio.create_task(
-            asyncio.to_thread(self._copy_src_to_pinned, src, data, nbytes)
+        # Submit immediately rather than scheduling a Task just to enter
+        # to_thread. Preserve to_thread's caller-context propagation explicitly:
+        # tracing and other request-local context must follow the native copy.
+        snapshot = asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, self._copy_src_to_pinned, src, data, nbytes
         )
         await _drain_transfer_futures([snapshot])
 

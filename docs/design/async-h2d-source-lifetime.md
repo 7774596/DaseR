@@ -27,12 +27,16 @@ promotion, cancellation and byte-exact restoration on a real CUDA device.
 Raw and packed stores have the inverse ownership boundary: an executor thread
 copies the worker's source into a reserved pinned destination. Cancelling the asyncio
 await cannot stop that thread. The store therefore shields and drains the copy
-task before propagating cancellation or freeing either buffer, including when
+executor future before propagating cancellation or freeing either buffer, including when
 the caller cancels repeatedly. Failed snapshots release their reservation and
 wake pool waiters before returning, so unrelated stores can reuse the pages.
 Both paths use one snapshot helper and the same cancellation-safe future drain;
 raw grouped stores retain their per-span snapshots and packed stores retain
-bounded contiguous-source snapshots.
+bounded contiguous-source snapshots. Snapshot submission carries the caller's
+`contextvars` into the default executor directly, without scheduling a separate
+asyncio task first. A single completion future is shielded and drained directly;
+multiple owners still use an aggregate wait so every owner finishes before an
+error escapes. This changes scheduling overhead, not the lifetime boundary.
 
 Every asynchronous L2 write uses one task for predecessor ordering, native IO,
 completion accounting and final ownership release. Waiting for predecessors

@@ -2,6 +2,7 @@
 """Protect pinned store destinations while executor copies are still running."""
 
 import asyncio
+from contextvars import ContextVar
 from pathlib import Path
 import threading
 from typing import Any
@@ -384,6 +385,60 @@ def test_drain_reports_write_error_after_other_native_writes_finish(
                 await layer.drain()
             except RuntimeError:
                 pass
+            layer.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["single", "grouped", "packed"])
+def test_snapshot_preserves_request_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Copy with the caller's context without leaking worker changes back.
+
+    Args:
+        tmp_path: Path for the managed temporary store.
+        monkeypatch: Pytest fixture replacing the public copy function.
+        mode: Public single, grouped or packed store entry point.
+    Returns:
+        None; asserts context isolation and byte-exact public readback.
+    Async/thread-safety:
+        Each copy runs on an executor thread with an independent context.
+        The layer is drained before closing its pinned and native resources.
+    """
+    request_id: ContextVar[str] = ContextVar("snapshot_request", default="unset")
+    observed: list[str] = []
+    original = copy_ops.copy_src_to_pinned
+
+    def copy(
+        src: Any, pinned: PinnedMemorySlice, target_offset: int, nbytes: int
+    ) -> None:
+        observed.append(request_id.get())
+        request_id.set("worker-local")
+        original(src, pinned, target_offset, nbytes)
+
+    monkeypatch.setattr(copy_ops, "copy_src_to_pinned", copy)
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            str(tmp_path / "snapshot-context.store"), l1_bytes=8192, l2_bytes=8192
+        )
+        try:
+            for index, value in enumerate(("request-a", "request-b")):
+                token = request_id.set(value)
+                try:
+                    payload = bytes([index + 1]) * 4096
+                    assert await _store(layer, payload, index * 4096, mode) == 4096
+                    assert request_id.get() == value
+                    restored = bytearray(4096)
+                    await layer.load_bytes(restored, index * 4096, 4096)
+                    assert restored == payload
+                finally:
+                    request_id.reset(token)
+            assert observed == ["request-a", "request-b"]
+            assert request_id.get() == "unset"
+        finally:
+            await layer.drain()
             layer.close()
 
     asyncio.run(scenario())
