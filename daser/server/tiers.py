@@ -453,8 +453,6 @@ class TierIndex:
         # chunks being demoted.
         self._clean_bytes = 0
         self._demoting_bytes = 0
-        # Exclusive: L1 lane bytes waiting promotions need beyond the target.
-        self._l1_demand = 0
         self._hold_s = hold_s
         self._clock = clock
         # Hold deadline per lookup-hit key; insertion order is deadline order.
@@ -1022,15 +1020,14 @@ class TierIndex:
         """Return the L1 lane bytes to demote to restore the clean target.
 
         Returns:
-            ``max(0, target + demand - (free + clean + demoting))`` in lane
-            bytes (``demand`` from ``add_l1_demand``); 0 without exclusive
-            tiers.
+            ``max(0, target - (free + clean + demoting))`` in lane bytes; 0
+            without exclusive tiers.
         """
         if not self._exclusive:
             return 0
         free = self._tiers[L1].allocator.free_bytes
         covered = free + self._clean_bytes + self._demoting_bytes
-        return max(0, self._clean_target + self._l1_demand - covered)
+        return max(0, self._clean_target - covered)
 
     def l1_room(self) -> int:
         """Return the L1 lane bytes a promotion can take without a demotion.
@@ -1045,19 +1042,6 @@ class TierIndex:
             return 0
         free = self._tiers[L1].allocator.free_bytes
         return free + self._clean_bytes if self._exclusive else free
-
-    def add_l1_demand(self, lane_bytes: int) -> None:
-        """Raise (or, negative, lower) the L1 room demotions must keep.
-
-        With exclusive tiers a waiting promotion adds the bytes it needs, so
-        ``demotion_deficit`` demotes cold dirty chunks until they are clean;
-        it subtracts them once it stops waiting.
-
-        Args:
-            lane_bytes: L1 lane bytes to add.
-        """
-        self._l1_demand += lane_bytes
-        assert self._l1_demand >= 0, "L1 demand released twice"
 
     def begin_demotions(self, max_bytes: int) -> list[Demotion]:
         """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.

@@ -23,7 +23,6 @@ from daser.connector.helpers import (
 from daser.metrics import MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.ipc import IPCServer
-from daser.server.ipc import server as ipc_server_module
 from daser.server.ipc.server import _CachedCudaArray
 from daser.server.tiers import L1, L2
 from daser.transfer import Move, StoreHandle, TransferLayer, TransferStats
@@ -1059,11 +1058,86 @@ async def test_prefetch_lease_promotes_and_pins_its_window(
     assert 'daser_prefetch_operations_total{status="incomplete"} 1.0' in rendered
 
 
+async def wait_full_tiers(core: ServerCore, key: str, tiers: tuple[str, ...]) -> None:
+    """Wait until background demotions leave ``key`` full in ``tiers``."""
+    for _ in range(200):
+        if core.full_tiers(key) == tiers:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{key} is in {core.full_tiers(key)}, not {tiers}")
+
+
 @pytest.mark.asyncio
-async def test_exclusive_prefetch_demotes_dirty_l1_chunks_to_make_room(
+async def test_exclusive_prefetch_promotes_into_clean_l1_room(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An L1 full of dirty chunks is demoted so a lease can promote."""
+    """A lease that fits the clean L1 room promotes its L2-only chunks."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", str(2 * RECORD))
+    registry = MetricsRegistry()
+    core = make_core(64, 2, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=2, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await server.start()
+    try:
+        # The clean target demotes every new dirty chunk in the background;
+        # p and q then take the chain's clean L1 extents, so the chain is in
+        # L2 only and p and q leave two clean grains of L1 room.
+        allocations = []
+        for index, key in enumerate(keys):
+            parent = keys[index - 1] if index else ""
+            allocations.append(
+                await store_raw_chunk(socket_path, key, pattern(index + 1), parent)
+            )
+            await wait_full_tiers(core, key, (L1, L2))
+        for index, key in enumerate(("p", "q")):
+            await store_raw_chunk(socket_path, key, pattern(40 + index))
+            await wait_full_tiers(core, key, (L1, L2))
+        before = [core.full_tiers(key) for key in (*keys, "p", "q")]
+        leased = await _send_recv(
+            socket_path,
+            {
+                "op": "lookup_prefetch",
+                "lease_id": "req",
+                "tokens": tokens + [99],
+                "model_id": "m",
+                "external_prefix_queries": 9,
+                "num_computed_tokens": 0,
+            },
+        )
+        prefetch = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
+        )
+        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
+        await _send_recv(
+            socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
+        )
+        after = [core.full_tiers(key) for key in (*keys, "p", "q")]
+    finally:
+        await server.stop()
+    assert before == [(L2,), (L2,), (L1, L2), (L1, L2)]
+    assert leased["tier"] == "l2"
+    assert prefetch["ok"] is True and prefetch["l2_bytes"] == 2 * RECORD
+    assert (loaded["l1_segments"], loaded["data"]) == (2, pattern(1) + pattern(2))
+    # p and q's clean L1 copies made the room; the promoted chain keeps its
+    # L2 copies.
+    assert after == [(L1, L2), (L1, L2), (L2,), (L2,)]
+    assert core.demotion_deficit() == 0
+    rendered = registry.render_prometheus()
+    assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
+    assert "daser_prefetch_room_skips_total" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_exclusive_prefetch_without_l1_room_skips_without_demoting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lease with no clean L1 room promotes nothing and forces no demotion.
+
+    Loads still work: they read the L2 copies.
+    """
     monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
     monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", "0")
     registry = MetricsRegistry()
@@ -1094,68 +1168,23 @@ async def test_exclusive_prefetch_demotes_dirty_l1_chunks_to_make_room(
         prefetch = await _send_recv(
             socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
         )
-        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
         await _send_recv(
             socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
         )
-        after = [core.full_tiers(key) for key in (*keys, "p", "q")]
+        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
+        after = [core.full_tiers(key) for key in ("p", "q")]
     finally:
         await server.stop()
     assert before == [(L2,), (L2,), (L1,), (L1,)]
     assert leased["tier"] == "l2"
-    assert prefetch["ok"] is True and prefetch["l2_bytes"] == 2 * RECORD
-    assert (loaded["l1_segments"], loaded["data"]) == (2, pattern(1) + pattern(2))
-    # p and q were demoted, then their clean L1 copies made room; the
-    # promoted chain keeps its L2 copies.
-    assert after == [(L1, L2), (L1, L2), (L2,), (L2,)]
-    assert core.demotion_deficit() == 0
-    rendered = registry.render_prometheus()
-    assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
-    assert "daser_prefetch_room_timeouts_total" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_exclusive_prefetch_without_l1_room_times_out_quietly(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A lease larger than L1 gives up after the room wait; loads still work."""
-    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
-    monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", "0")
-    monkeypatch.setattr(ipc_server_module, "_LEASE_ROOM_WAIT_S", 0.3)
-    registry = MetricsRegistry()
-    core = make_core(64, 1, registry=registry)
-    server = make_ipc_server(tmp_path, l1_records=1, core=core, registry=registry)
-    socket_path = sock(tmp_path)
-    tokens = list(range(8))
-    await server.start()
-    try:
-        await store_raw_chunk(socket_path, "p", pattern(40))
-        allocations = await store_chain(socket_path, tokens)
-        leased = await _send_recv(
-            socket_path,
-            {
-                "op": "lookup_prefetch",
-                "lease_id": "req",
-                "tokens": tokens + [99],
-                "model_id": "m",
-                "external_prefix_queries": 9,
-                "num_computed_tokens": 0,
-            },
-        )
-        prefetch = await _send_recv(
-            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
-        )
-        await _send_recv(
-            socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
-        )
-        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
-    finally:
-        await server.stop()
-    assert leased["tier"] == "l2"
     assert prefetch.get("ok") is not True
     assert loaded["data"] == pattern(1) + pattern(2)
+    # The dirty chunks stay where they were: the lease forced no demotion.
+    assert after == [(L1,), (L1,)]
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
-    assert "daser_prefetch_room_timeouts_total 1.0" in registry.render_prometheus()
+    rendered = registry.render_prometheus()
+    assert "daser_prefetch_room_skips_total 1.0" in rendered
+    assert "daser_tier_demotions_total" not in rendered
 
 
 @pytest.mark.asyncio

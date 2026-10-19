@@ -65,11 +65,6 @@ from daser.transfer.iouring import TieredIOUringTransferLayer
 logger = init_logger(__name__)
 
 _CUDA_IPC_CACHE_LIMIT = 16
-# Exclusive tiers: how long a lease waits for demotions to make L1 room before
-# giving up (the request then loads without the lease), and the poll period
-# for room freed by anything other than a demotion batch.
-_LEASE_ROOM_WAIT_S = 2.0
-_LEASE_ROOM_POLL_S = 0.05
 _RECORD_MODES = ("raw", "compressed")
 
 
@@ -413,8 +408,6 @@ class IPCServer:
         self._demote_budget = 4 * self._demote_piece
         self._demote_inflight = 0
         self._demote_scheduled = False
-        # Set when a demotion batch finishes; leases waiting for L1 room.
-        self._room_changed = asyncio.Event()
         if core.exclusive_tiers:
             core.set_demotion_listener(self._kick_demotions)
         self._lease_budget = int(
@@ -1999,7 +1992,6 @@ class IPCServer:
             for demotion in demotions:
                 self._core.finish_demotion(demotion, ok)
             self._demote_inflight -= lane_bytes
-            self._room_changed.set()
             self._kick_demotions()
 
     def _demotion_moves(self, demotion: Demotion) -> list[Move]:
@@ -2057,7 +2049,7 @@ class IPCServer:
         if state.promote_keys:
             await self._admit_lease(state)
             if self._core.exclusive_tiers:
-                await self._wait_l1_room(state)
+                self._check_l1_room(state)
             promotions = [
                 p
                 for p in await self._core.begin_promotions(state.promote_keys)
@@ -2130,23 +2122,21 @@ class IPCServer:
         state.admitted = True
         self._leased_bytes += state.nbytes
 
-    async def _wait_l1_room(self, state: _LeaseState) -> None:
-        """Wait until L1 can take a lease's promotions without a demotion.
+    def _check_l1_room(self, state: _LeaseState) -> None:
+        """Skip a lease whose promotions do not fit the room L1 has now.
 
         With exclusive tiers L1 admits a promotion only into free or clean
-        room; dirty chunks leave through demotions. A lease promoting more
-        than that room would promote part of its chunks (removing their L2
-        copies), fail, and demote them again. The lease raises the demotion
-        target by the bytes it needs and waits for the room instead.
+        room; dirty chunks leave through demotions. Forcing demotions for a
+        lease makes demotion reach past the L2 floor and drop hot subtrees
+        (R233 cmpxp: subtree drops 3515 vs 32 without prefetch), so a lease
+        that does not fit promotes nothing and the request loads as usual.
 
         Args:
             state: Admitted lease with chunks to promote.
 
         Raises:
-            ChunkUnavailable: If the lease is released, a chunk left the
-                index, or the room does not appear within
-                ``_LEASE_ROOM_WAIT_S`` (nothing was promoted; the request
-                loads without the lease).
+            ChunkUnavailable: If a chunk left the index or L1 has less room
+                than the lease's promotions need (nothing was promoted).
         """
         need = 0
         for key in state.promote_keys:
@@ -2154,31 +2144,14 @@ class IPCServer:
             if records is None:
                 raise ChunkUnavailable(f"chunk {key} has no tier copy")
             need += self._layout.extent_length(L1, records.record_sizes)
-        if self._core.l1_room() >= need:
-            return
-        self._core.add_l1_demand(need)
-        deadline = time.monotonic() + _LEASE_ROOM_WAIT_S
-        try:
-            while self._core.l1_room() < need:
-                if state.released:
-                    raise ChunkUnavailable(f"lease {state.lease_id} was released")
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    self._metrics.counter(
-                        "daser_prefetch_room_timeouts_total",
-                        "Leases that gave up waiting for L1 room.",
-                    ).inc()
-                    raise ChunkUnavailable(
-                        f"lease {state.lease_id} found no L1 room for {need} bytes"
-                    )
-                self._room_changed.clear()
-                # asyncio.TimeoutError is not the builtin before Python 3.11.
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        self._room_changed.wait(), min(left, _LEASE_ROOM_POLL_S)
-                    )
-        finally:
-            self._core.add_l1_demand(-need)
+        if self._core.l1_room() < need:
+            self._metrics.counter(
+                "daser_prefetch_room_skips_total",
+                "Leases that promoted nothing for lack of L1 room.",
+            ).inc()
+            raise ChunkUnavailable(
+                f"lease {state.lease_id} found no L1 room for {need} bytes"
+            )
 
     def _release_lease(self, lease_id: str) -> None:
         """Drop a lease's pins and budget share; idempotent.
