@@ -555,3 +555,88 @@ def test_waiting_load_resolves_current_l1_after_overlapping_store(
             await _finish(layer, probe, tasks)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reader", ["scalar", "grouped", "prefetch"])
+def test_cancelling_reader_preserves_pending_writer_and_other_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+) -> None:
+    """A reader waiting for an evicted dirty range cannot cancel its writer."""
+    started = threading.Event()
+    release = threading.Event()
+    native_write = NativeIOUring.write
+
+    def gated_write(
+        ring: NativeIOUring, fd: int, file_offset: int, data: memoryview
+    ) -> int:
+        if file_offset == 0:
+            started.set()
+            if not release.wait(_TIMEOUT):
+                raise TimeoutError("the test did not release the pending writer")
+        return native_write(ring, fd, file_offset, data)
+
+    monkeypatch.setattr(NativeIOUring, "write", gated_write)
+
+    async def scenario() -> None:
+        layer = _cold_layer(tmp_path, l1_blocks=2)
+        tasks: list[asyncio.Task[object]] = []
+        try:
+            assert await layer.store_bytes(b"z" * _BLOCK, 0, _BLOCK) == _BLOCK
+            assert await asyncio.to_thread(started.wait, _TIMEOUT)
+            assert await layer.store_bytes(b"y" * _BLOCK, _BLOCK, _BLOCK) == _BLOCK
+
+            async def wait_for_independent_write() -> None:
+                while layer.stats.l2_writes == 0:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_independent_write(), _TIMEOUT)
+            # The next store evicts the dirty range from L1. Its old writer
+            # still owns those pages; the completed independent write supplies
+            # reusable space so setup never needs to release the blocked IO.
+            assert (
+                await asyncio.wait_for(
+                    layer.store_bytes(b"x" * _BLOCK, 2 * _BLOCK, _BLOCK), _TIMEOUT
+                )
+                == _BLOCK
+            )
+            cancelled_dst = bytearray(_BLOCK)
+            if reader == "prefetch":
+                waiting = asyncio.create_task(
+                    layer.prefetch_bytes_grouped(
+                        [{"file_offset": 0, "nbytes": _BLOCK}], lease_id="cancelled"
+                    )
+                )
+            else:
+                waiting = asyncio.create_task(
+                    _load(layer, cancelled_dst, grouped=reader == "grouped")
+                )
+            tasks.append(waiting)
+            survivor_dst = bytearray(_BLOCK)
+            survivor = asyncio.create_task(_load(layer, survivor_dst, grouped=True))
+            tasks.append(survivor)
+            await _let_followers_wait()
+            assert not waiting.done()
+            assert not survivor.done()
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(waiting, _TIMEOUT)
+            await _let_followers_wait()
+            assert not survivor.done()
+            release.set()
+            assert await asyncio.wait_for(survivor, _TIMEOUT) == _BLOCK
+            assert survivor_dst == b"z" * _BLOCK
+            await layer.drain()
+            assert layer.stats.l2_writes == 3
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await layer.release_lease("cancelled")
+            try:
+                await layer.drain()
+            finally:
+                layer.close()
+
+    asyncio.run(scenario())

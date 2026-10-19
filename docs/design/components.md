@@ -240,6 +240,15 @@ class TransferLayer(ABC):
   buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输；当前环境不可用，
   不作为默认流程或优化目标。
 
+scalar load、grouped load 和 prefetch 的公开入口只负责范围校验、首次 L1
+解析、请求统计，以及各自的目的地址或 request lease。首次解析直接保留 L1
+返回的缺失范围，不重建一份相同的 miss 字典。缺失范围统一交给
+`_load_l2_misses_grouped` 推进；入口不再收集或等待 pending write。共同读取路径
+在等待后重新查 L1，再决定是否预留和提交 SSD 读取，因此取消一个等待者不会
+取消其他请求仍依赖的后台写入。单读与 grouped 的零长度、非法范围和
+`skip_l2` miss 计数约定保持不变；`PrefetchResult` 保留首次 L1 解析的请求字节
+归因，不能把其中的 `l2_bytes` 当作合并后的实际 SSD 读取字节数。
+
 普通 load 的并发读取复用由 iouring 编排层维护，scalar load、grouped load
 和 prefetch 共用在途 L2 promotion 记录。每条记录包含物理范围、预留时的
 cache mutation epoch 和完成通知；它只描述当前进程中的读操作，不进入持久化索引。

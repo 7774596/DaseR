@@ -566,7 +566,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             Number of bytes loaded.
         """
         self._check_range(file_offset, nbytes)
-        pending: list[asyncio.Task[None]] = []
         l1_hits: list[L1RangeHit] = []
         misses: list[dict[str, int]] = []
         copy_future: asyncio.Task[None] | None = None
@@ -598,18 +597,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                         for hit in l1_hits
                     ],
                 )
-            for miss in misses:
-                self._stats.l1_misses += 1
-                pending.extend(
-                    self._find_pending_l2_locked(
-                        int(miss["file_offset"]),
-                        int(miss["nbytes"]),
-                    )
-                )
+            self._stats.l1_misses += len(misses)
 
         try:
-            if pending:
-                await asyncio.gather(*pending)
             if misses:
                 await self._load_l2_misses_grouped(dst, misses)
         finally:
@@ -641,7 +631,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         total = 0
         merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         misses: list[dict[str, int]] = []
-        pending: list[asyncio.Task[None]] = []
         copy_future: asyncio.Task[None] | None = None
         async with self._lock:
             self._raise_l2_error_locked()
@@ -681,28 +670,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         for hit in l1_hits
                     )
-                for miss in span_misses:
-                    self._stats.l1_misses += 1
-                    pending.extend(
-                        self._find_pending_l2_locked(
-                            int(miss["file_offset"]),
-                            int(miss["nbytes"]),
-                        )
-                    )
-                    misses.append(
-                        {
-                            "target_offset": int(miss["target_offset"]),
-                            "file_offset": int(miss["file_offset"]),
-                            "nbytes": int(miss["nbytes"]),
-                            "accounted_nbytes": int(miss["accounted_nbytes"]),
-                        }
-                    )
+                self._stats.l1_misses += len(span_misses)
+                misses.extend(span_misses)
             if merged_l1:
                 copy_future = self._copy_grouped_to_dst(dst, merged_l1)
 
         try:
-            if pending:
-                await asyncio.gather(*pending)
             if misses:
                 await self._load_l2_misses_grouped(dst, misses)
         finally:
@@ -1138,7 +1111,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
         l1_bytes = 0
         misses: list[dict[str, int]] = []
-        pending: list[asyncio.Task[None]] = []
         try:
             async with self._lock:
                 if lease_id is not None:
@@ -1176,24 +1148,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                             span["accounted_nbytes"],
                             nbytes,
                         )
-                    for miss in span_misses:
-                        pending.extend(
-                            self._find_pending_l2_locked(
-                                int(miss["file_offset"]),
-                                int(miss["nbytes"]),
-                            )
-                        )
-                        misses.append(
-                            {
-                                "target_offset": 0,
-                                "file_offset": int(miss["file_offset"]),
-                                "nbytes": int(miss["nbytes"]),
-                                "accounted_nbytes": int(miss["accounted_nbytes"]),
-                            }
-                        )
+                    misses.extend(span_misses)
 
-            if pending:
-                await asyncio.gather(*set(pending))
             if misses:
                 await self._load_l2_misses_grouped(None, misses, lease_id=lease_id)
             l2_bytes = sum(int(miss["nbytes"]) for miss in misses)
@@ -1594,7 +1550,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         misses: list[dict[str, Any]],
         lease_id: str | None = None,
     ) -> None:
-        """Read grouped L2 misses concurrently, then promote in request order."""
+        """Advance demand and prefetch misses through one bounded read path.
+
+        Callers resolve initial L1 hits and record request-level accounting.
+        This driver alone waits for overlapping writes/promotions or pool
+        space, then resolves L1 again before reserving physical reads. Keeping
+        dependency waits here avoids obsolete miss plans and prevents a
+        cancelled reader from cancelling a shared background writer.
+        """
         # Online packed records are variable-length, but adjacent records are
         # laid out as one aligned physical range.  Merge those misses before
         # admission so a long prefix uses one io_uring read and one pinned L1
