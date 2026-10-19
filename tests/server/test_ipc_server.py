@@ -23,6 +23,7 @@ from daser.connector.helpers import (
 from daser.metrics import MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.ipc import IPCServer
+from daser.server.ipc import server as ipc_server_module
 from daser.server.ipc.server import _CachedCudaArray
 from daser.server.tiers import L1, L2
 from daser.transfer import Move, StoreHandle, TransferLayer, TransferStats
@@ -1110,6 +1111,50 @@ async def test_exclusive_prefetch_demotes_dirty_l1_chunks_to_make_room(
     rendered = registry.render_prometheus()
     assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
     assert "daser_prefetch_room_timeouts_total" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_exclusive_prefetch_without_l1_room_times_out_quietly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lease larger than L1 gives up after the room wait; loads still work."""
+    monkeypatch.setenv("DASER_EXCLUSIVE_TIERS", "1")
+    monkeypatch.setenv("DASER_EXCLUSIVE_CLEAN", "0")
+    monkeypatch.setattr(ipc_server_module, "_LEASE_ROOM_WAIT_S", 0.3)
+    registry = MetricsRegistry()
+    core = make_core(64, 1, registry=registry)
+    server = make_ipc_server(tmp_path, l1_records=1, core=core, registry=registry)
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    await server.start()
+    try:
+        await store_raw_chunk(socket_path, "p", pattern(40))
+        allocations = await store_chain(socket_path, tokens)
+        leased = await _send_recv(
+            socket_path,
+            {
+                "op": "lookup_prefetch",
+                "lease_id": "req",
+                "tokens": tokens + [99],
+                "model_id": "m",
+                "external_prefix_queries": 9,
+                "num_computed_tokens": 0,
+            },
+        )
+        prefetch = await _send_recv(
+            socket_path, {"op": "transfer_prefetch", "lease_id": "req"}
+        )
+        await _send_recv(
+            socket_path, {"op": "release_transfer_lease", "lease_id": "req"}
+        )
+        loaded = await load(socket_path, [load_span(allocations[0]["start_slot"], 2)])
+    finally:
+        await server.stop()
+    assert leased["tier"] == "l2"
+    assert prefetch.get("ok") is not True
+    assert loaded["data"] == pattern(1) + pattern(2)
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert "daser_prefetch_room_timeouts_total 1.0" in registry.render_prometheus()
 
 
 @pytest.mark.asyncio

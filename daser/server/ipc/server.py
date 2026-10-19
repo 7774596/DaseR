@@ -2172,7 +2172,8 @@ class IPCServer:
                         f"lease {state.lease_id} found no L1 room for {need} bytes"
                     )
                 self._room_changed.clear()
-                with contextlib.suppress(TimeoutError):
+                # asyncio.TimeoutError is not the builtin before Python 3.11.
+                with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
                         self._room_changed.wait(), min(left, _LEASE_ROOM_POLL_S)
                     )
