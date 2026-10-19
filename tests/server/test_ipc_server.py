@@ -949,9 +949,9 @@ async def test_exclusive_tiers_demote_cold_l1_chunks_to_l2(
     assert tiers == {"a": (L2,), "b": (L1, L2), "c": (L1,)}
     assert (reply["l1_segments"], reply["l2_segments"]) == (0, 1)
     assert reply["data"] == pattern(1)
-    # The read moved a back into L1 (dropping its L2 copy) over b's clean
-    # copy, which left L1 dirty again: c was demoted.
-    assert loaded == {"a": (L1,), "b": (L2,), "c": (L1, L2)}
+    # The read promoted a over b's clean copy and kept a's L2 copy; c was
+    # demoted while the promotion was still in flight.
+    assert loaded == {"a": (L1, L2), "b": (L2,), "c": (L1, L2)}
     rendered = registry.render_prometheus()
     assert 'daser_tier_demotions_total{outcome="ok"} 3.0' in rendered
 
@@ -1105,8 +1105,9 @@ async def test_exclusive_prefetch_demotes_dirty_l1_chunks_to_make_room(
     assert leased["tier"] == "l2"
     assert prefetch["ok"] is True and prefetch["l2_bytes"] == 2 * RECORD
     assert (loaded["l1_segments"], loaded["data"]) == (2, pattern(1) + pattern(2))
-    # p and q were demoted, then their clean L1 copies made room.
-    assert after == [(L1,), (L1,), (L2,), (L2,)]
+    # p and q were demoted, then their clean L1 copies made room; the
+    # promoted chain keeps its L2 copies.
+    assert after == [(L1, L2), (L1, L2), (L2,), (L2,)]
     assert core.demotion_deficit() == 0
     rendered = registry.render_prometheus()
     assert 'daser_prefetch_operations_total{status="ok"} 1.0' in rendered
