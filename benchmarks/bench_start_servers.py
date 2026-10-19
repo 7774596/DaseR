@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -83,6 +84,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--daser-codebooks",
+        type=Path,
+        default=None,
+        help=(
+            "Calibrated codebook directory for compressed-online storage "
+            "(default: generic codebooks)."
+        ),
+    )
+    parser.add_argument(
         "--skip-l2",
         action="store_true",
         help="Disable backend L2 persistence/adapters for no-evict L1-only runs.",
@@ -127,6 +137,7 @@ async def main_async(args: argparse.Namespace) -> None:
         daser_prefetch_max_requests=prefetch_max_requests,
         storage_format=args.storage_format,
         online_pack_batch_slots=args.online_pack_batch_slots,
+        daser_codebooks=args.daser_codebooks,
     )
     manifest = await manager.start()
     print(f"manifest={args.store_dir}/manifest.json")

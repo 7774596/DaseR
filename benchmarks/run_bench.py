@@ -93,6 +93,8 @@ class RunBenchArgs:
         daser_storage_format: DaseR physical storage format for prefix runs.
         daser_online_pack_batch_slots: Optional compressed-online codec batch
             size in raw slots; ``None`` keeps the connector default.
+        daser_codebooks: Optional calibrated codebook directory for
+            compressed-online storage; ``None`` uses the generic codebooks.
         prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
     Thread-safety:
@@ -134,6 +136,7 @@ class RunBenchArgs:
     daser_prefetch_max_requests: int = 0
     daser_storage_format: str = "raw"
     daser_online_pack_batch_slots: int | None = None
+    daser_codebooks: str | None = None
     prometheus_url: str = "http://127.0.0.1:9090"
 
 
@@ -242,6 +245,15 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         ),
     )
     parser.add_argument(
+        "--daser-codebooks",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Calibrated codebook directory for compressed-online storage "
+            "(default: generic codebooks)."
+        ),
+    )
+    parser.add_argument(
         "--prometheus-url",
         default="http://127.0.0.1:9090",
         help=(
@@ -293,6 +305,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         daser_prefetch_max_requests=effective_prefetch_max_requests,
         daser_storage_format=args.daser_storage_format,
         daser_online_pack_batch_slots=args.daser_online_pack_batch_slots,
+        daser_codebooks=args.daser_codebooks,
         prometheus_url=args.prometheus_url,
     )
     try:
@@ -458,6 +471,10 @@ def _validate_run_args(args: RunBenchArgs) -> None:
             )
         if args.daser_online_pack_batch_slots <= 0:
             raise ValueError("daser_online_pack_batch_slots must be positive")
+    if args.daser_codebooks is not None and (
+        args.daser_storage_format != "compressed-online"
+    ):
+        raise ValueError("--daser-codebooks requires compressed-online")
     positive_ints = {
         "block_size": args.block_size,
         "max_num_seqs": args.max_num_seqs,
@@ -638,6 +655,8 @@ def _start_command(
                     str(args.daser_online_pack_batch_slots),
                 ]
             )
+        if args.daser_codebooks is not None:
+            command.extend(["--daser-codebooks", args.daser_codebooks])
     if backend_run.backend == "daser":
         command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
     if args.trust_remote_code:

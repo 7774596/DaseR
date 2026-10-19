@@ -150,7 +150,8 @@ file of raw slot-major BF16 bytes and writes `codebooks.bin` plus
 `metadata.json`; metadata binds the result to `--model-id`, the full KV
 geometry, plane-major K/V layout, sample count, and source hash. The output is
 optional and is not selected by the online default, which remains the generic
-palette. Example:
+palette; pass `--daser-codebooks <dir>` to `run_bench.py` or
+`bench_start_servers.py` to use it in a compressed-online run. Example:
 
 ```bash
 python benchmarks/compression/calibrate_codebooks.py \

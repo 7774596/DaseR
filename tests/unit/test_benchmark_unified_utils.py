@@ -3294,6 +3294,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
             evict=True,
             daser_storage_format="compressed-online",
             daser_online_pack_batch_slots=16,
+            daser_codebooks="calibrated-books",
         )
     )
 
@@ -3316,9 +3317,11 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
             if cmd[cmd.index("--backend") + 1] == "daser":
                 assert cmd[cmd.index("--storage-format") + 1] == "compressed-online"
                 assert cmd[cmd.index("--online-pack-batch-slots") + 1] == "16"
+                assert cmd[cmd.index("--daser-codebooks") + 1] == "calibrated-books"
             else:
                 assert "--storage-format" not in cmd
                 assert "--online-pack-batch-slots" not in cmd
+                assert "--daser-codebooks" not in cmd
         if cmd[:3] == ["vllm", "bench", "serve"]:
             assert cmd[cmd.index("--num-prompts") + 1] == "3"
     for command in commands:
