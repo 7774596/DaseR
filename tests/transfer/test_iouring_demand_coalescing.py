@@ -640,3 +640,104 @@ def test_cancelling_reader_preserves_pending_writer_and_other_readers(
                 layer.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("independent_round", [False, True], ids=["waiting", "reading"])
+def test_all_readers_observe_a_shared_writer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, independent_round: bool
+) -> None:
+    """A consumed global error cannot turn another dependency into stale SSD data."""
+    probe = _install_probe(monkeypatch)
+    if not independent_round:
+        probe.release.set()
+    write_started = threading.Event()
+    fail_write = threading.Event()
+    native_write = NativeIOUring.write
+
+    def failing_write(
+        ring: NativeIOUring, fd: int, file_offset: int, data: memoryview
+    ) -> int:
+        if file_offset == 0:
+            write_started.set()
+            if not fail_write.wait(_TIMEOUT):
+                raise TimeoutError("the test did not release the failing writer")
+            raise OSError("shared SSD writer failed before persistence")
+        return native_write(ring, fd, file_offset, data)
+
+    monkeypatch.setattr(NativeIOUring, "write", failing_write)
+
+    async def scenario() -> None:
+        layer = _cold_layer(tmp_path, l1_blocks=2)
+        tasks: list[asyncio.Task[object]] = []
+        try:
+            await layer.store_bytes(b"z" * _BLOCK, 0, _BLOCK)
+            assert await asyncio.to_thread(write_started.wait, _TIMEOUT)
+            await layer.store_bytes(b"y" * _BLOCK, _BLOCK, _BLOCK)
+
+            async def wait_for_independent_write() -> None:
+                while layer.stats.l2_writes == 0:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_independent_write(), _TIMEOUT)
+            await asyncio.wait_for(
+                layer.store_bytes(b"x" * _BLOCK, 2 * _BLOCK, _BLOCK), _TIMEOUT
+            )
+            # The failed range is no longer in L1. The grouped reader can also
+            # own a separate native read while its write dependency fails; its
+            # next admission round must still observe that dependency's result.
+            spans = [{"target_offset": 0, "file_offset": 0, "nbytes": _BLOCK}]
+            if independent_round:
+                spans.append(
+                    {
+                        "target_offset": _BLOCK,
+                        "file_offset": 4 * _BLOCK,
+                        "nbytes": _BLOCK,
+                    }
+                )
+            tasks.append(
+                asyncio.create_task(
+                    layer.load_bytes_grouped(bytearray(len(spans) * _BLOCK), spans)
+                )
+            )
+            if independent_round:
+                await _wait_for_reader(probe)
+            tasks.append(
+                asyncio.create_task(layer.load_bytes(bytearray(_BLOCK), 0, _BLOCK))
+            )
+            tasks.append(
+                asyncio.create_task(
+                    layer.prefetch_bytes_grouped(
+                        [{"file_offset": 0, "nbytes": _BLOCK}], lease_id="failed-read"
+                    )
+                )
+            )
+            await _let_followers_wait()
+            assert all(not task.done() for task in tasks)
+            fail_write.set()
+            # Let a waiting reader consume the global error while a grouped
+            # reader, when enabled, remains inside its independent native IO.
+            await _let_followers_wait()
+            probe.release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), _TIMEOUT
+            )
+            assert all(
+                isinstance(outcome, (OSError, RuntimeError)) for outcome in outcomes
+            ), outcomes
+            assert all(offset != 0 for offset, _size in probe.ranges)
+        finally:
+            fail_write.set()
+            probe.release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await layer.release_lease("failed-read")
+            try:
+                await layer.drain()
+            except RuntimeError:
+                pass
+            finally:
+                layer.close()
+
+    asyncio.run(scenario())

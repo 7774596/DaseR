@@ -1651,14 +1651,25 @@ class TieredIOUringTransferLayer(TransferLayer):
         # second buffer for a range already being promoted.
         remaining: list[dict[str, Any]] = list(misses)
         processed: set[asyncio.Future[int]] = set()
+        waiters: set[asyncio.Future[Any]] = set()
         try:
             while remaining:
                 deferred: list[dict[str, Any]] = []
-                waiters: set[asyncio.Future[Any]] = set()
                 round_reads: list[
                     tuple[dict[str, Any], PinnedMemorySlice, int, int]
                 ] = []
                 async with self._lock:
+                    # Every reader must observe its own write dependencies:
+                    # another caller may already have consumed the global error
+                    # queue. Keep the preceding round's waiters even while this
+                    # batch performs independent reads, and check them before
+                    # resolving a failed writer's now-unregistered SSD range.
+                    # Promotion notifications carry no payload/error; their
+                    # successful result still means only "resolve L1 again".
+                    for waiter in waiters:
+                        if waiter.done():
+                            waiter.result()
+                    waiters.clear()
                     self._raise_l2_error_locked()
                     for span in remaining:
                         # A fully cold extent already has a bounded, target-aware
