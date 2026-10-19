@@ -637,22 +637,12 @@ def test_demotions_clean_l1_up_to_the_target() -> None:
     h = Harness(l1=3, l2=8, exclusive=True, clean_bytes=G)
     for key in "abc":
         h.store(key)
-    assert h.tiers.l1_room() == 0
     assert h.tiers.demotion_deficit() == G
     (demotion,) = h.tiers.begin_demotions(G)
     assert demotion.chunk_key == "a"
     h.tiers.finish_demotion(demotion, ok=True)
-    assert h.tiers.l1_room() == G
     assert h.tiers.demotion_deficit() == 0
     assert_invariants(h)
-
-
-def test_l1_room_counts_only_free_bytes_without_exclusive_tiers() -> None:
-    h = Harness(l1=2, l2=4)
-    h.store("a")
-    assert h.tiers.l1_room() == G
-    h.store("b")
-    assert h.tiers.l1_room() == 0
 
 
 def test_failed_demotion_drops_the_l2_copy() -> None:
@@ -728,7 +718,7 @@ async def test_exclusive_promotion_leaves_a_clean_droppable_l1_copy() -> None:
     b = h.tiers.chunk("b")
     assert b is not None and h.tiers.is_full(b.l1) and h.tiers.is_full(b.l2)
     # Clean: L1 needs no demotion, and the next store drops b's L1 copy.
-    assert h.tiers.l1_room() == G and h.tiers.demotion_deficit() == 0
+    assert h.tiers.demotion_deficit() == 0
     assert_invariants(h)
     placement = h.store("c")
     assert placement.l1 is not None and placement.l2 is None

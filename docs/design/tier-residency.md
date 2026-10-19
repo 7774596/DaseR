@@ -304,10 +304,12 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   `daser_prefetch_operations_total{status="incomplete"}`），scheduler 释放 lease
   后照常 load。`--prefetch-lease-budget` 限制所有 lease 固定的 L1 字节：只有一个
   lease 时总是接纳，否则超预算的 lease 等待更早的 lease 释放。
-- 独占分层下 L1 只能同步腾出空闲 + 干净字节（`l1_room`）。lease 待 promote 的字节超过
-  它时整个 lease 不 promote（计 `daser_prefetch_room_skips_total`，回复 `{"error"}`），
-  请求照常 load。不为 lease 抬高降级目标：那样降级会越过 L2 下限、删掉热子树
-  （R233 cmpxp：subtree drop 3515 vs 无 prefetch 32，命中 .66 vs .77）。
+- 独占分层下不发 lease：`lookup_prefetch` 像 `lookup` 一样启动 readahead，回复
+  `tier = None`，scheduler 不 defer、照常 load。lease 在请求等待期间固定整个外部
+  窗口，独占 L1 能同步腾出的只有干净余量（L1 的 1/8），窗口远大于它：R233 cmpxpm
+  189 个 lease 0 个完成、L1 接纳跳过 13 万次（无 prefetch 3 千），ΣTTFT 1062 vs 784。
+  为 lease 抬高降级目标也不行，降级会越过 L2 下限删热子树（cmpxp：subtree drop
+  3515 vs 32，命中 .66 vs .77）。layerwise 依赖 lease，独占下同样退回普通 load。
 - leased load 和 layerwise runs 从被固定的 L1 副本读。`transfer_load` 不带
   `lease_id`，由 `plan_load` 自然选中 L1 副本。
 - `release_transfer_lease` 解除固定，幂等。

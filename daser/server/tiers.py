@@ -1029,20 +1029,6 @@ class TierIndex:
         covered = free + self._clean_bytes + self._demoting_bytes
         return max(0, self._clean_target - covered)
 
-    def l1_room(self) -> int:
-        """Return the L1 lane bytes a promotion can take without a demotion.
-
-        Returns:
-            Free bytes plus, with exclusive tiers, clean bytes (droppable at
-            once; lease or io pinned ones are counted too, so this is an upper
-            bound). Without exclusive tiers every full L1 copy also has an L2
-            copy, so only free bytes are reported.
-        """
-        if L1 not in self._tiers:
-            return 0
-        free = self._tiers[L1].allocator.free_bytes
-        return free + self._clean_bytes if self._exclusive else free
-
     def begin_demotions(self, max_bytes: int) -> list[Demotion]:
         """Admit the coldest dirty L1 chunks into L2 for L1 -> L2 writes.
 

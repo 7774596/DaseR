@@ -689,7 +689,9 @@ class IPCServer:
         Every chunk of the window is lease pinned. ``tier`` is ``l1`` when
         all of them already have an L1 copy, else ``mixed`` (some) or ``l2``
         (none); ``transfer_prefetch`` then promotes the rest. Without an L1
-        tier, or for an empty window, no lease is taken and ``tier`` is None.
+        tier, with exclusive tiers (which start readahead instead, as
+        ``lookup`` does), or for an empty window, no lease is taken and
+        ``tier`` is None.
 
         Returns:
             ``{"chunks", "spans", "tier"}``; ``spans`` are the window's
@@ -708,6 +710,16 @@ class IPCServer:
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
         payloads = self._chunk_payloads(chunks)
         if not chunks or hits <= 0 or not self._layout.enabled(L1):
+            return {"chunks": payloads, "spans": [], "tier": None}
+        if self._core.exclusive_tiers:
+            # No lease: pinning a waiting request's window starves L1, whose
+            # synchronous room is only the clean margin (R233 cmpxpm: 0 of
+            # 189 leases complete, L1 admission skips 40x). The request
+            # loads as after a plain lookup, readahead included.
+            if self._readahead_piece:
+                await self._start_readahead(
+                    _window_slots(chunks, num_computed_tokens, hits, self._block_tokens)
+                )
             return {"chunks": payloads, "spans": [], "tier": None}
         windows = _window_slots(chunks, num_computed_tokens, hits, self._block_tokens)
         leases: list[Lease] = []
@@ -2048,8 +2060,6 @@ class IPCServer:
         """
         if state.promote_keys:
             await self._admit_lease(state)
-            if self._core.exclusive_tiers:
-                self._check_l1_room(state)
             promotions = [
                 p
                 for p in await self._core.begin_promotions(state.promote_keys)
@@ -2121,37 +2131,6 @@ class IPCServer:
                 raise ChunkUnavailable(f"lease {state.lease_id} was released")
         state.admitted = True
         self._leased_bytes += state.nbytes
-
-    def _check_l1_room(self, state: _LeaseState) -> None:
-        """Skip a lease whose promotions do not fit the room L1 has now.
-
-        With exclusive tiers L1 admits a promotion only into free or clean
-        room; dirty chunks leave through demotions. Forcing demotions for a
-        lease makes demotion reach past the L2 floor and drop hot subtrees
-        (R233 cmpxp: subtree drops 3515 vs 32 without prefetch), so a lease
-        that does not fit promotes nothing and the request loads as usual.
-
-        Args:
-            state: Admitted lease with chunks to promote.
-
-        Raises:
-            ChunkUnavailable: If a chunk left the index or L1 has less room
-                than the lease's promotions need (nothing was promoted).
-        """
-        need = 0
-        for key in state.promote_keys:
-            records = self._core.chunk_records(key)
-            if records is None:
-                raise ChunkUnavailable(f"chunk {key} has no tier copy")
-            need += self._layout.extent_length(L1, records.record_sizes)
-        if self._core.l1_room() < need:
-            self._metrics.counter(
-                "daser_prefetch_room_skips_total",
-                "Leases that promoted nothing for lack of L1 room.",
-            ).inc()
-            raise ChunkUnavailable(
-                f"lease {state.lease_id} found no L1 room for {need} bytes"
-            )
 
     def _release_lease(self, lease_id: str) -> None:
         """Drop a lease's pins and budget share; idempotent.
