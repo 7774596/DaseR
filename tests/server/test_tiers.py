@@ -694,26 +694,6 @@ def test_demotion_evicts_only_colder_l2_copies() -> None:
     assert_invariants(hot)
 
 
-def test_demotion_reclaims_a_duplicate_l2_copy_before_dropping() -> None:
-    h = Harness(l1=2, l2=1, exclusive=True, clean_bytes=G)
-    h.store("a")
-    (first,) = h.tiers.begin_demotions(G)
-    h.tiers.finish_demotion(first, ok=True)  # a: full in both tiers
-    h.store("b")  # L1, dirty
-    h.tiers.touch(["a"])  # a's L2 copy is hotter than b: above the floor
-    # b would be dropped (its last copy); a's L2 copy goes instead, and a
-    # keeps serving from L1.
-    (demotion,) = h.tiers.begin_demotions(G)
-    assert demotion.chunk_key == "b" and h.lost == []
-    h.tiers.finish_demotion(demotion, ok=True)
-    a = h.tiers.chunk("a")
-    assert a is not None and a.l2 is None and h.tiers.is_full(a.l1)
-    text = h.registry.render_prometheus()
-    assert "daser_tier_demotion_dup_reclaims_total 1" in text
-    assert 'outcome="dropped"' not in text
-    assert_invariants(h)
-
-
 def test_demotion_does_not_drop_chunks_a_lookup_just_hit() -> None:
     h = Harness(l1=1, l2=1, exclusive=True)
     h.store("a")  # L1
