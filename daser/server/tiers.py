@@ -27,6 +27,9 @@ TIERS = (L1, L2)
 #: Eviction-tree heap of L1-only chunks waiting to be written to L2
 #: (exclusive tiers).
 _DEMOTE = "demote"
+#: Eviction-tree heap of chunks full in both tiers whose L2 copy a demotion
+#: may reclaim without losing data (exclusive tiers).
+_DUP = "dup"
 #: Demotion candidates a batch skips (subtree pinned) before it ends.
 _STALL_SKIP_LIMIT = 32
 #: Nodes a subtree walk for a droppable leaf visits at most.
@@ -446,7 +449,7 @@ class TierIndex:
         self._demoting_bytes = 0
         # Exclusive: L1 lane bytes waiting promotions need beyond the target.
         self._l1_demand = 0
-        heaps = tuple(self._tiers) + ((_DEMOTE,) if exclusive else ())
+        heaps = tuple(self._tiers) + ((_DEMOTE, _DUP) if exclusive else ())
         self._tree = EvictionTree(heaps, self._is_candidate)
 
     @property
@@ -1036,8 +1039,10 @@ class TierIndex:
         Chunks leave the demotion heap in eviction order, tail first: a
         chunk is a candidate only once no child chunk is dirty. Each gets an L2
         extent, evicting only L2 candidates of strictly lower priority, so a
-        cold chunk never pushes out a hotter or hinted one. A chunk that
-        does not fit is the coldest of both tiers: the deepest leaves below
+        cold chunk never pushes out a hotter or hinted one. Failing that, the
+        L2 copies of chunks full in both tiers go first, coldest first: their
+        L1 copy keeps serving, so no data is lost. A chunk that still does
+        not fit is the coldest of both tiers: the deepest leaves below
         it are dropped from both tiers until it fits; a leaf is dropped from
         L1 instead (it may be the chunk's last copy). A chunk whose subtree
         has nothing droppable (pinned) is skipped and re-queued; the batch
@@ -1067,6 +1072,8 @@ class TierIndex:
             assert source is not None
             length = self._layout.extent_length(L2, chunk.record_sizes)
             offset = self._reserve(L2, length, below=key)
+            if offset is None:
+                offset = self._reserve_over_duplicates(length)
             if offset is None:
                 offset = self._reserve_over_subtree(key, length)
             if offset is None:
@@ -1281,6 +1288,14 @@ class TierIndex:
                 and not self._blocked(key)
                 and not self._has_dirty_child(key)
             )
+        if tier == _DUP:
+            return (
+                chunk.l2 is not None
+                and not chunk.l2.io_pins
+                and self.is_full(chunk.l2)
+                and self.is_full(chunk.l1)
+                and not self._blocked(key)
+            )
         copy = chunk.copy(tier)
         if copy is None or copy.io_pins or not self.is_full(copy):
             return False
@@ -1308,6 +1323,31 @@ class TierIndex:
             if state is not None and state.l1 is not None and state.l2 is None:
                 return True
         return False
+
+    def _reserve_over_duplicates(self, length: int) -> int | None:
+        """Reserve an L2 extent by evicting L2 copies of chunks full in L1.
+
+        A promotion keeps its L2 source, so L2 holds chunks L1 also serves.
+        Evicting such a copy loses nothing (the chunk turns dirty and is
+        written back when it leaves L1), whereas a subtree or leaf drop may
+        remove a chunk a lookup has returned but not yet loaded.
+
+        Returns:
+            Lane offset, or None when no duplicate L2 copy is left.
+        """
+        allocator = self._tiers[L2].allocator
+        if length > allocator.size:
+            return None
+        while (offset := allocator.reserve(length)) is None:
+            victim = self._tree.pop_victim(_DUP)
+            if victim is None:
+                return None
+            self._evict(L2, victim)
+            self._metrics.counter(
+                "daser_tier_demotion_dup_reclaims_total",
+                "L2 copies of chunks also full in L1 evicted for a demotion.",
+            ).inc()
+        return offset
 
     def _reserve_over_subtree(self, key: str, length: int) -> int | None:
         """Reserve an L2 extent for demoting ``key`` by dropping its subtree.

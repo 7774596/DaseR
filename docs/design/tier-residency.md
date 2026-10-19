@@ -258,8 +258,13 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   不被 L1 接纳的 store 报 `TierFull`、请求失败。子节点得到 L2 副本或失去 L1 副本时
   刷新父节点。
   `begin_demotions(max_bytes)` 为出堆的 chunk 预留 L2 extent，只允许淘汰优先级严格
-  低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。挤不下说明它是两层
-  里最冷的块；它的子孙只能经它被 lookup 命中，价值不高于它，但同优先级挡在下限外：
+  低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。还挤不下时先回收
+  重复副本：树多一个 `dup` 堆，候选为两层都完整、L2 无 io pin、未被写者挡住的 chunk，
+  按 LRU 淘汰它们的 L2 副本（L1 副本照常服务读，不丢数据，chunk 回到脏，计
+  `daser_tier_demotion_dup_reclaims_total`）。保留 promotion 源之后 L2 里有大量这类
+  重复，R233 raw 独占曾因它们挡在下限外而走子树/叶子丢弃（subtree_drops 640、dropped
+  481），丢掉 lookup 之后、load 之前的块，load 报 "no committed chunk"。重复也回收完
+  才说明它是两层里最冷的块；它的子孙只能经它被 lookup 命中，价值不高于它，但同优先级挡在下限外：
   一条 queue hint 用同一个 seq 提示整条前缀，touch 又让链尾的 tick 比链头新。丢它会让
   子孙成为孤儿，留它在 L1 则降级停摆（R228 frawxq：L1 干净字节 0、L1 不再接纳），所以
   先从两层丢它子树里最深的叶子（计 `daser_tier_demotion_subtree_drops_total`），直到
