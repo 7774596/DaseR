@@ -2,6 +2,8 @@
 
 """Public L1 ownership behavior across shared slices and eviction."""
 
+import ctypes
+
 import pytest
 
 pytest.importorskip("cupy")
@@ -177,7 +179,7 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
     original = cache.reserve_or_raise((0, 16384), 16384)
     payload = bytes(range(256)) * 64
     original.view()[:] = payload
-    original_ptr = original.ptr_at()
+    original_ptr = ctypes.addressof(ctypes.c_char.from_buffer(original.view()))
     allocation = original.allocation_id
     cache.put((0, 16384), original)
     if writer_held:
@@ -195,7 +197,10 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
             child = cache.get((offset, size))
             assert child is not None
             assert child.allocation_id == allocation
-            assert child.ptr_at() == original_ptr + offset
+            assert (
+                ctypes.addressof(ctypes.c_char.from_buffer(child.view()))
+                == original_ptr + offset
+            )
             assert bytes(child.view()) == payload[offset : offset + size]
         if writer_held:
             assert bytes(original.view()) == payload
@@ -211,7 +216,9 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
         assert cache.bytes_used == 0
         reused = cache.reserve_untracked(16384)
         assert reused is not None
-        assert reused.ptr_at() == original_ptr
+        assert (
+            ctypes.addressof(ctypes.c_char.from_buffer(reused.view())) == original_ptr
+        )
         # Final child close must return the allocation exactly once.
         assert cache.reserve_untracked(4096) is None
         reused.close()
