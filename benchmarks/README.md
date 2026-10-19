@@ -286,7 +286,8 @@ store file, and LMCache starts without an MP `--l2-adapter`.
 
 With `--evict`, both backends keep their L2 tiers enabled and capacities are
 chosen so L2 can hold the full workload while L1 cannot. L1 is derived from 80%
-of the workload, never below the largest single prompt, and must fit within 80%
+of the workload (`--evict-l1-fraction` changes the share; a small value keeps
+most warm reads on L2), never below the largest single prompt, and must fit within 80%
 of current host `MemFree`; if it does not fit, the benchmark fails instead
 of silently reducing the L1 size. L2 is derived from 105% of the workload.
 Machine caps come from host `MemFree` and free disk under the run store
@@ -304,7 +305,8 @@ the current `daser_up{job="daser"}` sample seen by Prometheus, so local DaseR
 metrics readiness can be distinguished from Prometheus scrape connectivity.
 
 `run_bench.py` entry point does not expose manual cache-size knobs; change
-`--evict` to switch between no-evict and eviction sizing.
+`--evict` to switch between no-evict and eviction sizing, and
+`--evict-l1-fraction` to move the L1 share in eviction sizing.
 
 Reports include both derived sizes and the manifest sizes passed to the
 services:

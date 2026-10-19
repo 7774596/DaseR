@@ -2157,6 +2157,22 @@ def test_run_bench_parser_rejects_invalid_numeric_args() -> None:
                 "nan",
             ]
         )
+    common = [
+        "--backend",
+        "daser-prefix",
+        "--model",
+        "/models/qwen",
+        "--store-dir",
+        "/data/zwt/daser_test/bench",
+    ]
+    with pytest.raises(SystemExit):
+        parse_args([*common, "--evict-l1-fraction", "0.1"])
+    with pytest.raises(SystemExit):
+        parse_args([*common, "--evict", "--evict-l1-fraction", "1.0"])
+    assert (
+        parse_args([*common, "--evict", "--evict-l1-fraction", "0.1"]).evict_l1_fraction
+        == 0.1
+    )
 
 
 def test_run_bench_parses_vllm_prefix_single_phase_args() -> None:
@@ -3292,10 +3308,15 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
             bench_output_len=1,
             bench_max_concurrency=2,
             evict=True,
+            evict_l1_fraction=0.5,
             daser_storage_format="compressed-online",
             daser_online_pack_batch_slots=16,
             daser_codebooks="calibrated-books",
         )
+    )
+    prepared = json.loads((run_root / "prepare.json").read_text())["config"]
+    assert prepared["derived_l1_size_bytes"] == (
+        prepared["total_blocks"] // 2 * prepared["slot_size_bytes"]
     )
 
     captured = capsys.readouterr().out

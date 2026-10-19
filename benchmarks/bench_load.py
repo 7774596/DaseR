@@ -44,6 +44,7 @@ from benchmarks.utils.prompts import (
 )
 from benchmarks.utils.servers import BenchmarkManifest
 from benchmarks.utils.sizing import (
+    EVICT_L1_FRACTION,
     BenchmarkCapacityLimits,
     BenchmarkSizing,
     derive_benchmark_sizing,
@@ -77,6 +78,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gen-seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--evict", action="store_true")
+    parser.add_argument("--evict-l1-fraction", type=float, default=EVICT_L1_FRACTION)
     parser.add_argument("--max-l1-size", type=parse_size_bytes, default=None)
     parser.add_argument("--max-l2-size", type=parse_size_bytes, default=None)
     parser.add_argument("--out", required=True)
@@ -163,6 +165,7 @@ async def main_async(args: argparse.Namespace) -> None:
             mode=COMPARISON_IOURING_MEM,
             evict=args.evict,
             capacity_limits=capacity_limits,
+            evict_l1_fraction=args.evict_l1_fraction,
         )
     gen_params = _generation_params(
         max_tokens=args.gen_max_tokens,

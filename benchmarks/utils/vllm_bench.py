@@ -195,6 +195,7 @@ def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
         mode=COMPARISON_IOURING_MEM,
         evict=args.evict,
         capacity_limits=derive_capacity_limits(run_root),
+        evict_l1_fraction=args.evict_l1_fraction,
     )
     return {
         "dataset": (

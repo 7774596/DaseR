@@ -26,6 +26,7 @@ from benchmarks.utils.servers import (
     resolve_daser_prefetch_max_requests,
     stop_from_pid_file,
 )
+from benchmarks.utils.sizing import EVICT_L1_FRACTION
 
 _DASER_METRICS_SETTLE_SECONDS = 2.0
 _BACKEND_CLEANUP_SETTLE_SECONDS = 2.0
@@ -88,6 +89,7 @@ class RunBenchArgs:
         bench_seed: vLLM bench random seed.
         bench_burstiness: vLLM bench burstiness factor.
         evict: Whether to enable L2 and eviction sizing.
+        evict_l1_fraction: Share of the workload L1 holds in evict runs.
         daser_prefetch: Explicitly enable scheduler-side DaseR prefetch.
         daser_prefetch_max_requests: Maximum concurrent DaseR prefetches.
         daser_storage_format: DaseR physical storage format for prefix runs.
@@ -132,6 +134,7 @@ class RunBenchArgs:
     bench_seed: int = 42
     bench_burstiness: float = 1.0
     evict: bool = False
+    evict_l1_fraction: float = EVICT_L1_FRACTION
     daser_prefetch: bool = False
     daser_prefetch_max_requests: int = 0
     daser_storage_format: str = "raw"
@@ -214,6 +217,16 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--bench-seed", type=int, default=42)
     parser.add_argument("--bench-burstiness", type=float, default=1.0)
     parser.add_argument("--evict", action="store_true")
+    parser.add_argument(
+        "--evict-l1-fraction",
+        type=float,
+        default=EVICT_L1_FRACTION,
+        metavar="F",
+        help=(
+            "Share of the workload L1 holds in --evict runs, in (0, 1) "
+            f"(default: {EVICT_L1_FRACTION})."
+        ),
+    )
     parser.add_argument(
         "--daser-prefetch",
         action="store_true",
@@ -301,6 +314,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         bench_seed=args.bench_seed,
         bench_burstiness=args.bench_burstiness,
         evict=args.evict,
+        evict_l1_fraction=args.evict_l1_fraction,
         daser_prefetch=args.daser_prefetch,
         daser_prefetch_max_requests=effective_prefetch_max_requests,
         daser_storage_format=args.daser_storage_format,
@@ -475,6 +489,10 @@ def _validate_run_args(args: RunBenchArgs) -> None:
         args.daser_storage_format != "compressed-online"
     ):
         raise ValueError("--daser-codebooks requires compressed-online")
+    if args.evict_l1_fraction != EVICT_L1_FRACTION and not args.evict:
+        raise ValueError("--evict-l1-fraction requires --evict")
+    if not 0.0 < args.evict_l1_fraction < 1.0:
+        raise ValueError("evict_l1_fraction must be in (0, 1)")
     positive_ints = {
         "block_size": args.block_size,
         "max_num_seqs": args.max_num_seqs,
@@ -700,7 +718,7 @@ def _load_command(
 
 def _append_common_optional_args(command: list[str], args: RunBenchArgs) -> None:
     if args.evict:
-        command.append("--evict")
+        command.extend(["--evict", "--evict-l1-fraction", str(args.evict_l1_fraction)])
     if args.imdb:
         command.extend(["--imdb", args.imdb])
     if args.longbench_dir:

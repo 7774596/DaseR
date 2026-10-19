@@ -188,6 +188,35 @@ def test_derive_benchmark_sizing_evict_uses_80_percent_mem_free_cap() -> None:
     assert sizing.daser_l1_bytes == 160 * gib
 
 
+def test_derive_benchmark_sizing_evict_l1_fraction_sets_l1_share() -> None:
+    """Evict runs size L1 by the requested fraction, never below one prompt."""
+    gib = 1024**3
+    limits = BenchmarkCapacityLimits(
+        max_l1_bytes=32 * gib,
+        max_l2_bytes=512 * gib,
+        memory_free_bytes=512 * gib,
+        disk_available_bytes=1024 * gib,
+    )
+    common = {
+        "total_blocks": 200,
+        "max_prompt_blocks": 8,
+        "slot_size": gib,
+        "mode": "iouring-mem-vs-lmcache-local-ssd-mem",
+        "evict": True,
+        "capacity_limits": limits,
+    }
+
+    assert derive_benchmark_sizing(**common, evict_l1_fraction=0.25).daser_l1_bytes == (
+        50 * gib
+    )
+    assert derive_benchmark_sizing(**common, evict_l1_fraction=0.01).daser_l1_bytes == (
+        8 * gib
+    )
+    for fraction in (0.0, 1.0):
+        with pytest.raises(ValueError, match="evict_l1_fraction"):
+            derive_benchmark_sizing(**common, evict_l1_fraction=fraction)
+
+
 def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_free_cap() -> None:
     """Evict runs fail when 80% workload exceeds 80% MemFree."""
     gib = 1024**3

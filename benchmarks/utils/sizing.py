@@ -111,6 +111,7 @@ def derive_benchmark_sizing(
     mode: str,
     evict: bool,
     capacity_limits: BenchmarkCapacityLimits,
+    evict_l1_fraction: float = EVICT_L1_FRACTION,
 ) -> BenchmarkSizing:
     """Derive L1/L2 sizes for benchmark scenarios with machine caps.
 
@@ -121,6 +122,8 @@ def derive_benchmark_sizing(
         mode: Comparison mode.
         evict: When True, choose capacities that force eviction.
         capacity_limits: Machine-derived maximum capacities.
+        evict_l1_fraction: Share of the workload L1 holds in evict runs, in
+            ``(0, 1)``; ignored without ``evict``.
 
     Returns:
         BenchmarkSizing with aligned DaseR and LMCache capacities.
@@ -130,6 +133,8 @@ def derive_benchmark_sizing(
     """
     if total_blocks <= 0:
         raise ValueError("total_blocks must be positive")
+    if not 0.0 < evict_l1_fraction < 1.0:
+        raise ValueError("evict_l1_fraction must be in (0, 1)")
     required_l2_bytes = max(1, max_prompt_blocks) * slot_size
     if capacity_limits.max_l2_bytes < required_l2_bytes:
         raise ValueError(
@@ -189,7 +194,7 @@ def derive_benchmark_sizing(
         if evict:
             desired_l1_blocks = max(
                 max_prompt_blocks,
-                math.floor(total_blocks * EVICT_L1_FRACTION),
+                math.floor(total_blocks * evict_l1_fraction),
             )
             if desired_l1_blocks >= total_blocks:
                 desired_l1_blocks = total_blocks - 1
