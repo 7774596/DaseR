@@ -264,7 +264,11 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   `daser_tier_demotion_dup_reclaims_total`）。保留 promotion 源之后 L2 里有大量这类
   重复，R233 raw 独占曾因它们挡在下限外而走子树/叶子丢弃（subtree_drops 640、dropped
   481），丢掉 lookup 之后、load 之前的块，load 报 "no committed chunk"。重复也回收完
-  才说明它是两层里最冷的块；它的子孙只能经它被 lookup 命中，价值不高于它，但同优先级挡在下限外：
+  才说明它是两层里最冷的块。下面的子树/叶子丢弃不看热度，而 lookup 不 pin 命中的块
+  （load 在之后才来），所以 `touch_path`（lookup 命中）给命中链上的块记 30 s 的
+  hold：hold 中的块不可被这两种丢弃删掉，降级改为 `stalled`、下批再试；普通 LRU
+  淘汰不受影响（刚 touch 的块本就最热）。R233 cmpxz 重复回收完后仍有 subtree 183 /
+  dropped 64。它的子孙只能经它被 lookup 命中，价值不高于它，但同优先级挡在下限外：
   一条 queue hint 用同一个 seq 提示整条前缀，touch 又让链尾的 tick 比链头新。丢它会让
   子孙成为孤儿，留它在 L1 则降级停摆（R228 frawxq：L1 干净字节 0、L1 不再接纳），所以
   先从两层丢它子树里最深的叶子（计 `daser_tier_demotion_subtree_drops_total`），直到

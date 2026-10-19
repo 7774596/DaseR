@@ -12,6 +12,7 @@ allocator and its own leaf-first LRU heap over the shared chunk tree. See
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import time
 
 # First Party
 from daser.logging import init_logger
@@ -30,6 +31,9 @@ _DEMOTE = "demote"
 #: Eviction-tree heap of chunks full in both tiers whose L2 copy a demotion
 #: may reclaim without losing data (exclusive tiers).
 _DUP = "dup"
+#: Seconds a lookup hit keeps its chunks out of the demotion drop fallback:
+#: nothing pins them between the lookup and the load that follows it.
+_LOOKUP_HOLD_S = 30.0
 #: Demotion candidates a batch skips (subtree pinned) before it ends.
 _STALL_SKIP_LIMIT = 32
 #: Nodes a subtree walk for a droppable leaf visits at most.
@@ -408,6 +412,9 @@ class TierIndex:
         exclusive: Keep L1 and L2 disjoint; needs both tiers.
         clean_bytes: Exclusive only: L1 lane bytes to keep free or clean
             (``demotion_deficit``); None means an eighth of the L1 lane.
+        hold_s: Seconds ``touch_path`` keeps a hit out of the demotion drop
+            fallback.
+        clock: Monotonic clock for the hold deadlines.
 
     Raises:
         ValueError: if ``exclusive`` is set without both tiers.
@@ -425,6 +432,8 @@ class TierIndex:
         metrics_registry: MetricsRegistry | None = None,
         exclusive: bool = False,
         clean_bytes: int | None = None,
+        hold_s: float = _LOOKUP_HOLD_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if exclusive and not (layout.enabled(L1) and layout.enabled(L2)):
             raise ValueError("exclusive tiers need both L1 and L2")
@@ -449,6 +458,10 @@ class TierIndex:
         self._demoting_bytes = 0
         # Exclusive: L1 lane bytes waiting promotions need beyond the target.
         self._l1_demand = 0
+        self._hold_s = hold_s
+        self._clock = clock
+        # Hold deadline per lookup-hit key; insertion order is deadline order.
+        self._holds: dict[str, float] = {}
         heaps = tuple(self._tiers) + ((_DEMOTE, _DUP) if exclusive else ())
         self._tree = EvictionTree(heaps, self._is_candidate)
 
@@ -490,12 +503,27 @@ class TierIndex:
         self._tree.touch(keys)
 
     def touch_path(self, key: str) -> None:
-        """Mark a chunk and its ancestors as just used.
+        """Mark a chunk and its ancestors as just used and hold them.
+
+        A lookup returns the hit without pinning it, and the load follows
+        later; for ``hold_s`` the demotion drop fallback, which ignores
+        recency, skips these chunks (``begin_demotions`` stalls instead).
 
         Args:
             key: Last chunk of a prefix hit; unknown keys are ignored.
         """
-        self._tree.touch_path(key)
+        keys = self._tree.touch_path(key)
+        now = self._clock()
+        holds = self._holds
+        while holds:
+            first = next(iter(holds))
+            if holds[first] > now:
+                break
+            del holds[first]
+        deadline = now + self._hold_s
+        for held in keys:
+            holds.pop(held, None)
+            holds[held] = deadline
 
     def refresh(self, key: str) -> None:
         """Re-queue a chunk after its ``blocked`` state cleared.
@@ -550,6 +578,7 @@ class TierIndex:
             key: Chunk key; unknown keys are ignored.
         """
         chunk = self._chunks.pop(key, None)
+        self._holds.pop(key, None)
         if chunk is not None:
             for tier in TIERS:
                 copy = chunk.copy(tier)
@@ -1045,8 +1074,9 @@ class TierIndex:
         not fit is the coldest of both tiers: the deepest leaves below
         it are dropped from both tiers until it fits; a leaf is dropped from
         L1 instead (it may be the chunk's last copy). A chunk whose subtree
-        has nothing droppable (pinned) is skipped and re-queued; the batch
-        ends after ``_STALL_SKIP_LIMIT`` skips.
+        has nothing droppable (pinned, or held by a recent lookup hit) is
+        skipped and re-queued; the batch ends after ``_STALL_SKIP_LIMIT``
+        skips.
 
         Args:
             max_bytes: Stop once the admitted L1 lane bytes reach this.
@@ -1077,11 +1107,15 @@ class TierIndex:
             if offset is None:
                 offset = self._reserve_over_subtree(key, length)
             if offset is None:
-                if self._tree.is_leaf(key) and not chunk.lease_pins:
+                if (
+                    self._tree.is_leaf(key)
+                    and not chunk.lease_pins
+                    and not self._is_held(key)
+                ):
                     self._evict(L1, key)
                     self._count_demotion("dropped")
                     continue
-                # Pinned below: try the next candidate, re-queue this one.
+                # Pinned or held: try the next candidate, re-queue this one.
                 self._count_demotion("stalled")
                 stalled.append(key)
                 if len(stalled) >= _STALL_SKIP_LIMIT:
@@ -1404,10 +1438,20 @@ class TierIndex:
                 found, depth = node, level
         return found
 
+    def _is_held(self, key: str) -> bool:
+        """Return whether a recent lookup hit holds ``key`` (``touch_path``)."""
+        deadline = self._holds.get(key)
+        return deadline is not None and deadline > self._clock()
+
     def _is_droppable(self, key: str) -> bool:
         """Return whether every copy of ``key`` may be evicted now."""
         chunk = self._chunks.get(key)
-        if chunk is None or chunk.lease_pins or self._blocked(key):
+        if (
+            chunk is None
+            or chunk.lease_pins
+            or self._blocked(key)
+            or self._is_held(key)
+        ):
             return False
         copies = [copy for copy in (chunk.l1, chunk.l2) if copy is not None]
         return bool(copies) and all(
@@ -1585,6 +1629,7 @@ class TierIndex:
             self._detach(chunk, survivor)
         if chunk.l1 is None and chunk.l2 is None:
             del self._chunks[key]
+            self._holds.pop(key, None)
             self._tree.remove(key)
             self._on_lost(key)
         else:

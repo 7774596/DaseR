@@ -167,7 +167,7 @@ class EvictionTree:
             [(key, node) for key in keys if (node := nodes.get(key)) is not None]
         )
 
-    def touch_path(self, key: str) -> None:
+    def touch_path(self, key: str) -> list[str]:
         """Mark a node and all its present ancestors as just used.
 
         A prefix hit ending at ``key`` used every block before it; ancestors
@@ -175,6 +175,9 @@ class EvictionTree:
 
         Args:
             key: Last chunk of a hit; unknown keys are ignored.
+
+        Returns:
+            The touched keys, ``key`` first.
 
         Async/thread-safety:
             O(depth of ``key``), on the server event loop.
@@ -188,6 +191,7 @@ class EvictionTree:
             key = node.parent_key
             node = nodes.get(key) if key else None
         self._touch_nodes(list(reversed(path.items())))
+        return list(path)
 
     def refresh(self, key: str) -> None:
         """Re-queue a node after an event that may make it a candidate.

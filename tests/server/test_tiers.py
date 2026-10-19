@@ -48,6 +48,7 @@ class Harness:
         self.lost: list[str] = []
         self.parents: dict[str, str] = {}
         self.registry = MetricsRegistry()
+        self.now = 0.0
         self.clean_target = l1 * G // 8 if clean_bytes is None else clean_bytes
         self.tiers = TierIndex(
             self.layout,
@@ -56,6 +57,8 @@ class Harness:
             metrics_registry=self.registry,
             exclusive=exclusive,
             clean_bytes=clean_bytes,
+            hold_s=30.0,
+            clock=lambda: self.now,
         )
 
     def add(self, key: str, parent: str = "") -> None:
@@ -711,6 +714,35 @@ def test_demotion_reclaims_a_duplicate_l2_copy_before_dropping() -> None:
     assert_invariants(h)
 
 
+def test_demotion_does_not_drop_chunks_a_lookup_just_hit() -> None:
+    h = Harness(l1=1, l2=1, exclusive=True)
+    h.store("a")  # L1
+    h.store("b")  # L2
+    h.tiers.touch_path("a")  # a lookup returned a; its load follows later
+    h.tiers.touch(["b"])  # b stays hotter: a is the coldest chunk
+    assert h.tiers.begin_demotions(G) == []
+    assert h.lost == []
+    assert 'outcome="stalled"} 1' in h.registry.render_prometheus()
+    h.now += 31.0  # the hold lapsed: a is dropped as before
+    assert h.tiers.begin_demotions(G) == []
+    assert h.lost == ["a"]
+    assert_invariants(h)
+
+    tail = Harness(l1=1, l2=1, exclusive=True)
+    tail.store("a")  # L1, dirty
+    tail.store("b", parent="a")  # L2 only
+    tail.tiers.touch_path("b")  # holds b and its ancestor a
+    assert tail.tiers.begin_demotions(G) == []
+    assert tail.lost == []
+    text = tail.registry.render_prometheus()
+    assert "daser_tier_demotion_subtree_drops_total" not in text
+    tail.now += 31.0
+    (demotion,) = tail.tiers.begin_demotions(G)
+    assert demotion.chunk_key == "a" and tail.lost == ["b"]
+    tail.tiers.finish_demotion(demotion, ok=True)
+    assert_invariants(tail)
+
+
 @pytest.mark.asyncio
 async def test_exclusive_promotion_leaves_a_clean_droppable_l1_copy() -> None:
     h = Harness(l1=1, l2=4, exclusive=True, clean_bytes=G)
@@ -925,6 +957,7 @@ async def test_random_operations_keep_tier_invariants(seed: int) -> None:
     leases = []
     serial = 0
     for _step in range(300):
+        h.now += 1.0  # lookup holds last 30 steps
         op = rng.random()
         if op < 0.45:
             serial += 1
