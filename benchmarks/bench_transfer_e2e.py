@@ -31,6 +31,8 @@ import time
 from types import FrameType
 from typing import Any
 
+COVERAGE_CONTRACT_REVISION = "unique-source-v2"
+
 
 def parse_args() -> argparse.Namespace:
     """Return validated CLI arguments (Namespace); main-thread operation only."""
@@ -231,6 +233,11 @@ def prepare_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if args.l2_bytes < 2 * working_set:
         raise ValueError("L2 must fit two full working sets to exclude ring eviction")
     return {
+        "coverage_contract_revision": COVERAGE_CONTRACT_REVISION,
+        "load_coverage_basis": "one unique prefix source per family wave",
+        "external_hit_semantics": (
+            "lookup-covered tokens, not per-target GPU restore completion"
+        ),
         "storage_format": args.storage_format,
         "prefetch_max_requests": args.prefetch_max_requests,
         "gen_max_tokens": args.gen_max_tokens,
@@ -314,6 +321,9 @@ def phase_summary(waves: list[dict[str, Any]]) -> dict[str, Any]:
         "external_hit_tokens": sum(
             wave["counters"]["external_hit_tokens"] for wave in waves
         ),
+        "external_query_tokens": sum(
+            wave["counters"]["external_query_tokens"] for wave in waves
+        ),
         "ssd_touched_waves": sum(wave["ssd_touched"] for wave in waves),
         "l1_only_waves": sum(wave["l1_only"] for wave in waves),
     }
@@ -326,23 +336,63 @@ def cycle_summary(
     concurrency: int,
     repeat: int,
 ) -> dict[str, Any]:
-    """Validate one full family cycle against prespecified SSD and load coverage.
+    """Validate physical source coverage and logical lookup coverage separately.
 
-    Args: args supplies workload limits; contract supplies model geometry; waves
-    is the full cycle; concurrency and repeat identify the planned cycle.
-    Returns a summary with validation failures. Pure, outside timed regions.
+    Args:
+        args: Namespace containing the fixed workload and SSD limits.
+        contract: Dict containing the minimum physical bytes per prefix source.
+        waves: Completed request-wave dicts for exactly one pass over all families.
+        concurrency: Number of requests required in each family wave.
+        repeat: Zero-based warm-cycle index for reporting.
+    Returns:
+        Dict containing measurements, explicit coverage expectations and failures.
+    Async/thread-safety:
+        Pure calculation outside timed regions; inputs are never modified.
     """
     summary = phase_summary(waves)
     reasons = []
     expected_requests = args.families * concurrency
-    expected_load_bytes = expected_requests * contract["minimum_prefix_bytes"]
-    expected_hit_tokens = expected_requests * args.prefix_tokens
-    if {wave["family_id"] for wave in waves} != set(range(args.families)):
-        reasons.append("cycle does not cover every planned family")
+    minimum_wave_load_bytes = contract["minimum_prefix_bytes"]
+    expected_load_bytes = args.families * minimum_wave_load_bytes
+    prompt_tokens = args.prefix_tokens + args.suffix_tokens
+    expected_wave_query_tokens = concurrency * prompt_tokens
+    expected_wave_hit_tokens = concurrency * (prompt_tokens - 1)
+    if len(waves) != args.families or {wave["family_id"] for wave in waves} != set(
+        range(args.families)
+    ):
+        reasons.append("cycle must contain exactly one wave per planned family")
     if summary["request_count"] != expected_requests:
         reasons.append("cycle request count differs from the manifest")
     if not summary["all_waves_valid"]:
         reasons.append("one or more request waves failed validation")
+    # One family wave repeats an identical immutable source. Worker planning
+    # can read it once and fan out its staging bytes to several destinations.
+    # Requiring a separate physical copy per request would reject valid sharing.
+    # Check every wave independently so excess traffic from another family
+    # cannot conceal a missing source. Raw and packed use the same invariant.
+    for wave in waves:
+        label = f"wave {wave['ordinal']} (family {wave['family_id']})"
+        if len(wave["requests"]) != concurrency:
+            reasons.append(f"{label}: request count differs from concurrency")
+        counters = wave["counters"]
+        if counters["load_bytes"] < minimum_wave_load_bytes:
+            reasons.append(
+                f"{label}: external load bytes do not cover its unique prefix"
+            )
+        # All warm requests repeat a fully seeded prompt. The connector leaves
+        # its final token for model execution, hence prompt_tokens - 1 hits.
+        # These are lookup-coverage counters, not evidence of each target DMA;
+        # request/output checks and the normal restore completion contract remain
+        # independent requirements. Exact per-wave counts also reject retries
+        # or double-counting that could hide under a cycle-wide lower bound.
+        if counters["external_query_tokens"] != expected_wave_query_tokens:
+            reasons.append(
+                f"{label}: external query tokens differ from exact expectation"
+            )
+        if counters["external_hit_tokens"] != expected_wave_hit_tokens:
+            reasons.append(
+                f"{label}: external hit tokens differ from exact expectation"
+            )
     if summary["l2_reads"] <= 0:
         reasons.append("cycle observed no SSD reads")
     if summary["process_read_bytes"] < args.min_cycle_ssd_bytes:
@@ -350,19 +400,20 @@ def cycle_summary(
             f"cycle read_bytes={summary['process_read_bytes']} below prespecified "
             f"minimum={args.min_cycle_ssd_bytes}"
         )
-    if summary["server_load_bytes"] < expected_load_bytes:
-        reasons.append("external load bytes do not cover the planned prefixes")
     if args.prefetch_max_requests and summary["prefetch_operations"] == 0:
         reasons.append("prefetch-enabled cycle observed no prefetch operations")
-    if summary["external_hit_tokens"] < expected_hit_tokens:
-        reasons.append("external hit tokens do not cover the planned prefixes")
     return {
+        "coverage_contract_revision": COVERAGE_CONTRACT_REVISION,
         "concurrency": concurrency,
         "repeat": repeat,
         "summary": summary,
         "minimum_ssd_bytes": args.min_cycle_ssd_bytes,
         "minimum_external_load_bytes": expected_load_bytes,
-        "minimum_external_hit_tokens": expected_hit_tokens,
+        "minimum_external_load_bytes_per_wave": minimum_wave_load_bytes,
+        "expected_external_query_tokens": args.families * expected_wave_query_tokens,
+        "expected_external_hit_tokens": args.families * expected_wave_hit_tokens,
+        "expected_external_query_tokens_per_wave": expected_wave_query_tokens,
+        "expected_external_hit_tokens_per_wave": expected_wave_hit_tokens,
         "wave_ordinals": [wave["ordinal"] for wave in waves],
         "valid": not reasons,
         "invalid_reasons": reasons,
