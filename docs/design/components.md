@@ -64,12 +64,14 @@ slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rin
 或恢复 `daser.index`。因此 lookup 和 store 都只对当前进程内的 L1 bytes 有意义；
 L1 淘汰或进程重启后没有 L2 可恢复。
 
-`compressed-online` 下，`ServerCore` 在 store 完成时按物理 slot 记录 packed
-record（mode、file offset、stored length），与 `MetadataStore` 分开保存。lookup
-仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
-展开被命中 slot 的 record。codec metadata 不进入 ring allocator，transfer backend
-也不依赖 server 实现类型。这些 record 只在内存中，因此该模式不保存也不恢复
-`daser.index`。
+`compressed-online` 下，chunk → 物理 record 只由 `ServerCore` 持有的
+`OnlinePackedLayout` 维护：store 先经它放置 packed record（mode、file offset、
+stored length），写完后 `record_store_ranges` 把对应 placement 标为已写；chunk
+离开 metadata store 时由 `ServerCore` 释放其 placement，再通知 removal listener。
+lookup 仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
+展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入 ring
+allocator，transfer backend 也不依赖 server 实现类型。这些 record 只在内存中，
+因此该模式不保存也不恢复 `daser.index`。
 
 ---
 
@@ -227,13 +229,44 @@ class TransferLayer(ABC):
   写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
   `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
   pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
-  写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
+  写回调度胶水留在编排层。每个常驻 range 在 `L1Cache` 里只有一条记录（slice 和
+  容量 charge），range/slice/allocation 索引都指向这条记录。编排层只保留按 IO
+  组织的状态：每个 range 最新的 L2 写、按 slice 身份登记的在途写 buffer、每个
+  在途 promotion 一条记录和请求 lease。`--skip-l2` 即「不构造 `L2IoEngine`」
   （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
   适用于需要 L2 文件的可选 backend。
 
 - `GDSTransferLayer`：可选兼容 backend，server 通过 CUDA IPC 打开 worker staging
   buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输；当前环境不可用，
   不作为默认流程或优化目标。
+
+scalar load、grouped load 和 prefetch 的公开入口只负责范围校验、首次 L1
+解析、请求统计，以及各自的目的地址或 request lease。首次解析直接保留 L1
+返回的缺失范围，不重建一份相同的 miss 字典。缺失范围统一交给
+`_load_l2_misses_grouped` 推进；入口不再收集或等待 pending write。共同读取路径
+在等待后重新查 L1，再决定是否预留和提交 SSD 读取，因此取消一个等待者不会
+取消其他请求仍依赖的后台写入。每轮重试前检查上一轮已完成的依赖结果，
+包括本轮曾执行独立读取时观察到的 writer；多个等待者都必须收到同一次写失败，
+不能依赖会被其他请求消费的全局错误队列。promotion 完成通知仍只表示需要
+重新解析 L1，不传播原读请求的失败。单读与 grouped 的零长度、非法范围和
+`skip_l2` miss 计数约定保持不变；`PrefetchResult` 保留首次 L1 解析的请求字节
+归因，不能把其中的 `l2_bytes` 当作合并后的实际 SSD 读取字节数。
+
+普通 load 的并发读取复用由 iouring 编排层维护，scalar load、grouped load
+和 prefetch 共用在途 L2 promotion 记录。每条记录包含物理范围、预留时的
+cache mutation epoch 和完成通知；它只描述当前进程中的读操作，不进入持久化索引。
+
+- 每轮实际预留 pinned buffer 前，在同一 metadata lock 内重新解析 L1，检查
+  重叠的在途读取，然后登记新的 promotion。等待 pending write 或容量之后，也
+  必须重新检查，不能直接使用等待前的 miss 列表。
+- 对已有 promotion 的请求等待完成通知，再从 L1 重新解析所需部分；只读取仍然
+  缺失的字节，保留各请求的 destination offset。单个请求取消不能取消其他请求
+  共用的完成通知；原读取失败或取消后，等待者重新检查并可重试。
+- 本轮已有预留读取时，先提交并处理这些读取，再重试延期的范围。不能持有尚未
+  提交的 buffer，同时等待自身或其他请求释放 pool。L1 容量压力下允许安全重读，
+  不承诺任意工作集都只读取一次。
+- 已有批内相邻范围合并、4096-byte 对齐、容量计费、store mutation epoch 检查
+  和异步 H2D 源引用保留规则继续适用。全 L1 命中路径无需等待 SSD promotion。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。

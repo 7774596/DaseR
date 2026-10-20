@@ -2,6 +2,9 @@
 
 """Public L1 ownership behavior across shared slices and eviction."""
 
+import ctypes
+import weakref
+
 import pytest
 
 pytest.importorskip("cupy")
@@ -9,6 +12,7 @@ pytest.importorskip("cupy")
 from daser.replacement import LRUReplacementPolicy, ReplacementPolicy
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.iouring.l1_cache import L1Cache
+from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 
 
 def test_resident_identity_tracks_children_and_capacity_eviction() -> None:
@@ -177,7 +181,7 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
     original = cache.reserve_or_raise((0, 16384), 16384)
     payload = bytes(range(256)) * 64
     original.view()[:] = payload
-    original_ptr = original.ptr_at()
+    original_ptr = ctypes.addressof(ctypes.c_char.from_buffer(original.view()))
     allocation = original.allocation_id
     cache.put((0, 16384), original)
     if writer_held:
@@ -195,7 +199,10 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
             child = cache.get((offset, size))
             assert child is not None
             assert child.allocation_id == allocation
-            assert child.ptr_at() == original_ptr + offset
+            assert (
+                ctypes.addressof(ctypes.c_char.from_buffer(child.view()))
+                == original_ptr + offset
+            )
             assert bytes(child.view()) == payload[offset : offset + size]
         if writer_held:
             assert bytes(original.view()) == payload
@@ -211,7 +218,9 @@ def test_repeated_overwrite_reuses_fragments_without_extra_pool_capacity(
         assert cache.bytes_used == 0
         reused = cache.reserve_untracked(16384)
         assert reused is not None
-        assert reused.ptr_at() == original_ptr
+        assert (
+            ctypes.addressof(ctypes.c_char.from_buffer(reused.view())) == original_ptr
+        )
         # Final child close must return the allocation exactly once.
         assert cache.reserve_untracked(4096) is None
         reused.close()
@@ -241,4 +250,33 @@ def test_fragment_eviction_cannot_reuse_detached_writer_allocation() -> None:
         reused.close()
     finally:
         original.close()
+        cache.close()
+
+
+def test_close_releases_injected_callback_owner() -> None:
+    """A retained closed cache must not keep its former orchestrator alive.
+
+    Args:
+        None.
+    Returns:
+        None; a weak reference verifies callback ownership ends at close.
+    Async/thread-safety:
+        Synchronous shutdown with no outstanding buffers or native operations.
+        No explicit cyclic collection is needed to release the callback owner.
+    """
+
+    class Owner:
+        def pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
+            """Return False for the idle owner's slices; no shared-state writes."""
+            return False
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    cache = L1Cache(4096, 4096, owner.pinned)
+    del owner
+    try:
+        assert reference() is not None
+        cache.close()
+        assert reference() is None
+    finally:
         cache.close()
