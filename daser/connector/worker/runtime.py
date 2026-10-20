@@ -33,6 +33,7 @@ from daser.connector.metadata import (
 )
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import (
+    DEFAULT_STAGING_BUDGET_BYTES,
     FixedCudaStagingPool,
     derive_staging_layout,
 )
@@ -249,7 +250,11 @@ class WorkerRuntime:
         load_value_scale: float,
         storage_format: str | None = None,
         online_pack_batch_slots: int = DEFAULT_ONLINE_PACK_BATCH_SLOTS,
+        staging_budget_bytes: int = DEFAULT_STAGING_BUDGET_BYTES,
     ) -> None:
+        if staging_budget_bytes <= 0:
+            raise ValueError("staging_budget_bytes must be positive")
+        self._staging_budget_bytes = int(staging_budget_bytes)
         self._socket_path = socket_path
         self._transfer_mode = transfer_mode
         self._skip_l2 = skip_l2
@@ -820,6 +825,7 @@ class WorkerRuntime:
             self._local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
+            self._staging_budget_bytes,
         )
         load_pool = FixedCudaStagingPool(
             device=sample.device,

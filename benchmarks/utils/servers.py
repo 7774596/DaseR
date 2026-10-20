@@ -433,6 +433,7 @@ class ServerManager:
         daser_layerwise_load: bool = False,
         storage_format: str = "raw",
         online_pack_batch_slots: int | None = None,
+        daser_staging_budget_bytes: int | None = None,
         async_scheduling: bool = True,
         extra_vllm_gpu_ids: tuple[str, ...] = (),
         lmcache_l2_odirect: bool = False,
@@ -513,6 +514,9 @@ class ServerManager:
                 codec; ``None`` uses the generic codebooks.
             online_pack_batch_slots: Optional compressed-online codec batch
                 size in raw slots; ``None`` keeps the connector default.
+            daser_staging_budget_bytes: Connector CUDA staging budget per
+                worker, charged against the GPU KV pool; ``None`` keeps the
+                connector default.
             async_scheduling: vLLM async scheduling, on by default as in vLLM;
                 ``False`` is an ablation.
             extra_vllm_gpu_ids: GPUs for additional vLLM instances that share
@@ -533,6 +537,8 @@ class ServerManager:
             raise ValueError("daser_l2_read_stripe_bytes must be non-negative")
         if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
             raise ValueError("online_pack_batch_slots must be positive")
+        if daser_staging_budget_bytes is not None and daser_staging_budget_bytes <= 0:
+            raise ValueError("daser_staging_budget_bytes must be positive")
         if lmcache_l2_bounded and lmcache_l2_native_workers <= 0:
             raise ValueError("lmcache_l2_bounded requires the fs_native L2 adapter")
         if not lmcache_daser_codec and (
@@ -584,6 +590,7 @@ class ServerManager:
         self.daser_layerwise_load = daser_layerwise_load
         self.storage_format = storage_format
         self.online_pack_batch_slots = online_pack_batch_slots
+        self.daser_staging_budget_bytes = daser_staging_budget_bytes
         self.async_scheduling = async_scheduling
         self.extra_vllm_gpu_ids = tuple(str(gpu) for gpu in extra_vllm_gpu_ids)
         self.extra_vllm_args = tuple(extra_vllm_args)
@@ -856,6 +863,8 @@ class ServerManager:
         }
         if self.online_pack_batch_slots is not None:
             extra_config["online_pack_batch_slots"] = self.online_pack_batch_slots
+        if self.daser_staging_budget_bytes is not None:
+            extra_config["staging_budget_bytes"] = self.daser_staging_budget_bytes
         if self.daser_coalesce_loads:
             extra_config["coalesce_loads"] = True
         if self.daser_layerwise_load:

@@ -29,6 +29,7 @@ from daser.connector.scheduler.adapter import SchedulerConnectorMixin
 from daser.connector.scheduler.lifecycle import RequestLifecycle
 from daser.connector.scheduler.probe import SchedulerProbe
 from daser.connector.worker.adapter import WorkerConnectorMixin
+from daser.connector.worker.memory import DEFAULT_STAGING_BUDGET_BYTES
 from daser.connector.worker.runtime import WorkerRuntime
 from daser.connector.worker.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
@@ -160,6 +161,9 @@ class DaserConnector(
                     extra.get(
                         "online_pack_batch_slots", DEFAULT_ONLINE_PACK_BATCH_SLOTS
                     )
+                ),
+                staging_budget_bytes=int(
+                    extra.get("staging_budget_bytes", DEFAULT_STAGING_BUDGET_BYTES)
                 ),
             )
 

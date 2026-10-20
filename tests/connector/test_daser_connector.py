@@ -3320,6 +3320,27 @@ def test_derive_staging_layout_scales_with_vram(monkeypatch):
     assert tight_total == tight_batch * 7
 
 
+def test_derive_staging_layout_honors_budget_cap(monkeypatch):
+    """A smaller cap keeps four buffers, each a quarter of the cap."""
+
+    class Props:
+        total_memory = 80 << 30
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: Props())
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda device=None: (64 << 30, 80 << 30)
+    )
+    batch, load, store, total = derive_staging_layout(
+        torch.device("cuda"), 6 << 20, 8, 1 << 30, 1536 << 20
+    )
+    assert (batch, load, store, total) == (384 << 20, 2, 2, 1536 << 20)
+    # One slot larger than a quarter of the cap still gets its own buffer.
+    with pytest.raises(ValueError):
+        derive_staging_layout(torch.device("cuda"), 1 << 30, 8, 1 << 30, 1 << 30)
+    with pytest.raises(ValueError):
+        derive_staging_layout(torch.device("cuda"), 6 << 20, 8, 1 << 30, 0)
+
+
 def test_store_cuda_staging_pool_reuses_preallocated_buffer():
     """Store staging pool reuses its init-time allocation after release."""
     pool = FixedCudaStagingPool(

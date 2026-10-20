@@ -207,14 +207,21 @@ def derive_staging_layout(
     local_slot_size: int,
     max_load_inflight: int,
     reserve_bytes: int,
+    budget_cap_bytes: int = DEFAULT_STAGING_BUDGET_BYTES,
 ) -> tuple[int, int, int, int]:
     """Partition one CUDA staging budget between load and store pools.
+
+    The budget holds four buffers (two per direction) when memory allows, so
+    a buffer is at most a quarter of ``budget_cap_bytes``. The staging budget
+    is charged against the GPU KV pool, so a smaller cap admits more KV
+    blocks at the cost of smaller store and load batches.
 
     Args:
         device: Device that owns worker-side staging tensors.
         local_slot_size: Minimum buffer size required for one KV slot.
         max_load_inflight: Maximum useful load pool depth.
         reserve_bytes: Free CUDA memory kept outside staging pools.
+        budget_cap_bytes: Upper bound on the combined staging allocation.
 
     Returns:
         Buffer bytes, load depth, store depth, and combined allocation bytes.
@@ -230,9 +237,12 @@ def derive_staging_layout(
         raise ValueError("local_slot_size must be positive")
     if max_load_inflight <= 0:
         raise ValueError("max_load_inflight must be positive")
+    if budget_cap_bytes <= 0:
+        raise ValueError("budget_cap_bytes must be positive")
+    buffer_cap = max(MIN_STORE_STAGING_BYTES, budget_cap_bytes // 4)
     if device.type != "cuda":
-        buffer_bytes = max(DEFAULT_STORE_STAGING_BYTES, local_slot_size)
-        budget_bytes = DEFAULT_STAGING_BUDGET_BYTES
+        buffer_bytes = max(buffer_cap, local_slot_size)
+        budget_bytes = budget_cap_bytes
     else:
         props = torch.cuda.get_device_properties(device)
         total = int(props.total_memory)
@@ -245,12 +255,12 @@ def derive_staging_layout(
         buffer_bytes = max(
             local_slot_size,
             min(
-                DEFAULT_STORE_STAGING_BYTES,
+                buffer_cap,
                 max(MIN_STORE_STAGING_BYTES, min(total // 50, free // 10)),
             ),
         )
         budget_bytes = min(
-            DEFAULT_STAGING_BUDGET_BYTES,
+            budget_cap_bytes,
             (2 * total) // 25,
             usable,
         )

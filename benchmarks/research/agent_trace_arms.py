@@ -595,6 +595,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DaseR scheduler prefetch workers (0 disables; DaseR arms only).",
     )
     parser.add_argument(
+        "--daser-staging-budget",
+        type=parse_size_bytes,
+        default=None,
+        help="Connector CUDA staging budget per GPU (DaseR arms; default 6 GiB).",
+    )
+    parser.add_argument(
         "--daser-prefetch-lease-budget",
         type=parse_size_bytes,
         default="0",
@@ -764,6 +770,9 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         skip_l2=args.skip_l2 and arm.startswith("daser"),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0
+        ),
+        daser_staging_budget_bytes=(
+            args.daser_staging_budget if arm.startswith("daser") else None
         ),
         daser_prefetch_lease_budget_bytes=(
             args.daser_prefetch_lease_budget if arm.startswith("daser") else 0
