@@ -172,7 +172,9 @@ def load_calibrated_codebooks(
     metadata = json.loads((artifact_path / "metadata.json").read_text("utf-8"))
     codebooks = (artifact_path / "codebooks.bin").read_bytes()
     fitted = metadata.get("geometry", {})
-    for field in ("num_layers", "num_kv_heads", "head_dim", "dtype_bytes"):
+    # Codebooks are per layer/K-or-V plane, pooled over heads, so an artifact
+    # fitted at one TP size serves every head shard of the same model.
+    for field in ("num_layers", "head_dim", "dtype_bytes"):
         if fitted.get(field) != getattr(geometry, field):
             raise ValueError(f"calibrated codebooks were fitted for another {field}")
     if metadata.get("codebook_sha256") != digest_bytes(codebooks).hex():

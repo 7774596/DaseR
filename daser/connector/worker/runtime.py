@@ -408,7 +408,14 @@ class WorkerRuntime:
         Async/thread-safety:
             Called on the vLLM worker thread after the step's state updates and
             before its forward launch, which is where restores are fenced.
+            Packed slots the TP ranks stored differently are resolved to
+            this rank's mode in place; the metadata object is per worker.
         """
+        for spec in connector_metadata.reqs_to_load.values():
+            if any(slot.rank_modes for slot in spec.compressed_slots):
+                spec.compressed_slots = [
+                    slot.for_rank(self._tp_rank) for slot in spec.compressed_slots
+                ]
         self._meta = connector_metadata
         self._load_pipeline.begin_step(bool(connector_metadata.reqs_to_load))
 

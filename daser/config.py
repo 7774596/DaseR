@@ -77,6 +77,33 @@ class ModelGeometry:
     dtype_bytes: int
     dtype_name: str
 
+    def local_kv_heads(self, tensor_parallel_size: int = 1) -> int:
+        """Return the KV heads one TP rank holds (vLLM replicates heads
+        when the TP size exceeds the head count).
+
+        Args:
+            tensor_parallel_size: Number of vLLM tensor-parallel ranks.
+
+        Returns:
+            KV heads per rank.
+
+        Raises:
+            ValueError: if the TP size is not positive or does not divide (or
+                is not a multiple of) the head count.
+        """
+        if tensor_parallel_size <= 0:
+            raise ValueError("tensor_parallel_size must be positive")
+        if self.num_kv_heads >= tensor_parallel_size:
+            compatible = self.num_kv_heads % tensor_parallel_size == 0
+        else:
+            compatible = tensor_parallel_size % self.num_kv_heads == 0
+        if not compatible:
+            raise ValueError(
+                "tensor_parallel_size must divide num_kv_heads or be divisible "
+                "by num_kv_heads"
+            )
+        return max(1, self.num_kv_heads // tensor_parallel_size)
+
     def local_slot_size_for_block_tokens(
         self, block_tokens: int, tensor_parallel_size: int = 1
     ) -> int:
@@ -92,20 +119,8 @@ class ModelGeometry:
         Raises:
             ValueError: if ``tensor_parallel_size`` is not positive.
         """
-        if tensor_parallel_size <= 0:
-            raise ValueError("tensor_parallel_size must be positive")
-        if self.num_kv_heads >= tensor_parallel_size:
-            compatible = self.num_kv_heads % tensor_parallel_size == 0
-        else:
-            compatible = tensor_parallel_size % self.num_kv_heads == 0
-        if not compatible:
-            raise ValueError(
-                "tensor_parallel_size must divide num_kv_heads or be divisible "
-                "by num_kv_heads"
-            )
-        local_kv_heads = max(1, self.num_kv_heads // tensor_parallel_size)
         return (
-            local_kv_heads
+            self.local_kv_heads(tensor_parallel_size)
             * self.head_dim
             * 2  # K and V
             * self.num_layers
@@ -439,7 +454,9 @@ class DaserConfig:
             from daser.compression.attn_page import blob_slot_bytes
 
             geometry = self.model_geometry()
-            return blob_slot_bytes(geometry.num_layers, geometry.num_kv_heads)
+            return blob_slot_bytes(
+                geometry.num_layers, geometry.local_kv_heads(self.tensor_parallel_size)
+            )
         return self.model_geometry().local_slot_size_for_block_tokens(
             self.block_tokens, self.tensor_parallel_size
         )

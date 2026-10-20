@@ -554,7 +554,6 @@ def test_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
     [
         (["--transfer-mode", "gds"], "--transfer-mode=iouring"),
         (["--cache-reuse-mode", "chunk"], "--cache-reuse-mode=prefix"),
-        (["--tensor-parallel-size", "2"], "--tensor-parallel-size=1"),
         (["--block-tokens", "16"], "--block-tokens=128"),
     ],
 )
@@ -627,6 +626,24 @@ def test_compression_runtime_config_defaults_to_generic_palette(
     )
     assert args.compressed_codebooks is None
     assert runtime["compressed_codebooks"] == default_online_codebooks(geometry)
+
+
+def test_compressed_online_tp_uses_each_rank_head_shard(tmp_path: Path) -> None:
+    """At TP 2 each rank stores half the KV heads; codebooks still load."""
+    args = _compressed_args(tmp_path, extra=["--tensor-parallel-size", "2"])
+    cfg = _build_daser_config(args)
+    model = cfg.model_geometry()
+    calibrated = _calibrated_dir(tmp_path, cfg, num_layers=model.num_layers)
+    args.compressed_codebooks = str(calibrated)
+
+    runtime = _compression_runtime_config(cfg, args)
+
+    local = model.local_slot_size_for_block_tokens(128, 2)
+    assert cfg.resolved_local_slot_size() == local
+    assert local * 2 == model.slot_size_for_block_tokens(128)
+    assert (
+        runtime["compressed_codebooks"] == (calibrated / "codebooks.bin").read_bytes()
+    )
 
 
 def test_compression_runtime_config_publishes_calibrated_codebooks(

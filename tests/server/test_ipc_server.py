@@ -745,6 +745,112 @@ async def test_packed_store_publishes_record_modes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_packed_tp_store_shares_slots_and_reports_rank_modes(
+    tmp_path: Path,
+) -> None:
+    """TP ranks' packed records share max-sized slots; modes stay per rank."""
+    server = make_ipc_server(
+        tmp_path,
+        core=make_core(64, 16, tp=2),
+        storage_format="compressed-online",
+        local_slot_size=2 * RECORD,
+    )
+    socket_path = sock(tmp_path)
+    tokens = list(range(8))
+    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
+    rank_records = {
+        0: [(RECORD, "compressed"), (2 * RECORD, "raw")],
+        1: [(2 * RECORD, "raw"), (RECORD, "compressed")],
+    }
+    rank_data = {
+        rank: b"".join(pattern(10 * rank + i, n) for i, (n, _m) in enumerate(records))
+        for rank, records in rank_records.items()
+    }
+
+    def rank_spans(start: int, rank: int) -> list[dict[str, Any]]:
+        spans, offset = [], 0
+        for index, (nbytes, mode) in enumerate(rank_records[rank]):
+            spans.append(
+                {
+                    "chunk_key": key,
+                    "start_slot": start,
+                    "num_slots": 2,
+                    "source_offset": offset,
+                    "nbytes": nbytes,
+                    "slot_index": index,
+                    "packed": True,
+                    "mode": mode,
+                }
+            )
+            offset += nbytes
+        return spans
+
+    await server.start()
+    try:
+        start = (await alloc(socket_path, key, 8))["start_slot"]
+        replies = await asyncio.gather(
+            *(
+                store(
+                    socket_path,
+                    rank_spans(start, rank),
+                    rank_data[rank],
+                    tp_rank=rank,
+                    tp_size=2,
+                )
+                for rank in (0, 1)
+            )
+        )
+        await drain(socket_path)
+        lookup = await _send_recv(
+            socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        loaded = {
+            rank: await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_load",
+                    "payload": {"return_data": True},
+                    "spans": [
+                        {
+                            "target_offset": 0,
+                            "start_slot": start,
+                            "num_slots": 2,
+                            "nbytes": 4 * RECORD,
+                        }
+                    ],
+                    "tp_rank": rank,
+                },
+            )
+            for rank in (0, 1)
+        }
+    finally:
+        await server.stop()
+    assert [reply["chunk_keys"] for reply in replies] == [[key], [key]]
+    assert lookup["chunks"][0]["compressed_slots"] == [
+        {
+            "slot_id": start,
+            "mode": "raw",
+            "stored_length": 2 * RECORD,
+            "rank_modes": ["compressed", "raw"],
+        },
+        {
+            "slot_id": start + 1,
+            "mode": "raw",
+            "stored_length": 2 * RECORD,
+            "rank_modes": ["raw", "compressed"],
+        },
+    ]
+    # Each rank reads its own records at the shared slot offsets.
+    for rank, records in rank_records.items():
+        data, cursor = loaded[rank]["data"], 0
+        for index, (nbytes, _mode) in enumerate(records):
+            assert (
+                data[index * 2 * RECORD :][:nbytes] == rank_data[rank][cursor:][:nbytes]
+            )
+            cursor += nbytes
+
+
+@pytest.mark.asyncio
 async def test_packed_lookup_run_lists_every_chunk_slot(tmp_path: Path) -> None:
     """A lookup run merging adjacent packed chunks lists all of their slots."""
     server = make_ipc_server(tmp_path, storage_format="compressed-online")

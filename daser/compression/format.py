@@ -159,7 +159,7 @@ class CompressedStoreGeometry:
         slot_size: Raw bytes reserved for each logical slot.
         block_tokens: Tokens represented by one slot.
         num_layers: Number of model KV layers.
-        num_kv_heads: KV heads stored by the TP=1 worker.
+        num_kv_heads: KV heads stored by one TP rank.
         head_dim: Scalars in each KV head.
         dtype_bytes: Bytes per scalar; version one requires BF16 (two bytes).
         tile_scalars: Independently decodable scalar count used by the kernel.

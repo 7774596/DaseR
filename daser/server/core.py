@@ -59,6 +59,28 @@ _PUBLISH_BUCKETS = (
     20.0,
     60.0,
 )
+# Packed TP stores wait this long for every rank's record sizes. Ranks store
+# the same scheduler step, so a rank missing for this long has failed.
+RANK_MERGE_TIMEOUT_S = 10.0
+_RANK_MERGE_POLL_S = 0.5
+
+
+@dataclass
+class _RankMerge:
+    """Per-rank record declarations of one packed TP chunk store.
+
+    Attributes:
+        sizes: Record sizes declared by each rank so far.
+        modes: Record modes declared by each rank so far.
+        ready: Set once every rank declared.
+        consumers: Ranks that took the merged layout; the entry is dropped
+            once every rank did.
+    """
+
+    sizes: dict[int, tuple[int, ...]]
+    modes: dict[int, tuple[str, ...]]
+    ready: asyncio.Event
+    consumers: set[int]
 
 
 @dataclass(frozen=True)
@@ -241,6 +263,8 @@ class StoreRequest:
             compressed ones); positive 4 KiB multiples, one per slot.
         record_modes: Per-slot codec mode (``raw`` or ``compressed``) of a
             packed chunk, one per slot; empty for the raw storage format.
+        tp_rank: Storing rank. Packed records differ per rank, so with TP > 1
+            the core merges every rank's sizes before placing the chunk.
     """
 
     chunk_key: str
@@ -248,19 +272,36 @@ class StoreRequest:
     num_slots: int
     record_sizes: tuple[int, ...]
     record_modes: tuple[str, ...] = ()
+    tp_rank: int = 0
 
 
 @dataclass(frozen=True)
 class ChunkRecords:
-    """Record layout of a stored chunk, identical on every rank.
+    """Record layout of a stored chunk.
+
+    Slot extents are identical on every rank: a packed TP chunk reserves the
+    largest record any rank stored for a slot, and each rank's record starts
+    at the slot's offset (its trailing bytes are unused).
 
     Attributes:
         record_sizes: Per-slot record bytes.
-        record_modes: Per-slot codec mode of a packed chunk; empty for raw.
+        rank_modes: Per-rank, per-slot codec modes of a packed chunk (one
+            tuple per TP rank); empty for raw.
     """
 
     record_sizes: tuple[int, ...]
-    record_modes: tuple[str, ...]
+    rank_modes: tuple[tuple[str, ...], ...]
+
+    def slot_modes(self, index: int) -> tuple[str, ...]:
+        """Return every rank's codec mode of one slot.
+
+        Args:
+            index: Slot index within the chunk.
+
+        Returns:
+            One mode per TP rank; empty for raw chunks.
+        """
+        return tuple(modes[index] for modes in self.rank_modes)
 
 
 @dataclass(frozen=True)
@@ -350,8 +391,12 @@ class ServerCore:
         # Keys whose last tier copy was evicted; their retrieval entries are
         # dropped by ``_flush_lost`` right after the evicting operation.
         self._lost: list[str] = []
-        # Codec modes of packed chunks with tier state (raw chunks have none).
-        self._record_modes: dict[str, tuple[str, ...]] = {}
+        # Per-rank codec modes of packed chunks with tier state (raw chunks
+        # have none).
+        self._record_modes: dict[str, tuple[tuple[str, ...], ...]] = {}
+        # Packed TP stores waiting for every rank's record sizes, keyed by
+        # allocation ``(chunk_key, start_slot, num_slots)``.
+        self._rank_merges: dict[tuple[str, int, int], _RankMerge] = {}
         clean = os.environ.get(EXCLUSIVE_CLEAN_ENV)
         self._tiers = TierIndex(
             tier_layout,
@@ -667,8 +712,14 @@ class ServerCore:
         ``TierIndex.place_store``). Evicts tier candidates as needed; when
         only in-flight IO blocks the space, waits for it and retries.
 
+        Packed records (requests with ``record_modes``) differ per rank. With
+        TP > 1 a new packed chunk is placed only after every rank declared its
+        record sizes; each slot then reserves the largest of them, so all
+        ranks share one extent layout and each rank's record fits its slot.
+
         Args:
-            requests: Chunks to store, each from a writer allocation.
+            requests: Chunks to store, each from a writer allocation, all
+                from one rank.
 
         Returns:
             One entry per request: the placement (every copy carries one io
@@ -677,30 +728,40 @@ class ServerCore:
             exists (the write must be dropped).
 
         Raises:
-            ValueError: if record sizes do not match the allocation or a
-                chunk appears twice.
+            ValueError: if record sizes do not match the allocation, a
+                chunk appears twice, or a rank's records exceed the slots of
+                an already placed chunk.
+            TimeoutError: if another rank did not declare a packed chunk
+                within ``RANK_MERGE_TIMEOUT_S``.
             TierFull: if a tier cannot fit a chunk once IO is idle.
 
         Async/thread-safety:
-            Runs on the server event loop; may await ``io_released``.
+            Runs on the server event loop; may await the other ranks'
+            requests and ``io_released``.
         """
+        live = []
+        for index, request in enumerate(requests):
+            if not self.is_current_allocation(
+                request.chunk_key, request.start_slot, request.num_slots
+            ):
+                continue
+            if len(request.record_sizes) != request.num_slots:
+                raise ValueError(
+                    f"chunk {request.chunk_key} has {request.num_slots} slots "
+                    f"but {len(request.record_sizes)} record sizes"
+                )
+            self._check_record_modes(request)
+            live.append((index, request))
+        layouts = await self._merge_ranks([request for _index, request in live])
+        kept = [
+            (index, request, layout)
+            for (index, request), layout in zip(live, layouts, strict=True)
+            if layout is not None
+        ]
         while True:
-            live = []
-            for index, request in enumerate(requests):
-                if not self.is_current_allocation(
-                    request.chunk_key, request.start_slot, request.num_slots
-                ):
-                    continue
-                if len(request.record_sizes) != request.num_slots:
-                    raise ValueError(
-                        f"chunk {request.chunk_key} has {request.num_slots} slots "
-                        f"but {len(request.record_sizes)} record sizes"
-                    )
-                self._check_record_modes(request)
-                live.append((index, request))
             try:
                 placements = self._tiers.place_store(
-                    [(r.chunk_key, tuple(r.record_sizes)) for _i, r in live]
+                    [(r.chunk_key, sizes) for _i, r, (sizes, _modes) in kept]
                 )
             except TierFull as exc:
                 await self._after_tier_change()
@@ -708,12 +769,12 @@ class ServerCore:
                     raise
                 await self._tiers.io_released(exc.tier)
                 continue
-            for _index, request in live:
-                if request.record_modes:
-                    self._record_modes[request.chunk_key] = tuple(request.record_modes)
+            for _index, request, (_sizes, modes) in kept:
+                if modes:
+                    self._record_modes[request.chunk_key] = modes
             await self._after_tier_change()
             result: list[StorePlacement | None] = [None] * len(requests)
-            for (index, _request), placement in zip(live, placements, strict=True):
+            for (index, _r, _layout), placement in zip(kept, placements, strict=True):
                 result[index] = placement
             return result
 
@@ -1058,7 +1119,7 @@ class ServerCore:
             return None
         return ChunkRecords(
             record_sizes=chunk.record_sizes,
-            record_modes=self._record_modes.get(chunk_key, ()),
+            rank_modes=self._record_modes.get(chunk_key, ()),
         )
 
     def promotion_pending(self, chunk_key: str) -> bool:
@@ -1736,10 +1797,115 @@ class ServerCore:
             or any(mode not in ("raw", "compressed") for mode in modes)
         ):
             raise ValueError(f"invalid record modes for chunk {request.chunk_key}")
-        if self._tiers.chunk(request.chunk_key) is not None and modes != (
-            self._record_modes.get(request.chunk_key, ())
-        ):
+        tp = self._tiers.layout.tensor_parallel_size
+        if not 0 <= request.tp_rank < tp:
+            raise ValueError(f"store rank {request.tp_rank} outside TP size {tp}")
+        if self._tiers.chunk(request.chunk_key) is None:
+            return
+        stored = self._record_modes.get(request.chunk_key, ())
+        if modes != (stored[request.tp_rank] if stored else ()):
             raise ValueError(f"record modes changed for chunk: {request.chunk_key}")
+
+    async def _merge_ranks(
+        self, requests: list[StoreRequest]
+    ) -> list[tuple[tuple[int, ...], tuple[tuple[str, ...], ...]] | None]:
+        """Return the slot sizes and per-rank modes to place each request with.
+
+        Raw and TP-1 requests keep their own records. A packed TP request of
+        a chunk with tier state reuses its layout. Otherwise the request
+        declares its rank's records under the allocation and waits until
+        every rank declared; each slot then takes the largest size.
+
+        Args:
+            requests: Current-allocation requests of one rank.
+
+        Returns:
+            Per request ``(record_sizes, rank_modes)``, or None when the
+            allocation went away while waiting.
+
+        Raises:
+            ValueError: if the rank's records exceed an existing layout.
+            TimeoutError: if a rank did not declare in time; this rank's
+                declarations are withdrawn.
+
+        Async/thread-safety:
+            Runs on the server event loop; awaits the other ranks.
+        """
+        tp = self._tiers.layout.tensor_parallel_size
+        layouts: list[tuple[tuple[int, ...], tuple[tuple[str, ...], ...]] | None] = []
+        waiting: list[tuple[int, tuple[str, int, int], _RankMerge]] = []
+        for request in requests:
+            sizes = tuple(request.record_sizes)
+            modes = tuple(request.record_modes)
+            if tp == 1 or not modes:
+                layouts.append((sizes, (modes,) if modes else ()))
+                continue
+            chunk = self._tiers.chunk(request.chunk_key)
+            if chunk is not None:
+                if any(
+                    own > slot
+                    for own, slot in zip(sizes, chunk.record_sizes, strict=True)
+                ):
+                    raise ValueError(
+                        f"rank {request.tp_rank} records exceed the slots of "
+                        f"chunk {request.chunk_key}"
+                    )
+                layouts.append(
+                    (chunk.record_sizes, self._record_modes[request.chunk_key])
+                )
+                continue
+            key = (request.chunk_key, request.start_slot, request.num_slots)
+            merge = self._rank_merges.get(key)
+            if merge is None:
+                merge = _RankMerge({}, {}, asyncio.Event(), set())
+                self._rank_merges[key] = merge
+            merge.sizes[request.tp_rank] = sizes
+            merge.modes[request.tp_rank] = modes
+            if len(merge.sizes) == tp:
+                merge.ready.set()
+            waiting.append((len(layouts), key, merge))
+            layouts.append(None)
+        if not waiting:
+            return layouts
+        rank = requests[0].tp_rank
+        deadline = asyncio.get_running_loop().time() + RANK_MERGE_TIMEOUT_S
+        try:
+            for index, key, merge in waiting:
+                while not merge.ready.is_set():
+                    if not self.is_current_allocation(*key):
+                        break
+                    left = deadline - asyncio.get_running_loop().time()
+                    if left <= 0:
+                        missing = sorted(set(range(tp)) - set(merge.sizes))
+                        raise TimeoutError(
+                            f"packed store of chunk {key[0]} waited "
+                            f"{RANK_MERGE_TIMEOUT_S:.0f} s for TP ranks {missing}"
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            merge.ready.wait(), min(left, _RANK_MERGE_POLL_S)
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                if not merge.ready.is_set():
+                    continue
+                merge.consumers.add(rank)
+                if len(merge.consumers) == tp and self._rank_merges.get(key) is merge:
+                    del self._rank_merges[key]
+                if self.is_current_allocation(*key):
+                    layouts[index] = (
+                        tuple(map(max, *(merge.sizes[r] for r in range(tp)))),
+                        tuple(merge.modes[r] for r in range(tp)),
+                    )
+        finally:
+            for _index, key, merge in waiting:
+                if rank in merge.consumers:
+                    continue
+                merge.sizes.pop(rank, None)
+                merge.modes.pop(rank, None)
+                if not merge.sizes and self._rank_merges.get(key) is merge:
+                    del self._rank_merges[key]
+        return layouts
 
     def _check_rank(self, tp_rank: int, tp_size: int) -> None:
         """Reject a rank outside the server's TP geometry."""

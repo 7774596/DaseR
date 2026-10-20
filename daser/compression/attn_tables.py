@@ -67,20 +67,30 @@ def calibrate(dump: NDArray[np.uint16]) -> NDArray[np.uint8]:
     return out
 
 
-def load_tables(path: str, device: torch.device) -> DeviceTables:
+def load_tables(
+    path: str, device: torch.device, heads: slice = slice(None)
+) -> DeviceTables:
     """Load a calibrated ``.npz`` and build the kernel tables on ``device``.
 
     Args:
         path: File written by the CLI.
         device: Target CUDA device.
+        heads: KV heads this worker holds (a TP rank's contiguous shard of
+            the calibrated heads); all heads by default.
 
     Returns:
-        Device tables.
+        Device tables of the selected heads.
+
+    Raises:
+        ValueError: if the selection holds no calibrated head.
 
     Async/thread-safety:
         Blocking file read and host-to-device copies.
     """
-    return device_tables(np.load(path)["table"], device)
+    table = np.load(path)["table"][:, :, heads]
+    if table.shape[2] == 0:
+        raise ValueError(f"AF1 tables {path} hold no head in {heads}")
+    return device_tables(np.ascontiguousarray(table), device)
 
 
 def device_tables(table: NDArray[np.uint8], device: torch.device) -> DeviceTables:

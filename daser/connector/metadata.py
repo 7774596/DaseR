@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -14,19 +14,51 @@ class CompressedLoadSlot:
 
     Attributes:
         slot_id: DaseR slot id of the record.
-        mode: Explicit ``raw`` or ``compressed`` record mode.
-        stored_length: Aligned record bytes to transfer.
+        mode: Explicit ``raw`` or ``compressed`` record mode. When TP ranks
+            stored the slot in different modes this is ``raw`` (the
+            scheduler must not assume a packed record) and ``rank_modes``
+            holds each rank's mode; workers decode only after ``for_rank``.
+        stored_length: Aligned record bytes to transfer (the largest record
+            of any rank; a rank's own record may end earlier).
+        rank_modes: Per-rank modes of a slot the ranks stored differently;
+            empty when ``mode`` holds on every rank.
     """
 
     slot_id: int
     mode: Literal["raw", "compressed"]
     stored_length: int
+    rank_modes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.slot_id < 0 or self.mode not in ("raw", "compressed"):
             raise ValueError("invalid compressed load slot identity")
         if self.stored_length <= 0:
             raise ValueError("invalid compressed load slot length")
+        if any(mode not in ("raw", "compressed") for mode in self.rank_modes):
+            raise ValueError("invalid compressed load slot rank mode")
+
+    def for_rank(self, tp_rank: int) -> "CompressedLoadSlot":
+        """Return the slot as one TP rank stored it.
+
+        Args:
+            tp_rank: Worker's tensor-parallel rank.
+
+        Returns:
+            ``self`` when the ranks agree, else a slot whose ``mode`` is the
+            rank's own and that carries no ``rank_modes``.
+
+        Raises:
+            ValueError: if ``tp_rank`` has no recorded mode.
+        """
+        if not self.rank_modes:
+            return self
+        if not 0 <= tp_rank < len(self.rank_modes):
+            raise ValueError(f"compressed load slot has no mode for rank {tp_rank}")
+        return replace(
+            self,
+            mode=self.rank_modes[tp_rank],  # type: ignore[arg-type]
+            rank_modes=(),
+        )
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CompressedLoadSlot":
@@ -35,6 +67,7 @@ class CompressedLoadSlot:
             slot_id=int(payload["slot_id"]),
             mode=str(payload["mode"]),  # type: ignore[arg-type]
             stored_length=int(payload["stored_length"]),
+            rank_modes=tuple(str(mode) for mode in payload.get("rank_modes", ())),
         )
 
 

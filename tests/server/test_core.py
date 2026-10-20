@@ -15,7 +15,8 @@ from daser.connector.helpers import (
     rolling_prefix_keys,
 )
 from daser.metrics import MetricsRegistry
-from daser.server.core import ChunkRecords, ServerCore, StoreRequest
+from daser.server import core as core_module
+from daser.server.core import Allocation, ChunkRecords, ServerCore, StoreRequest
 from daser.server.tiers import L1, L2, ChunkUnavailable, TierFull
 from tests.server.core_helpers import (
     BLOCK_TOKENS,
@@ -794,11 +795,85 @@ async def test_packed_record_modes_are_checked_and_kept() -> None:
         await core.place_store([packed(("compressed", "compressed"))])
     await core.store_persisted(placement, 0, 1)
     assert core.chunk_records("a") == ChunkRecords(
-        record_sizes=(2 * RECORD, RECORD), record_modes=("raw", "compressed")
+        record_sizes=(2 * RECORD, RECORD), rank_modes=(("raw", "compressed"),)
     )
     raw = await alloc_and_store(core, "b")
     records = core.chunk_records(raw.chunk_key)
-    assert records is not None and records.record_modes == ()
+    assert records is not None and records.rank_modes == ()
+
+
+def _packed(
+    alloc: Allocation, rank: int, sizes: tuple[int, ...], modes: tuple[str, ...]
+) -> StoreRequest:
+    """Return one rank's packed store request of an allocation."""
+    return StoreRequest(
+        chunk_key=alloc.chunk_key,
+        start_slot=alloc.start_slot,
+        num_slots=alloc.num_slots,
+        record_sizes=sizes,
+        record_modes=modes,
+        tp_rank=rank,
+    )
+
+
+@pytest.mark.asyncio
+async def test_packed_tp_store_waits_for_every_rank_and_takes_slot_max() -> None:
+    """TP ranks share one layout holding the largest record of each slot."""
+    core = make_core(tp=2)
+    alloc = await core.alloc_chunk("a", 2 * BLOCK_TOKENS, "m")
+    first = asyncio.create_task(
+        core.place_store([_packed(alloc, 0, (RECORD, 2 * RECORD), ("compressed",) * 2)])
+    )
+    await asyncio.sleep(0.01)
+    assert not first.done() and core.chunk_records("a") is None
+    (second,) = await core.place_store(
+        [_packed(alloc, 1, (2 * RECORD, RECORD), ("raw", "compressed"))]
+    )
+    (placement,) = await first
+    assert placement is not None and second is not None
+    assert placement.record_sizes == second.record_sizes == (2 * RECORD, 2 * RECORD)
+    for rank, done in enumerate((placement, second)):
+        await core.store_persisted(done, rank, 2)
+    records = core.chunk_records("a")
+    assert records is not None
+    assert records.rank_modes == (("compressed", "compressed"), ("raw", "compressed"))
+    assert records.slot_modes(0) == ("compressed", "raw")
+    # A retry of one rank reuses the layout; its records must still fit.
+    (again,) = await core.place_store(
+        [_packed(alloc, 1, (2 * RECORD, RECORD), ("raw", "compressed"))]
+    )
+    assert again is not None and again.record_sizes == (2 * RECORD, 2 * RECORD)
+    core.release_placement(again)
+    with pytest.raises(ValueError, match="exceed"):
+        await core.place_store(
+            [_packed(alloc, 0, (3 * RECORD, RECORD), ("compressed",) * 2)]
+        )
+    with pytest.raises(ValueError, match="changed"):
+        await core.place_store([_packed(alloc, 0, (RECORD, RECORD), ("raw",) * 2)])
+
+
+@pytest.mark.asyncio
+async def test_packed_tp_store_times_out_and_drops_stale_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing rank fails the wait; a released allocation ends it quietly."""
+    monkeypatch.setattr(core_module, "RANK_MERGE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(core_module, "_RANK_MERGE_POLL_S", 0.01)
+    core = make_core(tp=2)
+    alloc = await core.alloc_chunk("a", BLOCK_TOKENS, "m")
+    with pytest.raises(TimeoutError, match=r"\[1\]"):
+        await core.place_store([_packed(alloc, 0, (RECORD,), ("compressed",))])
+    # The timed-out declaration was withdrawn: rank 1 alone waits again.
+    with pytest.raises(TimeoutError, match=r"\[0\]"):
+        await core.place_store([_packed(alloc, 1, (RECORD,), ("compressed",))])
+
+    monkeypatch.setattr(core_module, "RANK_MERGE_TIMEOUT_S", 10.0)
+    waiting = asyncio.create_task(
+        core.place_store([_packed(alloc, 0, (RECORD,), ("compressed",))])
+    )
+    await asyncio.sleep(0.02)
+    await core.release_chunk_writer("a", alloc.start_slot, alloc.num_slots)
+    assert await asyncio.wait_for(waiting, 1.0) == [None]
 
 
 @pytest.mark.asyncio

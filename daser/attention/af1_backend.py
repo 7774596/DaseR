@@ -19,8 +19,9 @@ write, which vLLM does not pass to attention backends, so the model runner's
 scheduler output (:class:`OpenBlocks`).
 
 Requirements: V2 model runner, BF16 KV, head size 128, ``H * 8`` query heads,
-block size 128, SM90, no speculative decoding, TP 1. Calibrated tables are
-read from ``DASER_AF1_TABLES`` (see :mod:`daser.compression.attn_tables`).
+block size 128, SM90, no speculative decoding, a TP size that divides the KV
+heads. Calibrated tables are read from ``DASER_AF1_TABLES`` (see
+:mod:`daser.compression.attn_tables`); each TP rank uses its own heads' tables.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import (
@@ -257,8 +259,6 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
             raise ValueError("AF1 attention needs the V2 model runner")
         if vllm_config.speculative_config is not None:
             raise ValueError("AF1 attention does not support speculative decoding")
-        if vllm_config.parallel_config.tensor_parallel_size != 1:
-            raise ValueError("AF1 attention supports TP 1 only")
         if vllm_config.cache_config.block_size != BLOCK_TOKENS:
             raise ValueError(f"AF1 attention needs --block-size {BLOCK_TOKENS}")
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
@@ -294,7 +294,14 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
             raise ValueError(
                 "DASER_AF1_TABLES must point at calibrated AF1 tables (.npz)"
             )
-        self.tables = load_tables(path, device)
+        # vLLM gives TP rank r the KV heads [r * H, (r + 1) * H).
+        rank = get_tensor_model_parallel_rank()
+        heads = slice(rank * self.kv_heads, (rank + 1) * self.kv_heads)
+        self.tables = load_tables(path, device, heads)
+        if self.tables.plut.shape[2] != self.kv_heads:
+            raise ValueError(
+                f"AF1 tables {path} do not cover KV heads {heads.start}..{heads.stop}"
+            )
         self.store: HbmKvStore | None = None
         self.store_key: tuple[int, int] | None = None
         self.layer_tables: list[RecordTables] = []

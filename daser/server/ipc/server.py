@@ -1029,7 +1029,7 @@ class IPCServer:
                 f"TP size {self._layout.tensor_parallel_size}"
             )
         transfer = self._ensure_transfer()
-        groups = self._store_groups(spans)
+        groups = self._store_groups(spans, tp_rank)
         buffer, one_shot = self._store_buffer(payload, spans)
         parts: list[_StorePart] = []
         try:
@@ -1268,12 +1268,13 @@ class IPCServer:
     # ------------------------------------------------------------------
 
     def _store_groups(
-        self, spans: list[dict[str, Any]]
+        self, spans: list[dict[str, Any]], tp_rank: int = 0
     ) -> list[tuple[StoreRequest, list[dict[str, int]], frozenset[int]]]:
         """Validate store spans and group them into per-chunk store requests.
 
         Args:
             spans: Request spans (see ``_op_transfer_store``).
+            tp_rank: Storing rank, recorded on every request.
 
         Returns:
             One ``(StoreRequest, spans, slots)`` per chunk allocation, with
@@ -1327,6 +1328,7 @@ class IPCServer:
                     num_slots,
                     tuple(s["nbytes"] for s in parsed),
                     modes,
+                    tp_rank,
                 )
                 slots = frozenset(range(num_slots))
             else:
@@ -1344,7 +1346,7 @@ class IPCServer:
                         )
                     covered.update(range(s["slot_index"], s["slot_index"] + count))
                 request = StoreRequest(
-                    key, start_slot, num_slots, (slot_size,) * num_slots
+                    key, start_slot, num_slots, (slot_size,) * num_slots, (), tp_rank
                 )
                 slots = frozenset(covered)
             result.append((request, parsed, slots))
@@ -2423,7 +2425,10 @@ class IPCServer:
             ``ChunkInfo.to_dict`` per chunk, plus ``compressed_slots`` of
             ``{slot_id, mode, stored_length}`` (one per slot) for results
             whose chunks all carry codec modes. A result may be a run of
-            several adjacent chunks.
+            several adjacent chunks. ``mode`` is the slot's mode when every
+            TP rank stored it alike; otherwise it is ``raw`` and the slot
+            adds ``rank_modes`` (one mode per rank) for each worker to
+            resolve its own.
         """
         payloads: list[dict[str, Any]] = []
         for chunk in chunks:
@@ -2437,17 +2442,19 @@ class IPCServer:
                 self._core.resolve_slots(start, int(chunk.num_slots)) or []
             ):
                 records = self._core.chunk_records(key)
-                if records is None or not records.record_modes:
+                if records is None or not records.rank_modes:
                     slots = []
                     break
                 for index in range(first, first + count):
-                    slots.append(
-                        {
-                            "slot_id": start + len(slots),
-                            "mode": records.record_modes[index],
-                            "stored_length": records.record_sizes[index],
-                        }
-                    )
+                    modes = records.slot_modes(index)
+                    slot = {
+                        "slot_id": start + len(slots),
+                        "mode": modes[0] if len(set(modes)) == 1 else "raw",
+                        "stored_length": records.record_sizes[index],
+                    }
+                    if len(set(modes)) > 1:
+                        slot["rank_modes"] = list(modes)
+                    slots.append(slot)
             if slots:
                 payload["compressed_slots"] = slots
         return payloads

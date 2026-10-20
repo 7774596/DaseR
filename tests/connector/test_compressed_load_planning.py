@@ -33,6 +33,26 @@ def _spec() -> ReqLoadSpec:
     )
 
 
+def test_slot_resolves_the_mode_its_rank_stored() -> None:
+    """Ranks that stored a slot differently each decode their own mode."""
+    slot = CompressedLoadSlot.from_payload(
+        {
+            "slot_id": 7,
+            "mode": "raw",
+            "stored_length": 8192,
+            "rank_modes": ["compressed", "raw"],
+        }
+    )
+    assert slot.for_rank(0) == CompressedLoadSlot(7, "compressed", 8192)
+    assert slot.for_rank(1) == CompressedLoadSlot(7, "raw", 8192)
+    agreed = CompressedLoadSlot(8, "compressed", 4096)
+    assert agreed.for_rank(1) is agreed
+    with pytest.raises(ValueError):
+        slot.for_rank(2)
+    with pytest.raises(ValueError):
+        CompressedLoadSlot(7, "raw", 8192, ("zstd", "raw"))
+
+
 def test_compressed_plan_reads_only_indexed_lengths() -> None:
     """Consecutive packed slot ids form one span of their stored bytes."""
     spec = _spec()

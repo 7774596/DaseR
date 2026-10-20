@@ -426,8 +426,6 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
             violations.append("--transfer-mode=iouring")
         if cfg.cache_reuse_mode != CACHE_REUSE_PREFIX:
             violations.append("--cache-reuse-mode=prefix")
-        if cfg.tensor_parallel_size != 1:
-            violations.append("--tensor-parallel-size=1")
         if cfg.block_tokens != 128:
             violations.append("--block-tokens=128")
         if geometry.dtype_name != "bfloat16":
@@ -645,7 +643,7 @@ def _compression_runtime_config(
         slot_size=cfg.resolved_local_slot_size(),
         block_tokens=cfg.block_tokens,
         num_layers=model.num_layers,
-        num_kv_heads=model.num_kv_heads,
+        num_kv_heads=model.local_kv_heads(cfg.tensor_parallel_size),
         head_dim=model.head_dim,
         dtype_bytes=model.dtype_bytes,
         tile_scalars=ONLINE_TILE_SCALARS,
