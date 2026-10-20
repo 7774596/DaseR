@@ -73,7 +73,7 @@ MAX_WARP_RAW = 32  # the kernel patches at most one raw scalar per lane
 # fixed header (u32 magic, version, L, H; i64 bytes, digest) and the i32
 # var-length table [L, 2, H] in a BLOB_ALIGN-padded head, then the records in
 # (layer, kv, head) order, each DENSE_BYTES + var_len (raw records whole).
-BLOB_MAGIC = 0x42314641  # "AF1B"
+BLOB_MAGIC = 0x424B5046  # "FPKB"
 BLOB_FIXED_BYTES = 64
 BLOB_ALIGN = 4096
 
@@ -302,7 +302,7 @@ def blob_head_bytes(num_layers: int, kv_heads: int) -> int:
 def blob_slot_bytes(num_layers: int, kv_heads: int) -> int:
     """Return the largest block blob, rounded up to ``BLOB_ALIGN``.
 
-    Every record raw: the external-tier slot size of AF1 storage.
+    Every record raw: the external-tier slot size of FragPack storage.
 
     Args:
         num_layers: Layers ``L``.

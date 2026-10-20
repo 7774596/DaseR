@@ -21,16 +21,16 @@ CACHE_REUSE_MODES = (CACHE_REUSE_PREFIX, CACHE_REUSE_CHUNK)
 DEFAULT_CACHE_REUSE_MODE = CACHE_REUSE_CHUNK
 STORAGE_FORMAT_RAW = "raw"
 STORAGE_FORMAT_COMPRESSED_ONLINE = "compressed-online"
-#: Blocks kept as AF1 records (HBM-resident compressed KV, AF1 attention) and
-#: moved through the tiers as block blobs; see docs/design/af1-external-tiers.md.
-STORAGE_FORMAT_AF1 = "af1"
+#: Blocks kept as FragPack records (HBM-resident compressed KV, FragPack attention) and
+#: moved through the tiers as block blobs; see docs/design/fragpack-external-tiers.md.
+STORAGE_FORMAT_FRAGPACK = "fragpack"
 STORAGE_FORMATS = (
     STORAGE_FORMAT_RAW,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_AF1,
+    STORAGE_FORMAT_FRAGPACK,
 )
 #: Formats whose chunks are variable-length packed records.
-PACKED_STORAGE_FORMATS = (STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_AF1)
+PACKED_STORAGE_FORMATS = (STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_FRAGPACK)
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
@@ -437,7 +437,7 @@ class DaserConfig:
         Returns:
             Slot size in bytes.
         """
-        if self.storage_format == STORAGE_FORMAT_AF1:
+        if self.storage_format == STORAGE_FORMAT_FRAGPACK:
             return self.resolved_local_slot_size() * self.tensor_parallel_size
         return self.model_geometry().slot_size_for_block_tokens(
             self.block_tokens, self.tensor_parallel_size
@@ -448,9 +448,9 @@ class DaserConfig:
 
         Returns:
             Per-rank KV slot bytes derived from model and TP configuration;
-            for AF1 storage the largest block blob (every record raw).
+            for FragPack storage the largest block blob (every record raw).
         """
-        if self.storage_format == STORAGE_FORMAT_AF1:
+        if self.storage_format == STORAGE_FORMAT_FRAGPACK:
             from daser.compression.attn_page import blob_slot_bytes
 
             geometry = self.model_geometry()

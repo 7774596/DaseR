@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM general plugin: registers the AF1 backend as ``--attention-backend CUSTOM``.
+"""vLLM general plugin: register the FragPack backend as the CUSTOM backend.
 
 Expose it through a ``vllm.general_plugins`` entry point
-(``daser_af1 = daser.attention.plugin:register``).
+(``daser_fragpack = daser.attention.plugin:register``).
 """
 
 from __future__ import annotations
 
 
 def register() -> None:
-    """Register :class:`~daser.attention.af1_backend.Af1AttentionBackend` as CUSTOM.
+    """Register ``fragpack_backend.FragPackAttentionBackend`` as CUSTOM.
 
     Returns:
         None.
@@ -24,5 +24,6 @@ def register() -> None:
     )
 
     register_backend(
-        AttentionBackendEnum.CUSTOM, "daser.attention.af1_backend.Af1AttentionBackend"
+        AttentionBackendEnum.CUSTOM,
+        "daser.attention.fragpack_backend.FragPackAttentionBackend",
     )

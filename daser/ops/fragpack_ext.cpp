@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Python bindings for the AF1 decode-attention and HBM KV store kernels.
+// Python bindings for the FragPack decode-attention and HBM KV store kernels.
 #include <torch/extension.h>
 
 void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len,

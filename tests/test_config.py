@@ -12,8 +12,8 @@ from daser.config import (
     DEFAULT_IOURING_L1_BYTES,
     DEFAULT_TIER_GRAIN,
     MAX_STAGING_BYTES,
-    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_FRAGPACK,
     DaserConfig,
     model_geometry_from_path,
 )
@@ -125,8 +125,8 @@ def test_daser_config_uses_configured_block_tokens_for_slot_size(
     assert cfg.runtime_config()["block_tokens"] == 128
 
 
-def test_af1_slot_holds_the_largest_block_blob(tmp_path: Path) -> None:
-    """AF1 slots fit a blob whose records are all raw, plus its head."""
+def test_fragpack_slot_holds_the_largest_block_blob(tmp_path: Path) -> None:
+    """FragPack slots fit a blob whose records are all raw, plus its head."""
     model_path = tmp_path / "model"
     _write_model_config(
         model_path,
@@ -140,7 +140,7 @@ def test_af1_slot_holds_the_largest_block_blob(tmp_path: Path) -> None:
     )
     cfg = DaserConfig(
         model_path=str(model_path),
-        storage_format=STORAGE_FORMAT_AF1,
+        storage_format=STORAGE_FORMAT_FRAGPACK,
         block_tokens=128,
     )
 

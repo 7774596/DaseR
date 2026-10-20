@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Move AF1 blocks between the HBM KV store and DaseR staging buffers.
+"""Move FragPack blocks between the HBM KV store and DaseR staging buffers.
 
-With AF1 attention (``daser.attention.af1_backend``), the engine's KV cache
-holds AF1 records rather than BF16 KV. External tiers therefore store each
+With FragPack attention (``daser.attention.fragpack_backend``), the engine's KV cache
+holds FragPack records rather than BF16 KV. External tiers therefore store each
 block as a block blob (``attn_page.BLOB_MAGIC``) and never re-encode:
-:class:`Af1BlockExporter` copies closed blocks' records into store staging
-with the same contract as the online packer, and :class:`Af1BlockImporter`
+:class:`FragPackBlockExporter` copies closed blocks' records into store staging
+with the same contract as the online packer, and :class:`FragPackBlockImporter`
 installs fetched blobs into the destination blocks on the restore stream.
 Both resolve the store lazily through :func:`daser.ops.hbm_kv.active_store`,
 since attention creates it only after the connector registers its caches.
@@ -29,12 +29,12 @@ def _upload(
     return host.to(device, non_blocking=True)
 
 
-class Af1BlockExporter:
-    """Copy closed AF1 blocks into fixed-stride store staging regions.
+class FragPackBlockExporter:
+    """Copy closed FragPack blocks into fixed-stride store staging regions.
 
     Args:
         slot_stride: Staging bytes reserved per block; must equal the store's
-            ``blob_stride`` (the server's AF1 slot size).
+            ``blob_stride`` (the server's FragPack slot size).
 
     Async/thread-safety:
         Call ``pack_into`` from one store thread at a time.
@@ -58,7 +58,7 @@ class Af1BlockExporter:
             staging: Worker-owned CUDA byte staging buffer.
             block_ids: Closed physical blocks in logical order.
             logical_slots: Prompt-relative slot ids matching ``block_ids``.
-            slot_stride: Staging region stride (the AF1 slot size).
+            slot_stride: Staging region stride (the FragPack slot size).
             stream: Store stream, already ordered after the producing forward.
 
         Returns:
@@ -72,15 +72,15 @@ class Af1BlockExporter:
             Blocks the calling thread until ``stream`` has copied the blobs.
         """
         if not block_ids or len(block_ids) != len(logical_slots):
-            raise ValueError("AF1 export block metadata is invalid")
+            raise ValueError("FragPack export block metadata is invalid")
         store = active_store()
         if slot_stride != self._slot_stride or slot_stride != store.blob_stride:
             raise ValueError(
-                f"AF1 export stride {slot_stride} does not match the store's "
+                f"FragPack export stride {slot_stride} does not match the store's "
                 f"{store.blob_stride}"
             )
         if staging.numel() < len(block_ids) * slot_stride:
-            raise ValueError("AF1 export staging capacity is insufficient")
+            raise ValueError("FragPack export staging capacity is insufficient")
         with torch.cuda.stream(stream):
             blocks = _upload(block_ids, torch.int32, staging.device)
             lengths = store.export_blocks(blocks, staging, slot_stride)
@@ -100,7 +100,7 @@ class Af1BlockExporter:
         ]
 
 
-class Af1RestorePlan:
+class FragPackRestorePlan:
     """One prepared blob import; mirrors ``PreparedKVRestore``.
 
     Async/thread-safety:
@@ -165,8 +165,8 @@ class Af1RestorePlan:
         ]
 
 
-class Af1BlockImporter:
-    """Prepare imports of fetched AF1 blobs; mirrors the fused decoder.
+class FragPackBlockImporter:
+    """Prepare imports of fetched FragPack blobs; mirrors the fused decoder.
 
     Async/thread-safety:
         Call from the load thread only.
@@ -182,17 +182,17 @@ class Af1BlockImporter:
         buffer_index: int,
         stream: torch.cuda.Stream,
         plane_range: tuple[int, int] | None = None,
-    ) -> Af1RestorePlan | None:
+    ) -> FragPackRestorePlan | None:
         """Upload import metadata without launching the import.
 
         Args:
             staging: Leased GPU byte tensor the server fills with blobs.
             staging_offsets: Blob offset per destination.
             block_ids: Distinct destination blocks.
-            modes: Record modes; every AF1 blob is compressed (1).
+            modes: Record modes; every FragPack blob is compressed (1).
             buffer_index: Staging ring index (unused; metadata is per plan).
             stream: Restore stream ordering the upload and the import.
-            plane_range: Must be None: AF1 blobs restore whole blocks.
+            plane_range: Must be None: FragPack blobs restore whole blocks.
 
         Returns:
             Restore plan, or None for empty input.
@@ -206,19 +206,19 @@ class Af1BlockImporter:
         """
         del buffer_index
         if plane_range is not None:
-            raise ValueError("AF1 blobs do not support layer-wise restore")
+            raise ValueError("FragPack blobs do not support layer-wise restore")
         if not len(staging_offsets) == len(block_ids) == len(modes):
-            raise ValueError("AF1 restore metadata lengths do not match")
+            raise ValueError("FragPack restore metadata lengths do not match")
         if not block_ids:
             return None
         if any(mode != 1 for mode in modes):
-            raise ValueError("AF1 restore requires compressed records")
+            raise ValueError("FragPack restore requires compressed records")
         if len(set(block_ids)) != len(block_ids):
-            raise ValueError("AF1 restore destinations must be distinct")
+            raise ValueError("FragPack restore destinations must be distinct")
         with torch.cuda.stream(stream):
             offsets = _upload(staging_offsets, torch.int64, staging.device)
             blocks = _upload(block_ids, torch.int32, staging.device)
-        return Af1RestorePlan(staging, offsets, blocks, list(block_ids), stream)
+        return FragPackRestorePlan(staging, offsets, blocks, list(block_ids), stream)
 
 
-__all__ = ["Af1BlockExporter", "Af1BlockImporter", "Af1RestorePlan"]
+__all__ = ["FragPackBlockExporter", "FragPackBlockImporter", "FragPackRestorePlan"]

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// Split-KV decode attention over AF1 records (see fused_attn_decode.py).
+// Split-KV decode attention over FragPack records (see fused_attn_decode.py).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
-#include "af1_common.cuh"
+#include "fragpack_common.cuh"
 
 namespace {
 
-using namespace af1;
+using namespace fragpack;
 
 constexpr int kPs = 8 * 256;  // 8 heads x 128 tokens bf16
 // Record metadata is staged per chunk of pages plus one lookahead page (the

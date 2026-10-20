@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-(layer, kv, head) AF1 lookup tables for the HBM-resident KV store.
+"""Per-(layer, kv, head) FragPack lookup tables for the HBM-resident KV store.
 
 The tables are calibrated offline from captured KV pages and saved as one
 ``.npz`` with ``table`` uint8 ``[L, 2, H, 22]`` (high bytes, most frequent
@@ -89,7 +89,7 @@ def load_tables(
     """
     table = np.load(path)["table"][:, :, heads]
     if table.shape[2] == 0:
-        raise ValueError(f"AF1 tables {path} hold no head in {heads}")
+        raise ValueError(f"FragPack tables {path} hold no head in {heads}")
     return device_tables(np.ascontiguousarray(table), device)
 
 

@@ -22,8 +22,8 @@ from daser.compression import CompressedStoreGeometry, default_online_codebooks
 from daser.compression.attn_page import blob_slot_bytes
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 from daser.config import (
-    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_FRAGPACK,
     STORAGE_FORMAT_RAW,
 )
 from daser.connector.helpers import base_req_id
@@ -300,8 +300,8 @@ class WorkerRuntime:
         Async/thread-safety:
             Called once during worker initialization before request traffic.
         """
-        if self._storage_format == STORAGE_FORMAT_AF1:
-            self._register_af1_kv_caches(kv_caches)
+        if self._storage_format == STORAGE_FORMAT_FRAGPACK:
+            self._register_fragpack_kv_caches(kv_caches)
             return
         layer_names, kv_cache = cross_layer_kv_view(kv_caches)
         self._kv_caches = {CROSS_LAYER_KV_CACHE_KEY: kv_cache}
@@ -350,11 +350,11 @@ class WorkerRuntime:
             self._prewarm_online_compression(kv_cache)
         self._init_server_transfer()
 
-    def _register_af1_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Register AF1 attention's per-layer page arenas.
+    def _register_fragpack_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Register FragPack attention's per-layer page arenas.
 
         The pipelines never address these tensors: blocks move as blobs
-        through the HBM store (``daser.ops.af1_codec``). They only provide the
+        through the HBM store (``daser.ops.fragpack_codec``). They only provide the
         device, the model-stream fence, and the slot geometry.
 
         Args:
@@ -362,7 +362,7 @@ class WorkerRuntime:
                 layer order.
 
         Raises:
-            ValueError: If the pages do not hold whole AF1 block-layers or the
+            ValueError: If the pages do not hold whole FragPack block-layers or the
                 slot geometry does not match the DaseR server.
 
         Async/thread-safety:
@@ -375,7 +375,7 @@ class WorkerRuntime:
         page = sample.stride(0) * sample.element_size()
         kv_heads = page // page_bytes(1)
         if kv_heads < 1 or page % 16:
-            raise ValueError(f"KV page of {page} B is not an AF1 block-layer page")
+            raise ValueError(f"KV page of {page} B is not an FragPack block-layer page")
         local_slot_size = blob_slot_bytes(len(kv_caches), kv_heads)
         _validate_tp_layout(
             local_slot_size,
@@ -389,7 +389,7 @@ class WorkerRuntime:
             self._slot_size = local_slot_size * self._tp_size
         load_staging_depth = self._configure_pipelines(sample)
         logger.info(
-            "[CONNECTOR] register_kv_caches af1: layers=%d kv_heads=%d page=%d "
+            "[CONNECTOR] register_kv_caches fragpack: layers=%d kv_heads=%d page=%d "
             "local_slot_size=%d load_staging_depth=%d",
             len(kv_caches),
             kv_heads,

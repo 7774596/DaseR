@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Split-KV decode attention over AF1 KV records.
+"""Split-KV decode attention over FragPack KV records.
 
 One CTA (256 threads) handles one split of one (sequence, KV head) pair for
 all ``GQA`` query heads, with an online softmax; a small combine kernel merges
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from daser.logging import init_logger
-from daser.ops.af1_ext import extension
+from daser.ops.fragpack_ext import extension
 
 logger = init_logger(__name__)
 

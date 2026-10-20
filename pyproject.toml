@@ -27,7 +27,7 @@ dev = [
 service = []
 
 [project.entry-points."vllm.general_plugins"]
-daser_af1 = "daser.attention.plugin:register"
+daser_fragpack = "daser.attention.plugin:register"
 
 [tool.setuptools.packages.find]
 include = ["daser*"]

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM attention backend that keeps the KV cache AF1-compressed in HBM.
+"""vLLM attention backend that keeps the KV cache FragPack-compressed in HBM.
 
 Each paged KV block holds, per layer, one page of
-:func:`~daser.ops.hbm_kv.page_bytes` that its ``2 H`` AF1 records share (23.25
+:func:`~daser.ops.hbm_kv.page_bytes` that its ``2 H`` FragPack records share (23.25
 KiB per record on average instead of 32 KiB raw), so the same KV memory holds
 1.38x as many blocks. :class:`~daser.ops.hbm_kv.HbmKvStore`
 manages the records over the engine's cache; decode attention decompresses
@@ -10,7 +10,7 @@ records inside the attention kernel
 (:func:`~daser.ops.fused_attn_decode.decode_attention`), and prefill decodes
 the context pages into a BF16 workspace and runs FlashAttention over it.
 
-Per step: :meth:`Af1MetadataBuilder.build` calls ``HbmKvStore.prepare``
+Per step: :meth:`FragPackMetadataBuilder.build` calls ``HbmKvStore.prepare``
 (eagerly, also before a FULL CUDA-graph replay); per layer the impl writes the
 new tokens, attends, and encodes the blocks closed this step; the last layer
 commits. The store needs the ids of every block a running request may still
@@ -20,7 +20,7 @@ scheduler output (:class:`OpenBlocks`).
 
 Requirements: V2 model runner, BF16 KV, head size 128, ``H * 8`` query heads,
 block size 128, SM90, no speculative decoding, a TP size that divides the KV
-heads. Calibrated tables are read from ``DASER_AF1_TABLES`` (see
+heads. Calibrated tables are read from ``DASER_FRAGPACK_TABLES`` (see
 :mod:`daser.compression.attn_tables`); each TP rank uses its own heads' tables.
 """
 
@@ -74,7 +74,7 @@ logger = init_logger(__name__)
 
 _POLL_EVERY = 16
 _LOG_EVERY = 4096
-# Raw (incompressible) records; DASER_AF1_OVERFLOW. Real KV almost never
+# Raw (incompressible) records; DASER_FRAGPACK_OVERFLOW. Real KV almost never
 # falls back (~1 in 10^6 records), but a degenerate prompt (one token
 # repeated) falls back ~96%: 8192 holds such a 2048-token prompt (~5.9k
 # records) cached alongside real traffic, at 256 MiB.
@@ -192,7 +192,7 @@ class PrefillGroup:
 
 
 @dataclass
-class Af1Metadata:
+class FragPackMetadata:
     """Per-step metadata shared by every layer.
 
     Attributes:
@@ -230,8 +230,8 @@ class Af1Metadata:
     wv: torch.Tensor
 
 
-class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
-    """Builds :class:`Af1Metadata` and owns the store and workspaces.
+class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
+    """Builds :class:`FragPackMetadata` and owns the store and workspaces.
 
     Args:
         kv_cache_spec: KV spec of the layer group.
@@ -256,11 +256,11 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         if not vllm_config.use_v2_model_runner:
-            raise ValueError("AF1 attention needs the V2 model runner")
+            raise ValueError("FragPack attention needs the V2 model runner")
         if vllm_config.speculative_config is not None:
-            raise ValueError("AF1 attention does not support speculative decoding")
+            raise ValueError("FragPack attention does not support speculative decoding")
         if vllm_config.cache_config.block_size != BLOCK_TOKENS:
-            raise ValueError(f"AF1 attention needs --block-size {BLOCK_TOKENS}")
+            raise ValueError(f"FragPack attention needs --block-size {BLOCK_TOKENS}")
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
         _install_tracker()
 
@@ -289,10 +289,10 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         self.wk = torch.empty(ws, dtype=torch.bfloat16, device=device)
         self.wv = torch.empty(ws, dtype=torch.bfloat16, device=device)
 
-        path = os.environ.get("DASER_AF1_TABLES")
+        path = os.environ.get("DASER_FRAGPACK_TABLES")
         if not path:
             raise ValueError(
-                "DASER_AF1_TABLES must point at calibrated AF1 tables (.npz)"
+                "DASER_FRAGPACK_TABLES must point at calibrated FragPack tables (.npz)"
             )
         # vLLM gives TP rank r the KV heads [r * H, (r + 1) * H).
         rank = get_tensor_model_parallel_rank()
@@ -300,7 +300,8 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         self.tables = load_tables(path, device, heads)
         if self.tables.plut.shape[2] != self.kv_heads:
             raise ValueError(
-                f"AF1 tables {path} do not cover KV heads {heads.start}..{heads.stop}"
+                f"FragPack tables {path} do not cover KV heads "
+                f"{heads.start}..{heads.stop}"
             )
         self.store: HbmKvStore | None = None
         self.store_key: tuple[int, int] | None = None
@@ -312,7 +313,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> Af1Metadata:
+    ) -> FragPackMetadata:
         """Prepare the store for this step and build the metadata.
 
         Args:
@@ -333,7 +334,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
-    ) -> Af1Metadata:
+    ) -> FragPackMetadata:
         """Build capture metadata without touching store state.
 
         Args:
@@ -344,7 +345,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         """
         return self._build(common_attn_metadata, capture=True)
 
-    def _build(self, cam: CommonAttentionMetadata, capture: bool) -> Af1Metadata:
+    def _build(self, cam: CommonAttentionMetadata, capture: bool) -> FragPackMetadata:
         store = self._store()
         num_reqs = cam.num_reqs
         nd, npf, _, _ = split_decodes_and_prefills(cam, decode_threshold=1)
@@ -364,12 +365,12 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
             if self.steps % _POLL_EVERY == 0:
                 stats = store.poll()
                 if stats is not None and self.steps % _LOG_EVERY == 0:
-                    logger.info("AF1 store: %s", stats)
+                    logger.info("FragPack store: %s", stats)
 
         prefills: list[PrefillGroup] = []
         if npf and not capture:
             prefills = self._prefill_groups(cam, nd, num_reqs, qsl, seq)
-        return Af1Metadata(
+        return FragPackMetadata(
             store=store,
             layer_tables=self.layer_tables,
             layer_index=self.layer_index,
@@ -394,7 +395,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         caches = [layers[name].kv_cache for name in self.layer_names]
         if caches[0].numel() == 0:
             raise RuntimeError(
-                "AF1 attention built metadata before the KV cache was bound"
+                "FragPack attention built metadata before the KV cache was bound"
             )
         key = (caches[0].data_ptr(), caches[0].shape[0])
         if self.store is None or key != self.store_key:
@@ -406,7 +407,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
                 self.max_tokens,
                 staging_slots=self.max_reqs,
                 overflow_records=int(
-                    os.environ.get("DASER_AF1_OVERFLOW", _OVERFLOW_RECORDS)
+                    os.environ.get("DASER_FRAGPACK_OVERFLOW", _OVERFLOW_RECORDS)
                 ),
             )
             self.store_key = key
@@ -415,7 +416,7 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
                 RecordTables(*self.store.layer_tables(i)) for i in range(len(caches))
             ]
             logger.info(
-                "AF1 store: %d layers x %d blocks, %d B/block-layer (raw %d), "
+                "FragPack store: %d layers x %d blocks, %d B/block-layer (raw %d), "
                 "%d staging slots, %d overflow records, %.0f MiB staging+scratch"
                 "+overflow, %.0f MiB prefill workspace",
                 len(caches),
@@ -494,8 +495,8 @@ class Af1MetadataBuilder(AttentionMetadataBuilder[Af1Metadata]):
         )
 
 
-class Af1AttentionImpl(AttentionImpl[Af1Metadata]):
-    """Decoder self-attention over the AF1 HBM store.
+class FragPackAttentionImpl(AttentionImpl[FragPackMetadata]):
+    """Decoder self-attention over the FragPack HBM store.
 
     Args:
         num_heads: Query heads.
@@ -527,15 +528,17 @@ class Af1AttentionImpl(AttentionImpl[Af1Metadata]):
     ) -> None:
         num_kv_heads = num_kv_heads or num_heads
         if num_heads != GQA * num_kv_heads or head_size != HEAD_DIM:
-            raise ValueError(f"AF1 attention needs {GQA}x GQA and head size {HEAD_DIM}")
+            raise ValueError(
+                f"FragPack attention needs {GQA}x GQA and head size {HEAD_DIM}"
+            )
         if alibi_slopes is not None or sliding_window is not None or logits_soft_cap:
-            raise ValueError("AF1 attention supports plain causal attention only")
+            raise ValueError("FragPack attention supports plain causal attention only")
         if (
             attn_type != AttentionType.DECODER
             or kv_sharing_target_layer_name is not None
         ):
             raise ValueError(
-                "AF1 attention supports unshared decoder self-attention only"
+                "FragPack attention supports unshared decoder self-attention only"
             )
         self.num_heads = num_heads
         self.head_size = head_size
@@ -551,7 +554,7 @@ class Af1AttentionImpl(AttentionImpl[Af1Metadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: Af1Metadata,
+        attn_metadata: FragPackMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -577,7 +580,9 @@ class Af1AttentionImpl(AttentionImpl[Af1Metadata]):
             decode-only batches.
         """
         if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError("AF1 attention does not fuse output quantization")
+            raise NotImplementedError(
+                "FragPack attention does not fuse output quantization"
+            )
         md = attn_metadata
         if md is None:
             return output.zero_()
@@ -619,8 +624,8 @@ class Af1AttentionImpl(AttentionImpl[Af1Metadata]):
         return output
 
 
-class Af1AttentionBackend(AttentionBackend):
-    """AF1-compressed HBM KV cache backend (``--attention-backend CUSTOM``)."""
+class FragPackAttentionBackend(AttentionBackend):
+    """FragPack-compressed HBM KV cache backend (``--attention-backend CUSTOM``)."""
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = True
@@ -638,14 +643,14 @@ class Af1AttentionBackend(AttentionBackend):
         return "CUSTOM"
 
     @staticmethod
-    def get_impl_cls() -> type[Af1AttentionImpl]:
+    def get_impl_cls() -> type[FragPackAttentionImpl]:
         """Return the impl class."""
-        return Af1AttentionImpl
+        return FragPackAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type[Af1MetadataBuilder]:
+    def get_builder_cls() -> type[FragPackMetadataBuilder]:
         """Return the metadata builder class."""
-        return Af1MetadataBuilder
+        return FragPackMetadataBuilder
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -654,7 +659,7 @@ class Af1AttentionBackend(AttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        """Size a block as one AF1 record page per layer.
+        """Size a block as one FragPack record page per layer.
 
         Args:
             spec: Dense KV spec.
@@ -682,9 +687,9 @@ class Af1AttentionBackend(AttentionBackend):
 
 
 __all__ = [
-    "Af1AttentionBackend",
-    "Af1AttentionImpl",
-    "Af1Metadata",
-    "Af1MetadataBuilder",
+    "FragPackAttentionBackend",
+    "FragPackAttentionImpl",
+    "FragPackMetadata",
+    "FragPackMetadataBuilder",
     "PrefillGroup",
 ]

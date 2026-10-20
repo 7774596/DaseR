@@ -55,9 +55,9 @@ ARMS = (
     # prefetch for leases), on packed and raw stores.
     "daser-compressed-layerwise",
     "daser-raw-layerwise",
-    # AF1 attention (--attention-backend CUSTOM, vLLM extra args) holds KV
+    # FragPack attention (--attention-backend CUSTOM, vLLM extra args) holds KV
     # compressed in HBM; DaseR stores its records as block blobs as-is.
-    "daser-af1",
+    "daser-fragpack",
     # LMCache MP server (L1 + O_DIRECT fs L2) through its vLLM connector,
     # raw and with the DaseR lossless chunk codec (codec-patched checkout).
     "lmcache",
@@ -241,8 +241,8 @@ def _drafter_kv_layers(config: dict[str, Any] | None) -> int:
 
 def _storage_format(arm: str) -> str:
     """Return the DaseR storage format of one arm."""
-    if arm == "daser-af1":
-        return "af1"
+    if arm == "daser-fragpack":
+        return "fragpack"
     return "compressed-online" if arm.startswith("daser-compressed") else "raw"
 
 

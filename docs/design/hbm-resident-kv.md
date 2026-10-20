@@ -1,6 +1,6 @@
-# HBM 常驻压缩 KV（AF1 attention backend）
+# HBM 常驻压缩 KV（FragPack attention backend）
 
-GPU KV cache 以无损 AF1 记录常驻 HBM，解压融合进 decode attention 内核。
+GPU KV cache 以无损 FragPack 记录常驻 HBM，解压融合进 decode attention 内核。
 同样的 KV 显存能放下 1.38 倍 block，前缀命中率随之上升；只要 attention 不比
 FlashAttention 慢，多出的容量就是净收益。
 
@@ -20,11 +20,11 @@ FlashAttention 慢，多出的容量就是净收益。
   raw 存入 overflow 池。
 
 码表按 (layer, K/V, head) 离线标定（`python -m daser.compression.attn_tables`），
-运行时由 `DASER_AF1_TABLES` 指定。`attn_page.encode_record` 是逐位参考。
+运行时由 `DASER_FRAGPACK_TABLES` 指定。`attn_page.encode_record` 是逐位参考。
 
 ## Arena 与 vLLM KV spec
 
-`Af1AttentionBackend.customize_spec` 把每层 page 改成
+`FragPackAttentionBackend.customize_spec` 把每层 page 改成
 `page_bytes(H) = 2H × (22528 + VAR_SHARE)`，`VAR_SHARE` = 1280（H=4 时
 190464 B，raw 262144 B），vLLM 照常按 KV 字节预算分 block，block 数 ×1.38。
 block `b` 第 `l` 层的 page 就是这条 KV cache 的第 `b` 行；store 不另外分配
@@ -105,10 +105,10 @@ FULL graph，混合 batch 走 PIECEWISE（attention eager）。
 `vllm serve ... --attention-backend CUSTOM` 启用；不修改 vLLM 源码。
 
 要求：V2 model runner、BF16 KV、head 128、GQA 8、block 128、SM90、TP 1、
-无投机解码。与 DaseR 外部层同时使用时，server 需 `--storage-format af1`，
-记录以 block blob 原样存取，见 [AF1 记录的外部层存储](af1-external-tiers.md)。
+无投机解码。与 DaseR 外部层同时使用时，server 需 `--storage-format fragpack`，
+记录以 block blob 原样存取，见 [FragPack 记录的外部层存储](fragpack-external-tiers.md)。
 
-环境变量：`DASER_AF1_TABLES`（必需）、`DASER_AF1_OVERFLOW`（overflow 记录数，
+环境变量：`DASER_FRAGPACK_TABLES`（必需）、`DASER_FRAGPACK_OVERFLOW`（overflow 记录数，
 默认 8192，256 MiB）。
 
 overflow 池是一张原子位图（每槽 1 bit），encode、`prepare` 的 claim 与
@@ -119,7 +119,7 @@ overflow 容量：真实 KV（cc trace 前 40 请求，287 万条记录）fallba
 2048 token 的此类 prompt 占约 5.9k 条且随前缀缓存常驻。默认值按这种 prompt
 加余量取。overflow 耗尽时丢弃的记录计入 `err_overflow`，`poll` 抛
 `StoreError`，不会静默读错数据；更多退化 prompt 同时常驻时需调大
-`DASER_AF1_OVERFLOW`。
+`DASER_FRAGPACK_OVERFLOW`。
 
 ## 端到端结果
 
@@ -129,11 +129,11 @@ Qwen3-30B-A3B-FP8，H800（单卡），cc agent trace（P16 会话、客户端�
 | arm | GPU KV token | ΣTTFT | Σlat | span | TTFT p50 / p90 | TPOT p50 |
 |-----|-------------:|------:|-----:|-----:|---------------:|---------:|
 | FlashAttention | 305k | 3565 s | 10491 s | 2634 s | 8.6 / 28.1 s | 59.5 ms |
-| FlashAttention，raw 显存放大到 AF1 容量 | 398k | 2282 s | 9700 s | 2432 s | 6.4 / 15.7 s | 62.7 ms |
-| AF1（固定 24576 B 槽位） | 395k | 2264 s | 9651 s | 2419 s | 6.2 / 15.7 s | 63.2 ms |
-| AF1（共享 page，当前实现） | 408k | 2306 s | 9769 s | 2449 s | 6.4 / 16.0 s | 61.8 ms |
+| FlashAttention，raw 显存放大到 FragPack 容量 | 398k | 2282 s | 9700 s | 2432 s | 6.4 / 15.7 s | 62.7 ms |
+| FragPack（固定 24576 B 槽位） | 395k | 2264 s | 9651 s | 2419 s | 6.2 / 15.7 s | 63.2 ms |
+| FragPack（共享 page，当前实现） | 408k | 2306 s | 9769 s | 2449 s | 6.4 / 16.0 s | 61.8 ms |
 
-AF1 对 FlashAttention ΣTTFT 1.57×、Σlat / span 1.09×，与同容量 raw 上界相差
+FragPack 对 FlashAttention ΣTTFT 1.57×、Σlat / span 1.09×，与同容量 raw 上界相差
 1% 以内：融合解压的开销在端到端不可见，收益全部来自容量。负载在这一区间对
 容量在 300k–400k token 区间很敏感（约 14 s ΣTTFT / 1k token）。
 

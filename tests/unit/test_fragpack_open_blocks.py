@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("vllm")
 
-from daser.attention.af1_backend import OpenBlocks  # noqa: E402
+from daser.attention.fragpack_backend import OpenBlocks  # noqa: E402
 
 
 def _output(

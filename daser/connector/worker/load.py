@@ -22,8 +22,8 @@ from daser.compression.format import IO_ALIGNMENT, slot_header_bytes
 from daser.compression.layer_major import plan_layer_groups, staged_descriptor_patch
 from daser.config import (
     LAYERWISE_GPU_STALL_ENV,
-    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_FRAGPACK,
     STORAGE_FORMAT_RAW,
 )
 from daser.connector.helpers import base_req_id
@@ -39,12 +39,12 @@ from daser.connector.worker.staging import (
     copy_staging_to_kv_cache,
 )
 from daser.logging import init_logger
-from daser.ops.af1_codec import Af1BlockImporter, Af1RestorePlan
 from daser.ops.compressed_kv import (
     FusedCompressedKVDecoder,
     PreparedKVRestore,
     compressed_slot_metadata,
 )
+from daser.ops.fragpack_codec import FragPackBlockImporter, FragPackRestorePlan
 from daser.ops.stream_priority import cuda_stream_priority
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
@@ -344,7 +344,7 @@ class _InflightLoadBatch:
     copies: int = 0
     copy_runs: int = 0
     restore_future: asyncio.Future[float] | None = None
-    prepared_restore: PreparedKVRestore | Af1RestorePlan | None = None
+    prepared_restore: PreparedKVRestore | FragPackRestorePlan | None = None
     ready_after: torch.cuda.Event | None = None
 
 
@@ -423,11 +423,11 @@ class LoadPipeline:
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
         self._raw_layerwise_stream: torch.cuda.Stream | None = None
         self._time_gpu_stall = os.environ.get(LAYERWISE_GPU_STALL_ENV) == "1"
-        # Packed formats: the fused decoder, or the AF1 blob importer (same
+        # Packed formats: the fused decoder, or the FragPack blob importer (same
         # ``prepare`` contract). None restores raw slots.
-        self._compressed_decoder: FusedCompressedKVDecoder | Af1BlockImporter | None = (
-            None
-        )
+        self._compressed_decoder: (
+            FusedCompressedKVDecoder | FragPackBlockImporter | None
+        ) = None
         self._layerwise: _LayerwiseLoad | None = None
         # Model-stream point this step's restores wait for (see begin_step).
         self._step_fence: torch.cuda.Event | None = None
@@ -511,7 +511,7 @@ class LoadPipeline:
         """Configure immutable fused restore state from server runtime config.
 
         Args:
-            storage_format: Raw, compressed-online, or af1 (blob import;
+            storage_format: Raw, compressed-online, or fragpack (blob import;
                 codebooks unused).
             codebooks: Plane-major static high-byte codebooks.
             tile_scalars: Codec tile size from the server runtime config.
@@ -523,8 +523,8 @@ class LoadPipeline:
         if storage_format == STORAGE_FORMAT_RAW:
             self._compressed_decoder = None
             return
-        if storage_format == STORAGE_FORMAT_AF1:
-            self._compressed_decoder = Af1BlockImporter()
+        if storage_format == STORAGE_FORMAT_FRAGPACK:
+            self._compressed_decoder = FragPackBlockImporter()
             return
         if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
             raise ValueError(f"unknown storage format: {storage_format}")

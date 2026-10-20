@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// AF1 record constants and device helpers shared by the decode-attention and
+// FragPack record constants and device helpers shared by the decode-attention and
 // HBM KV store kernels. Record format: daser/compression/attn_page.py.
 #pragma once
 
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-namespace af1 {
+namespace fragpack {
 
 constexpr int kThreads = 256;
 constexpr int kTile = 128 * 256;  // 128 tokens x 256 B
@@ -185,4 +185,4 @@ __device__ __forceinline__ void decode_rec(const uint8_t* rec, int vlen, uint32_
   }
 }
 
-}  // namespace af1
+}  // namespace fragpack

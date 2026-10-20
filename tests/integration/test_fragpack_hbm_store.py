@@ -20,7 +20,7 @@ import torch
 from daser.compression import attn_page as ap
 from daser.compression.attn_tables import device_tables
 from daser.compression.format import SlotMode
-from daser.ops.af1_codec import Af1BlockExporter, Af1BlockImporter
+from daser.ops.fragpack_codec import FragPackBlockExporter, FragPackBlockImporter
 from daser.ops.fused_attn_decode import (
     GQA,
     RecordTables,
@@ -332,7 +332,7 @@ def test_codec_wrappers_round_trip() -> None:
     staging = torch.zeros(2 * stride, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
     register_store(src.store)
-    records = Af1BlockExporter(stride).pack_into(
+    records = FragPackBlockExporter(stride).pack_into(
         staging=staging,
         block_ids=[0, 1],
         logical_slots=[10, 11],
@@ -343,7 +343,7 @@ def test_codec_wrappers_round_trip() -> None:
     assert all(r.mode == SlotMode.COMPRESSED for r in records)
     assert [r.source_offset for r in records] == [0, stride]
     with pytest.raises(ValueError):
-        Af1BlockExporter(stride + 16).pack_into(
+        FragPackBlockExporter(stride + 16).pack_into(
             staging=staging,
             block_ids=[0],
             logical_slots=[0],
@@ -354,7 +354,7 @@ def test_codec_wrappers_round_trip() -> None:
     dst = _Harness(np.random.default_rng(0), page_bytes(H))
     torch.cuda.synchronize()
     register_store(dst.store)
-    importer = Af1BlockImporter()
+    importer = FragPackBlockImporter()
     offsets = [r.source_offset for r in records]
     plan = importer.prepare(
         staging=staging,

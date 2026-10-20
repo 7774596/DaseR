@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HBM-resident AF1 KV store over a paged KV cache.
+"""HBM-resident FragPack KV store over a paged KV cache.
 
 The paged KV cache allocated by the serving engine is used as the arena: row
 ``b`` of layer ``l`` is one page shared by the block's ``2 H`` records, packed
@@ -50,7 +50,7 @@ import torch
 from daser.compression import attn_page as ap
 from daser.compression.attn_tables import DeviceTables
 from daser.logging import init_logger
-from daser.ops.af1_ext import extension
+from daser.ops.fragpack_ext import extension
 
 logger = init_logger(__name__)
 
@@ -139,14 +139,16 @@ def active_store() -> HbmKvStore:
         The current store.
 
     Raises:
-        RuntimeError: If attention has not created one yet (the AF1 backend
+        RuntimeError: If attention has not created one yet (the FragPack backend
             creates it on its first metadata build).
 
     Async/thread-safety:
         Lock-free read; the reference is replaced only on KV re-binding.
     """
     if _ACTIVE is None:
-        raise RuntimeError("no AF1 KV store: the AF1 attention backend is not active")
+        raise RuntimeError(
+            "no FragPack KV store: the FragPack attention backend is not active"
+        )
     return _ACTIVE
 
 
@@ -166,7 +168,7 @@ def blob_failures(status: int) -> str:
 
 
 class HbmKvStore:
-    """AF1 KV store whose arena is the engine's paged KV cache.
+    """FragPack KV store whose arena is the engine's paged KV cache.
 
     Args:
         kv_caches: One uint8-viewable tensor per layer, in layer order. The
@@ -550,9 +552,9 @@ class HbmKvStore:
         )
         if stats.err_staging or stats.err_overflow:
             raise StoreError(
-                f"AF1 store dropped KV: staging={stats.err_staging} "
+                f"FragPack store dropped KV: staging={stats.err_staging} "
                 f"overflow={stats.err_overflow} "
-                "(staging must cover max_num_seqs; raise DASER_AF1_OVERFLOW)"
+                "(staging must cover max_num_seqs; raise DASER_FRAGPACK_OVERFLOW)"
             )
         return stats
 

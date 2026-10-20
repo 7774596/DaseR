@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// HBM-resident AF1 KV store kernels (see hbm_kv.py for the state machine).
+// HBM-resident FragPack KV store kernels (see hbm_kv.py for the state machine).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
-#include "af1_common.cuh"
+#include "fragpack_common.cuh"
 
 namespace {
 
-using namespace af1;
+using namespace fragpack;
 
 // Counter slots (int32[kCounters]).
 enum : int {
@@ -449,7 +449,7 @@ __global__ void __launch_bounds__(kThreads) gather_kernel(const int32_t* src, co
 // [L, 2, H] fill a kBlobAlign-padded head; the records follow in (layer, kv,
 // head) order, each kDenseBytes + rec_len bytes (raw records 32768), so every
 // record stays 16-byte aligned. ``bytes`` excludes the tail padding.
-constexpr uint32_t kBlobMagic = 0x42314641u;  // "AF1B"
+constexpr uint32_t kBlobMagic = 0x424B5046u;  // "FPKB"
 constexpr uint32_t kBlobVersion = 1;
 constexpr int kBlobFixed = 64;
 constexpr int64_t kBlobAlign = 4096;
