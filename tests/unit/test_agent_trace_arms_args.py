@@ -12,6 +12,7 @@ import pytest
 from benchmarks.research.agent_trace_arms import (
     ArmTerminated,
     StopSignals,
+    _agentx_command,
     _manager,
     _restore_probe_command,
     parse_args,
@@ -186,3 +187,39 @@ def test_restore_probe_command_forwards_the_sweep_arguments(tmp_path: Path) -> N
     ]
     no_daser = _restore_probe_command(args, "http://v", None, "q", tmp_path)
     assert "--daser-url" not in no_daser
+
+
+def test_agentx_args_replace_the_trace_replay(tmp_path: Path) -> None:
+    """AgentX mode needs no trace and drives the arm's vLLM with the harness."""
+    args = parse_args(
+        [
+            "--artifact",
+            str(tmp_path / "art"),
+            "--scratch",
+            str(tmp_path / "scr"),
+            "--model",
+            "/models/qwen",
+            "--agentx-args",
+            "--concurrency 8 --benchmark-duration 900",
+        ]
+    )
+    command = _agentx_command(args, "http://127.0.0.1:8001", "qwen", tmp_path)
+    assert command[:2] == ["agentx", "profile"]
+    assert command[command.index("--url") + 1] == "http://127.0.0.1:8001"
+    assert command[command.index("--model") + 1] == "qwen"
+    assert command[-4:] == ["--concurrency", "8", "--benchmark-duration", "900"]
+
+
+def test_trace_is_required_without_agentx(tmp_path: Path) -> None:
+    """The Mooncake replay still needs its trace."""
+    with pytest.raises(SystemExit):
+        parse_args(_args(tmp_path)[2:])
+
+
+def test_tensor_parallel_size_reaches_vllm_and_daser(tmp_path: Path) -> None:
+    """TP arms start vLLM and the DaseR server with the same rank count."""
+    args = parse_args(_args(tmp_path, "--tensor-parallel-size", "2", "--gpu-id", "3,4"))
+    manager = _manager("daser-compressed", args)
+    vllm = manager.vllm_command(None)
+    assert vllm[vllm.index("--tensor-parallel-size") + 1] == "2"
+    assert manager.tensor_parallel_size == 2

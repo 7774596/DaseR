@@ -290,6 +290,38 @@ def _probe_command(
     ]
 
 
+def _agentx_command(
+    args: argparse.Namespace, server_url: str, model_name: str, out_dir: Path
+) -> list[str]:
+    """Return the official AgentX harness command replacing an arm's replay.
+
+    Args:
+        args: Parsed runner arguments (``--agentx-args`` set); the harness
+            flags (dataset, tokenizer, concurrency, duration) come from there.
+        server_url: vLLM URL the harness drives.
+        model_name: Served model name.
+        out_dir: Arm artifact directory; the harness writes under ``agentx/``.
+
+    Returns:
+        argv for ``subprocess.Popen``.
+    """
+    return [
+        args.agentx_bin,
+        "profile",
+        "--url",
+        server_url,
+        "--endpoint",
+        "/v1/chat/completions",
+        "--model",
+        model_name,
+        "--output-artifact-dir",
+        str(out_dir / "agentx"),
+        "--ui-type",
+        "simple",
+        *shlex.split(args.agentx_args),
+    ]
+
+
 def _restore_probe_command(
     args: argparse.Namespace,
     server_url: str,
@@ -435,7 +467,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--trace", required=True)
+    parser.add_argument(
+        "--trace",
+        default=None,
+        help="Mooncake-format trace to replay (unless --agentx-args is set).",
+    )
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--scratch", required=True, type=Path)
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
@@ -478,6 +514,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run DaseR arms memory-only: the store lives in L1 (--l1-size).",
     )
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="vLLM and DaseR tensor-parallel ranks; --gpu-id lists one GPU per "
+        'rank, comma-separated (e.g. "3,4").',
+    )
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument(
         "--max-num-seqs",
@@ -642,6 +685,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         '(one quoted string, e.g. "--total-tokens 32768 --tiers ssd"); '
         "needs --session-tokens and VLLM_SERVER_DEV_MODE=1.",
     )
+    parser.add_argument(
+        "--agentx-args",
+        default="",
+        help="Instead of replaying --trace, run the official AgentX harness "
+        "(agentx profile) against each arm with these extra arguments (one "
+        'quoted string, e.g. "--concurrency 8 --public-dataset ...").',
+    )
+    parser.add_argument(
+        "--agentx-bin",
+        default="agentx",
+        help="AgentX harness executable (its own environment).",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(
         "--vllm-port",
@@ -668,7 +723,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Poll DaseR tier counters this often during the replay into "
         "counter_trace.jsonl for per-request tier attribution (0 = off).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.trace is None and not args.agentx_args:
+        parser.error("--trace is required unless --agentx-args is set")
+    return args
 
 
 def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
@@ -694,6 +752,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         transfer_mode="iouring",
         startup_timeout=900.0,
         max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=True,
         storage_format=_storage_format(arm),
         daser_l1_accounting=("raw" if arm == "daser-compressed-raw-l1" else "stored"),
@@ -825,7 +884,9 @@ async def run_arm(
         daser_before = await _daser_metrics(arm, manager)
         vllm_before = await _vllm_metrics(manager)
         server_urls = list(manager.vllm_urls)
-        if args.prefix_restore_probe:
+        if args.agentx_args:
+            replay_command = _agentx_command(args, server_urls[0], model_name, out_dir)
+        elif args.prefix_restore_probe:
             replay_command = _restore_probe_command(
                 args,
                 server_urls[0],
