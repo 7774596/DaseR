@@ -1009,6 +1009,9 @@ async def run_arm(
                 stdout=replay_log,
                 stderr=subprocess.STDOUT,
             )
+            # The watchdog finds the replay by this PID (the AgentX harness
+            # rewrites its process title).
+            (out_dir / "replay.pid").write_text(str(replay.pid))
             try:
                 stop.child = replay
                 replay.wait()

@@ -128,20 +128,13 @@ def test_runner_exit_with_requests_is_a_finished_replay(tmp_path: Path) -> None:
 
 
 def test_agentx_harness_is_watched_as_the_replay(tmp_path: Path) -> None:
-    """An ``agentx profile`` process writing under ``<out>/agentx`` is the replay."""
+    """A replay recorded in ``replay.pid`` is watched whatever its argv."""
     out = tmp_path / "art" / "daser-compressed"
     service = tmp_path / "scr"
     (out / "agentx").mkdir(parents=True)
-    harness = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(2)",
-            "profile",
-            "--output-artifact-dir",
-            str((out / "agentx").resolve()),
-        ]
-    )
+    # Like the AgentX harness after setproctitle: nothing in argv to match.
+    harness = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+    (out / "replay.pid").write_text(str(harness.pid))
     try:
         ok, message = watch(parse_args(_startup_args(out, service, tmp_path)))
     finally:

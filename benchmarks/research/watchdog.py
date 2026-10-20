@@ -20,9 +20,10 @@ Checks per tick:
 - a service process exiting while the replay still runs;
 - free disk below the thresholds.
 
-The replay client is ``benchmarks.mooncake.benchmark`` or the AgentX harness;
-only the former writes ``requests.jsonl``, so failed-request checks apply to it
-alone.
+The replay client is ``benchmarks.mooncake.benchmark`` (found by its argv) or
+the AgentX harness, which renames its processes and is found through the
+``replay.pid`` file the runner writes; only the former writes
+``requests.jsonl``, so failed-request checks apply to it alone.
 
 Before the replay starts, the watchdog also exits once the arm runner
 (``agent_trace_arms`` with the parent of ``--output-dir`` as an argument) has
@@ -52,9 +53,9 @@ from benchmarks.utils.servers import (
 _METRIC = re.compile(r"^(vllm:[a-z_]+)(?:\{[^}]*\})? ([0-9.eE+-]+)$")
 _LOG_ALARM = re.compile(r"Traceback|\bERROR\b")
 _REPLAY_MODULE = "benchmarks.mooncake.benchmark"
-# The AgentX harness (``agentx profile``) replaces the replay when the runner
-# gets ``--agentx-args``; it writes under ``<output-dir>/agentx``.
-_AGENTX_SUBCOMMAND = "profile"
+# The runner records the replay client's PID here; the AgentX harness
+# rewrites its process title, so its argv cannot be matched.
+_REPLAY_PID_FILE = "replay.pid"
 _RUNNER_MODULE = "benchmarks.research.agent_trace_arms"
 
 
@@ -86,9 +87,13 @@ def _find_pid(module: str, path: Path) -> int | None:
 def _find_replay_pid(output_dir: Path) -> int | None:
     """Return the PID of the replay client (or AgentX harness) of ``output_dir``."""
     pid = _find_pid(_REPLAY_MODULE, output_dir)
-    if pid is None:
-        pid = _find_pid(_AGENTX_SUBCOMMAND, output_dir / "agentx")
-    return pid
+    if pid is not None:
+        return pid
+    try:
+        recorded = int((output_dir / _REPLAY_PID_FILE).read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    return recorded if _pid_running(recorded) else None
 
 
 def _find_runner_pid(output_dir: Path) -> int | None:
