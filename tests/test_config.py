@@ -12,6 +12,7 @@ from daser.config import (
     DEFAULT_IOURING_L1_BYTES,
     DEFAULT_TIER_GRAIN,
     MAX_STAGING_BYTES,
+    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     DaserConfig,
     model_geometry_from_path,
@@ -122,6 +123,31 @@ def test_daser_config_uses_configured_block_tokens_for_slot_size(
 
     assert cfg.resolved_slot_size() == 4 * 128 * 2 * 28 * 128 * 2
     assert cfg.runtime_config()["block_tokens"] == 128
+
+
+def test_af1_slot_holds_the_largest_block_blob(tmp_path: Path) -> None:
+    """AF1 slots fit a blob whose records are all raw, plus its head."""
+    model_path = tmp_path / "model"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 1024,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "torch_dtype": "bfloat16",
+        },
+    )
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        storage_format=STORAGE_FORMAT_AF1,
+        block_tokens=128,
+    )
+
+    raw = 4 * 128 * 2 * 28 * 128 * 2
+    assert cfg.resolved_local_slot_size() == 4096 + raw
+    assert cfg.runtime_config()["slot_size"] == 4096 + raw
+    assert cfg.l1_record_bytes == 0
 
 
 @pytest.mark.parametrize(

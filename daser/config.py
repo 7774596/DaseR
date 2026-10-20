@@ -21,10 +21,16 @@ CACHE_REUSE_MODES = (CACHE_REUSE_PREFIX, CACHE_REUSE_CHUNK)
 DEFAULT_CACHE_REUSE_MODE = CACHE_REUSE_CHUNK
 STORAGE_FORMAT_RAW = "raw"
 STORAGE_FORMAT_COMPRESSED_ONLINE = "compressed-online"
+#: Blocks kept as AF1 records (HBM-resident compressed KV, AF1 attention) and
+#: moved through the tiers as block blobs; see docs/design/af1-external-tiers.md.
+STORAGE_FORMAT_AF1 = "af1"
 STORAGE_FORMATS = (
     STORAGE_FORMAT_RAW,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_AF1,
 )
+#: Formats whose chunks are variable-length packed records.
+PACKED_STORAGE_FORMATS = (STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_AF1)
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
 L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
@@ -318,9 +324,9 @@ class DaserConfig:
     def persists_index(self) -> bool:
         """Whether ``daser.index`` describes the store across restarts.
 
-        Memory-only mode has no durable bytes. Compressed-online records carry
-        per-slot codec metadata that lives only in server memory, so only raw
-        chunks with an L2 copy are persisted.
+        Memory-only mode has no durable bytes. Packed records carry per-slot
+        metadata that lives only in server memory, so only raw chunks with an
+        L2 copy are persisted.
         """
         return not self.skip_l2 and self.storage_format == STORAGE_FORMAT_RAW
 
@@ -416,6 +422,8 @@ class DaserConfig:
         Returns:
             Slot size in bytes.
         """
+        if self.storage_format == STORAGE_FORMAT_AF1:
+            return self.resolved_local_slot_size() * self.tensor_parallel_size
         return self.model_geometry().slot_size_for_block_tokens(
             self.block_tokens, self.tensor_parallel_size
         )
@@ -424,8 +432,14 @@ class DaserConfig:
         """Return bytes stored by one TP rank for one logical KV slot.
 
         Returns:
-            Per-rank KV slot bytes derived from model and TP configuration.
+            Per-rank KV slot bytes derived from model and TP configuration;
+            for AF1 storage the largest block blob (every record raw).
         """
+        if self.storage_format == STORAGE_FORMAT_AF1:
+            from daser.compression.attn_page import blob_slot_bytes
+
+            geometry = self.model_geometry()
+            return blob_slot_bytes(geometry.num_layers, geometry.num_kv_heads)
         return self.model_geometry().local_slot_size_for_block_tokens(
             self.block_tokens, self.tensor_parallel_size
         )

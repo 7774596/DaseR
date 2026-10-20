@@ -26,11 +26,15 @@ dev = [
 ]
 service = []
 
+[project.entry-points."vllm.general_plugins"]
+daser_af1 = "daser.attention.plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["daser*"]
 
 [tool.setuptools.package-data]
 "daser.server.http" = ["static/*"]
+"daser.ops" = ["*.cu", "*.cuh", "*.cpp"]
 
 [tool.ruff]
 line-length = 88

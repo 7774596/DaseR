@@ -16,6 +16,7 @@ import torch
 
 from daser import stalldump
 from daser.config import (
+    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
 )
@@ -34,6 +35,7 @@ from daser.connector.worker.staging import (
     record_cuda_event,
 )
 from daser.logging import init_logger
+from daser.ops.af1_codec import Af1BlockExporter
 from daser.ops.compressed_kv import (
     FusedOnlineKVPacker,
     OnlinePackedSlot,
@@ -131,7 +133,9 @@ class StorePipeline:
         # loop to progress transfers for an already-completed batch.
         self._stage_lock = threading.Lock()
         self._storage_format = STORAGE_FORMAT_RAW
-        self._online_packer: FusedOnlineKVPacker | None = None
+        # Packed formats: the online codec, or the AF1 block exporter (same
+        # ``pack_into`` contract). None stores raw slots.
+        self._online_packer: FusedOnlineKVPacker | Af1BlockExporter | None = None
         self._producer_event_order = 0
         self._probe = StoreProbe.from_env()
         self._thread.start()
@@ -206,10 +210,12 @@ class StorePipeline:
         codebooks: bytes,
         tile_scalars: int,
     ) -> None:
-        """Bind the startup-warmed online packer to server codebooks.
+        """Bind the store-side packer of the server's storage format.
 
         Args:
-            storage_format: ``raw`` or ``compressed-online``.
+            storage_format: ``raw``, ``compressed-online`` (the startup-warmed
+                online packer bound to ``codebooks``) or ``af1`` (block blob
+                exporter; codebooks unused).
             codebooks: Server-owned plane-major codebook bytes.
             tile_scalars: Codec tile quantum.
 
@@ -219,6 +225,16 @@ class StorePipeline:
         """
         self._storage_format = storage_format
         self._online_packer = None
+        if storage_format == STORAGE_FORMAT_AF1:
+            if self._staging_pool is None:
+                raise ValueError("af1 storage requires configured store staging")
+            self._online_packer = Af1BlockExporter(self._local_slot_size)
+            logger.info(
+                "[CONNECTOR] af1 export configured batch_slots=%d slot_size=%d",
+                self.max_online_pack_slots,
+                self._local_slot_size,
+            )
+            return
         if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
             if storage_format != STORAGE_FORMAT_RAW:
                 raise ValueError(f"unknown storage format: {storage_format}")

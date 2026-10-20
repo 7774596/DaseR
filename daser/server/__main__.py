@@ -29,6 +29,8 @@ from daser.config import (
     DEFAULT_L2_BYTES,
     DEFAULT_TIER_GRAIN,
     L1_ACCOUNTING_MODES,
+    PACKED_STORAGE_FORMATS,
+    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -227,7 +229,8 @@ def _parse_args() -> argparse.Namespace:
         choices=STORAGE_FORMATS,
         default=STORAGE_FORMAT_RAW,
         help="Physical KV storage format. compressed-online losslessly packs "
-        "KV on store and decodes it on load.",
+        "KV on store and decodes it on load; af1 stores the AF1 records of an "
+        "engine running AF1 attention (--attention-backend CUSTOM) as-is.",
     )
     parser.add_argument(
         "--compressed-codebooks",
@@ -412,7 +415,11 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         )
     if cfg.prefetch_lease_budget_bytes > cfg.l1_size_bytes:
         raise ValueError("--prefetch-lease-budget must not exceed --l1-size")
-    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+    if cfg.storage_format == STORAGE_FORMAT_AF1 and getattr(
+        args, "compressed_codebooks", None
+    ):
+        raise ValueError("--compressed-codebooks requires compressed-online")
+    if cfg.storage_format in PACKED_STORAGE_FORMATS:
         geometry = cfg.model_geometry()
         violations = []
         if cfg.transfer_mode != "iouring":

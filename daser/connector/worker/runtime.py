@@ -19,8 +19,10 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.compression import CompressedStoreGeometry, default_online_codebooks
+from daser.compression.attn_page import blob_slot_bytes
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 from daser.config import (
+    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
 )
@@ -44,6 +46,7 @@ from daser.connector.worker.store import (
 )
 from daser.logging import init_logger
 from daser.ops.compressed_kv import warm_fused_online_kv_packer
+from daser.ops.hbm_kv import page_bytes
 from daser.ops.kv_layout import allocate_cross_layer_kv_cache, cross_layer_kv_view
 from daser.ops.rope_apply import (
     apply_rope_delta_to_kv_key_block_table,
@@ -297,6 +300,9 @@ class WorkerRuntime:
         Async/thread-safety:
             Called once during worker initialization before request traffic.
         """
+        if self._storage_format == STORAGE_FORMAT_AF1:
+            self._register_af1_kv_caches(kv_caches)
+            return
         layer_names, kv_cache = cross_layer_kv_view(kv_caches)
         self._kv_caches = {CROSS_LAYER_KV_CACHE_KEY: kv_cache}
         self._layer_names = layer_names
@@ -342,6 +348,55 @@ class WorkerRuntime:
                 tile_scalars=ONLINE_TILE_SCALARS,
             )
             self._prewarm_online_compression(kv_cache)
+        self._init_server_transfer()
+
+    def _register_af1_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Register AF1 attention's per-layer page arenas.
+
+        The pipelines never address these tensors: blocks move as blobs
+        through the HBM store (``daser.ops.af1_codec``). They only provide the
+        device, the model-stream fence, and the slot geometry.
+
+        Args:
+            kv_caches: dict mapping layer_name -> one layer's block pages, in
+                layer order.
+
+        Raises:
+            ValueError: If the pages do not hold whole AF1 block-layers or the
+                slot geometry does not match the DaseR server.
+
+        Async/thread-safety:
+            Called once during worker initialization before request traffic.
+        """
+        self._kv_caches = dict(kv_caches)
+        self._layer_names = list(kv_caches)
+        self._layer_idx_map = {name: i for i, name in enumerate(self._layer_names)}
+        sample = next(iter(kv_caches.values()))
+        page = sample.stride(0) * sample.element_size()
+        kv_heads = page // page_bytes(1)
+        if kv_heads < 1 or page % 16:
+            raise ValueError(f"KV page of {page} B is not an AF1 block-layer page")
+        local_slot_size = blob_slot_bytes(len(kv_caches), kv_heads)
+        _validate_tp_layout(
+            local_slot_size,
+            self._slot_size,
+            self._tp_size,
+            self._server_tp_size,
+            self._tp_rank,
+        )
+        self._local_slot_size = local_slot_size
+        if self._slot_size == 0:
+            self._slot_size = local_slot_size * self._tp_size
+        load_staging_depth = self._configure_pipelines(sample)
+        logger.info(
+            "[CONNECTOR] register_kv_caches af1: layers=%d kv_heads=%d page=%d "
+            "local_slot_size=%d load_staging_depth=%d",
+            len(kv_caches),
+            kv_heads,
+            page,
+            local_slot_size,
+            load_staging_depth,
+        )
         self._init_server_transfer()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:

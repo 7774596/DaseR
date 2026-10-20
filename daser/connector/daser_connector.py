@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # First Party
 from daser.config import (
     ADMIT_TRACE_ENV,
+    STORAGE_FORMAT_AF1,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
 )
@@ -108,6 +109,8 @@ class DaserConnector(
         storage_format = str(extra.get("storage_format", STORAGE_FORMAT_RAW))
         if storage_format not in STORAGE_FORMATS:
             raise ValueError(f"unknown storage_format: {storage_format}")
+        if storage_format == STORAGE_FORMAT_AF1 and extra.get("layerwise_load"):
+            raise ValueError("af1 storage restores whole blocks, not layer-wise")
         if role == KVConnectorRole.SCHEDULER:
             prefetch_max_requests = int(extra.get("prefetch_max_requests", 0))
             if prefetch_max_requests < 0:
@@ -201,9 +204,15 @@ class DaserConnector(
         Returns:
             ``"BLNHC"`` so vLLM allocates one block-outermost buffer: every
             block holds all layers contiguously, which lets one chunk move as
-            a single strided copy between vLLM and DaseR staging.
+            a single strided copy between vLLM and DaseR staging. None for
+            af1 storage: the AF1 attention backend owns the layout and the
+            connector moves its records through the HBM store instead.
 
         Async/thread-safety:
             Class-level config helper with no mutable state.
         """
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        extra = (transfer.kv_connector_extra_config or {}) if transfer else {}
+        if extra.get("storage_format") == STORAGE_FORMAT_AF1:
+            return None
         return "BLNHC"

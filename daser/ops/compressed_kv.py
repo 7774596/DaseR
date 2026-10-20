@@ -797,6 +797,17 @@ class PreparedKVRestore:
         """Return the total destination slots covered by this immutable plan."""
         return self._blocks.numel()
 
+    def failed_blocks(self) -> list[tuple[int, str]]:
+        """Return destinations the restore rejected; the codec never rejects.
+
+        Returns:
+            Always empty: the online format is validated by the server.
+
+        Async/thread-safety:
+            Pure accessor.
+        """
+        return []
+
     def submit(self) -> int:
         """Enqueue decode of every source on the prepared stream once.
 

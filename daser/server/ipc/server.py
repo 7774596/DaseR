@@ -40,7 +40,7 @@ from daser.config import (
     L2_WRITE_GATE_ENV,
     LOAD_READAHEAD_ENV,
     LOAD_READAHEAD_WINDOW_ENV,
-    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    PACKED_STORAGE_FORMATS,
 )
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
@@ -383,8 +383,7 @@ class IPCServer:
         # writer key during the short transfer/commit interval. Retry for this
         # format; raw keeps immediate-miss semantics.
         self._packed_format = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
+            self._runtime_config.get("storage_format") in PACKED_STORAGE_FORMATS
         )
         self._lookup_wait_pending = self._packed_format
         logger.info("lookup wait_for_pending=%s", self._lookup_wait_pending)
