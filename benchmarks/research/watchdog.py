@@ -20,6 +20,10 @@ Checks per tick:
 - a service process exiting while the replay still runs;
 - free disk below the thresholds.
 
+The replay client is ``benchmarks.mooncake.benchmark`` or the AgentX harness;
+only the former writes ``requests.jsonl``, so failed-request checks apply to it
+alone.
+
 Before the replay starts, the watchdog also exits once the arm runner
 (``agent_trace_arms`` with the parent of ``--output-dir`` as an argument) has
 been seen and is gone, instead of waiting out ``--startup-timeout``.
@@ -48,6 +52,9 @@ from benchmarks.utils.servers import (
 _METRIC = re.compile(r"^(vllm:[a-z_]+)(?:\{[^}]*\})? ([0-9.eE+-]+)$")
 _LOG_ALARM = re.compile(r"Traceback|\bERROR\b")
 _REPLAY_MODULE = "benchmarks.mooncake.benchmark"
+# The AgentX harness (``agentx profile``) replaces the replay when the runner
+# gets ``--agentx-args``; it writes under ``<output-dir>/agentx``.
+_AGENTX_SUBCOMMAND = "profile"
 _RUNNER_MODULE = "benchmarks.research.agent_trace_arms"
 
 
@@ -77,8 +84,11 @@ def _find_pid(module: str, path: Path) -> int | None:
 
 
 def _find_replay_pid(output_dir: Path) -> int | None:
-    """Return the PID of the replay client writing to ``output_dir``."""
-    return _find_pid(_REPLAY_MODULE, output_dir)
+    """Return the PID of the replay client (or AgentX harness) of ``output_dir``."""
+    pid = _find_pid(_REPLAY_MODULE, output_dir)
+    if pid is None:
+        pid = _find_pid(_AGENTX_SUBCOMMAND, output_dir / "agentx")
+    return pid
 
 
 def _find_runner_pid(output_dir: Path) -> int | None:
@@ -220,7 +230,9 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
         runner_alive = _find_runner_pid(args.output_dir) is not None
         runner_seen |= runner_alive
         if runner_seen and not runner_alive:
-            if (args.output_dir / "requests.jsonl").is_file():
+            if (args.output_dir / "requests.jsonl").is_file() or (
+                args.output_dir / "agentx"
+            ).is_dir():
                 return True, "replay exited before the first tick"
             return False, "runner exited before the replay client started"
         time.sleep(args.interval / 4)

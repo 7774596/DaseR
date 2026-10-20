@@ -125,3 +125,27 @@ def test_runner_exit_with_requests_is_a_finished_replay(tmp_path: Path) -> None:
     finally:
         runner.wait(timeout=5)
     assert ok, message
+
+
+def test_agentx_harness_is_watched_as_the_replay(tmp_path: Path) -> None:
+    """An ``agentx profile`` process writing under ``<out>/agentx`` is the replay."""
+    out = tmp_path / "art" / "daser-compressed"
+    service = tmp_path / "scr"
+    (out / "agentx").mkdir(parents=True)
+    harness = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(2)",
+            "profile",
+            "--output-artifact-dir",
+            str((out / "agentx").resolve()),
+        ]
+    )
+    try:
+        ok, message = watch(parse_args(_startup_args(out, service, tmp_path)))
+    finally:
+        harness.wait(timeout=5)
+    assert ok, message
+    assert message.startswith("replay exited")
+    assert f"pid={harness.pid}" in message
