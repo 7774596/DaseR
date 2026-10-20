@@ -561,7 +561,18 @@ def test_waiting_load_resolves_current_l1_after_overlapping_store(
 def test_cancelling_reader_preserves_pending_writer_and_other_readers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
 ) -> None:
-    """A reader waiting for an evicted dirty range cannot cancel its writer."""
+    """A reader waiting for an evicted dirty range cannot cancel its writer.
+
+    Args:
+        tmp_path (Path): Per-test directory for the native IO store.
+        monkeypatch (pytest.MonkeyPatch): Fixture installing the gated writer.
+        reader (str): Scalar, grouped, or prefetch public read entry point.
+    Returns:
+        None; asserts the cancelled follower leaves the writer and survivor live.
+    Async/thread-safety:
+        Runs one asyncio loop; thread events gate the native executor writer.
+        Cleanup releases the gate and drains owners before closing the layer.
+    """
     started = threading.Event()
     release = threading.Event()
     native_write = NativeIOUring.write
@@ -646,7 +657,18 @@ def test_cancelling_reader_preserves_pending_writer_and_other_readers(
 def test_all_readers_observe_a_shared_writer_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, independent_round: bool
 ) -> None:
-    """A consumed global error cannot turn another dependency into stale SSD data."""
+    """A consumed global error cannot turn another dependency into stale SSD data.
+
+    Args:
+        tmp_path (Path): Per-test directory for the native IO store.
+        monkeypatch (pytest.MonkeyPatch): Fixture installing gated IO failures.
+        independent_round (bool): Whether a reader also owns an independent read.
+    Returns:
+        None; asserts every reader observes its shared writer's failure.
+    Async/thread-safety:
+        Runs one asyncio loop and uses thread events to control native IO.
+        All gates and outstanding owners are released during cleanup.
+    """
     probe = _install_probe(monkeypatch)
     if not independent_round:
         probe.release.set()

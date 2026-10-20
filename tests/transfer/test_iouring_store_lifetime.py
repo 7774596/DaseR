@@ -168,7 +168,18 @@ def test_grouped_store_streams_through_smaller_l1(
 def test_cancelled_drain_preserves_ordered_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    """Repeated drain cancellation preserves both writers and their old buffers."""
+    """Repeated drain cancellation preserves both writers and their old buffers.
+
+    Args:
+        tmp_path (Path): Per-test directory for the native IO store.
+        monkeypatch (pytest.MonkeyPatch): Fixture installing the gated writer.
+        mode (str): Single, grouped, or packed public store entry point.
+    Returns:
+        None; asserts ordered persistence and reuse after repeated cancellation.
+    Async/thread-safety:
+        Runs one asyncio loop with a thread-event gate on the native writer.
+        Cleanup unblocks the writer and drains outstanding work before close.
+    """
     started = threading.Event()
     release = threading.Event()
     writes: list[bytes] = []
@@ -245,7 +256,18 @@ def test_cancelled_drain_preserves_ordered_overwrite(
 def test_cancel_after_publication_keeps_evicted_write_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    """Cancellation after self-eviction cannot close a pending SSD source."""
+    """Cancellation after self-eviction cannot close a pending SSD source.
+
+    Args:
+        tmp_path (Path): Per-test directory for the native IO store.
+        monkeypatch (pytest.MonkeyPatch): Fixture intercepting public publication.
+        mode (str): Single, grouped, or packed public store entry point.
+    Returns:
+        None; asserts a published source survives cancellation and pool pressure.
+    Async/thread-safety:
+        Publication cancels the caller on its asyncio loop; a thread event gates
+        native IO. Cleanup releases that gate and drains the transfer owners.
+    """
     started = threading.Event()
     release = threading.Event()
     original_write = NativeIOUring.write
@@ -323,7 +345,17 @@ def test_cancel_after_publication_keeps_evicted_write_alive(
 def test_drain_reports_write_error_after_other_native_writes_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An already-recorded failure cannot let drain abandon another SSD owner."""
+    """An already-recorded failure cannot let drain abandon another SSD owner.
+
+    Args:
+        tmp_path (Path): Per-test directory for the native IO store.
+        monkeypatch (pytest.MonkeyPatch): Fixture installing gated native writes.
+    Returns:
+        None; asserts drain waits for the remaining owner before reporting error.
+    Async/thread-safety:
+        Runs one asyncio loop; thread events order failure and independent IO.
+        Cleanup releases all gates and joins work before closing the layer.
+    """
     failed_started = threading.Event()
     other_started = threading.Event()
     fail = threading.Event()
