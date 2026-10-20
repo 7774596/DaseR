@@ -26,6 +26,7 @@ from daser.connector.worker.memory import FixedCudaStagingPool
 from daser.connector.worker.store import (
     StagedStoreBatch,
     StorePipeline,
+    _DeferredFinishedSave,
 )
 
 
@@ -963,3 +964,99 @@ async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> 
     )
 
     assert restore_future.done()
+
+
+def _ordered_tp_pipeline(
+    stage_delay_s: dict[str, float],
+    writes: list[str],
+    fail: set[str] = frozenset(),  # type: ignore[assignment]
+) -> tuple[StorePipeline, list[str]]:
+    """Return a packed TP-2 pipeline with two staging leases and stub IO."""
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._online_packer = object()  # noqa: SLF001
+    pipeline._tp_size = 2  # noqa: SLF001
+    pipeline._store_capacity = 2  # noqa: SLF001
+    pipeline._store_semaphore = None  # noqa: SLF001
+    pipeline._staging_pool = SimpleNamespace(depth=2)  # noqa: SLF001
+    released_writers: list[str] = []
+
+    class Lease:
+        view = torch.empty(1)
+
+        def release(self) -> None:
+            pass
+
+    def plan(save: Any) -> list[tuple[list[int], list[StoreWriteSpan]]]:
+        key = next(iter(save.reqs_to_store))
+        return [
+            ([0], [StoreWriteSpan(0, 16, 0, f"{key}{i}", 0, 1, 0, 1)]) for i in range(2)
+        ]
+
+    def stage(block_ids: list[int], spans: list[Any], event: Any) -> Any:
+        del block_ids, event
+        time.sleep(stage_delay_s[spans[0].chunk_key[0]])
+        return StagedStoreBatch(torch.empty(1), spans, Lease())
+
+    async def write(staged: StagedStoreBatch) -> list[str]:
+        key = staged.spans[0].chunk_key
+        if key[0] in fail:
+            raise RuntimeError("rank timed out")
+        writes.append(key)
+        return [key]
+
+    async def release_chunk_writer(key: str, start: int, num: int) -> None:
+        del start, num
+        released_writers.append(key)
+
+    pipeline._plan_finished_save = plan  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline._stage_batch_serialized = stage  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline._write_cuda_buffer = write  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline._client = SimpleNamespace(release_chunk_writer=release_chunk_writer)  # noqa: SLF001
+    return pipeline, released_writers
+
+
+def _deferred(key: str) -> _DeferredFinishedSave:
+    return _DeferredFinishedSave({key: _store_spec(key, [0])}, finished=True)
+
+
+@pytest.mark.asyncio
+async def test_tp_packed_stores_transfer_in_submission_order() -> None:
+    """With TP > 1, packed batches reach the server in submission order.
+
+    Every rank must declare a chunk before the server places it, so ranks
+    whose staging finishes in different orders must not reorder transfers.
+    """
+    writes: list[str] = []
+    # The first save stages slowest: unordered, its batches would go last.
+    pipeline, _ = _ordered_tp_pipeline({"a": 0.05, "b": 0.02, "c": 0.0}, writes)
+    saves = [_deferred(key) for key in "abc"]
+    for save in saves:
+        pipeline._reserve_tickets(save)  # noqa: SLF001
+    await asyncio.gather(
+        *(pipeline._run_bounded_save(save, None) for save in saves)  # noqa: SLF001
+    )
+
+    assert writes == ["a0", "a1", "b0", "b1", "c0", "c1"]
+    assert all(save.snapshot_done for save in saves)
+
+
+@pytest.mark.asyncio
+async def test_failed_tp_store_is_left_uncached_and_later_stores_proceed() -> None:
+    """A failed store releases its writers and frees its blocks; no raise."""
+    writes: list[str] = []
+    pipeline, released = _ordered_tp_pipeline(
+        {"a": 0.0, "b": 0.0, "c": 0.0}, writes, fail={"b"}
+    )
+    saves = [_deferred(key) for key in "abc"]
+    for save in saves:
+        pipeline._reserve_tickets(save)  # noqa: SLF001
+    await asyncio.wait_for(
+        asyncio.gather(
+            *(pipeline._run_bounded_save(save, None) for save in saves)  # noqa: SLF001
+        ),
+        timeout=5.0,
+    )
+
+    assert writes == ["a0", "a1", "c0", "c1"]
+    assert released == ["b"]
+    assert all(save.snapshot_done for save in saves)

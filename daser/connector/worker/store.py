@@ -69,9 +69,50 @@ def _merge_store_requests(
     return merged
 
 
+class _TicketGate:
+    """Admit numbered tickets strictly in increasing order.
+
+    A ticket's holder awaits ``wait(ticket)`` and calls ``done(ticket)`` when
+    its turn ends; ``done`` may also retire a ticket that never waited (its
+    work was skipped) and is idempotent.
+
+    Async/thread-safety:
+        Used only on the store event loop.
+    """
+
+    def __init__(self) -> None:
+        self._next = 0
+        self._retired: set[int] = set()
+        self._waiters: dict[int, asyncio.Event] = {}
+
+    async def wait(self, ticket: int) -> None:
+        """Return once every lower ticket is done."""
+        if ticket <= self._next:
+            return
+        event = self._waiters.setdefault(ticket, asyncio.Event())
+        await event.wait()
+
+    def done(self, ticket: int) -> None:
+        """Retire ``ticket`` and wake the next ticket once it is admissible."""
+        if ticket < self._next:
+            return
+        self._retired.add(ticket)
+        while self._next in self._retired:
+            self._retired.remove(self._next)
+            self._next += 1
+        event = self._waiters.pop(self._next, None)
+        if event is not None:
+            event.set()
+
+
 @dataclass
 class _DeferredFinishedSave:
-    """Hold request store work until vLLM reports it finished."""
+    """Hold request store work until vLLM reports it finished.
+
+    ``first_ticket`` numbers the first of ``planned_batches``, the staging
+    batches fixed at submission, when stores are ordered (packed records with
+    TP > 1); otherwise both are ``None``.
+    """
 
     reqs_to_store: dict[str, ReqStoreSpec]
     finished: bool = False
@@ -81,6 +122,8 @@ class _DeferredFinishedSave:
     snapshot_done: bool = False
     completion_emitted: bool = False
     timeline: SaveTimeline = field(default_factory=SaveTimeline)
+    first_ticket: int | None = None
+    planned_batches: list[tuple[list[int], list[StoreWriteSpan]]] | None = None
 
 
 class StorePipeline:
@@ -97,6 +140,11 @@ class StorePipeline:
     Async/thread-safety:
         Public methods are called on the vLLM worker thread. Snapshot, IPC, and
         commit execute on the private store thread and its fixed CUDA stream.
+        With packed records and TP > 1 the server places a chunk only after
+        every rank declared it, so each rank must transfer chunks in the same
+        order: batches are numbered at submission (in the scheduler's order,
+        identical on every rank) and both staging leases and transfers are
+        granted in that order.
     """
 
     def __init__(
@@ -122,6 +170,9 @@ class StorePipeline:
         self._store_capacity = 1
         self._store_semaphore: asyncio.Semaphore | None = None
         self._staging_lease_semaphore: asyncio.Semaphore | None = None
+        self._next_ticket = 0
+        self._lease_gate: _TicketGate | None = None
+        self._transfer_gate: _TicketGate | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._local_slot_size = 0
@@ -189,6 +240,9 @@ class StorePipeline:
         self._store_capacity = staging_pool.depth
         self._store_semaphore = None
         self._staging_lease_semaphore = None
+        self._next_ticket = 0
+        self._lease_gate = None
+        self._transfer_gate = None
 
     @property
     def max_online_pack_slots(self) -> int:
@@ -529,6 +583,7 @@ class StorePipeline:
             # do not expose a packed producer event.
             sample = next(iter(self._kv_caches.values()), None)
             producer_event = record_cuda_event(sample) if sample is not None else None
+        self._reserve_tickets(save)
         save.future = self._submit(self._run_bounded_save(save, producer_event))
 
     def _group_packed_saves(
@@ -575,6 +630,7 @@ class StorePipeline:
         member_futures: tuple[Future[None], ...] = tuple(Future() for _save in saves)
         for save, member_future in zip(saves, member_futures, strict=True):
             save.future = member_future
+        self._reserve_tickets(merged)
 
         group_future = self._submit(
             self._run_bounded_save_group(merged, producer_event, saves)
@@ -608,13 +664,7 @@ class StorePipeline:
             saves from entering synchronous staging acquisition than there are
             preallocated buffers; semaphore waiters are admitted in FIFO order.
         """
-        semaphore = self._store_semaphore
-        if semaphore is None:
-            semaphore = asyncio.Semaphore(max(1, self._store_capacity))
-            self._store_semaphore = semaphore
-        async with semaphore:
-            self._stamp((save,), "admitted")
-            await self._store_finished_save(save, producer_event)
+        await self._run_admitted(save, producer_event, (save,))
 
     async def _run_bounded_save_group(
         self,
@@ -623,17 +673,59 @@ class StorePipeline:
         members: tuple[_DeferredFinishedSave, ...],
     ) -> None:
         """Run one cross-request packed save under normal store admission."""
-        semaphore = self._store_semaphore
-        if semaphore is None:
-            semaphore = asyncio.Semaphore(max(1, self._store_capacity))
-            self._store_semaphore = semaphore
-        async with semaphore:
+        await self._run_admitted(merged, producer_event, members)
+
+    async def _run_admitted(
+        self,
+        save: _DeferredFinishedSave,
+        producer_event: torch.cuda.Event | None,
+        members: tuple[_DeferredFinishedSave, ...],
+    ) -> None:
+        """Admit and run one save; a failed store leaves its chunks uncached.
+
+        Args:
+            save: Save (or merged group save) to transfer.
+            producer_event: CUDA event ordering the KV snapshot.
+            members: Request saves whose completion this save reports.
+
+        Async/thread-safety:
+            Runs on the private store event loop. Unordered saves pass a FIFO
+            semaphore of the staging depth; ordered saves are bounded by the
+            ticket-ordered lease grant instead, since a semaphore would admit
+            them out of order. A store failure is logged, the writer claims
+            are released and the source blocks are reported free, so one
+            failed chunk never stops the engine.
+        """
+        first_ticket = getattr(save, "first_ticket", None)
+
+        async def run() -> None:
             self._stamp(members, "admitted")
-            await self._store_finished_save(
-                merged,
-                producer_event,
-                snapshot_targets=members,
-            )
+            if members == (save,):
+                await self._store_finished_save(save, producer_event)
+            else:
+                await self._store_finished_save(
+                    save, producer_event, snapshot_targets=members
+                )
+
+        try:
+            if first_ticket is None:
+                semaphore = self._store_semaphore
+                if semaphore is None:
+                    semaphore = asyncio.Semaphore(max(1, self._store_capacity))
+                    self._store_semaphore = semaphore
+                async with semaphore:
+                    await run()
+            else:
+                await run()
+        except Exception as exc:  # noqa: BLE001
+            await self._store_failed(save, members, exc)
+        finally:
+            if first_ticket is not None:
+                # Retire the tickets of batches that never ran (failure).
+                lease_gate, transfer_gate = self._gates()
+                for index in range(len(save.planned_batches or ())):
+                    lease_gate.done(first_ticket + index)
+                    transfer_gate.done(first_ticket + index)
 
     def _plan_finished_save(
         self,
@@ -665,7 +757,9 @@ class StorePipeline:
         *,
         snapshot_targets: tuple[_DeferredFinishedSave, ...] | None = None,
     ) -> None:
-        batches = self._plan_finished_save(save)
+        batches = getattr(save, "planned_batches", None)
+        if batches is None:
+            batches = self._plan_finished_save(save)
         snapshot_saves = snapshot_targets or (save,)
         if not batches:
             self._stamp(snapshot_saves, "ready")
@@ -703,34 +797,36 @@ class StorePipeline:
         # errors before its lease can be reclaimed.
         transfer_tasks: list[asyncio.Task[list[str]]] = []
         pending_stage: asyncio.Task[StagedStoreBatch] | None = None
+        first_ticket = getattr(save, "first_ticket", None)
+
+        def stage(index: int) -> Any:
+            block_ids, spans = batches[index]
+            if first_ticket is None:
+                return self._stage_batch_acquired(block_ids, spans, producer_event)
+            return self._stage_batch_acquired(
+                block_ids, spans, producer_event, ticket=first_ticket + index
+            )
+
+        def transfer(index: int, staged: StagedStoreBatch) -> Any:
+            if first_ticket is None:
+                return self._transfer_staged(staged)
+            return self._transfer_staged(staged, ticket=first_ticket + index)
+
         try:
             if overlap_batches:
-                pending_stage = asyncio.create_task(
-                    self._stage_batch_acquired(
-                        batches[0][0], batches[0][1], producer_event
-                    )
-                )
-            for index, (block_ids, spans) in enumerate(batches):
+                pending_stage = asyncio.create_task(stage(0))
+            for index in range(len(batches)):
                 if pending_stage is None:
-                    staged = await self._stage_batch_acquired(
-                        block_ids, spans, producer_event
-                    )
+                    staged = await stage(index)
                 else:
                     staged = await pending_stage
                     pending_stage = None
                 if overlap_batches and index + 1 < len(batches):
-                    next_block_ids, next_spans = batches[index + 1]
-                    pending_stage = asyncio.create_task(
-                        self._stage_batch_acquired(
-                            next_block_ids, next_spans, producer_event
-                        )
-                    )
+                    pending_stage = asyncio.create_task(stage(index + 1))
                 # The lease is intentionally captured by the transfer task.
                 # Its release occurs only after the server has consumed the
                 # CUDA IPC mapping and completed L1/L2 write plus commit.
-                transfer_tasks.append(
-                    asyncio.create_task(self._transfer_staged(staged))
-                )
+                transfer_tasks.append(asyncio.create_task(transfer(index, staged)))
 
             # All source blocks are now immutable snapshots in worker-owned
             # staging leases.  ``collect_finished`` can release vLLM blocks
@@ -750,12 +846,16 @@ class StorePipeline:
                 await asyncio.gather(*transfer_tasks, return_exceptions=True)
             raise
 
-    async def _transfer_staged(self, staged: "StagedStoreBatch") -> list[str]:
+    async def _transfer_staged(
+        self, staged: "StagedStoreBatch", *, ticket: int | None = None
+    ) -> list[str]:
         """Transfer one packed snapshot and release its staging lease.
 
         Args:
             staged: Snapshot whose lease must remain valid for the full IPC
                 transfer and server-side commit.
+            ticket: Batch number of an ordered store: the transfer starts
+                after every lower-numbered transfer finished.
 
         Returns:
             Chunk keys accepted by the server transfer layer.
@@ -766,7 +866,14 @@ class StorePipeline:
             staging pool or leave pinned memory retained indefinitely.
         """
         try:
-            return await self._write_staged(staged)
+            if ticket is None:
+                return await self._write_staged(staged)
+            gate = self._gates()[1]
+            await gate.wait(ticket)
+            try:
+                return await self._write_staged(staged)
+            finally:
+                gate.done(ticket)
         finally:
             self._release_staged(staged)
 
@@ -775,6 +882,8 @@ class StorePipeline:
         block_ids: list[int],
         spans: list[StoreWriteSpan],
         producer_event: torch.cuda.Event | None,
+        *,
+        ticket: int | None = None,
     ) -> "StagedStoreBatch":
         """Acquire a bounded staging lease and snapshot one store batch.
 
@@ -782,6 +891,8 @@ class StorePipeline:
             block_ids: Physical vLLM blocks in logical order.
             spans: Server-owned write spans for this batch.
             producer_event: CUDA event ordering the live KV snapshot.
+            ticket: Batch number of an ordered store: the lease is granted
+                after every lower-numbered batch got its lease.
 
         Returns:
             A staged batch that owns one lease-semaphore permit until transfer
@@ -799,7 +910,15 @@ class StorePipeline:
             lease_semaphore = asyncio.Semaphore(max(1, depth))
             self._staging_lease_semaphore = lease_semaphore
         wait_started = time.monotonic()
-        await lease_semaphore.acquire()
+        if ticket is None:
+            await lease_semaphore.acquire()
+        else:
+            gate = self._gates()[0]
+            await gate.wait(ticket)
+            try:
+                await lease_semaphore.acquire()
+            finally:
+                gate.done(ticket)
         stage_started = time.monotonic()
         try:
             staged = await asyncio.to_thread(
@@ -1026,6 +1145,58 @@ class StorePipeline:
             (time.perf_counter() - transfer_started) * 1000,
         )
         return chunk_keys
+
+    def _reserve_tickets(self, save: _DeferredFinishedSave) -> None:
+        """Number ``save``'s staging batches when stores must be ordered.
+
+        Called on the worker thread in submission order, which is the
+        scheduler's order and therefore the same on every TP rank.
+        """
+        if getattr(self, "_online_packer", None) is None:
+            return
+        if getattr(self, "_tp_size", 1) <= 1:
+            return
+        save.planned_batches = self._plan_finished_save(save)
+        save.first_ticket = getattr(self, "_next_ticket", 0)
+        self._next_ticket = save.first_ticket + len(save.planned_batches)
+
+    def _gates(self) -> tuple[_TicketGate, _TicketGate]:
+        """Return the lease and transfer gates of ordered stores."""
+        if (
+            getattr(self, "_lease_gate", None) is None
+            or getattr(self, "_transfer_gate", None) is None
+        ):
+            self._lease_gate = _TicketGate()
+            self._transfer_gate = _TicketGate()
+        assert self._lease_gate is not None and self._transfer_gate is not None
+        return self._lease_gate, self._transfer_gate
+
+    async def _store_failed(
+        self,
+        save: _DeferredFinishedSave,
+        members: tuple[_DeferredFinishedSave, ...],
+        exc: Exception,
+    ) -> None:
+        """Leave a failed save's chunks uncached and free its source blocks."""
+        logger.warning(
+            "[CONNECTOR] store of %d chunk(s) failed, left uncached: %s",
+            len(save.reqs_to_store),
+            exc,
+        )
+        try:
+            await self._release_writer_claims(tuple(save.reqs_to_store.values()))
+        except Exception as release_exc:  # noqa: BLE001
+            logger.warning(
+                "[CONNECTOR] writer release after a failed store failed: %s",
+                release_exc,
+            )
+        if getattr(self, "_online_packer", None) is not None:
+            stream = getattr(self, "_cuda_stream", None)
+            if stream is not None:
+                # A staging kernel may still read the source blocks.
+                await asyncio.to_thread(stream.synchronize)
+            for member in members:
+                member.snapshot_done = True
 
     def _register_staging_buffers(self) -> None:
         """Map fixed store buffers before request traffic; fail startup on error."""
