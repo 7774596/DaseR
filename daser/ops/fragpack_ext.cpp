@@ -5,7 +5,7 @@
 void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len,
                   torch::Tensor plut, torch::Tensor slut, torch::Tensor block_table,
                   torch::Tensor seq_lens, torch::Tensor opart, torch::Tensor ml,
-                  torch::Tensor out, int64_t splits, double scale);
+                  torch::Tensor out, int64_t units, double scale);
 
 void hbm_prepare(torch::Tensor counters, torch::Tensor wslot, torch::Tensor tags,
                  torch::Tensor free_stack, torch::Tensor ovf_bits, torch::Tensor claim_list,

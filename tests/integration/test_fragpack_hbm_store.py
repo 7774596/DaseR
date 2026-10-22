@@ -25,7 +25,7 @@ from daser.ops.fused_attn_decode import (
     GQA,
     RecordTables,
     decode_attention,
-    decode_splits,
+    decode_units,
     workspace_elems,
 )
 from daser.ops.hbm_kv import HbmKvStore, page_bytes, register_store
@@ -168,7 +168,11 @@ class _Harness:
                     )
 
     def check_decode(self, tables: list[list[int]], seqs: list[int]) -> None:
-        """Fused decode vs an fp32 reference over the written KV."""
+        """Fused decode vs an fp32 reference over the written KV.
+
+        Runs with the default unit count (one page per chunk here) and with
+        fewer units, so chunks span several pages and sequences end mid-chunk.
+        """
         B = len(seqs)
         width = max(len(t) for t in tables)
         bt = np.zeros((B, width), np.int32)
@@ -177,29 +181,29 @@ class _Harness:
         block_table = torch.from_numpy(bt).cuda()
         seq_lens = torch.tensor(seqs, dtype=torch.int32, device="cuda")
         sms = torch.cuda.get_device_properties(0).multi_processor_count
-        splits = decode_splits(B, H, sms)
-        opart, ml = workspace_elems(B, H, splits)
-        ws = (
-            torch.empty(opart, device="cuda"),
-            torch.empty(ml, device="cuda"),
-        )
-        for layer in range(L):
-            q = torch.randn(B, HQ, D, dtype=torch.bfloat16, device="cuda")
-            out = torch.empty_like(q)
-            tabs = RecordTables(*self.store.layer_tables(layer))
-            decode_attention(q, tabs, block_table, seq_lens, SCALE, splits, out, ws)
-            kv = _bf16(self.ref[layer]).float()  # [2, NB, T, H, D]
-            ref = torch.empty(B, HQ, D, device="cuda")
-            for i, (t, s) in enumerate(zip(tables, seqs, strict=True)):
-                pg = torch.tensor(t, device="cuda")
-                for h in range(H):
-                    k = kv[0, pg, :, h].reshape(-1, D)[:s]
-                    v = kv[1, pg, :, h].reshape(-1, D)[:s]
-                    qh = q[i, GQA * h : GQA * (h + 1)].float()
-                    ref[i, GQA * h : GQA * (h + 1)] = (
-                        torch.softmax(qh @ k.T * SCALE, -1) @ v
-                    )
-            torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+        for units in (decode_units(B, H, sms), B, B + 1):
+            opart, ml = workspace_elems(H, units)
+            ws = (
+                torch.empty(opart, device="cuda"),
+                torch.empty(ml, device="cuda"),
+            )
+            for layer in range(L):
+                q = torch.randn(B, HQ, D, dtype=torch.bfloat16, device="cuda")
+                out = torch.empty_like(q)
+                tabs = RecordTables(*self.store.layer_tables(layer))
+                decode_attention(q, tabs, block_table, seq_lens, SCALE, units, out, ws)
+                kv = _bf16(self.ref[layer]).float()  # [2, NB, T, H, D]
+                ref = torch.empty(B, HQ, D, device="cuda")
+                for i, (t, s) in enumerate(zip(tables, seqs, strict=True)):
+                    pg = torch.tensor(t, device="cuda")
+                    for h in range(H):
+                        k = kv[0, pg, :, h].reshape(-1, D)[:s]
+                        v = kv[1, pg, :, h].reshape(-1, D)[:s]
+                        qh = q[i, GQA * h : GQA * (h + 1)].float()
+                        ref[i, GQA * h : GQA * (h + 1)] = (
+                            torch.softmax(qh @ k.T * SCALE, -1) @ v
+                        )
+                torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(

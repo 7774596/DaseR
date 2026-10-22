@@ -38,9 +38,31 @@ struct Params {
   float* opart;
   float* ml;
   int64_t q_stride, bt_stride;  // q in uint32 words, block table in entries
-  int kvh, splits;
+  int batch, kvh, units;
   float scale_log2;
 };
+
+// Work split: every sequence's pages are cut into chunks of ``ppc`` pages, the
+// same for the whole batch, so long sequences get proportionally more CTAs.
+// ``ppc`` is the smallest chunk for which the chunks of all sequences fit
+// ``units - batch`` (each sequence adds at most one partial chunk), computed
+// on device from ``seq_lens`` so the launch shape depends only on the batch.
+// A sequence without pages still owns one (empty) unit.
+__device__ __forceinline__ int seq_pages(const int32_t* seq_lens, int b) {
+  return (seq_lens[b] + 127) >> 7;
+}
+
+__device__ __forceinline__ int pages_per_chunk(const int32_t* seq_lens, int batch,
+                                               int units) {
+  int total = 0;
+  for (int b = 0; b < batch; ++b) total += seq_pages(seq_lens, b);
+  const int budget = max(1, units - batch);
+  return max(1, (total + budget - 1) / budget);
+}
+
+__device__ __forceinline__ int seq_chunks(int pages, int ppc) {
+  return max(1, (pages + ppc - 1) / ppc);
+}
 
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -101,12 +123,18 @@ __global__ void __launch_bounds__(kThreads, 2) decode_attn(Params p) {
   int32_t* mlen = reinterpret_cast<int32_t*>(smem + kLenRel);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, c = lane & 3;
-  const int split = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int unit = blockIdx.x, h = blockIdx.y;
+  const int ppc = pages_per_chunk(p.seq_lens, p.batch, p.units);
+  int b = 0, first = 0, chunks = seq_chunks(seq_pages(p.seq_lens, 0), ppc);
+  while (first + chunks <= unit) {
+    first += chunks;
+    if (++b == p.batch) return;  // past the last sequence's units
+    chunks = seq_chunks(seq_pages(p.seq_lens, b), ppc);
+  }
   const int seq = p.seq_lens[b];
   const int pages = (seq + 127) >> 7;
-  const int pps = (pages + p.splits - 1) / p.splits;
-  const int p0 = split * pps;
-  const int n = max(0, min(pages, p0 + pps) - p0);
+  const int p0 = (unit - first) * ppc;
+  const int n = max(0, min(pages, p0 + ppc) - p0);
   const int32_t* bt = p.block_table + (int64_t)b * p.bt_stride + p0;
   // Local pages [base, base + kMetaPages) of this split into maddr / mlen.
   auto load_meta = [&](int base) {
@@ -234,7 +262,7 @@ __global__ void __launch_bounds__(kThreads, 2) decode_attn(Params p) {
   }
 
   // Partial outputs: rows are query heads, columns d.
-  const int64_t row0 = ((int64_t)(b * p.kvh + h) * p.splits + split) * 8;
+  const int64_t row0 = ((int64_t)h * p.units + unit) * 8;
 #pragma unroll
   for (int jj = 0; jj < 2; ++jj)
 #pragma unroll
@@ -259,16 +287,20 @@ __global__ void __launch_bounds__(kThreads, 2) decode_attn(Params p) {
 }
 
 // Rows with no context (cudagraph padding) produce zeros.
-__global__ void combine(const float* opart, const float* ml, __nv_bfloat16* out,
-                        int64_t out_stride, int kvh, int splits) {
+__global__ void combine(const float* opart, const float* ml, const int32_t* seq_lens,
+                        __nv_bfloat16* out, int64_t out_stride, int batch, int units) {
   const int b = blockIdx.x, qh = blockIdx.y, d = threadIdx.x;
   const int h = qh >> 3, g = qh & 7;
-  const int64_t base = (int64_t)(b * kvh + h) * splits;
+  const int ppc = pages_per_chunk(seq_lens, batch, units);
+  int first = 0;
+  for (int r = 0; r < b; ++r) first += seq_chunks(seq_pages(seq_lens, r), ppc);
+  const int chunks = seq_chunks(seq_pages(seq_lens, b), ppc);
+  const int64_t base = (int64_t)h * units + first;
   float gm = -INFINITY;
-  for (int s = 0; s < splits; ++s) gm = fmaxf(gm, ml[((base + s) * 8 + g) * 2]);
+  for (int s = 0; s < chunks; ++s) gm = fmaxf(gm, ml[((base + s) * 8 + g) * 2]);
   float den = 0.f, acc = 0.f;
   if (gm != -INFINITY) {
-    for (int s = 0; s < splits; ++s) {
+    for (int s = 0; s < chunks; ++s) {
       const int64_t r = (base + s) * 8 + g;
       const float w = exp2f(ml[r * 2] - gm);
       den += w * ml[r * 2 + 1];
@@ -283,7 +315,7 @@ __global__ void combine(const float* opart, const float* ml, __nv_bfloat16* out,
 void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len,
                   torch::Tensor plut, torch::Tensor slut, torch::Tensor block_table,
                   torch::Tensor seq_lens, torch::Tensor opart, torch::Tensor ml,
-                  torch::Tensor out, int64_t splits, double scale) {
+                  torch::Tensor out, int64_t units, double scale) {
   TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.stride(2) == 1 && q.stride(1) == 128 &&
                   q.stride(0) % 2 == 0,
               "q must be [B, H, 128] with contiguous heads");
@@ -292,8 +324,9 @@ void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len
   TORCH_CHECK(block_table.stride(1) == 1, "block_table rows must be contiguous");
   const int B = q.size(0), kvh = q.size(1) / 8;
   if (B == 0) return;
-  TORCH_CHECK(opart.numel() >= (int64_t)B * kvh * splits * 8 * 128 &&
-                  ml.numel() >= (int64_t)B * kvh * splits * 16,
+  TORCH_CHECK(units >= B, "decode needs at least one unit per sequence");
+  TORCH_CHECK(opart.numel() >= (int64_t)kvh * units * 8 * 128 &&
+                  ml.numel() >= (int64_t)kvh * units * 16,
               "decode workspace too small");
   Params p;
   p.q = reinterpret_cast<const uint32_t*>(q.data_ptr());
@@ -307,15 +340,16 @@ void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len
   p.ml = ml.data_ptr<float>();
   p.q_stride = q.stride(0) / 2;
   p.bt_stride = block_table.stride(0);
+  p.batch = B;
   p.kvh = kvh;
-  p.splits = splits;
+  p.units = units;
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   auto stream = at::cuda::getCurrentCUDAStream();
   cudaFuncSetAttribute(decode_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
-  decode_attn<<<dim3(splits, kvh, B), kThreads, kSmem, stream>>>(p);
+  decode_attn<<<dim3(units, kvh), kThreads, kSmem, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   combine<<<dim3(B, kvh * 8), 128, 0, stream>>>(
-      p.opart, p.ml, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), out.stride(0), kvh,
-      splits);
+      p.opart, p.ml, p.seq_lens, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      out.stride(0), B, units);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

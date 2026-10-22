@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Split-KV decode attention over FragPack KV records.
 
-One CTA (256 threads) handles one split of one (sequence, KV head) pair for
-all ``GQA`` query heads, with an online softmax; a small combine kernel merges
-the splits. The MMAs are transposed, ``S^T = K Q^T`` and ``O^T += V^T P^T``,
-so K / V^T is the 16-row A operand and the 8 GQA heads fill the n8 side
-without padding. Thread 0 bulk-copies (TMA) each K and V record into its own
-shared slot, and every thread decodes its 64 kernel-order scalars straight
-into A fragments, overlapping the next record's copy.
+One CTA (256 threads) handles one chunk of pages of one (sequence, KV head)
+pair for all ``GQA`` query heads, with an online softmax; a small combine
+kernel merges each sequence's chunks. The MMAs are transposed,
+``S^T = K Q^T`` and ``O^T += V^T P^T``, so K / V^T is the 16-row A operand and
+the 8 GQA heads fill the n8 side without padding. Thread 0 bulk-copies (TMA)
+each K and V record into its own shared slot, and every thread decodes its 64
+kernel-order scalars straight into A fragments, overlapping the next record's
+copy.
 
 Records come from :mod:`daser.compression.attn_page` and are located through
 per-record tables: ``rec_addr[P, 2, H]`` absolute device addresses and
 ``rec_len[P, 2, H]`` record bytes minus ``DENSE_BYTES`` (raw records, whose
-length exceeds ``VAR_CAP``, included). Each sequence's pages are split into
-``splits`` equal ranges on device, so a launch depends only on the batch size
-and is CUDA-graph safe.
+length exceeds ``VAR_CAP``, included). The kernel cuts every sequence into
+chunks of the same page count, chosen on device so that the batch fills
+``units`` CTAs per KV head: a sequence gets CTAs in proportion to its length,
+so a batch mixing short and long contexts does not wait on the long one's few
+CTAs. A launch depends only on the batch size and is CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -48,11 +51,12 @@ class RecordTables:
     slut: torch.Tensor
 
 
-def decode_splits(batch: int, kv_heads: int, num_sms: int) -> int:
-    """Return the per-(sequence, KV head) split count for a decode batch.
+def decode_units(batch: int, kv_heads: int, num_sms: int) -> int:
+    """Return the CTAs per KV head of a decode launch.
 
-    Two CTAs fit per SM; splits fill one wave. Depending on the batch size only
-    keeps the launch shape fixed under CUDA graphs.
+    Two CTAs fit per SM; the units of all KV heads fill one wave, and every
+    sequence gets at least one. Depending on the batch size only keeps the
+    launch shape fixed under CUDA graphs.
 
     Args:
         batch: Number of sequences (padded batch size under CUDA graphs).
@@ -60,21 +64,20 @@ def decode_splits(batch: int, kv_heads: int, num_sms: int) -> int:
         num_sms: Streaming multiprocessor count.
 
     Returns:
-        Split count, at least 1.
+        Unit count, at least ``batch``.
 
     Async/thread-safety:
         Pure function.
     """
-    return max(1, (2 * num_sms) // max(1, batch * kv_heads))
+    return max(batch, (2 * num_sms) // max(1, kv_heads))
 
 
-def workspace_elems(batch: int, kv_heads: int, splits: int) -> tuple[int, int]:
+def workspace_elems(kv_heads: int, units: int) -> tuple[int, int]:
     """Return the float element counts of the ``(opart, ml)`` workspace.
 
     Args:
-        batch: Number of sequences.
         kv_heads: KV heads per sequence.
-        splits: Split count.
+        units: Units per KV head.
 
     Returns:
         Elements needed for ``opart`` and ``ml``.
@@ -82,7 +85,7 @@ def workspace_elems(batch: int, kv_heads: int, splits: int) -> tuple[int, int]:
     Async/thread-safety:
         Pure function.
     """
-    rows = batch * kv_heads * splits * GQA
+    rows = kv_heads * units * GQA
     return rows * 128, rows * 2
 
 
@@ -92,7 +95,7 @@ def decode_attention(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     scale: float,
-    splits: int,
+    units: int,
     out: torch.Tensor,
     workspace: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
@@ -104,7 +107,8 @@ def decode_attention(
         block_table: int32 ``[B, max_pages]`` page ids (rows may be strided).
         seq_lens: int32 ``[B]`` context lengths; 0 yields a zero output row.
         scale: Softmax scale.
-        splits: CTAs per (sequence, KV head), e.g. from :func:`decode_splits`.
+        units: CTAs per KV head, at least ``B``, e.g. from
+            :func:`decode_units`.
         out: BF16 ``[B, H * GQA, 128]`` output (rows may be strided).
         workspace: ``(opart, ml)`` float tensors sized by
             :func:`workspace_elems`.
@@ -126,7 +130,7 @@ def decode_attention(
         workspace[0],
         workspace[1],
         out,
-        splits,
+        units,
         scale,
     )
 
@@ -135,6 +139,6 @@ __all__ = [
     "GQA",
     "RecordTables",
     "decode_attention",
-    "decode_splits",
+    "decode_units",
     "workspace_elems",
 ]

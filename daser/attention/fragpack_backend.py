@@ -59,7 +59,7 @@ from daser.ops.fused_attn_decode import (
     GQA,
     RecordTables,
     decode_attention,
-    decode_splits,
+    decode_units,
     workspace_elems,
 )
 from daser.ops.hbm_kv import (
@@ -205,7 +205,7 @@ class FragPackMetadata:
         num_decodes: Leading single-token rows.
         decode_block_table: int32 ``[num_decodes, max_pages]``.
         decode_seq_lens: int32 ``[num_decodes]``.
-        splits: Decode split count.
+        units: Decode CTAs per KV head.
         decode_workspace: ``(opart, ml)`` of the decode kernel.
         max_close: Grid bound of the per-layer encode.
         prefills: Prefill groups.
@@ -222,7 +222,7 @@ class FragPackMetadata:
     num_decodes: int
     decode_block_table: torch.Tensor
     decode_seq_lens: torch.Tensor
-    splits: int
+    units: int
     decode_workspace: tuple[torch.Tensor, torch.Tensor]
     max_close: int
     prefills: list[PrefillGroup]
@@ -275,11 +275,10 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
         props = torch.cuda.get_device_properties(device)
         self.num_sms = props.multi_processor_count
         self.max_reqs = sched.max_num_seqs
-        rows_splits = max(
-            decode_splits(b, self.kv_heads, self.num_sms) * b
-            for b in range(1, max(self.max_reqs, capture) + 1)
+        opart, ml = workspace_elems(
+            self.kv_heads,
+            decode_units(max(self.max_reqs, capture), self.kv_heads, self.num_sms),
         )
-        opart, ml = workspace_elems(1, self.kv_heads, rows_splits)
         f32 = dict(dtype=torch.float32, device=device)
         self.decode_workspace = (torch.empty(opart, **f32), torch.empty(ml, **f32))
         self.workspace_pages = -(
@@ -380,7 +379,7 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
             num_decodes=nd,
             decode_block_table=cam.block_table_tensor[:nd],
             decode_seq_lens=cam.seq_lens[:nd],
-            splits=decode_splits(max(nd, 1), self.kv_heads, self.num_sms),
+            units=decode_units(max(nd, 1), self.kv_heads, self.num_sms),
             decode_workspace=self.decode_workspace,
             max_close=max_close,
             prefills=prefills,
@@ -598,7 +597,7 @@ class FragPackAttentionImpl(AttentionImpl[FragPackMetadata]):
                 md.decode_block_table,
                 md.decode_seq_lens,
                 self.scale,
-                md.splits,
+                md.units,
                 output[:nd],
                 md.decode_workspace,
             )
