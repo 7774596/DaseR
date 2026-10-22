@@ -14,10 +14,12 @@ Records come from :mod:`daser.compression.attn_page` and are located through
 per-record tables: ``rec_addr[P, 2, H]`` absolute device addresses and
 ``rec_len[P, 2, H]`` record bytes minus ``DENSE_BYTES`` (raw records, whose
 length exceeds ``VAR_CAP``, included). The kernel cuts every sequence into
-chunks of the same page count, chosen on device so that the batch fills
+chunks of the same page count, the smallest for which the batch fits
 ``units`` CTAs per KV head: a sequence gets CTAs in proportion to its length,
 so a batch mixing short and long contexts does not wait on the long one's few
-CTAs. A launch depends only on the batch size and is CUDA-graph safe.
+CTAs. A one-block plan kernel picks the chunk size and maps units to
+(sequence, page) on device once per step, and every layer of the step reuses
+the plan. A launch depends only on the batch size and is CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -72,21 +74,21 @@ def decode_units(batch: int, kv_heads: int, num_sms: int) -> int:
     return max(batch, (2 * num_sms) // max(1, kv_heads))
 
 
-def workspace_elems(kv_heads: int, units: int) -> tuple[int, int]:
-    """Return the float element counts of the ``(opart, ml)`` workspace.
+def workspace_elems(kv_heads: int, units: int) -> tuple[int, int, int]:
+    """Return the element counts of the ``(opart, ml, plan)`` workspace.
 
     Args:
         kv_heads: KV heads per sequence.
         units: Units per KV head.
 
     Returns:
-        Elements needed for ``opart`` and ``ml``.
+        Float elements of ``opart`` and ``ml``, int32 elements of ``plan``.
 
     Async/thread-safety:
         Pure function.
     """
     rows = kv_heads * units * GQA
-    return rows * 128, rows * 2
+    return rows * 128, rows * 2, 1 + 4 * units
 
 
 def decode_attention(
@@ -97,7 +99,8 @@ def decode_attention(
     scale: float,
     units: int,
     out: torch.Tensor,
-    workspace: tuple[torch.Tensor, torch.Tensor],
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    replan: bool,
 ) -> None:
     """Run split-KV decode attention for one query token per sequence.
 
@@ -110,8 +113,11 @@ def decode_attention(
         units: CTAs per KV head, at least ``B``, e.g. from
             :func:`decode_units`.
         out: BF16 ``[B, H * GQA, 128]`` output (rows may be strided).
-        workspace: ``(opart, ml)`` float tensors sized by
-            :func:`workspace_elems`.
+        workspace: ``(opart, ml, plan)`` float, float, int32 tensors sized
+            by :func:`workspace_elems`.
+        replan: Recompute the work plan from ``seq_lens`` and ``units``;
+            later calls with the same batch (the other layers of a step) may
+            pass False to reuse it.
 
     Returns:
         None; writes ``out``.
@@ -129,8 +135,10 @@ def decode_attention(
         seq_lens,
         workspace[0],
         workspace[1],
+        workspace[2],
         out,
         units,
+        replan,
         scale,
     )
 

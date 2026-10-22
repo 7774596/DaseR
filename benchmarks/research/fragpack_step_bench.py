@@ -14,6 +14,10 @@ step:
   ``gather`` + FA3 over the BF16 workspace;
 - the per-layer ``write`` + ``encode`` of a decode-only step.
 
+``--raw-records`` calibrates the codebooks on random bytes, so the store
+keeps every record raw and the fused kernel reads the format without the
+byte savings.
+
 Usage:
     python -m benchmarks.research.fragpack_step_bench --dump KV.npy \
         --heads 0:2 --out OUT.json [--lengths lengths.npy]
@@ -145,10 +149,16 @@ def _decode_rows(
         out_fa, out_fp = torch.empty_like(q), torch.empty_like(q)
         auto = decode_units(b, heads, sms)
         sweep = [auto] + [int(u) for u in args.units.split(",") if u]
-        ws = tuple(
-            torch.empty(n, dtype=torch.float32, device="cuda")
-            for n in workspace_elems(heads, max(sweep))
-        )
+        opart, ml, plan = workspace_elems(heads, max(sweep))
+        f32 = dict(dtype=torch.float32, device="cuda")
+        part = (torch.empty(opart, **f32), torch.empty(ml, **f32))
+        # One plan per unit count, written once: a step plans at its first
+        # layer and every layer reuses the plan, timed separately below.
+        ws = [
+            (*part, torch.empty(plan, dtype=torch.int32, device="cuda")) for _ in sweep
+        ]
+        for u, w in zip(sweep, ws, strict=True):
+            decode_attention(q, tables, bt, seq, scale, u, out_fp, w, True)
         meta = get_scheduler_metadata(
             batch_size=b,
             max_seqlen_q=1,
@@ -182,10 +192,13 @@ def _decode_rows(
             fa_version=3,
         )
         fused = [
-            partial(decode_attention, q, tables, bt, seq, scale, u, out_fp, ws)
-            for u in sweep
+            partial(decode_attention, q, tables, bt, seq, scale, u, out_fp, w, False)
+            for u, w in zip(sweep, ws, strict=True)
         ]
-        t_fa, *t_us = _time_rounds([fa3, *fused], args.rounds, 10)
+        replan = partial(
+            decode_attention, q, tables, bt, seq, scale, auto, out_fp, ws[0], True
+        )
+        t_fa, t_plan, *t_us = _time_rounds([fa3, replan, *fused], args.rounds, 10)
         t_fp = t_us[0]
         raw_bytes = 2 * sum(pages) * T * heads * D * 2
         rows.append(
@@ -198,6 +211,7 @@ def _decode_rows(
                 ),
                 "us_fa3": round(t_fa, 1),
                 "us_fused": round(t_fp, 1),
+                "us_plan": round(t_plan - t_fp, 1),
                 "fused_over_fa3": round(t_fp / t_fa, 3),
                 "raw_gbs_fa3": round(raw_bytes / t_fa / 1e3),
                 "raw_gbs_fused": round(raw_bytes / t_fp / 1e3),
@@ -309,6 +323,7 @@ def main() -> None:
     p.add_argument("--lengths", help="int .npy of context lengths to sample")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--samples", type=int, default=6)
+    p.add_argument("--raw-records", action="store_true")
     p.add_argument("--prefill", default="16000x2048,100000x2048,100000x8192")
     args = p.parse_args()
     torch.manual_seed(0)
@@ -316,7 +331,10 @@ def main() -> None:
     dump = np.load(args.dump, mmap_mode="r")
     layer = np.asarray(dump[:, args.layer : args.layer + 1, :, :, h0:h1])
     heads = h1 - h0
-    table = calibrate(layer[: args.calib_pages])
+    calib = layer[: args.calib_pages]
+    if args.raw_records:
+        calib = np.random.default_rng(0).integers(0, 1 << 16, calib.shape, np.uint16)
+    table = calibrate(calib)
     content = layer[args.calib_pages :, 0]
     idx = np.arange(args.blocks) % content.shape[0]
     kv = torch.from_numpy(content[idx].view(np.int16)).cuda().view(torch.bfloat16)
@@ -328,7 +346,8 @@ def main() -> None:
         device_tables(table, torch.device("cuda")),
         FILL_BLOCKS * T,
         8,
-        4096,
+        # Raw records all live in overflow.
+        2 * heads * nb + 4096 if args.raw_records else 4096,
     )
     _fill(store, kv)
     st = store.stats()
@@ -340,6 +359,7 @@ def main() -> None:
         "blocks": nb,
         "fallbacks": st.fallbacks,
         "spills": st.spills,
+        "raw_records": args.raw_records,
     }
     logger.info("%s", head)
     rows = _decode_rows(

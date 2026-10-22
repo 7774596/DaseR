@@ -182,16 +182,19 @@ class _Harness:
         seq_lens = torch.tensor(seqs, dtype=torch.int32, device="cuda")
         sms = torch.cuda.get_device_properties(0).multi_processor_count
         for units in (decode_units(B, H, sms), B, B + 1):
-            opart, ml = workspace_elems(H, units)
+            opart, ml, plan = workspace_elems(H, units)
             ws = (
                 torch.empty(opart, device="cuda"),
                 torch.empty(ml, device="cuda"),
+                torch.empty(plan, dtype=torch.int32, device="cuda"),
             )
             for layer in range(L):
                 q = torch.randn(B, HQ, D, dtype=torch.bfloat16, device="cuda")
                 out = torch.empty_like(q)
                 tabs = RecordTables(*self.store.layer_tables(layer))
-                decode_attention(q, tabs, block_table, seq_lens, SCALE, units, out, ws)
+                decode_attention(
+                    q, tabs, block_table, seq_lens, SCALE, units, out, ws, layer == 0
+                )
                 kv = _bf16(self.ref[layer]).float()  # [2, NB, T, H, D]
                 ref = torch.empty(B, HQ, D, device="cuda")
                 for i, (t, s) in enumerate(zip(tables, seqs, strict=True)):

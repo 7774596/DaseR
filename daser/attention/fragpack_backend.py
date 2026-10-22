@@ -206,7 +206,8 @@ class FragPackMetadata:
         decode_block_table: int32 ``[num_decodes, max_pages]``.
         decode_seq_lens: int32 ``[num_decodes]``.
         units: Decode CTAs per KV head.
-        decode_workspace: ``(opart, ml)`` of the decode kernel.
+        decode_workspace: ``(opart, ml, plan)`` of the decode kernel; the
+            first layer of a step writes the plan, the others reuse it.
         max_close: Grid bound of the per-layer encode.
         prefills: Prefill groups.
         wk: BF16 prefill K workspace ``[W, 128, H, 128]``.
@@ -223,7 +224,7 @@ class FragPackMetadata:
     decode_block_table: torch.Tensor
     decode_seq_lens: torch.Tensor
     units: int
-    decode_workspace: tuple[torch.Tensor, torch.Tensor]
+    decode_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     max_close: int
     prefills: list[PrefillGroup]
     wk: torch.Tensor
@@ -275,12 +276,16 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
         props = torch.cuda.get_device_properties(device)
         self.num_sms = props.multi_processor_count
         self.max_reqs = sched.max_num_seqs
-        opart, ml = workspace_elems(
+        opart, ml, plan = workspace_elems(
             self.kv_heads,
             decode_units(max(self.max_reqs, capture), self.kv_heads, self.num_sms),
         )
         f32 = dict(dtype=torch.float32, device=device)
-        self.decode_workspace = (torch.empty(opart, **f32), torch.empty(ml, **f32))
+        self.decode_workspace = (
+            torch.empty(opart, **f32),
+            torch.empty(ml, **f32),
+            torch.empty(plan, dtype=torch.int32, device=device),
+        )
         self.workspace_pages = -(
             -vllm_config.model_config.max_model_len // BLOCK_TOKENS
         )
@@ -600,6 +605,7 @@ class FragPackAttentionImpl(AttentionImpl[FragPackMetadata]):
                 md.units,
                 output[:nd],
                 md.decode_workspace,
+                replan=li == 0,
             )
         for g in md.prefills:
             store.gather(li, g.src_blocks, md.wk, md.wv)

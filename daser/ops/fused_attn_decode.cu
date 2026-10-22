@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <cub/block/block_scan.cuh>
 
 #include "fragpack_common.cuh"
 
@@ -35,33 +36,101 @@ struct Params {
   const uint8_t* slut;
   const int32_t* block_table;
   const int32_t* seq_lens;
+  const int32_t* plan;
   float* opart;
   float* ml;
   int64_t q_stride, bt_stride;  // q in uint32 words, block table in entries
-  int batch, kvh, units;
+  int kvh, units;
   float scale_log2;
 };
 
 // Work split: every sequence's pages are cut into chunks of ``ppc`` pages, the
 // same for the whole batch, so long sequences get proportionally more CTAs.
 // ``ppc`` is the smallest chunk for which the chunks of all sequences fit
-// ``units - batch`` (each sequence adds at most one partial chunk), computed
-// on device from ``seq_lens`` so the launch shape depends only on the batch.
+// ``units``. plan_decode computes it on device from ``seq_lens`` once per step
+// (every layer shares it), so the launch shape depends only on the batch.
 // A sequence without pages still owns one (empty) unit.
+//
+// Plan layout (int32): [0] ppc; [1 + 2u, 2 + 2u] (sequence, first page) of
+// unit u, sequence -1 for an idle unit; [1 + 2 * units + 2b, ... + 1] (first
+// unit, chunks) of sequence b.
+constexpr int kPlanThreads = 256;
+
 __device__ __forceinline__ int seq_pages(const int32_t* seq_lens, int b) {
   return (seq_lens[b] + 127) >> 7;
 }
 
-__device__ __forceinline__ int pages_per_chunk(const int32_t* seq_lens, int batch,
-                                               int units) {
-  int total = 0;
-  for (int b = 0; b < batch; ++b) total += seq_pages(seq_lens, b);
-  const int budget = max(1, units - batch);
-  return max(1, (total + budget - 1) / budget);
-}
-
 __device__ __forceinline__ int seq_chunks(int pages, int ppc) {
   return max(1, (pages + ppc - 1) / ppc);
+}
+
+// Block-wide sum (or max) of ``v``, returned to every thread.
+template <bool kMax>
+__device__ __forceinline__ int block_reduce(int v, int* sh) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int x = 16; x; x >>= 1) {
+    const int o = __shfl_xor_sync(0xffffffffu, v, x);
+    v = kMax ? max(v, o) : v + o;
+  }
+  __syncthreads();  // ``sh`` may still be read by the previous call
+  if (lane == 0) sh[warp] = v;
+  __syncthreads();
+  v = lane < (int)(blockDim.x >> 5) ? sh[lane] : 0;
+#pragma unroll
+  for (int x = 16; x; x >>= 1) {
+    const int o = __shfl_xor_sync(0xffffffffu, v, x);
+    v = kMax ? max(v, o) : v + o;
+  }
+  return v;
+}
+
+__global__ void __launch_bounds__(kPlanThreads) plan_decode(const int32_t* seq_lens,
+                                                            int32_t* plan, int batch,
+                                                            int units) {
+  using Scan = cub::BlockScan<int, kPlanThreads>;
+  __shared__ typename Scan::TempStorage scan;
+  __shared__ int sh[32];
+  const int tid = threadIdx.x;
+  int total = 0, longest = 0;
+  for (int b = tid; b < batch; b += kPlanThreads) {
+    const int n = seq_pages(seq_lens, b);
+    total += n;
+    longest = max(longest, n);
+  }
+  total = block_reduce<false>(total, sh);
+  longest = block_reduce<true>(longest, sh);
+  // Chunk count falls as ppc grows; ppc = longest gives one per sequence.
+  int lo = max(1, (total + units - 1) / units), hi = max(1, longest);
+  while (lo < hi) {
+    const int mid = (lo + hi) >> 1;
+    int c = 0;
+    for (int b = tid; b < batch; b += kPlanThreads) c += seq_chunks(seq_pages(seq_lens, b), mid);
+    if (block_reduce<false>(c, sh) <= units) hi = mid;
+    else lo = mid + 1;
+  }
+  const int ppc = lo;
+  int32_t* seq_plan = plan + 1 + 2 * units;
+  int used = 0;
+  for (int base = 0; base < batch; base += kPlanThreads) {
+    const int b = base + tid;
+    const int c = b < batch ? seq_chunks(seq_pages(seq_lens, b), ppc) : 0;
+    int first, tile;
+    Scan(scan).ExclusiveSum(c, first, tile);
+    first += used;
+    if (b < batch) {
+      seq_plan[2 * b] = first;
+      seq_plan[2 * b + 1] = c;
+      for (int s = 0; s < c; ++s) {
+        plan[1 + 2 * (first + s)] = b;
+        plan[2 + 2 * (first + s)] = s * ppc;
+      }
+    }
+    used += tile;
+    __syncthreads();  // ``scan`` is reused by the next tile
+  }
+  for (int u = used + tid; u < units; u += kPlanThreads) plan[1 + 2 * u] = -1;
+  if (tid == 0) plan[0] = ppc;
 }
 
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
@@ -124,16 +193,11 @@ __global__ void __launch_bounds__(kThreads, 2) decode_attn(Params p) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, c = lane & 3;
   const int unit = blockIdx.x, h = blockIdx.y;
-  const int ppc = pages_per_chunk(p.seq_lens, p.batch, p.units);
-  int b = 0, first = 0, chunks = seq_chunks(seq_pages(p.seq_lens, 0), ppc);
-  while (first + chunks <= unit) {
-    first += chunks;
-    if (++b == p.batch) return;  // past the last sequence's units
-    chunks = seq_chunks(seq_pages(p.seq_lens, b), ppc);
-  }
+  const int b = p.plan[1 + 2 * unit];
+  if (b < 0) return;  // past the last sequence's units
+  const int ppc = p.plan[0], p0 = p.plan[2 + 2 * unit];
   const int seq = p.seq_lens[b];
   const int pages = (seq + 127) >> 7;
-  const int p0 = (unit - first) * ppc;
   const int n = max(0, min(pages, p0 + ppc) - p0);
   const int32_t* bt = p.block_table + (int64_t)b * p.bt_stride + p0;
   // Local pages [base, base + kMetaPages) of this split into maddr / mlen.
@@ -287,14 +351,11 @@ __global__ void __launch_bounds__(kThreads, 2) decode_attn(Params p) {
 }
 
 // Rows with no context (cudagraph padding) produce zeros.
-__global__ void combine(const float* opart, const float* ml, const int32_t* seq_lens,
-                        __nv_bfloat16* out, int64_t out_stride, int batch, int units) {
+__global__ void combine(const float* opart, const float* ml, const int32_t* plan,
+                        __nv_bfloat16* out, int64_t out_stride, int units) {
   const int b = blockIdx.x, qh = blockIdx.y, d = threadIdx.x;
   const int h = qh >> 3, g = qh & 7;
-  const int ppc = pages_per_chunk(seq_lens, batch, units);
-  int first = 0;
-  for (int r = 0; r < b; ++r) first += seq_chunks(seq_pages(seq_lens, r), ppc);
-  const int chunks = seq_chunks(seq_pages(seq_lens, b), ppc);
+  const int first = plan[1 + 2 * units + 2 * b], chunks = plan[2 + 2 * units + 2 * b];
   const int64_t base = (int64_t)h * units + first;
   float gm = -INFINITY;
   for (int s = 0; s < chunks; ++s) gm = fmaxf(gm, ml[((base + s) * 8 + g) * 2]);
@@ -315,7 +376,8 @@ __global__ void combine(const float* opart, const float* ml, const int32_t* seq_
 void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len,
                   torch::Tensor plut, torch::Tensor slut, torch::Tensor block_table,
                   torch::Tensor seq_lens, torch::Tensor opart, torch::Tensor ml,
-                  torch::Tensor out, int64_t units, double scale) {
+                  torch::Tensor plan, torch::Tensor out, int64_t units, bool replan,
+                  double scale) {
   TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.stride(2) == 1 && q.stride(1) == 128 &&
                   q.stride(0) % 2 == 0,
               "q must be [B, H, 128] with contiguous heads");
@@ -328,6 +390,8 @@ void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len
   TORCH_CHECK(opart.numel() >= (int64_t)kvh * units * 8 * 128 &&
                   ml.numel() >= (int64_t)kvh * units * 16,
               "decode workspace too small");
+  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.numel() >= 1 + 4 * units,
+              "decode plan must be int32 with 1 + 4 * units elements");
   Params p;
   p.q = reinterpret_cast<const uint32_t*>(q.data_ptr());
   p.rec_addr = rec_addr.data_ptr<int64_t>();
@@ -336,20 +400,25 @@ void fused_decode(torch::Tensor q, torch::Tensor rec_addr, torch::Tensor rec_len
   p.slut = slut.data_ptr<uint8_t>();
   p.block_table = block_table.data_ptr<int32_t>();
   p.seq_lens = seq_lens.data_ptr<int32_t>();
+  p.plan = plan.data_ptr<int32_t>();
   p.opart = opart.data_ptr<float>();
   p.ml = ml.data_ptr<float>();
   p.q_stride = q.stride(0) / 2;
   p.bt_stride = block_table.stride(0);
-  p.batch = B;
   p.kvh = kvh;
   p.units = units;
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (replan) {
+    plan_decode<<<1, kPlanThreads, 0, stream>>>(p.seq_lens, plan.data_ptr<int32_t>(), B,
+                                                units);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   cudaFuncSetAttribute(decode_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
   decode_attn<<<dim3(units, kvh), kThreads, kSmem, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   combine<<<dim3(B, kvh * 8), 128, 0, stream>>>(
-      p.opart, p.ml, p.seq_lens, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      out.stride(0), B, units);
+      p.opart, p.ml, p.plan, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      out.stride(0), units);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
