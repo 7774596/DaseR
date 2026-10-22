@@ -511,7 +511,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-l2",
         action="store_true",
-        help="Run DaseR arms memory-only: the store lives in L1 (--l1-size).",
+        help="Run DaseR and LMCache arms memory-only: the store lives in L1 "
+        "(--l1-size).",
     )
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument(
@@ -767,7 +768,7 @@ def _manager(arm: str, args: argparse.Namespace) -> MatchedServer:
         ),
         daser_coalesce_loads=arm.endswith("-coalesce"),
         daser_layerwise_load=arm.endswith("-layerwise"),
-        skip_l2=args.skip_l2 and arm.startswith("daser"),
+        skip_l2=args.skip_l2 and arm.startswith(("daser", "lmcache")),
         daser_prefetch_max_requests=(
             args.daser_prefetch_max_requests if arm.startswith("daser") else 0
         ),

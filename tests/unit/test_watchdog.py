@@ -142,3 +142,41 @@ def test_agentx_harness_is_watched_as_the_replay(tmp_path: Path) -> None:
     assert ok, message
     assert message.startswith("replay exited")
     assert f"pid={harness.pid}" in message
+
+
+def _watch_with_service_log(tmp_path: Path, lines: list[str]) -> tuple[bool, str]:
+    """Watch a short replay while a service log holds ``lines``."""
+    out = tmp_path / "art" / "lmcache"
+    service = tmp_path / "scr"
+    (out / "agentx").mkdir(parents=True)
+    (service / "logs").mkdir(parents=True)
+    (service / "logs" / "lmcache_mp_server.log").write_text("\n".join(lines) + "\n")
+    harness = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+    (out / "replay.pid").write_text(str(harness.pid))
+    try:
+        return watch(parse_args(_startup_args(out, service, tmp_path)))
+    finally:
+        harness.terminate()
+        harness.wait(timeout=5)
+
+
+def test_lmcache_lazy_heap_memcheck_is_not_an_anomaly(tmp_path: Path) -> None:
+    """LMCache's memcheck race during lazy pinning does not stop the arm."""
+    ok, message = _watch_with_service_log(
+        tmp_path,
+        [
+            "LMCache ERROR: Memory allocator size is inconsistent",
+            "LMCache ERROR: This implies a bug in the memory allocator",
+        ],
+    )
+    assert ok, message
+    assert message.startswith("replay exited")
+
+
+def test_other_service_error_is_an_anomaly(tmp_path: Path) -> None:
+    """Any other ERROR line in a service log stops the arm."""
+    ok, message = _watch_with_service_log(
+        tmp_path, ["LMCache ERROR: Failed to store chunk"]
+    )
+    assert not ok
+    assert "Failed to store chunk" in message

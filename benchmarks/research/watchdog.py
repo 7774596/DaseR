@@ -52,6 +52,12 @@ from benchmarks.utils.servers import (
 
 _METRIC = re.compile(r"^(vllm:[a-z_]+)(?:\{[^}]*\})? ([0-9.eE+-]+)$")
 _LOG_ALARM = re.compile(r"Traceback|\bERROR\b")
+# LMCache 0.5.5's /status runs an unlocked allocator memcheck while its lazy
+# pinned-memory thread is still growing the heap, so free + allocated briefly
+# differs from the heap size with nothing allocated. Not a failure.
+_LOG_BENIGN = re.compile(
+    r"Memory allocator size is inconsistent|This implies a bug in the memory allocator"
+)
 _REPLAY_MODULE = "benchmarks.mooncake.benchmark"
 # The runner records the replay client's PID here; the AgentX harness
 # rewrites its process title, so its argv cannot be matched.
@@ -289,7 +295,7 @@ def watch(args: argparse.Namespace) -> tuple[bool, str]:
         for log in (args.service_dir / "logs").glob("*.log"):
             tail = log_tails.setdefault(log, _Tail(log))
             for line in tail.new_lines():
-                if _LOG_ALARM.search(line):
+                if _LOG_ALARM.search(line) and not _LOG_BENIGN.search(line):
                     return False, f"{log.name}: {line.strip()[:300]}"
 
         pid_file = args.service_dir / "pids.json"
