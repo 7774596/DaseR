@@ -16,6 +16,7 @@ codec call, on the same card:
   SplitZip GPU codec calibrated on the same slots as DaseR. These codecs work
   on contiguous buffers, so restore adds a copy into the paged blocks
   (``dec_gbs``); ``dec_contig_gbs`` stops at the codec's own output;
+- optionally ExANS (OpenLake) builds through their scatter/gather C API;
 - optionally single-core CPU zstd over byte-shuffled slots.
 
 Every restore is checked byte-exact. One JSON object per arm and call size is
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
 from typing import Any, Callable
@@ -190,6 +192,10 @@ class _PagedKV:
     def clear(self) -> None:
         """Zero the destination blocks before a correctness pass."""
         self.rows.index_fill_(0, self.ids, 0)
+
+    def reset(self) -> None:
+        """Rewrite the source bytes, undoing an earlier arm's inexact restore."""
+        self.rows.index_copy_(0, self.ids, self.reference)
 
     def exact(self) -> bool:
         """Return whether every destination block matches its source bytes."""
@@ -497,6 +503,179 @@ def _splitzip_rows(
     return rows
 
 
+def _exans_rows(
+    kv: _PagedKV, lib_path: str, ks: list[int], repeats: int
+) -> list[dict[str, Any]]:
+    """Time the ExANS codec (OpenLake) through its scatter/gather C API.
+
+    ExANS codes fixed 999424-byte blocks given as lists of segment addresses,
+    so each call presents its paged rows as 16 KiB segments, 61 per ExANS
+    block; the few trailing segments of a call that do not fill a block are
+    kept raw. Records are sized just under a block so every block fits and
+    ``ratio`` counts each record's ``actual_bytes`` (ExANS stores fixed-size
+    record slots; this is the codec's own ratio). Decode reads record headers
+    on the host before launching, as the API does.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL(lib_path)
+    u32p, u64p = ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint64)
+    lib.openlake_expans_create.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        u32p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.openlake_expans_encode.argtypes = [
+        ctypes.c_void_p,
+        u64p,
+        u32p,
+        u32p,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_uint64,
+    ]
+    lib.openlake_expans_decode.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        u32p,
+        ctypes.c_uint32,
+        u64p,
+        u32p,
+        u32p,
+        ctypes.c_uint64,
+    ]
+    lib.openlake_expans_last_error.argtypes = [ctypes.c_void_p]
+    lib.openlake_expans_last_error.restype = ctypes.c_char_p
+    lib.openlake_expans_destroy.argtypes = [ctypes.c_void_p]
+
+    def ptr(a: np.ndarray, kind: Any) -> Any:
+        return a.ctypes.data_as(kind)
+
+    raw_block, seg = 999424, 16384
+    per_block = raw_block // seg
+    record_bytes = raw_block - 16
+    row_bytes = kv.slot_bytes
+    segs_per_row = row_bytes // seg
+    rows_u8 = kv.rows.view(torch.uint8)
+    base = rows_u8.data_ptr()
+    stream = torch.cuda.current_stream()
+    rows: list[dict[str, Any]] = []
+    for k in ks:
+        groups = call_groups(len(kv.block_ids), k)
+        max_blocks = (k * segs_per_row) // per_block
+        codec = ctypes.c_void_p()
+        seg_sizes = np.full(per_block, seg, dtype=np.uint32)
+        if lib.openlake_expans_create(
+            raw_block,
+            record_bytes,
+            ptr(seg_sizes, u32p),
+            per_block,
+            max_blocks,
+            ctypes.byref(codec),
+        ):
+            raise RuntimeError(lib.openlake_expans_last_error(codec).decode())
+        calls = []
+        for g in groups:
+            ids = kv.block_ids[g]
+            addrs = np.array(
+                [
+                    base + b * row_bytes + s * seg
+                    for b in ids
+                    for s in range(segs_per_row)
+                ],
+                dtype=np.uint64,
+            )
+            n = len(addrs) // per_block
+            calls.append(
+                {
+                    "n": n,
+                    "addrs": addrs[: n * per_block].copy(),
+                    "sizes": np.full(n * per_block, seg, dtype=np.uint32),
+                    "offsets": (np.arange(n + 1, dtype=np.uint32) * per_block),
+                    "idx": np.arange(n, dtype=np.uint32),
+                    "fits": np.zeros(n, dtype=np.uint8),
+                    "records": torch.empty(
+                        n * record_bytes, dtype=torch.uint8, device="cuda"
+                    ),
+                    "tail_row": ids[-1],
+                    "tail_bytes": (len(addrs) - n * per_block) * seg,
+                }
+            )
+
+        def check(status: int, codec: Any = codec) -> None:
+            if status:
+                raise RuntimeError(lib.openlake_expans_last_error(codec).decode())
+
+        def encode(_: Any, calls: list = calls, codec: Any = codec) -> None:
+            for c in calls:
+                check(
+                    lib.openlake_expans_encode(
+                        codec,
+                        ptr(c["addrs"], u64p),
+                        ptr(c["sizes"], u32p),
+                        ptr(c["offsets"], u32p),
+                        c["n"],
+                        c["records"].data_ptr(),
+                        ptr(c["fits"], ctypes.POINTER(ctypes.c_uint8)),
+                        stream.cuda_stream,
+                    )
+                )
+                if c["tail_bytes"]:
+                    c["tail"] = rows_u8[c["tail_row"], -c["tail_bytes"] :].clone()
+
+        def paged(_: Any, calls: list = calls, codec: Any = codec) -> None:
+            for c in calls:
+                check(
+                    lib.openlake_expans_decode(
+                        codec,
+                        c["records"].data_ptr(),
+                        ptr(c["idx"], u32p),
+                        c["n"],
+                        ptr(c["addrs"], u64p),
+                        ptr(c["sizes"], u32p),
+                        ptr(c["offsets"], u32p),
+                        stream.cuda_stream,
+                    )
+                )
+                if c["tail_bytes"]:
+                    rows_u8[c["tail_row"], -c["tail_bytes"] :].copy_(c["tail"])
+
+        try:
+            kv.reset()
+            encode(None)
+            torch.cuda.synchronize()
+            stored = 0
+            for c in calls:
+                # actual_bytes is the uint32 at offset 20 of each 64-byte header.
+                heads = c["records"].view(c["n"], record_bytes)[:, 20:24].cpu()
+                actual = heads.contiguous().view(torch.int32).view(-1).numpy()
+                stored += int(np.where(c["fits"] > 0, actual, raw_block).sum())
+                stored += c["tail_bytes"]
+            kv.clear()
+            torch.cuda.synchronize()
+            paged(None)
+            rows.append(
+                {
+                    "arm": Path(lib_path).stem.removeprefix("lib"),
+                    "blocks_per_call": k,
+                    "ratio": stored / kv.total,
+                    "fit_blocks": int(sum(c["fits"].sum() for c in calls)),
+                    "exans_blocks": int(sum(c["n"] for c in calls)),
+                    "exact": kv.exact(),
+                    "enc_gbs": kv.total / _best_ms(encode, stream, repeats) / 1e6,
+                    "dec_gbs": kv.total / _best_ms(paged, stream, repeats) / 1e6,
+                }
+            )
+        finally:
+            calls.clear()
+            lib.openlake_expans_destroy(codec)
+    return rows
+
+
 def _cpu_zstd_rows(raw: np.ndarray, level: int) -> list[dict[str, Any]]:
     """Time single-core zstd over byte-shuffled slots (per-core throughput)."""
     import zstandard
@@ -560,6 +739,12 @@ def main() -> None:
         default=None,
         help="directory holding the SplitZip codec_gpu module",
     )
+    parser.add_argument(
+        "--exans-lib",
+        nargs="+",
+        default=[],
+        help="shared libraries exporting the OpenLake ExANS C API (one arm each)",
+    )
     args = parser.parse_args()
 
     slots = np.load(args.slots)
@@ -603,6 +788,9 @@ def main() -> None:
             for row in _splitzip_rows(
                 kv, calibration, args.splitzip_path, ks, args.repeats
             ):
+                _emit(rows, row)
+        for lib in args.exans_lib:
+            for row in _exans_rows(kv, lib, ks, args.repeats):
                 _emit(rows, row)
     if args.cpu_zstd_level is not None:
         for row in _cpu_zstd_rows(evaluate, args.cpu_zstd_level):
