@@ -96,6 +96,18 @@ FULL graph，混合 batch 走 PIECEWISE（attention eager）。
 - `prepare` 在 `build` 中 eager 执行，FULL replay 前已就位。
 - 每层内核（write / decode / encode）的 launch 形状只依赖每个 batch 形状
   固定的 host 值（padded token 数、`max_close`、splits）。
+- decode 按 padded batch 数预留每请求一个 unit，再加一 wave 减一个的拆分
+  余量（`wave = max(1, 2 * SM / KV_heads)`，整数除法）。这样并发数达到一
+  wave 时，长请求仍能拆成多份，不会被短请求各自占用的 unit 挤成单 CTA。
+  device planner 按实际非空请求数扣除 padding 的保留 unit，空行不分配
+  chunk，由 combine 直接写零；padding 不会改变同一组有效请求的拆分预算。
+  额外余量只在原预算会让最长 chunk 超过每 unit 理想平均页数的两倍时启用，
+  避免均匀长度或小 batch 因过度拆分增加任务轮次和 combine 成本。
+  静态 CTA 网格仍为 `(max(padded_batch, wave), KV_heads)`；每个 CTA
+  在自己的 head 内循环处理后续 unit。普通负载保持原来的 CTA 网格，
+  额外拆分不依赖额外空闲 CTA 的调度。重用共享内存前同步整个 CTA，
+  并失效已完成任务的 TMA barrier，再初始化下一任务的 barrier。
+  planner 仍只在每 step 首层执行，后续层复用，不新增 host 同步。
 - capture 时的 build 不调 `prepare`；`commit` 清空 close 列表，因此 capture
   或 warmup 的前向不会重编码上一 step 的 block；slot −1 的写入为空操作。
 
