@@ -104,20 +104,84 @@ def decode_attention(
 ) -> None:
     """Run split-KV decode attention for one query token per sequence.
 
+    The kernel attends ``GQA`` query heads per KV head. A model with a
+    smaller group ``G`` (a divisor of ``GQA``) runs on zero-padded queries,
+    and only its ``G`` rows per KV head are copied to ``out``.
+
     Args:
-        q: BF16 ``[B, H * GQA, 128]`` queries (rows may be strided).
+        q: BF16 ``[B, H * G, 128]`` queries (rows may be strided).
         tables: Record tables of this layer.
         block_table: int32 ``[B, max_pages]`` page ids (rows may be strided).
         seq_lens: int32 ``[B]`` context lengths; 0 yields a zero output row.
         scale: Softmax scale.
         units: CTAs per KV head, at least ``B``, e.g. from
             :func:`decode_units`.
-        out: BF16 ``[B, H * GQA, 128]`` output (rows may be strided).
+        out: BF16 ``[B, H * G, 128]`` output (rows may be strided).
         workspace: ``(opart, ml, plan)`` float, float, int32 tensors sized
             by :func:`workspace_elems`.
         replan: Recompute the work plan from ``seq_lens`` and ``units``;
             later calls with the same batch (the other layers of a step) may
             pass False to reuse it.
+
+    Returns:
+        None; writes ``out``.
+
+    Raises:
+        ValueError: If the query group does not divide ``GQA``.
+
+    Async/thread-safety:
+        Enqueues on the current CUDA stream; not synchronized. Allocations
+        for padded groups come from the caching allocator and are CUDA-graph
+        safe.
+    """
+    kv_heads = tables.rec_addr.shape[2]
+    group = q.shape[1] // kv_heads
+    if group * kv_heads != q.shape[1] or GQA % group:
+        raise ValueError(f"query heads {q.shape[1]} need a group dividing {GQA}")
+    if group == GQA:
+        _launch(q, tables, block_table, seq_lens, scale, units, out, workspace, replan)
+        return
+    rows = q.unflatten(1, (kv_heads, group))
+    qp = q.new_zeros(q.shape[0], kv_heads, GQA, q.shape[2])
+    qp[:, :, :group] = rows
+    op = torch.empty_like(qp)
+    _launch(
+        qp.flatten(1, 2),
+        tables,
+        block_table,
+        seq_lens,
+        scale,
+        units,
+        op.flatten(1, 2),
+        workspace,
+        replan,
+    )
+    out.unflatten(1, (kv_heads, group)).copy_(op[:, :, :group])
+
+
+def _launch(
+    q: torch.Tensor,
+    tables: RecordTables,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+    units: int,
+    out: torch.Tensor,
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    replan: bool,
+) -> None:
+    """Launch the kernel on ``GQA`` query rows per KV head.
+
+    Args:
+        q: BF16 ``[B, H * GQA, 128]`` queries.
+        tables: Record tables of this layer.
+        block_table: int32 ``[B, max_pages]`` page ids.
+        seq_lens: int32 ``[B]`` context lengths.
+        scale: Softmax scale.
+        units: CTAs per KV head.
+        out: BF16 ``[B, H * GQA, 128]`` output.
+        workspace: ``(opart, ml, plan)`` workspace tensors.
+        replan: Recompute the work plan.
 
     Returns:
         None; writes ``out``.

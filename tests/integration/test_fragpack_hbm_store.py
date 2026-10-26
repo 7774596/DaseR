@@ -167,11 +167,14 @@ class _Harness:
                         got[kv][i, :n], self.ref[layer, kv, b, :n], err_msg=f"{b}"
                     )
 
-    def check_decode(self, tables: list[list[int]], seqs: list[int]) -> None:
+    def check_decode(
+        self, tables: list[list[int]], seqs: list[int], group: int = GQA
+    ) -> None:
         """Fused decode vs an fp32 reference over the written KV.
 
         Runs with the default unit count (one page per chunk here) and with
         fewer units, so chunks span several pages and sequences end mid-chunk.
+        ``group`` is the number of query heads per KV head.
         """
         B = len(seqs)
         width = max(len(t) for t in tables)
@@ -189,21 +192,21 @@ class _Harness:
                 torch.empty(plan, dtype=torch.int32, device="cuda"),
             )
             for layer in range(L):
-                q = torch.randn(B, HQ, D, dtype=torch.bfloat16, device="cuda")
+                q = torch.randn(B, H * group, D, dtype=torch.bfloat16, device="cuda")
                 out = torch.empty_like(q)
                 tabs = RecordTables(*self.store.layer_tables(layer))
                 decode_attention(
                     q, tabs, block_table, seq_lens, SCALE, units, out, ws, layer == 0
                 )
                 kv = _bf16(self.ref[layer]).float()  # [2, NB, T, H, D]
-                ref = torch.empty(B, HQ, D, device="cuda")
+                ref = torch.empty(B, H * group, D, device="cuda")
                 for i, (t, s) in enumerate(zip(tables, seqs, strict=True)):
                     pg = torch.tensor(t, device="cuda")
                     for h in range(H):
                         k = kv[0, pg, :, h].reshape(-1, D)[:s]
                         v = kv[1, pg, :, h].reshape(-1, D)[:s]
-                        qh = q[i, GQA * h : GQA * (h + 1)].float()
-                        ref[i, GQA * h : GQA * (h + 1)] = (
+                        qh = q[i, group * h : group * (h + 1)].float()
+                        ref[i, group * h : group * (h + 1)] = (
                             torch.softmax(qh @ k.T * SCALE, -1) @ v
                         )
                 torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
@@ -239,7 +242,8 @@ def test_store_steps_match_reference(page: int, spills: int) -> None:
     assert stats.err_staging == 0 and stats.err_overflow == 0
     # Block 11 was never written: it must read as zeros, not arena garbage.
     h.check_gather({0: T, 1: T, 4: T, 5: 2, 8: T, 9: T, 10: 3, 3: 11, 11: T})
-    h.check_decode([a, b, d, [11]], [386, 259, 11, T])
+    for group in (GQA, 4, 1):
+        h.check_decode([a, b, d, [11]], [386, 259, 11, T], group)
 
 
 # Source blocks closed by _prefill, and where the import puts them (the WIDE
