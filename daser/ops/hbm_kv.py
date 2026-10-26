@@ -21,6 +21,13 @@ blocks hold raw BF16 records in kernel order in a staging slot:
 * transient scratch ``[S_t, 2, H, 32768]`` for blocks that open and close in
   the same step; one layer's worth, reused layer after layer in stream order.
 
+A request whose chunk completes its partial block and opens a new tail holds
+two slots within the step. When the free stack is empty, the new tail is an
+*heir*: it is written to transient scratch, and each layer's encode copies its
+record into the slot of a block closing that step, which the heir keeps at
+commit. So ``S_p`` must cover the blocks open between steps (one per running
+request), not the peak within a step.
+
 Per step, :meth:`HbmKvStore.prepare` (once, before the forward) releases the
 staging of blocks no request references any more, claims staging for blocks
 receiving offset 0, lists the blocks receiving offset 127, and points claimed
@@ -181,7 +188,9 @@ class HbmKvStore:
         max_tokens: Most tokens in one step (sizes the per-step lists and
             transient scratch).
         staging_slots: Persistent staging slots ``S_p``, i.e. blocks that may
-            stay open across steps at once (at least one per running request).
+            stay open across steps at once (at least one per running request;
+            heirs cover the second slot a request needs within a step). Also
+            bounds the heirs of a step, which take transient scratch.
         overflow_records: Raw records that may be held in the overflow pool.
 
     Async/thread-safety:
@@ -231,7 +240,9 @@ class HbmKvStore:
 
         L, NB, H = self.num_layers, self.num_blocks, kv_heads
         i32 = dict(dtype=torch.int32, device=dev)
-        transient = max_tokens // BLOCK_TOKENS + 2
+        # Blocks opening and closing in the step, plus at most one heir per
+        # persistent slot.
+        transient = max_tokens // BLOCK_TOKENS + 2 + staging_slots
         self.counters = torch.zeros(_N_COUNTERS, **i32)
         self.counters[0] = staging_slots
         self.wslot = torch.full((NB,), -1, **i32)
@@ -245,8 +256,9 @@ class HbmKvStore:
         self.ovf_bits = torch.from_numpy(
             np.packbits(bits, bitorder="little").view(np.int32).copy()
         ).to(dev)
-        self.claim_list = torch.zeros(max_tokens, **i32)
-        self.close_list = torch.zeros(max_tokens, **i32)
+        # [2, max_tokens]: claims then heirs; closes then each close's heir.
+        self.claim_list = torch.zeros(2 * max_tokens, **i32)
+        self.close_list = torch.zeros(2 * max_tokens, **i32)
         # Until a block is first claimed its records read one all-zero raw
         # record, so attention over a never-written block (the engine's null
         # block, dummy runs) stays in bounds.
@@ -554,7 +566,8 @@ class HbmKvStore:
             raise StoreError(
                 f"FragPack store dropped KV: staging={stats.err_staging} "
                 f"overflow={stats.err_overflow} "
-                "(staging must cover max_num_seqs; raise DASER_FRAGPACK_OVERFLOW)"
+                "(staging must cover one open block per running request; "
+                "overflow is sized by DASER_FRAGPACK_OVERFLOW)"
             )
         return stats
 

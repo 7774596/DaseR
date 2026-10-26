@@ -90,7 +90,8 @@ class OpenBlocks:
     it. :meth:`live_blocks` lists exactly those; the store's GC frees the slot
     of every other block. A superset is not safe: a block freed while open and
     reallocated ahead of its new owner's write position would keep its stale
-    slot, so one request would hold two and exhaust staging.
+    slot, so blocks open between steps would outnumber requests and exhaust
+    staging.
     """
 
     def __init__(self) -> None:
@@ -404,7 +405,9 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
             )
         key = (caches[0].data_ptr(), caches[0].shape[0])
         if self.store is None or key != self.store_key:
-            # Every running request holds at most one block open across steps.
+            # Every running request holds at most one block open across steps;
+            # the store hands a closing block's slot to the request's new tail
+            # when a chunk needs both within the step.
             self.store = HbmKvStore(
                 caches,
                 self.kv_heads,

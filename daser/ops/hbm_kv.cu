@@ -21,6 +21,8 @@ enum : int {
   kFallbacks = 6,    // records stored raw in the overflow pool (cumulative)
   kEncoded = 7,      // records encoded (cumulative)
   kSpills = 8,       // coded records spilled raw: block-layer page full (cumulative)
+  kHeirs = 9,        // blocks waiting for a closing block's slot this step
+  kDonors = 10,      // closing blocks whose slot passes to an heir this step
 };
 // Per-block step stamps (int32[kTags, NB]).
 enum : int { kTagLive = 0, kTagClose = 1, kTagClaim = 2, kTagCloseDedupe = 3, kTags = 4 };
@@ -33,8 +35,8 @@ struct Store {
   int32_t* tags;        // [kTags, NB]
   int32_t* free_stack;  // [S_p]
   uint32_t* ovf_bits;   // [ceil(O / 32)] overflow slots in use (tail bits preset)
-  int32_t* claim_list;  // [cap]
-  int32_t* close_list;  // [cap]
+  int32_t* claim_list;  // [2, cap]: claimed blocks, then heirs
+  int32_t* close_list;  // [2, cap]: closing blocks, then the heir of each
   int64_t* rec_addr;    // [L, NB, 2, H]
   int32_t* rec_len;     // [L, NB, 2, H]
   int64_t staging;      // [S_p, L, 2, H, kRawRecord] persistent staging
@@ -42,7 +44,7 @@ struct Store {
   int64_t ovf_base;     // [O, kRawRecord] raw records that do not code
   int64_t ovf_end;
   int32_t* fill;        // [L, NB] arena bytes used in each block-layer page
-  int L, H, NB, S_p, S_t, ovf_words;
+  int L, H, NB, S_p, S_t, ovf_words, cap;
 };
 
 Store make_store(torch::Tensor counters, torch::Tensor wslot, torch::Tensor tags,
@@ -71,6 +73,7 @@ Store make_store(torch::Tensor counters, torch::Tensor wslot, torch::Tensor tags
   s.H = rec_addr.size(3);
   s.S_p = free_stack.numel();
   s.S_t = scratch.numel() / (2LL * s.H * kRawRecord);
+  s.cap = claim_list.numel() / 2;
   return s;
 }
 
@@ -109,7 +112,12 @@ __device__ __forceinline__ void ovf_free(const Store& s, int64_t addr) {
 // 2. Mark blocks receiving their last token (offset 127) this step.
 // 3. Claim: a block receiving offset 0 gets a staging slot (kept if it
 //    still owns one; transient if it also closes this step; else popped).
-// 4. Close list: blocks receiving offset 127 that own a slot.
+//    With the free stack empty, a block that stays open becomes an *heir*:
+//    it fills a transient slot and takes over the persistent slot of a block
+//    closing this step (a request finishing its partial block and opening a
+//    new tail in one chunk holds both slots until commit).
+// 4. Close list: blocks receiving offset 127 that own a slot; each closing
+//    persistent slot is paired with the next waiting heir.
 // 5. Point every claimed block's records (all layers) at its staging, release
 //    overflow records they held, and empty its arena pages for the encodes.
 __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(Store s, const int64_t* slots,
@@ -124,6 +132,8 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(Store s, const in
     s.counters[kTrans] = 0;
     s.counters[kClaims] = 0;
     s.counters[kCloses] = 0;
+    s.counters[kHeirs] = 0;
+    s.counters[kDonors] = 0;
   }
   for (int i = tid; i < n_live; i += kPrepThreads) live_tag[live[i]] = step;
   __syncthreads();
@@ -148,7 +158,8 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(Store s, const in
     if (atomicExch(&claim_tag[b], step) == step) continue;
     int w = s.wslot[b];
     if (w < 0) {
-      if (close_tag[b] == step) {
+      const bool closes = close_tag[b] == step;
+      if (closes) {
         const int t = atomicAdd(&s.counters[kTrans], 1);
         if (t < s.S_t) w = s.S_p + t;
       }
@@ -158,7 +169,13 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(Store s, const in
           w = s.free_stack[top];
         } else {
           atomicAdd(&s.counters[kFreeTop], 1);
-          atomicAdd(&s.counters[kErrStaging], 1);
+          const int t = closes ? s.S_t : atomicAdd(&s.counters[kTrans], 1);
+          if (t < s.S_t) {
+            w = s.S_p + t;
+            s.claim_list[s.cap + atomicAdd(&s.counters[kHeirs], 1)] = b;
+          } else {
+            atomicAdd(&s.counters[kErrStaging], 1);
+          }
         }
       }
     }
@@ -166,13 +183,28 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(Store s, const in
     if (w >= 0) s.claim_list[atomicAdd(&s.counters[kClaims], 1)] = b;
   }
   __syncthreads();
+  const int n_heirs = s.counters[kHeirs];
   for (int i = tid; i < n_tok; i += kPrepThreads) {
     const int64_t sl = slots[i];
     if (sl < 0 || (sl & 127) != 127) continue;
     const int b = sl >> 7;
     if (atomicExch(&dedupe_tag[b], step) == step) continue;
-    if (s.wslot[b] >= 0) s.close_list[atomicAdd(&s.counters[kCloses], 1)] = b;
+    const int w = s.wslot[b];
+    if (w < 0) continue;
+    const int c = atomicAdd(&s.counters[kCloses], 1);
+    s.close_list[c] = b;
+    int heir = -1;
+    if (w < s.S_p && n_heirs) {
+      const int d = atomicAdd(&s.counters[kDonors], 1);
+      if (d < n_heirs) heir = s.claim_list[s.cap + d];
+    }
+    s.close_list[s.cap + c] = heir;
   }
+  __syncthreads();
+  // Every block open after a step belongs to a distinct running request, so
+  // S_p >= max_num_seqs leaves no heir unpaired; one would lose its KV.
+  if (tid == 0 && s.counters[kDonors] < n_heirs)
+    atomicAdd(&s.counters[kErrStaging], n_heirs - s.counters[kDonors]);
   const int n_claim = s.counters[kClaims];
   const int per = s.L * 2 * s.H;
   for (int x = tid; x < n_claim * per; x += kPrepThreads) {
@@ -243,6 +275,18 @@ __global__ void __launch_bounds__(kThreads) encode_kernel(Store s, int layer, in
   uint4 wd[8];
 #pragma unroll
   for (int st = 0; st < 8; ++st) wd[st] = reinterpret_cast<const uint4*>(src)[st * kThreads + tid];
+  // Hand this layer's slot record to the heir: copy its transient record in
+  // (each thread overwrites only the words it has just read) and point the
+  // heir's table there; attention has read the transient one already.
+  const int heir = s.close_list[s.cap + blockIdx.x];
+  if (heir >= 0) {
+    const uint4* from = reinterpret_cast<const uint4*>(staging_addr(s, s.wslot[heir], layer, kvh));
+    uint4* to = reinterpret_cast<uint4*>(const_cast<uint8_t*>(src));
+#pragma unroll
+    for (int st = 0; st < 8; ++st) to[st * kThreads + tid] = from[st * kThreads + tid];
+    if (tid == 0)
+      s.rec_addr[((int64_t)layer * s.NB + heir) * 2 * s.H + kvh] = reinterpret_cast<int64_t>(src);
+  }
   for (int i = tid; i < kVarCap / 16; i += kThreads)
     reinterpret_cast<uint4*>(var_s)[i] = make_uint4(0, 0, 0, 0);
   __syncthreads();
@@ -384,14 +428,19 @@ __global__ void __launch_bounds__(kThreads) encode_kernel(Store s, int layer, in
   }
 }
 
-// Closed blocks release their staging slot; the close list is then emptied so
-// a forward without a fresh prepare (CUDA-graph capture) encodes nothing.
+// Closed blocks release their staging slot, or pass it to their heir; the
+// close list is then emptied so a forward without a fresh prepare (CUDA-graph
+// capture) encodes nothing.
 __global__ void commit_kernel(Store s) {
   const int n = s.counters[kCloses];
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     const int b = s.close_list[i];
     const int w = s.wslot[b];
-    if (w >= 0 && w < s.S_p) s.free_stack[atomicAdd(&s.counters[kFreeTop], 1)] = w;
+    const int heir = s.close_list[s.cap + i];
+    if (heir >= 0)
+      s.wslot[heir] = w;
+    else if (w >= 0 && w < s.S_p)
+      s.free_stack[atomicAdd(&s.counters[kFreeTop], 1)] = w;
     s.wslot[b] = -1;
   }
   __syncthreads();
@@ -625,8 +674,9 @@ void hbm_prepare(torch::Tensor counters, torch::Tensor wslot, torch::Tensor tags
                  torch::Tensor slot_mapping, int64_t n_tok, torch::Tensor live, int64_t n_live,
                  int64_t step) {
   TORCH_CHECK(slot_mapping.scalar_type() == torch::kInt64, "slot_mapping must be int64");
-  // Claims and closes are both bounded by the token count.
-  TORCH_CHECK(n_tok <= claim_list.numel() && n_tok <= close_list.numel(), "block lists too small");
+  // Claims, heirs and closes are each bounded by the token count.
+  TORCH_CHECK(claim_list.numel() == close_list.numel() && 2 * n_tok <= claim_list.numel(),
+              "block lists too small");
   Store s = make_store(counters, wslot, tags, free_stack, ovf_bits, claim_list, close_list,
                        rec_addr, rec_len, staging, scratch, overflow, fill);
   prepare_kernel<<<1, kPrepThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -664,7 +714,7 @@ void hbm_encode(torch::Tensor counters, torch::Tensor wslot, torch::Tensor tags,
   if (max_close == 0) return;
   Store s = make_store(counters, wslot, tags, free_stack, ovf_bits, claim_list, close_list,
                        rec_addr, rec_len, staging, scratch, overflow, fill);
-  TORCH_CHECK(max_close <= close_list.numel(), "close list too small");
+  TORCH_CHECK(2 * max_close <= close_list.numel(), "close list too small");
   TORCH_CHECK(rank_of.numel() == (int64_t)s.L * 2 * s.H * 256, "rank_of must hold every layer");
   TORCH_CHECK(page_bytes % 16 == 0 && page_bytes < (1LL << 31), "bad arena page size");
   encode_kernel<<<dim3(max_close, 2 * s.H), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(

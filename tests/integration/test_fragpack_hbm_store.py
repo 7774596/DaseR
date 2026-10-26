@@ -10,7 +10,8 @@ released by GC and commit, and decode attention over coded, raw, and
 still-open blocks against an fp32 reference. Block blobs exported from one
 store and imported into other blocks of a second store must pass the same
 checks, free the overflow slots they replace, and reject corrupt or foreign
-blobs without touching the destination.
+blobs without touching the destination. A request whose chunk closes its
+open block and opens a new tail must not need a second persistent slot.
 """
 
 import numpy as np
@@ -57,7 +58,11 @@ def _overflow_used(store: HbmKvStore, records: int) -> int:
 
 class _Harness:
     def __init__(
-        self, rng: np.random.Generator, page: int, overflow_records: int = 16
+        self,
+        rng: np.random.Generator,
+        page: int,
+        overflow_records: int = 16,
+        staging_slots: int = 3,
     ) -> None:
         self.rng = rng
         self.page = page
@@ -75,7 +80,7 @@ class _Harness:
             H,
             device_tables(self.table, torch.device("cuda")),
             max_tokens=1024,
-            staging_slots=3,
+            staging_slots=staging_slots,
             overflow_records=overflow_records,
         )
         self.overflow_records = overflow_records
@@ -244,6 +249,32 @@ def test_store_steps_match_reference(page: int, spills: int) -> None:
     h.check_gather({0: T, 1: T, 4: T, 5: 2, 8: T, 9: T, 10: 3, 3: 11, 11: T})
     for group in (GQA, 4, 1):
         h.check_decode([a, b, d, [11]], [386, 259, 11, T], group)
+
+
+def test_chunk_reopening_tail_inherits_closing_slot() -> None:
+    """One slot per request suffices when chunks close and reopen blocks.
+
+    Each chunk of step 2 completes its request's open block and opens a new
+    tail, so both requests need two slots within the step while staging has
+    one each; the tails must inherit the closing blocks' slots.
+    """
+    h = _Harness(np.random.default_rng(1), page_bytes(H), staging_slots=2)
+    a, b = [0, 1, 2], [3, 4, 5]
+    h.step([(a, 0, 200), (b, 0, 200)], [])
+    h.step([(a, 200, 100), (b, 200, 100)], [1, 4])
+    torch.cuda.synchronize()
+    assert h.store.stats().err_staging == 0
+    assert h.check_arena([0, 1, 3, 4]) == (0, 0)
+    h.check_gather({2: 44, 5: 44})
+    h.step([(a, 300, 1), (b, 300, 1)], [2, 5])
+    h.step([(a, 301, 83), (b, 301, 83)], [2, 5])
+    torch.cuda.synchronize()
+    stats = h.store.stats()
+    assert stats.err_staging == 0 and stats.err_overflow == 0
+    assert stats.encoded == 6 * L * 2 * H
+    assert h.check_arena([0, 1, 2, 3, 4, 5]) == (0, 0)
+    h.check_gather({b: T for b in range(6)})
+    h.check_decode([a, b], [384, 384])
 
 
 # Source blocks closed by _prefill, and where the import puts them (the WIDE
