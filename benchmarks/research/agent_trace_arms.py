@@ -413,15 +413,35 @@ class CPUOffloadServer(MatchedServer):
     """Start vLLM with its built-in CPU KV offload connector."""
 
     def offload_config(self) -> dict[str, Any]:
-        """Return the SimpleCPUOffloadConnector config sized to L1.
+        """Return vLLM's CPU offload connector config sized to L1.
+
+        ``DASER_BENCH_VLLM_OFFLOAD`` selects the connector: ``simple``
+        (default, SimpleCPUOffloadConnector), ``native`` (OffloadingConnector,
+        what ``--kv-offloading-backend native`` picks) or ``fs``
+        (OffloadingConnector with its file-system secondary tier under the
+        arm's store directory; that tier has no capacity bound).
 
         Returns:
             kv-transfer-config mapping.
         """
+        mode = os.environ.get("DASER_BENCH_VLLM_OFFLOAD", "simple")
+        extra: dict[str, Any] = {"cpu_bytes_to_use": self.l1_size_bytes}
+        if mode == "simple":
+            connector = "SimpleCPUOffloadConnector"
+        elif mode == "native":
+            connector = "OffloadingConnector"
+        elif mode == "fs":
+            connector = "OffloadingConnector"
+            extra["spec_name"] = "TieringOffloadingSpec"
+            extra["secondary_tiers"] = [
+                {"type": "fs", "root_dir": str(self.store_dir / "vllm_fs")}
+            ]
+        else:
+            raise ValueError(f"unknown DASER_BENCH_VLLM_OFFLOAD {mode!r}")
         return {
-            "kv_connector": "SimpleCPUOffloadConnector",
+            "kv_connector": connector,
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {"cpu_bytes_to_use": self.l1_size_bytes},
+            "kv_connector_extra_config": extra,
         }
 
     async def start_vllm_only(self) -> None:
