@@ -133,7 +133,8 @@ def _reference(
     key, value = (
         source.permute(0, 3, 1, 2, 4).reshape(2, HEADS, BLOCKS * TOKENS, DIM).float()
     )
-    query = q.reshape(len(lengths), HEADS, GQA, DIM).float()
+    group = q.shape[1] // HEADS
+    query = q.reshape(len(lengths), HEADS, group, DIM).float()
     logits = torch.einsum("bhgd,htd->bhgt", query, key) * SCALE
     # Repeating a token n times contributes n * exp(logit) to both numerator
     # and denominator. Adding log(n) gives exactly the same dense attention,
@@ -241,15 +242,17 @@ def test_ragged_batches_match_fp32_attention(
 
 
 @pytest.mark.parametrize("units_policy", ["auto", "minimum"])
+@pytest.mark.parametrize("group", [1, 2, 4, GQA])
 def test_graph_replans_padding_and_reuses_plan_across_layers(
-    encoded_store: StoreFixture, units_policy: str
+    encoded_store: StoreFixture, units_policy: str, group: int
 ) -> None:
-    """Replay one graph with changing lengths, empty rows, and an empty batch.
+    """Replay supported query groups with changing lengths and empty rows.
 
     Args:
         encoded_store (StoreFixture): Encoded KV and owning tensors.
         units_policy (str): Automatic split capacity or the public minimum
             of one reserved unit per batch row.
+        group (int): Query heads per KV head, including padded smaller groups.
 
     Returns:
         None.
@@ -277,7 +280,7 @@ def test_graph_replans_padding_and_reuses_plan_across_layers(
     queries = [
         torch.randn(
             batch,
-            HEADS * GQA,
+            HEADS * group,
             DIM,
             dtype=torch.bfloat16,
             device=source.device,

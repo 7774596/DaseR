@@ -41,11 +41,14 @@ def test_memory_accounting_uses_actual_stride_and_tensor_element_sizes(
     usage = store.memory_usage()
     assert usage["arena"] == 2 * 3 * (page_bytes(1) + 16)
     assert usage["staging"] == 2 * 2 * 2 * 32768
-    assert usage["scratch"] == 3 * 2 * 32768
+    # Three slots cover blocks closed within the step; two more allow each
+    # persistent slot to hand its storage to a newly opened tail.
+    assert usage["scratch"] == 5 * 2 * 32768
     assert usage["overflow"] == 3 * 32768
     assert usage["codebooks"] == 2 * 2 * (256 + 2 * 4 + 16)
     # 16 counters, per-block slot/tags/fill/live metadata, two free slots,
-    # one overflow bitmap word, two 128-entry lists, one null BF16 record,
+    # one overflow bitmap word, two 256-entry lists (including heir mappings),
+    # one null BF16 record,
     # 12 int64 addresses + 12 int32 lengths and per-layer base/stride arrays.
     assert usage["metadata"] == (
         16 * 4
@@ -53,7 +56,7 @@ def test_memory_accounting_uses_actual_stride_and_tensor_element_sizes(
         + 4 * 3 * 4
         + 2 * 4
         + 4
-        + 2 * 128 * 4
+        + 2 * 256 * 4
         + 32768
         + 12 * 8
         + 12 * 4

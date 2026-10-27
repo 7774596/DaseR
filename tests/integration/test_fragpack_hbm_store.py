@@ -10,7 +10,8 @@ released by GC and commit, and decode attention over coded, raw, and
 still-open blocks against an fp32 reference. Block blobs exported from one
 store and imported into other blocks of a second store must pass the same
 checks, free the overflow slots they replace, and reject corrupt or foreign
-blobs without touching the destination.
+blobs without touching the destination. A request whose chunk closes its
+open block and opens a new tail must not need a second persistent slot.
 """
 
 import numpy as np
@@ -57,7 +58,11 @@ def _overflow_used(store: HbmKvStore, records: int) -> int:
 
 class _Harness:
     def __init__(
-        self, rng: np.random.Generator, page: int, overflow_records: int = 16
+        self,
+        rng: np.random.Generator,
+        page: int,
+        overflow_records: int = 16,
+        staging_slots: int = 3,
     ) -> None:
         self.rng = rng
         self.page = page
@@ -75,7 +80,7 @@ class _Harness:
             H,
             device_tables(self.table, torch.device("cuda")),
             max_tokens=1024,
-            staging_slots=3,
+            staging_slots=staging_slots,
             overflow_records=overflow_records,
         )
         self.overflow_records = overflow_records
@@ -167,11 +172,14 @@ class _Harness:
                         got[kv][i, :n], self.ref[layer, kv, b, :n], err_msg=f"{b}"
                     )
 
-    def check_decode(self, tables: list[list[int]], seqs: list[int]) -> None:
+    def check_decode(
+        self, tables: list[list[int]], seqs: list[int], group: int = GQA
+    ) -> None:
         """Fused decode vs an fp32 reference over the written KV.
 
         Runs with the default unit count (one page per chunk here) and with
         fewer units, so chunks span several pages and sequences end mid-chunk.
+        ``group`` is the number of query heads per KV head.
         """
         B = len(seqs)
         width = max(len(t) for t in tables)
@@ -189,21 +197,21 @@ class _Harness:
                 torch.empty(plan, dtype=torch.int32, device="cuda"),
             )
             for layer in range(L):
-                q = torch.randn(B, HQ, D, dtype=torch.bfloat16, device="cuda")
+                q = torch.randn(B, H * group, D, dtype=torch.bfloat16, device="cuda")
                 out = torch.empty_like(q)
                 tabs = RecordTables(*self.store.layer_tables(layer))
                 decode_attention(
                     q, tabs, block_table, seq_lens, SCALE, units, out, ws, layer == 0
                 )
                 kv = _bf16(self.ref[layer]).float()  # [2, NB, T, H, D]
-                ref = torch.empty(B, HQ, D, device="cuda")
+                ref = torch.empty(B, H * group, D, device="cuda")
                 for i, (t, s) in enumerate(zip(tables, seqs, strict=True)):
                     pg = torch.tensor(t, device="cuda")
                     for h in range(H):
                         k = kv[0, pg, :, h].reshape(-1, D)[:s]
                         v = kv[1, pg, :, h].reshape(-1, D)[:s]
-                        qh = q[i, GQA * h : GQA * (h + 1)].float()
-                        ref[i, GQA * h : GQA * (h + 1)] = (
+                        qh = q[i, group * h : group * (h + 1)].float()
+                        ref[i, group * h : group * (h + 1)] = (
                             torch.softmax(qh @ k.T * SCALE, -1) @ v
                         )
                 torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
@@ -239,7 +247,34 @@ def test_store_steps_match_reference(page: int, spills: int) -> None:
     assert stats.err_staging == 0 and stats.err_overflow == 0
     # Block 11 was never written: it must read as zeros, not arena garbage.
     h.check_gather({0: T, 1: T, 4: T, 5: 2, 8: T, 9: T, 10: 3, 3: 11, 11: T})
-    h.check_decode([a, b, d, [11]], [386, 259, 11, T])
+    for group in (GQA, 4, 2, 1):
+        h.check_decode([a, b, d, [11]], [386, 259, 11, T], group)
+
+
+def test_chunk_reopening_tail_inherits_closing_slot() -> None:
+    """One slot per request suffices when chunks close and reopen blocks.
+
+    Each chunk of step 2 completes its request's open block and opens a new
+    tail, so both requests need two slots within the step while staging has
+    one each; the tails must inherit the closing blocks' slots.
+    """
+    h = _Harness(np.random.default_rng(1), page_bytes(H), staging_slots=2)
+    a, b = [0, 1, 2], [3, 4, 5]
+    h.step([(a, 0, 200), (b, 0, 200)], [])
+    h.step([(a, 200, 100), (b, 200, 100)], [1, 4])
+    torch.cuda.synchronize()
+    assert h.store.stats().err_staging == 0
+    assert h.check_arena([0, 1, 3, 4]) == (0, 0)
+    h.check_gather({2: 44, 5: 44})
+    h.step([(a, 300, 1), (b, 300, 1)], [2, 5])
+    h.step([(a, 301, 83), (b, 301, 83)], [2, 5])
+    torch.cuda.synchronize()
+    stats = h.store.stats()
+    assert stats.err_staging == 0 and stats.err_overflow == 0
+    assert stats.encoded == 6 * L * 2 * H
+    assert h.check_arena([0, 1, 2, 3, 4, 5]) == (0, 0)
+    h.check_gather({b: T for b in range(6)})
+    h.check_decode([a, b], [384, 384])
 
 
 # Source blocks closed by _prefill, and where the import puts them (the WIDE

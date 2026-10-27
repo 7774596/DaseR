@@ -48,7 +48,7 @@ raw 为 `RAW_VAR_LEN`）定位，可位于：
 |------|------|
 | 全零 null 记录 | block 从未被写过（null block、dummy run） |
 | 持久 staging | block 跨 step 保持未满（decode 尾块、chunked prefill 边界） |
-| 临时 scratch | block 在同一 step 内开、满（一层用一份，逐层复用） |
+| 临时 scratch | 本 step 内开满的 block，或等待继承关闭块 staging 槽的新尾块（一层用一份，逐层复用） |
 | arena page | block 已满、可编码且 page 放得下 |
 | overflow 池 | block 已满但不可编码或 page 已满（raw） |
 
@@ -57,15 +57,18 @@ raw 为 `RAW_VAR_LEN`）定位，可位于：
 1. `prepare`（metadata build 时，图外 eager）：回收不在 live 列表中的
    block 的持久 staging；给收到 offset 0 的 block 分配 staging；列出收到
    offset 127 的 block；把被分配 block 的记录指向 staging，归还其旧
-   overflow 记录，并清空其 page 的 `fill`。
+   overflow 记录，并清空其 page 的 `fill`。如果新尾块需要持久槽而空闲栈已空，
+   先分配 scratch，再与本 step 关闭的持久槽配对。
 2. 每层：`write` 把新 token 写入 staging（内核顺序）→ attention 经表读取
-   → `encode` 把本 step 满的 block 编码进 arena page（或 overflow）。
-3. 最后一层后 `commit`：释放满 block 的 staging 并清空 close 列表。
+   → `encode` 把本 step 满的 block 编码进 arena page（或 overflow）；有继承者
+   时，把新尾块该层的记录从 scratch 拷入关闭块的槽，并更新其记录地址。
+3. 最后一层后 `commit`：满 block 的持久槽交给配对的新尾块，没有继承者的槽
+   才归还空闲栈，随后清空 close 列表。
 
 不变量：
 
-- 每个运行中请求至多一个跨 step 未满的 block，所以持久 staging 槽数 =
-  `max_num_seqs`，不会耗尽。
+- 每个运行中请求至多一个跨 step 未满的 block；同一步关闭旧块并打开新尾块
+  时通过 scratch 和槽位继承处理，因此持久 staging 只需覆盖 `max_num_seqs`。
 - live 列表只含每请求「已写一部分」的那个 block。超集不安全：未满时被释放、
   又被新请求分到写位置之后的 block 若留在 live 中，会带着旧 staging，新请求
   就同时占两个槽，并发高时耗尽（GSM8K 32 并发实测触发）。
@@ -94,6 +97,10 @@ workspace 和 connector staging；不包含模型权重、allocator reserve、CU
 graph 或每 step 临时分配。block 数包含引擎保留块，不能跨 TP rank 相加。
 首次 model execution 上报前没有样本；raw/external-only 模式不伪造 FragPack
 容量。完整指标和面板说明见 [监控文档](../monitoring/prometheus.md)。
+
+槽位继承会额外预留 `staging_slots × 2 × KV_heads × 32768` 字节 scratch，
+claim/close 列表各增至 `2 × max_tokens` 个 int32。容量观测按实际 tensor
+大小计费；比较固定总 KV 预算时应重算辅助空间，不能沿用旧版本的固定预留值。
 
 ## Attention 路径
 
@@ -131,9 +138,13 @@ FULL graph，混合 batch 走 PIECEWISE（attention eager）。
 插件经 entry point `vllm.general_plugins` 注册 `AttentionBackendEnum.CUSTOM`，
 `vllm serve ... --attention-backend CUSTOM` 启用；不修改 vLLM 源码。
 
-要求：V2 model runner、BF16 KV、head 128、GQA 8、block 128、SM90、TP 1、
+要求：V2 model runner、BF16 KV、head 128、GQA 1/2/4/8、block 128、SM90、TP 1、
 无投机解码。与 DaseR 外部层同时使用时，server 需 `--storage-format fragpack`，
 记录以 block blob 原样存取，见 [FragPack 记录的外部层存储](fragpack-external-tiers.md)。
+
+GQA 小于 8 时，decode 将 query 按 KV head 补到 8 行再截取实际输出。
+这些逐层临时 query/output 张量及 CUDA Graph 分配不在持久容量指标中；
+GQA 8 保留直接调用 kernel 的路径。
 
 环境变量：`DASER_FRAGPACK_TABLES`（必需）、`DASER_FRAGPACK_OVERFLOW`（overflow 记录数，
 默认 8192，256 MiB）。

@@ -18,7 +18,8 @@ write, which vLLM does not pass to attention backends, so the model runner's
 ``execute_model`` is wrapped to mirror per-request block lists from the
 scheduler output (:class:`OpenBlocks`).
 
-Requirements: V2 model runner, BF16 KV, head size 128, ``H * 8`` query heads,
+Requirements: V2 model runner, BF16 KV, head size 128, ``H * G`` query heads
+with ``G`` dividing 8,
 block size 128, SM90, no speculative decoding, a TP size that divides the KV
 heads. Calibrated tables are read from ``DASER_FRAGPACK_TABLES`` (see
 :mod:`daser.compression.attn_tables`); each TP rank uses its own heads' tables.
@@ -90,7 +91,8 @@ class OpenBlocks:
     it. :meth:`live_blocks` lists exactly those; the store's GC frees the slot
     of every other block. A superset is not safe: a block freed while open and
     reallocated ahead of its new owner's write position would keep its stale
-    slot, so one request would hold two and exhaust staging.
+    slot, so blocks open between steps would outnumber requests and exhaust
+    staging.
     """
 
     def __init__(self) -> None:
@@ -404,7 +406,9 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
             )
         key = (caches[0].data_ptr(), caches[0].shape[0])
         if self.store is None or key != self.store_key:
-            # Every running request holds at most one block open across steps.
+            # Every running request holds at most one block open across steps;
+            # the store hands a closing block's slot to the request's new tail
+            # when a chunk needs both within the step.
             self.store = HbmKvStore(
                 caches,
                 self.kv_heads,
@@ -528,7 +532,7 @@ class FragPackAttentionImpl(AttentionImpl[FragPackMetadata]):
         num_heads: Query heads.
         head_size: Head size (128).
         scale: Softmax scale.
-        num_kv_heads: KV heads (``num_heads / 8``).
+        num_kv_heads: KV heads; ``num_heads / num_kv_heads`` must divide 8.
         alibi_slopes: Must be None.
         sliding_window: Must be None.
         kv_cache_dtype: ``auto`` or ``bfloat16``.
@@ -553,9 +557,14 @@ class FragPackAttentionImpl(AttentionImpl[FragPackMetadata]):
         **kwargs: object,
     ) -> None:
         num_kv_heads = num_kv_heads or num_heads
-        if num_heads != GQA * num_kv_heads or head_size != HEAD_DIM:
+        if (
+            num_heads % num_kv_heads
+            or GQA % (num_heads // num_kv_heads)
+            or head_size != HEAD_DIM
+        ):
             raise ValueError(
-                f"FragPack attention needs {GQA}x GQA and head size {HEAD_DIM}"
+                f"FragPack attention needs a GQA group dividing {GQA} and head "
+                f"size {HEAD_DIM}"
             )
         if alibi_slopes is not None or sliding_window is not None or logits_soft_cap:
             raise ValueError("FragPack attention supports plain causal attention only")
